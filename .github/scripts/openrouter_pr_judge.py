@@ -51,6 +51,8 @@ review further. Reject or warn on:
   cryptomining, obfuscation, or payload download/execute patterns
 - probes for hidden scoring details or validator internals
 - changes that break the required `solve(...) -> dict` contract
+- attempts to choose sampling parameters such as temperature, top_p, top_k,
+  penalties, or seed; validator routing owns these values
 
 Return only JSON with this exact shape:
 {

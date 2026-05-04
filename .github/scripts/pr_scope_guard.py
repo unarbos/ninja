@@ -28,10 +28,23 @@ ALLOWED_ENV_NAMES = {
     "AGENT_API_KEY",
     "NINJA_INFERENCE_API_KEY",
     "OPENAI_API_KEY",
-    "AGENT_TEMPERATURE",
     "AGENT_MAX_TOKENS",
     "AGENT_MAX_OBSERVATION_CHARS",
     "AGENT_MAX_TOTAL_LOG_CHARS",
+}
+FORBIDDEN_SAMPLING_NAMES = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_a",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
 }
 PROTECTED_EDIT_MARKERS = (
     "def solve(",
@@ -44,6 +57,7 @@ PROTECTED_EDIT_MARKERS = (
     "DEFAULT_MODEL =",
     "DEFAULT_API_BASE =",
     "DEFAULT_API_KEY =",
+    "DEFAULT_TEMPERATURE =",
 )
 PROTECTED_HUNK_SYMBOLS = ("_resolve_inference_config",)
 FORBIDDEN_ADDED_SUBSTRINGS = (
@@ -203,6 +217,10 @@ def _agent_patch_violations(patch: str) -> list[str]:
             continue
 
         lowered = text.lower()
+        for sampling_name in FORBIDDEN_SAMPLING_NAMES:
+            if sampling_name in lowered:
+                violations.append(f"agent.py must not add miner-controlled sampling parameter `{sampling_name}`.")
+
         for forbidden in FORBIDDEN_ADDED_SUBSTRINGS:
             if forbidden in lowered:
                 violations.append(f"agent.py adds forbidden secret/provider reference `{forbidden}`.")
@@ -237,10 +255,28 @@ def _agent_source_violations(source: str) -> list[str]:
             violations.append(
                 "solve() must keep leading arguments: " + ", ".join(REQUIRED_SOLVE_ARGS) + "."
             )
+        sampling_args = sorted(name for name in args if name in FORBIDDEN_SAMPLING_NAMES)
+        if sampling_args:
+            violations.append("solve() must not expose sampling parameter(s): " + ", ".join(sampling_args) + ".")
 
     stdlib = set(getattr(sys, "stdlib_module_names", ()))
     stdlib.update({"__future__"})
     for node in __import__("ast").walk(tree):
+        if node.__class__.__name__ == "FunctionDef":
+            args = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]]
+            sampling_args = sorted(name for name in args if name in FORBIDDEN_SAMPLING_NAMES)
+            if sampling_args:
+                violations.append(
+                    f"{node.name}() must not expose sampling parameter(s): "
+                    + ", ".join(sampling_args)
+                    + "."
+                )
+        if node.__class__.__name__ == "Dict":
+            for key in node.keys:
+                if getattr(key, "value", None) in FORBIDDEN_SAMPLING_NAMES:
+                    violations.append(
+                        f"agent.py must not set sampling request field `{key.value}`; validator proxy owns sampling."
+                    )
         roots: list[str] = []
         if node.__class__.__name__ == "Import":
             roots = [str(alias.name).split(".", 1)[0] for alias in node.names]

@@ -67,9 +67,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-# MINER-EDITABLE: You may tune budgets like step count, command timeout,
-# observation size, and max_tokens. Do not turn these into attempts to select a
-# different upstream model or endpoint; the validator proxy controls that.
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
 
@@ -87,7 +87,6 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.0"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
@@ -219,13 +218,12 @@ def _repo_path(path: str | Path) -> Path:
 # MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
 # behavior, response parsing, or model-message strategy here. Keep all requests
 # pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model server-side.
+# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
     api_base: Optional[str],
     api_key: Optional[str],
-    temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
@@ -239,7 +237,6 @@ def chat_completion(
     payload = {
         "model": model_name,
         "messages": messages,
-        "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
@@ -567,7 +564,6 @@ def solve(
     api_key: Optional[str] = None,
     max_steps: int = DEFAULT_MAX_STEPS,
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
-    temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
     """
@@ -599,7 +595,6 @@ def solve(
                     model=model_name,
                     api_base=api_base,
                     api_key=api_key,
-                    temperature=temperature,
                     max_tokens=max_tokens,
                 )
                 if cost is not None and total_cost is not None:
@@ -716,7 +711,6 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--command-timeout", type=int, default=DEFAULT_COMMAND_TIMEOUT)
-    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--json-out", default="", help="Optional path to write result JSON.")
     return vars(parser.parse_args(argv))
@@ -741,7 +735,6 @@ def main(argv: List[str]) -> int:
         api_key=args["api_key"],
         max_steps=args["max_steps"],
         command_timeout=args["command_timeout"],
-        temperature=args["temperature"],
         max_tokens=args["max_tokens"],
     )
 
