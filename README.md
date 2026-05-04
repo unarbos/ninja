@@ -4,6 +4,9 @@
 `agent.py` and keep the validator, task generation, scoring, and hidden tests
 outside this repo.
 
+Miner submissions happen through pull requests to this repo. The validator only
+runs PRs that are also committed on-chain by a registered miner hotkey.
+
 ## Contract
 
 The validator imports `agent.py` and calls:
@@ -40,6 +43,11 @@ The validator passes a managed model id, proxy URL, and per-run proxy token into
 routing are enforced. In production, every miner agent should hit this same
 inference surface rather than choosing its own provider or model.
 
+Sampling is also validator-owned. Do not add or tune request fields such as
+`temperature`, `top_p`, `top_k`, `seed`, penalties, `logit_bias`, or `logprobs`.
+The validator proxy overwrites `temperature=0.0`, overwrites `top_p=1.0`, and
+strips other miner-controlled sampling fields before forwarding to OpenRouter.
+
 ## Editing
 
 Work directly in `agent.py`. The validator owns the task repo and sandbox, so
@@ -54,9 +62,48 @@ AGENT_COMMAND_TIMEOUT=30
 AGENT_MODEL=validator-managed-model
 OPENAI_BASE_URL=http://validator-proxy/v1
 OPENAI_API_KEY=per-run-proxy-token
-AGENT_TEMPERATURE=0
 AGENT_MAX_TOKENS=2048
 ```
+
+External miner PRs are expected to touch `agent.py` only. Good areas to edit
+include prompting, context gathering, command selection, result parsing,
+stopping logic, patch generation, safety checks, and how the harness uses its
+step budget.
+
+Keep these boundaries intact:
+
+- preserve the `solve(repo_path, issue, model, api_base, api_key)` entry point
+- return `patch`, `logs`, `steps`, `cost`, and `success`
+- use only the supplied `api_base` and `api_key`
+- do not hardcode another model, provider endpoint, API key, wallet, scorer, or
+  validator secret
+- do not add third-party Python dependencies
+- do not read or exfiltrate host secrets, hidden tests, prompts, or evaluator
+  data
+
+## Miner PR Flow
+
+1. Fork or branch from `unarbos/ninja`.
+2. Edit `agent.py`.
+3. Open a PR back to `unarbos/ninja:main`.
+4. Make the PR title start with your exact miner hotkey:
+
+```text
+<miner-hotkey> improve command loop
+```
+
+Do not use a label such as `hkey:` before the hotkey. The hotkey must be the
+first characters in the title.
+
+5. Commit the PR head on-chain using:
+
+```text
+github-pr:unarbos/ninja#<pr-number>@<head-sha>
+```
+
+The validator binds the PR to the committing hotkey by checking that the PR
+title starts with the same hotkey that made the on-chain commitment. It also
+checks that the committed SHA matches the current PR head SHA.
 
 ## What Belongs Here
 
@@ -74,6 +121,17 @@ Pull requests are judged by `.github/workflows/openrouter-pr-judge.yml`.
 The workflow uses `pull_request_target`, checks out only trusted code from the
 base branch, fetches the PR diff through the GitHub API, and sends that diff to
 an OpenRouter-routed model. It does not run miner-submitted code.
+
+The CI checks are:
+
+- `PR Scope Guard`: rejects external PRs that touch files outside `agent.py`,
+  break the `solve(...)` contract, add forbidden provider/secret references, or
+  try to control sampling.
+- `OpenRouter PR Judge`: uses `moonshotai/kimi-k2.6` through OpenRouter to judge
+  whether the PR is a real, scoped, safe miner edit.
+
+Both checks require the PR title to start with a hotkey-shaped prefix. If the
+title gate fails, the OpenRouter judge exits before making an LLM request.
 
 Required GitHub secret:
 
