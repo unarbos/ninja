@@ -25,6 +25,8 @@ DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_MAX_PATCH_CHARS = 120_000
 DEFAULT_MIN_SCORE = 70
 DEFAULT_OPENROUTER_ATTEMPTS = 3
+DEFAULT_OPENROUTER_MAX_TOKENS = 4096
+OPENROUTER_REASONING = {"effort": "low", "exclude": True}
 MINER_HOTKEY_TITLE_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}(?:$|[\s:#-])")
 
 SYSTEM_PROMPT = """\
@@ -308,7 +310,7 @@ def _static_checks(files: list[dict[str, Any]]) -> dict[str, Any]:
 def _judge_with_openrouter(api_key: str, model: str, pr_payload: dict[str, Any]) -> dict[str, Any]:
     base = os.environ.get("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE).rstrip("/")
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-    max_tokens = _int_env("OPENROUTER_MAX_TOKENS", 1800)
+    max_tokens = _int_env("OPENROUTER_MAX_TOKENS", DEFAULT_OPENROUTER_MAX_TOKENS)
     attempts = _int_env("OPENROUTER_ATTEMPTS", DEFAULT_OPENROUTER_ATTEMPTS)
 
     messages = [
@@ -326,6 +328,7 @@ def _judge_with_openrouter(api_key: str, model: str, pr_payload: dict[str, Any])
         "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
+        "reasoning": OPENROUTER_REASONING,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",

@@ -170,7 +170,11 @@ Optional Doppler variables:
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_SITE_URL=https://github.com/unarbos/ninja
 OPENROUTER_APP_NAME=ninja-pr-judge
-OPENROUTER_MAX_TOKENS=1800
+OPENROUTER_MAX_TOKENS=4096
 JUDGE_MIN_SCORE=70
 JUDGE_MAX_PATCH_CHARS=120000
 ```
+
+The PR judge uses low OpenRouter reasoning effort and excludes reasoning text
+from the returned message, so the model can reason internally while still
+returning the required JSON verdict.
