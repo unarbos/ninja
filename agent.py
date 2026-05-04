@@ -54,9 +54,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "")
-DEFAULT_API_BASE = os.environ.get("AGENT_API_BASE") or os.environ.get("OPENAI_BASE_URL", "")
-DEFAULT_API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
+DEFAULT_API_BASE = (
+    os.environ.get("AGENT_API_BASE")
+    or os.environ.get("NINJA_INFERENCE_BASE_URL")
+    or os.environ.get("OPENAI_BASE_URL", "")
+)
+DEFAULT_API_KEY = (
+    os.environ.get("AGENT_API_KEY")
+    or os.environ.get("NINJA_INFERENCE_API_KEY")
+    or os.environ.get("OPENAI_API_KEY", "")
+)
 DEFAULT_TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.0"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
