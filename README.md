@@ -85,7 +85,6 @@ Required Doppler variables:
 
 ```text
 OPENROUTER_API_KEY
-OPENROUTER_MODEL
 ```
 
 Optional Doppler variables:
