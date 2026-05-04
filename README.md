@@ -60,3 +60,35 @@ AGENT_MAX_TOKENS=2048
 
 Validator services, PM2 config, task pools, R2 tooling, chain wallets, and
 generated workspaces should live outside this repo.
+
+## PR Judge CI
+
+Pull requests are judged by `.github/workflows/openrouter-pr-judge.yml`.
+
+The workflow uses `pull_request_target`, checks out only trusted code from the
+base branch, fetches the PR diff through the GitHub API, and sends that diff to
+an OpenRouter-routed model. It does not run miner-submitted code.
+
+Required GitHub secret:
+
+```text
+DOPPLER_TOKEN
+```
+
+Required Doppler variables:
+
+```text
+OPENROUTER_API_KEY
+OPENROUTER_MODEL
+```
+
+Optional Doppler variables:
+
+```text
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_SITE_URL=https://github.com/unarbos/ninja
+OPENROUTER_APP_NAME=ninja-pr-judge
+OPENROUTER_MAX_TOKENS=1800
+JUDGE_MIN_SCORE=70
+JUDGE_MAX_PATCH_CHARS=120000
+```
