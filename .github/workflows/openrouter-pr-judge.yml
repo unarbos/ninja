@@ -42,11 +42,8 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Install Doppler CLI
-        uses: dopplerhq/cli-action@v4
-
       - name: Judge PR patch with OpenRouter
         env:
-          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: doppler run -- python3 .github/scripts/openrouter_pr_judge.py
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python3 .github/scripts/openrouter_pr_judge.py

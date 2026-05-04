@@ -3,7 +3,7 @@
 
 The workflow runs from pull_request_target, checks out only trusted base-branch
 code, fetches the PR diff through the GitHub API, and sends that diff to an
-OpenRouter-routed model. Secrets come from Doppler via `doppler run`.
+OpenRouter-routed model using CI-provided secrets.
 """
 
 from __future__ import annotations

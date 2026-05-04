@@ -70,7 +70,6 @@ FORBIDDEN_ADDED_SUBSTRINGS = (
     "fireworks_api_key",
     "mistral_api_key",
     "deepinfra_api_key",
-    "doppler",
     "github_token",
     "api.openai.com",
     "openrouter.ai",
