@@ -30,6 +30,21 @@ Design goals:
     - Bash-only action interface.
     - Validator owns repo, tests, sandbox, scoring, hidden tasks.
     - Miners only patch this file.
+
+Miner editing guide:
+    You are expected to improve this file. Good areas to edit include prompting,
+    context gathering, command selection, tool/result parsing, stopping logic,
+    patch generation, safety checks, and how the agent uses its step budget.
+
+    Keep these validator-owned boundaries intact:
+    - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
+      public entry point.
+    - Return a dict with patch, logs, steps, cost, and success.
+    - Use only the validator-provided api_base/api_key for LLM calls.
+    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
+      path, or validator secret.
+    - Do not add third-party package requirements; this file must stay portable.
+    - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
 """
 
 from __future__ import annotations
@@ -52,8 +67,15 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
+# MINER-EDITABLE: You may tune budgets like step count, command timeout,
+# observation size, and max_tokens. Do not turn these into attempts to select a
+# different upstream model or endpoint; the validator proxy controls that.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
+
+# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
+# validator wiring. During real validation the validator passes model, api_base,
+# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -71,6 +93,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
 
+# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
+# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -192,6 +216,10 @@ def _repo_path(path: str | Path) -> Path:
 # OpenAI-compatible client
 # -----------------------------
 
+# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
+# behavior, response parsing, or model-message strategy here. Keep all requests
+# pointed at the api_base/api_key supplied by solve(); the validator proxy
+# rewrites the model server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -247,6 +275,10 @@ def chat_completion(
 # Shell execution
 # -----------------------------
 
+# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
+# repo. You may improve command validation, environment handling, timeouts, and
+# output shaping. Keep commands scoped to the repo and avoid secrets or network
+# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -459,6 +491,9 @@ def get_repo_summary(repo: Path) -> str:
 # Prompting
 # -----------------------------
 
+# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
+# agent. Prompt improvements are encouraged as long as they respect the
+# validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
 You must fix the issue by editing files in the repo.
@@ -520,6 +555,10 @@ your command here
 # Main agent
 # -----------------------------
 
+# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
+# agent. You may change planning, memory, context collection, repair behavior,
+# test strategy, and stopping criteria. Preserve the solve() signature and
+# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -662,6 +701,9 @@ def _looks_like_successful_test_output(observation: str) -> bool:
 # CLI for local testing
 # -----------------------------
 
+# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
+# CLI to make local experiments easier, but do not rely on CLI-only behavior for
+# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
