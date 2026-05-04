@@ -89,9 +89,11 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.0"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MODEL_ATTEMPTS = int(os.environ.get("AGENT_MODEL_ATTEMPTS", "3"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
+RETRYABLE_MODEL_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -249,22 +251,42 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+    attempts = max(1, DEFAULT_MODEL_ATTEMPTS)
+    last_error: Optional[BaseException] = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Model request failed: {e}") from e
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
 
-    try:
-        content = data["choices"][0]["message"]["content"] or ""
-    except Exception as e:
-        raise RuntimeError(f"Unexpected model response shape: {data}") from e
+            try:
+                content = data["choices"][0]["message"]["content"] or ""
+            except Exception as e:
+                raise RuntimeError(f"Unexpected model response shape: {data}") from e
+
+            if content.strip():
+                break
+            last_error = RuntimeError("model endpoint returned an empty message")
+            if attempt >= attempts:
+                raise last_error
+
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}")
+            if e.code not in RETRYABLE_MODEL_STATUS_CODES or attempt >= attempts:
+                raise last_error from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_error = RuntimeError(f"Model request failed: {e}")
+            if attempt >= attempts:
+                raise last_error from e
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}") from e
+
+        time.sleep(min(8.0, 0.5 * (2 ** (attempt - 1))))
+    else:
+        raise RuntimeError(f"Model request failed after {attempts} attempts: {last_error}")
 
     usage = data.get("usage") or {}
     cost = 0.0 if usage else None
