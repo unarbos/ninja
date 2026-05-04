@@ -472,7 +472,8 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
-        "find . -maxdepth 3 -type f | sed 's#^./##' | sort | head -200",
+        "find . -maxdepth 2 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name 'test*' -o -name '*test*' -o -name 'Makefile' -o -name 'pytest.ini' -o -name 'package.json' \\) | sed 's#^./##' | sort",
+        "find . -maxdepth 1 -type f | sed 's#^./##' | sort",
         "git status --short || true",
     ]
 
@@ -491,49 +492,67 @@ def get_repo_summary(repo: Path) -> str:
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+SYSTEM_PROMPT = """You are an expert coding agent. Your goal is to efficiently fix issues in a repository.
 
-You must fix the issue by editing files in the repo.
+INTERACTION FORMAT:
+- Communicate ONLY through bash commands wrapped in <command>...</command> tags
+- When finished (code is fixed and tests pass), respond with <final>summary</final>
 
-You interact only by issuing bash commands. The environment will run your command and return stdout/stderr.
+STRATEGY:
+1. UNDERSTAND: Locate the relevant files mentioned in the issue
+2. INSPECT: Read files to understand the bug (use: cat, grep, head, tail)
+3. ANALYZE: Identify the root cause with minimal commands
+4. FIX: Make precise, minimal code changes
+5. VERIFY: Run tests to confirm the fix works
+6. FINALIZE: When all tests pass, respond with <final>...</final>
 
-Use this exact format when you want to run a command:
+CRITICAL RULES:
+- Make SMALL, TARGETED changes. Avoid touching unrelated code
+- ALWAYS run the relevant test suite AFTER making changes
+- Inspect files BEFORE editing them to understand context
+- Use efficient commands (grep, head, tail) to survey code
+- Stop unnecessary exploration - focus on the issue
+- Do NOT use sudo, do NOT delete critical files
+- Do NOT modify test files themselves
+- Do NOT access secrets or hidden test data
+- Do NOT make external network calls
+- You have limited steps - be efficient and decisive
+- If tests pass, you MUST finalize immediately
 
-<command>
-your bash command here
-</command>
+COMMON TOOLS:
+- grep -r "pattern" . : Find code patterns
+- find . -name "*.py" -type f : List Python files
+- cat filename : View file contents
+- pytest, npm test, make test : Run test suites
+- git diff : Show your changes
+- sed, awk, python -c : Transform code inline
 
-When you are finished, respond with:
-
-<final>
-short summary of what you changed
-</final>
-
-Rules:
-- Work directly in the repository.
-- Prefer small, targeted changes.
-- Inspect files before editing them.
-- Run relevant tests when possible.
-- Do not use sudo.
-- Do not delete the repository.
-- Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
-- Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+EFFICIENCY TIPS:
+- Use grep to search for error messages or function names
+- Run full test suite FIRST to understand failures
+- Look at test expectations to understand required behavior
+- Make ONE focused fix, test it, then finalize if successful
+- Do not iterate endlessly - if stuck after 5 attempts on same issue, try different approach
 """
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str) -> str:
-    return f"""We need fix this issue:
+    return f"""You must fix this GitHub issue efficiently:
 
+ISSUE:
 {issue}
 
-Repository summary:
-
+REPOSITORY STATE:
 {repo_summary}
 
-Start by inspecting the relevant files. Then edit the repo and run tests.
+IMMEDIATE TASKS:
+1. First, find and run the test suite to see what's failing
+2. Locate the bug by inspecting relevant source files
+3. Make a minimal fix to the code
+4. Verify tests pass
+5. When tests pass, respond with <final>summary</final>
+
+Be methodical and efficient - you have limited steps. Start with running tests to understand the failures.
 """
 
 
@@ -574,6 +593,7 @@ def solve(
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
     success = False
+    consecutive_no_command = 0
 
     try:
         repo = _repo_path(repo_path)
@@ -614,10 +634,15 @@ def solve(
             command = extract_command(response_text)
 
             if command is None:
+                consecutive_no_command += 1
+                if consecutive_no_command >= 2:
+                    logs.append("\nSTOPPED: Model failed to produce valid commands twice.")
+                    break
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": build_no_command_repair_prompt()})
                 continue
 
+            consecutive_no_command = 0
             result = run_command(command, repo, timeout=command_timeout)
             observation = format_observation(result)
 
@@ -626,7 +651,7 @@ def solve(
             messages.append({"role": "assistant", "content": response_text})
             messages.append({"role": "user", "content": observation})
 
-            if step >= 6:
+            if step >= 4:
                 patch = get_patch(repo)
                 if patch.strip() and _looks_like_successful_test_output(observation):
                     logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
@@ -676,6 +701,10 @@ def _looks_like_successful_test_output(observation: str) -> bool:
         "exit_code:\n1",
         "exit_code:\n2",
         "exit_code:\n124",
+        "failed:",
+        "failures:",
+        "error:",
+        "stderr:",
     ]
 
     good_markers = [
@@ -684,6 +713,9 @@ def _looks_like_successful_test_output(observation: str) -> bool:
         " exit_code:\n0",
         "ok",
         "success",
+        "tests passed",
+        "passed all",
+        "test session starts",
     ]
 
     has_good = any(marker in lower for marker in good_markers)
