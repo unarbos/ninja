@@ -110,6 +110,16 @@ The validator binds the PR to the committing hotkey by checking that the PR
 title starts with the same hotkey that made the on-chain commitment. It also
 checks that the committed SHA matches the current PR head SHA.
 
+## Scoring Target
+
+Validation tasks are generated from real GitHub commits, but miner duel scores
+are compared against the validator's Cursor baseline solution for each task.
+The mined GitHub reference patch is still used to construct and filter tasks;
+the round winner is whichever agent's patch is more similar to Cursor's patch.
+
+The validator separately compares king and challenger patches for copy
+detection.
+
 ## What Belongs Here
 
 - `agent.py`
