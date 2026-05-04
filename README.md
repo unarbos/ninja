@@ -146,7 +146,7 @@ The CI checks are:
 - `PR Scope Guard`: rejects external PRs that touch files outside `agent.py`,
   break the `solve(...)` contract, add forbidden provider/secret references, or
   try to control sampling.
-- `OpenRouter PR Judge`: uses `moonshotai/kimi-k2.6` through OpenRouter to judge
+- `OpenRouter PR Judge`: uses `deepseek/deepseek-v4-flash` through OpenRouter to judge
   whether the PR is a real, scoped, safe miner edit.
 
 Both checks require the PR title to start with a hotkey-shaped prefix. If the
