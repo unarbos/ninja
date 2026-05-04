@@ -20,7 +20,7 @@ from typing import Any
 GITHUB_API = "https://api.github.com"
 MARKER = "<!-- ninja-openrouter-pr-judge -->"
 DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash"
+DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_MAX_PATCH_CHARS = 120_000
 DEFAULT_MIN_SCORE = 70
 
