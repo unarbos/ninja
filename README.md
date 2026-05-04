@@ -152,19 +152,13 @@ The CI checks are:
 Both checks require the PR title to start with a hotkey-shaped prefix. If the
 title gate fails, the OpenRouter judge exits before making an LLM request.
 
-Required GitHub secret:
-
-```text
-DOPPLER_TOKEN
-```
-
-Required Doppler variables:
+Required CI secret material:
 
 ```text
 OPENROUTER_API_KEY
 ```
 
-Optional Doppler variables:
+Optional CI environment variables:
 
 ```text
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
