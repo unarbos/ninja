@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -15,6 +16,65 @@ GITHUB_API = "https://api.github.com"
 MARKER = "<!-- ninja-pr-scope-guard -->"
 DEFAULT_TRUSTED_AUTHORS = ("unarbos",)
 DEFAULT_EXTERNAL_ALLOWED_FILES = ("agent.py",)
+REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
+ALLOWED_ENV_NAMES = {
+    "AGENT_MAX_STEPS",
+    "AGENT_COMMAND_TIMEOUT",
+    "AGENT_MODEL",
+    "NINJA_MODEL",
+    "AGENT_API_BASE",
+    "NINJA_INFERENCE_BASE_URL",
+    "OPENAI_BASE_URL",
+    "AGENT_API_KEY",
+    "NINJA_INFERENCE_API_KEY",
+    "OPENAI_API_KEY",
+    "AGENT_TEMPERATURE",
+    "AGENT_MAX_TOKENS",
+    "AGENT_MAX_OBSERVATION_CHARS",
+    "AGENT_MAX_TOTAL_LOG_CHARS",
+}
+PROTECTED_EDIT_MARKERS = (
+    "def solve(",
+    "repo_path: str,",
+    "issue: str,",
+    "model: Optional[str] = None,",
+    "api_base: Optional[str] = None,",
+    "api_key: Optional[str] = None,",
+    "def _resolve_inference_config(",
+    "DEFAULT_MODEL =",
+    "DEFAULT_API_BASE =",
+    "DEFAULT_API_KEY =",
+)
+PROTECTED_HUNK_SYMBOLS = ("_resolve_inference_config",)
+FORBIDDEN_ADDED_SUBSTRINGS = (
+    "openrouter_api_key",
+    "anthropic_api_key",
+    "gemini_api_key",
+    "groq_api_key",
+    "together_api_key",
+    "fireworks_api_key",
+    "mistral_api_key",
+    "deepinfra_api_key",
+    "doppler",
+    "github_token",
+    "api.openai.com",
+    "openrouter.ai",
+    "anthropic.com",
+    "generativelanguage.googleapis.com",
+    "api.groq.com",
+    "api.together.xyz",
+    "api.fireworks.ai",
+    "api.mistral.ai",
+    "api.deepseek.com",
+    "deepinfra.com",
+    "cohere.ai",
+    "/proc/self/environ",
+    "/proc/environ",
+    ".ssh",
+    "id_rsa",
+    ".netrc",
+    "wallet",
+)
 
 
 def main() -> int:
@@ -31,28 +91,41 @@ def main() -> int:
 
         files = _fetch_pr_files(token, repo, pr_number)
         changed_files = [str(item.get("filename") or "") for item in files]
-        violations = _scope_violations(changed_files, author, trusted_authors, allowed_files)
+        scope_violations = _scope_violations(changed_files, author, trusted_authors, allowed_files)
 
         if author in trusted_authors:
-            body = _render_comment("pass", author, changed_files, allowed_files, [])
+            body = _render_comment("pass", author, changed_files, allowed_files, [], [])
             _update_existing_comment(token, repo, pr_number, body)
             _write_step_summary(body)
             print(f"Trusted PR author {author}; external file-scope guard bypassed.")
             return 0
 
-        if violations:
-            body = _render_comment("fail", author, changed_files, allowed_files, violations)
+        contract_violations = _agent_contract_violations(token, files)
+        if scope_violations or contract_violations:
+            body = _render_comment(
+                "fail",
+                author,
+                changed_files,
+                allowed_files,
+                scope_violations,
+                contract_violations,
+            )
             _upsert_comment(token, repo, pr_number, body)
             _write_step_summary(body)
-            print("External PR changed files outside the allowed surface:")
-            for filename in violations:
-                print(f"- {filename}")
+            if scope_violations:
+                print("External PR changed files outside the allowed surface:")
+                for filename in scope_violations:
+                    print(f"- {filename}")
+            if contract_violations:
+                print("External PR violated the agent.py contract:")
+                for reason in contract_violations:
+                    print(f"- {reason}")
             return 1
 
-        body = _render_comment("pass", author, changed_files, allowed_files, [])
+        body = _render_comment("pass", author, changed_files, allowed_files, [], [])
         _update_existing_comment(token, repo, pr_number, body)
         _write_step_summary(body)
-        print("External PR file scope is valid.")
+        print("External PR file scope and agent.py contract are valid.")
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"scope guard error: {exc}", file=sys.stderr)
@@ -89,6 +162,95 @@ def _scope_violations(
     if author in trusted_authors:
         return []
     return [filename for filename in changed_files if filename not in allowed_files]
+
+
+def _agent_contract_violations(token: str, files: list[dict[str, Any]]) -> list[str]:
+    agent_file = next((item for item in files if item.get("filename") == "agent.py"), None)
+    if not agent_file:
+        return ["PR must modify agent.py."]
+    if agent_file.get("status") in {"removed", "renamed"}:
+        return ["agent.py must not be removed or renamed."]
+
+    violations = _agent_patch_violations(str(agent_file.get("patch") or ""))
+    raw_url = str(agent_file.get("raw_url") or "")
+    if raw_url:
+        agent_source = _fetch_url_text(token, raw_url)
+        violations.extend(_agent_source_violations(agent_source))
+    else:
+        violations.append("Unable to fetch agent.py for static contract checks.")
+    return _dedupe(violations)
+
+
+def _agent_patch_violations(patch: str) -> list[str]:
+    violations: list[str] = []
+    current_hunk = ""
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@"):
+            current_hunk = raw_line
+            continue
+        if not raw_line.startswith(("+", "-")) or raw_line.startswith(("+++", "---")):
+            continue
+
+        text = raw_line[1:].strip()
+        if not text:
+            continue
+        if any(symbol in current_hunk for symbol in PROTECTED_HUNK_SYMBOLS):
+            violations.append(f"agent.py must not edit validator-owned function near `{current_hunk}`.")
+        if any(marker in text for marker in PROTECTED_EDIT_MARKERS):
+            violations.append(f"agent.py must not edit validator-owned contract line `{text[:100]}`.")
+
+        if not raw_line.startswith("+"):
+            continue
+
+        lowered = text.lower()
+        for forbidden in FORBIDDEN_ADDED_SUBSTRINGS:
+            if forbidden in lowered:
+                violations.append(f"agent.py adds forbidden secret/provider reference `{forbidden}`.")
+
+        if "os.environ" in text or "getenv(" in text:
+            env_names = set(re.findall(r"""["']([A-Z][A-Z0-9_]{2,})["']""", text))
+            disallowed = sorted(name for name in env_names if name not in ALLOWED_ENV_NAMES)
+            if disallowed:
+                violations.append(
+                    "agent.py reads non-allowlisted environment variable(s): "
+                    + ", ".join(disallowed[:8])
+                )
+    return violations
+
+
+def _agent_source_violations(source: str) -> list[str]:
+    try:
+        tree = __import__("ast").parse(source, filename="agent.py")
+    except SyntaxError as exc:
+        return [f"agent.py must remain valid Python: {exc.msg} at line {exc.lineno}."]
+
+    violations: list[str] = []
+    solve = next(
+        (node for node in tree.body if node.__class__.__name__ == "FunctionDef" and node.name == "solve"),
+        None,
+    )
+    if solve is None:
+        violations.append("agent.py must define solve(...).")
+    else:
+        args = [arg.arg for arg in [*solve.args.posonlyargs, *solve.args.args]]
+        if tuple(args[: len(REQUIRED_SOLVE_ARGS)]) != REQUIRED_SOLVE_ARGS:
+            violations.append(
+                "solve() must keep leading arguments: " + ", ".join(REQUIRED_SOLVE_ARGS) + "."
+            )
+
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    stdlib.update({"__future__"})
+    for node in __import__("ast").walk(tree):
+        roots: list[str] = []
+        if node.__class__.__name__ == "Import":
+            roots = [str(alias.name).split(".", 1)[0] for alias in node.names]
+        elif node.__class__.__name__ == "ImportFrom":
+            roots = [str(node.module or "").split(".", 1)[0]]
+        for root in roots:
+            if root and root not in stdlib:
+                violations.append(f"agent.py imports non-stdlib module `{root}`.")
+
+    return violations
 
 
 def _fetch_pr_files(token: str, repo: str, pr_number: int) -> list[dict[str, Any]]:
@@ -131,12 +293,29 @@ def _github_request(token: str, path: str, method: str, body: bytes | None) -> b
         raise RuntimeError(f"GitHub API {method} {path} failed with HTTP {exc.code}: {error_body}") from exc
 
 
+def _fetch_url_text(token: str, url: str) -> str:
+    req = urllib.request.Request(
+        url=url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "ninja-pr-scope-guard",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Fetch {url} failed with HTTP {exc.code}: {error_body}") from exc
+
+
 def _render_comment(
     verdict: str,
     author: str,
     changed_files: list[str],
     allowed_files: set[str],
-    violations: list[str],
+    scope_violations: list[str],
+    contract_violations: list[str],
 ) -> str:
     title_verdict = verdict.upper()
     lines = [
@@ -149,21 +328,31 @@ def _render_comment(
         + ", ".join(f"`{filename}`" for filename in sorted(allowed_files)),
         "",
     ]
-    if violations:
-        lines.extend(
-            [
-                "External PRs may only change the miner harness file.",
-                "",
-                "### Files Outside Scope",
-            ]
-        )
-        lines.extend(f"- `{filename}`" for filename in violations)
+    if scope_violations or contract_violations:
+        lines.append("External PRs may only change allowed miner-owned parts of agent.py.")
+        if scope_violations:
+            lines.extend(["", "### Files Outside Scope"])
+            lines.extend(f"- `{filename}`" for filename in scope_violations)
+        if contract_violations:
+            lines.extend(["", "### Agent.py Contract Violations"])
+            lines.extend(f"- {reason}" for reason in contract_violations)
     else:
-        lines.append("This PR satisfies the external contributor file-scope rule.")
+        lines.append("This PR satisfies the external contributor file-scope and agent.py contract rules.")
 
     lines.extend(["", "### Changed Files"])
     lines.extend(f"- `{filename}`" for filename in changed_files or ["No files returned by GitHub."])
     return "\n".join(lines) + "\n"
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _upsert_comment(token: str, repo: str, pr_number: int, body: str) -> None:
