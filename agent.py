@@ -1530,7 +1530,7 @@ def solve(
             if observations:
                 observation_text = "\n\n".join(observations)
                 if polish_pending:
-                    observation_text += "\n\n" + build_polish_prompt(_diff_junk_summary(get_patch(repo)))
+                    observation_text += "\n\n" + build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))
                 elif self_check_pending:
                     observation_text += "\n\n" + build_self_check_prompt(get_patch(repo), issue)
                 elif not success and get_patch(repo).strip():
@@ -1546,7 +1546,7 @@ def solve(
                     )
                 messages.append({"role": "user", "content": observation_text})
             elif polish_pending:
-                messages.append({"role": "user", "content": build_polish_prompt(_diff_junk_summary(get_patch(repo)))})
+                messages.append({"role": "user", "content": build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))})
             elif self_check_pending:
                 messages.append({"role": "user", "content": build_self_check_prompt(get_patch(repo), issue)})
 
