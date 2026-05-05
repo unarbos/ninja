@@ -977,7 +977,10 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     if b"\0" in data[:4096]:
         return ""
-    text = data.decode("utf-8", errors="replace")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1", errors="replace")
     return _truncate(text, max_chars)
 
 
