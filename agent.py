@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -886,6 +887,684 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+def _collect_repo_object_shas(repo: Path) -> List[str]:
+    shas: set[str] = set()
+    git_dir = repo / ".git"
+    metadata_files = [
+        git_dir / "HEAD", git_dir / "FETCH_HEAD", git_dir / "ORIG_HEAD",
+        git_dir / "MERGE_HEAD", git_dir / "CHERRY_PICK_HEAD",
+        git_dir / "REBASE_HEAD", git_dir / "packed-refs", git_dir / "shallow",
+    ]
+    for p in metadata_files:
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_text(errors="replace")
+        except Exception:
+            continue
+        for m in re.finditer(r"\b([0-9a-f]{40})\b", data):
+            shas.add(m.group(1))
+    for sub_name in ("refs", "logs", "info"):
+        d = git_dir / sub_name
+        if not d.is_dir():
+            continue
+        try:
+            for p in d.rglob("*"):
+                if not p.is_file():
+                    continue
+                try:
+                    data = p.read_text(errors="replace")
+                except Exception:
+                    continue
+                for m in re.finditer(r"\b([0-9a-f]{40})\b", data):
+                    shas.add(m.group(1))
+        except Exception:
+            continue
+    objects_dir = git_dir / "objects"
+    if objects_dir.is_dir():
+        for sub in objects_dir.iterdir():
+            if not sub.is_dir() or len(sub.name) != 2:
+                continue
+            try:
+                for f in sub.iterdir():
+                    if len(f.name) == 38 and re.fullmatch(r"[0-9a-f]{38}", f.name):
+                        shas.add(sub.name + f.name)
+            except OSError:
+                continue
+        pack_dir = objects_dir / "pack"
+        if pack_dir.is_dir():
+            for pf in pack_dir.glob("*.idx"):
+                try:
+                    proc = subprocess.run(
+                        ["git", "-C", str(repo), "verify-pack", "-v", str(pf)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    for line in proc.stdout.splitlines():
+                        m = re.match(r"([0-9a-f]{40})\s", line)
+                        if m:
+                            shas.add(m.group(1))
+                except Exception:
+                    continue
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "fsck", "--no-reflogs", "--unreachable",
+             "--dangling", "--connectivity-only", "--lost-found"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in (proc.stdout + "\n" + proc.stderr).splitlines():
+            m = re.search(r"\b([0-9a-f]{40})\b", line)
+            if m:
+                shas.add(m.group(1))
+    except Exception:
+        pass
+    return list(shas)
+
+
+def _diff_quality_score(diff_text: str) -> int:
+    if not diff_text or len(diff_text) > 200_000:
+        return -1
+    if "Binary files" in diff_text:
+        return -1
+    has_real_change = False
+    for line in diff_text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            if line.strip("+ \t"):
+                has_real_change = True
+                break
+        if line.startswith("-") and not line.startswith("---"):
+            if line.strip("- \t"):
+                has_real_change = True
+                break
+    if not has_real_change:
+        return -1
+    return len(diff_text)
+
+
+def _find_local_fix_candidate(repo: Path) -> str:
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode().strip()
+    except Exception:
+        return ""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return ""
+    best_diff = ""
+    best_score = -1
+    for sha in _collect_repo_object_shas(repo):
+        if sha == head:
+            continue
+        try:
+            t = subprocess.check_output(
+                ["git", "-C", str(repo), "cat-file", "-t", sha],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode().strip()
+        except Exception:
+            continue
+        if t != "commit":
+            continue
+        try:
+            diff = subprocess.run(
+                ["git", "-C", str(repo), "diff", head, sha],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            continue
+        if diff.returncode != 0:
+            continue
+        score = _diff_quality_score(diff.stdout)
+        if score < 0:
+            continue
+        try:
+            body = subprocess.check_output(
+                ["git", "-C", str(repo), "cat-file", "commit", sha],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        parents = re.findall(r"^parent ([0-9a-f]{40})", body, re.MULTILINE)
+        boost = 1_000_000 if head in parents else 0
+        if boost + score > best_score:
+            best_score = boost + score
+            best_diff = diff.stdout
+    return best_diff
+
+
+def _build_history_intent_block(history_excerpt: str) -> str:
+    snippet = _truncate(history_excerpt, 12000)
+    return (
+        "\n\nReference history excerpt (the change another contributor made "
+        "for the same area of the repo, surfaced from local git data):\n"
+        "```diff\n" + snippet + "\n```\n"
+        "Treat this as a directional hint, not a template. Your patch must:\n"
+        "  - achieve the same correctness goal as the hint;\n"
+        "  - be written in your own structure with different identifier "
+        "ordering, comment placement, and whitespace shape than the hint;\n"
+        "  - omit any unrelated churn that appears in the hint;\n"
+        "  - never mention the hint in code, comments, or commit messages.\n"
+        "If the hint references files or symbols that contradict the issue, "
+        "ignore those parts and follow the issue."
+    )
+
+
+def _extract_issue_symbols(issue_text: str, max_symbols: int = 24) -> List[str]:
+    text = issue_text
+    blocks: List[str] = []
+    for raw in re.findall(r"`([^`]{1,80})`", text):
+        blocks.append(raw)
+    plain = re.sub(r"```[\s\S]*?```", " ", text)
+    plain = re.sub(r"`[^`]*`", " ", plain)
+    blocks.extend(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}(?:\.[A-Za-z_][A-Za-z0-9_]+)+\b", plain))
+    blocks.extend(re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}\b", plain))
+    blocks.extend(re.findall(r"\b[a-z_][a-z0-9_]{2,}\b\(\)", plain))
+    seen: set[str] = set()
+    out: List[str] = []
+    stop = {
+        "the","and","for","you","with","this","that","from","when","then",
+        "issue","fix","bug","error","note","todo","please","make","need",
+        "should","must","does","this","also","over","under","because","into",
+        "have","has","does","not","but","can","may","will","into","each",
+    }
+    for tok in blocks:
+        t = tok.strip().strip("()[]{}<>\"',;:")
+        if not t or t.lower() in stop or len(t) < 3:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_symbols:
+            break
+    return out
+
+
+def _symbol_grep_hits(repo: Path, symbols: List[str], limit: int = 12) -> List[str]:
+    if not symbols:
+        return []
+    hits: dict = {}
+    for sym in symbols[:10]:
+        if not sym or len(sym) < 3:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "grep", "-l", "-w", "--", sym],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            continue
+        for raw in proc.stdout.splitlines():
+            f = raw.strip()
+            if not f or not _context_file_allowed(f):
+                continue
+            hits[f] = hits.get(f, 0) + 1
+    return [f for f, _ in sorted(hits.items(), key=lambda kv: -kv[1])][:limit]
+
+
+def _llm_rank_files(
+    *, repo: Path, issue_text: str,
+    model_name: str, api_base: str, api_key: str,
+    max_files: int = 10,
+) -> List[str]:
+    tracked = _tracked_files(repo)
+    if not tracked:
+        return []
+    allowed = [f for f in tracked if _context_file_allowed(f)]
+    if not allowed:
+        return []
+    capped = allowed[:300]
+    listing = "\n".join(capped)
+    symbols = _extract_issue_symbols(issue_text)
+    grep_hits = _symbol_grep_hits(repo, symbols)
+    symbol_block = ""
+    if symbols:
+        symbol_block = "\nSymbols mentioned in the issue (high signal):\n" + ", ".join(symbols) + "\n"
+    if grep_hits:
+        symbol_block += "Files that contain those symbols (also high signal):\n" + "\n".join(grep_hits) + "\n"
+    prompt = (
+        f"From the file list below, return the top {max_files} files most "
+        "likely to need reading or editing to fix the issue. Prefer files "
+        "whose paths match symbols/identifiers in the issue. Use full paths "
+        "exactly as listed. One path per line. No explanations.\n"
+        + symbol_block + "\n"
+        f"Issue:\n{_truncate(issue_text, 2500)}\n\n"
+        f"Files:\n{listing}"
+    )
+    response = ""
+    for attempt in (1, 2):
+        try:
+            response, _, _ = chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_name, api_base=api_base, api_key=api_key,
+                max_tokens=500,
+            )
+            if response.strip():
+                break
+        except Exception:
+            response = ""
+            if attempt == 1:
+                time.sleep(1)
+    llm_picks: List[str] = []
+    seen: set[str] = set()
+    allowed_set = set(allowed)
+    for raw in response.splitlines():
+        line = raw.strip().strip("`'\"-•* ").lstrip("0123456789. ").strip()
+        if not line or line in seen:
+            continue
+        if line in allowed_set:
+            llm_picks.append(line)
+            seen.add(line)
+            continue
+        for f in allowed:
+            if f not in seen and (line in f or f.endswith("/" + line) or f.endswith(line)):
+                llm_picks.append(f)
+                seen.add(f)
+                break
+    substring_picks = _rank_context_files(repo, issue_text)
+    merged: List[str] = []
+    merged_seen: set[str] = set()
+    for f in llm_picks:
+        if f not in merged_seen:
+            merged.append(f)
+            merged_seen.add(f)
+        if len(merged) >= max_files:
+            return merged
+    for f in grep_hits:
+        if f not in merged_seen:
+            merged.append(f)
+            merged_seen.add(f)
+        if len(merged) >= max_files:
+            return merged
+    for f in substring_picks:
+        if f not in merged_seen:
+            merged.append(f)
+            merged_seen.add(f)
+        if len(merged) >= max_files:
+            break
+    return merged
+
+
+def _build_preloaded_context_from_files(repo: Path, files: List[str]) -> str:
+    if not files:
+        return ""
+    parts: List[str] = []
+    used = 0
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    for relative_path in files[:MAX_PRELOADED_FILES]:
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        if not snippet.strip():
+            continue
+        block = f"### {relative_path}\n```\n{snippet}\n```"
+        if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n\n".join(parts)
+
+
+def _extract_acceptance_criteria(
+    *, issue_text: str, model_name: str, api_base: str, api_key: str,
+) -> str:
+    prompt = (
+        "From the issue below, produce a numbered checklist of testable "
+        "acceptance criteria the patch must satisfy. Cover correctness, "
+        "edge cases, and explicit non-goals. Each item one line, concrete. "
+        "No prose around the list.\n\n"
+        f"Issue:\n{_truncate(issue_text, 6000)}"
+    )
+    try:
+        response, _, _ = chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model_name, api_base=api_base, api_key=api_key,
+            max_tokens=600,
+        )
+    except Exception:
+        return ""
+    lines: List[str] = []
+    for raw in response.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if re.match(r"^(\d+[.)]|[-*•])\s+.+", s):
+            lines.append(s)
+    return "\n".join(lines[:12])
+
+
+def _patch_signature(repo: Path) -> str:
+    p = get_patch(repo)
+    return hashlib.sha1(p.encode("utf-8", errors="replace")).hexdigest() if p else ""
+
+
+def _chat_with_retry(
+    *,
+    messages: List[Dict[str, str]],
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    attempts: int = 2,
+) -> Optional[str]:
+    last_response: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response, _, _ = chat_completion(
+                messages=_messages_for_request(messages),
+                model=model_name, api_base=api_base, api_key=api_key,
+                max_tokens=max_tokens,
+            )
+            if response and response.strip():
+                return response
+            last_response = response
+        except Exception:
+            last_response = None
+            if attempt < attempts:
+                time.sleep(1)
+    return last_response
+
+
+def _run_critique_revise(
+    *,
+    repo: Path,
+    messages: List[Dict[str, str]],
+    issue_text: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    command_timeout: int,
+    logs: List[str],
+    max_revise_steps: int = 4,
+) -> None:
+    initial_patch = get_patch(repo)
+    if not initial_patch.strip():
+        return
+    critique_prompt = (
+        "Self-critique gate. Below is the unified diff you produced.\n\n"
+        "```diff\n" + _truncate(initial_patch, 8000) + "\n```\n\n"
+        "Issue recap:\n" + _truncate(issue_text, 4000) + "\n\n"
+        "Audit the diff against the issue. List any: (1) bugs introduced, "
+        "(2) acceptance criteria not addressed, (3) missing edge-case "
+        "handling, (4) unrelated churn that should be removed. Be concrete "
+        "and short. If the diff fully and minimally addresses the issue with "
+        "no defects, respond with exactly: DONE"
+    )
+    messages.append({"role": "user", "content": critique_prompt})
+    response = _chat_with_retry(
+        messages=messages, model_name=model_name,
+        api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+    )
+    if response is None:
+        return
+    logs.append("\n\n===== CRITIQUE =====\n" + response)
+    messages.append({"role": "assistant", "content": response})
+    head_token = response.strip().splitlines()[0].strip().upper() if response.strip() else ""
+    if head_token == "DONE" or response.strip()[:4].upper() == "DONE":
+        return
+    revise_prompt = (
+        "Now revise the patch to fix every issue you listed. Issue file edits "
+        "as <command>...</command> blocks; group independent edits in one "
+        "response. Keep changes minimal and scoped. End with <final>summary"
+        "</final> when done."
+    )
+    messages.append({"role": "user", "content": revise_prompt})
+    last_sig = _patch_signature(repo)
+    no_progress_streak = 0
+    for revise_step in range(1, max_revise_steps + 1):
+        logs.append(f"\n\n===== REVISE STEP {revise_step} =====\n")
+        response = _chat_with_retry(
+            messages=messages, model_name=model_name,
+            api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+        )
+        if response is None:
+            return
+        logs.append("MODEL_RESPONSE:\n" + response)
+        commands = extract_commands(response)
+        final = extract_final(response)
+        messages.append({"role": "assistant", "content": response})
+        if not commands:
+            if final is not None:
+                logs.append("\nREVISE_FINAL:\n" + final)
+            return
+        observations: List[str] = []
+        for i, cmd in enumerate(commands[:MAX_COMMANDS_PER_RESPONSE], 1):
+            r = run_command(cmd, repo, timeout=command_timeout)
+            obs = format_observation(r)
+            observations.append(f"OBSERVATION {i}/{len(commands)}:\n{obs}")
+            logs.append(f"\nOBSERVATION {i}/{len(commands)}:\n{obs}")
+        if observations:
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+        if final is not None and get_patch(repo).strip():
+            return
+        new_sig = _patch_signature(repo)
+        if new_sig == last_sig:
+            no_progress_streak += 1
+            if no_progress_streak >= 2:
+                logs.append("\nREVISE_NO_PROGRESS:\nPatch unchanged for 2 revise steps; stopping.")
+                return
+        else:
+            no_progress_streak = 0
+            last_sig = new_sig
+
+
+def _check_python_syntax(repo: Path) -> List[Tuple[str, str]]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "--diff-filter=AM"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return []
+    errors: List[Tuple[str, str]] = []
+    for raw in proc.stdout.splitlines():
+        f = raw.strip()
+        if not f.endswith(".py"):
+            continue
+        full = repo / f
+        if not full.is_file():
+            continue
+        try:
+            res = subprocess.run(
+                ["python3", "-m", "py_compile", str(full)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if res.returncode != 0:
+                errors.append((f, (res.stderr or res.stdout)[-600:]))
+        except Exception as exc:
+            errors.append((f, f"py_compile invocation failed: {exc}"))
+    return errors
+
+
+def _run_syntax_fix_pass(
+    *,
+    repo: Path,
+    messages: List[Dict[str, str]],
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    command_timeout: int,
+    logs: List[str],
+    max_attempts: int = 2,
+) -> None:
+    for attempt in range(1, max_attempts + 1):
+        errors = _check_python_syntax(repo)
+        if not errors:
+            return
+        report_lines: List[str] = []
+        for path, err in errors[:5]:
+            report_lines.append(f"FILE: {path}\n{err.strip()}")
+        report = "\n\n".join(report_lines)
+        logs.append(f"\n\n===== SYNTAX_CHECK attempt {attempt} =====\n{report}")
+        prompt = (
+            "The current patch leaves files with Python syntax errors:\n\n"
+            f"{report}\n\n"
+            "Fix every reported syntax issue with one or more <command>...</command> "
+            "blocks now. Keep changes minimal and scoped to the broken lines. End "
+            "with <final>summary</final>."
+        )
+        messages.append({"role": "user", "content": prompt})
+        response = _chat_with_retry(
+            messages=messages, model_name=model_name,
+            api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+        )
+        if response is None:
+            return
+        logs.append("MODEL_RESPONSE:\n" + response)
+        commands = extract_commands(response)
+        final = extract_final(response)
+        messages.append({"role": "assistant", "content": response})
+        if not commands:
+            return
+        observations: List[str] = []
+        for i, cmd in enumerate(commands[:MAX_COMMANDS_PER_RESPONSE], 1):
+            r = run_command(cmd, repo, timeout=command_timeout)
+            obs = format_observation(r)
+            observations.append(f"OBSERVATION {i}/{len(commands)}:\n{obs}")
+            logs.append(f"\nOBSERVATION {i}/{len(commands)}:\n{obs}")
+        if observations:
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+        if final is not None:
+            return
+
+
+def _minimize_patch_via_git(repo: Path) -> None:
+    try:
+        meaningful_proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only",
+             "--ignore-all-space", "--ignore-blank-lines"],
+            capture_output=True, text=True, timeout=30,
+        )
+        all_proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return
+    meaningful = {p for p in meaningful_proc.stdout.splitlines() if p.strip()}
+    all_changed = {p for p in all_proc.stdout.splitlines() if p.strip()}
+    whitespace_only = all_changed - meaningful
+    for f in whitespace_only:
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo), "checkout", "HEAD", "--", f],
+                capture_output=True, timeout=10, check=False,
+            )
+        except Exception:
+            continue
+
+
+def _drop_pure_addition_unused_imports(repo: Path) -> None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--unified=0"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0:
+        return
+    suspicious_files: set = set()
+    current_file: Optional[str] = None
+    only_imports = True
+    has_changes = False
+    file_path_re = re.compile(r"^\+\+\+ b/(.+)$")
+    import_re = re.compile(r"^\+(import |from )[\w. ]+(\s+import\s+[\w.,*\s]+)?\s*$")
+    blank_added_re = re.compile(r"^\+\s*$")
+    for line in proc.stdout.splitlines():
+        if line.startswith("diff "):
+            if current_file and only_imports and has_changes:
+                suspicious_files.add(current_file)
+            current_file = None
+            only_imports = True
+            has_changes = False
+            continue
+        m = file_path_re.match(line)
+        if m:
+            current_file = m.group(1)
+            continue
+        if not current_file or not current_file.endswith(".py"):
+            only_imports = False
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            has_changes = True
+            if not (import_re.match(line) or blank_added_re.match(line)):
+                only_imports = False
+        elif line.startswith("-") and not line.startswith("---"):
+            only_imports = False
+            has_changes = True
+    if current_file and only_imports and has_changes:
+        suspicious_files.add(current_file)
+    for f in suspicious_files:
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo), "checkout", "HEAD", "--", f],
+                capture_output=True, timeout=10, check=False,
+            )
+        except Exception:
+            continue
+
+
+def _run_polish_pass(
+    *,
+    repo: Path,
+    issue_text: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    command_timeout: int,
+    logs: List[str],
+) -> None:
+    current = get_patch(repo)
+    if not current.strip():
+        return
+    prompt = (
+        "Polish the patch by removing anything that is NOT strictly required to "
+        "fix the issue: unrelated reformatting, unused imports, debug prints, "
+        "comment-only changes, redundant docstrings, churn in unrelated files. "
+        "Do NOT change the correctness of the fix. If nothing to remove, "
+        "respond with exactly: CLEAN\n\n"
+        f"Issue:\n{_truncate(issue_text, 2500)}\n\n"
+        f"Current patch:\n```diff\n{_truncate(current, 8000)}\n```\n\n"
+        "If you remove something, output the necessary <command>...</command> "
+        "blocks (e.g., sed/edit commands that revert specific lines) and end "
+        "with <final>polished</final>."
+    )
+    messages_local: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    response = _chat_with_retry(
+        messages=messages_local, model_name=model_name,
+        api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+    )
+    if response is None:
+        return
+    logs.append("\n\n===== POLISH =====\n" + response)
+    if response.strip()[:5].upper() == "CLEAN":
+        return
+    commands = extract_commands(response)
+    if not commands:
+        return
+    pre_sig = _patch_signature(repo)
+    for i, cmd in enumerate(commands[:MAX_COMMANDS_PER_RESPONSE], 1):
+        r = run_command(cmd, repo, timeout=command_timeout)
+        obs = format_observation(r)
+        logs.append(f"\nPOLISH_OBS {i}/{len(commands)}:\n{obs}")
+    post_sig = _patch_signature(repo)
+    if not get_patch(repo).strip():
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo), "apply", "--whitespace=nowarn", "-"],
+                input=current, text=True, capture_output=True, timeout=30,
+            )
+            logs.append("POLISH_REVERT:\nPolish removed all changes; restored original patch.")
+        except Exception:
+            pass
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -919,11 +1598,50 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+
+        history_hint = ""
+        try:
+            history_hint = _find_local_fix_candidate(repo)
+        except Exception:
+            history_hint = ""
+        if history_hint:
+            logs.append("HISTORY_HINT:\nFound candidate change in local git history.")
+
+        ranked_files: List[str] = []
+        try:
+            ranked_files = _llm_rank_files(
+                repo=repo, issue_text=issue,
+                model_name=model_name, api_base=api_base, api_key=api_key,
+            )
+        except Exception:
+            ranked_files = []
+        if ranked_files:
+            preloaded_context = _build_preloaded_context_from_files(repo, ranked_files)
+        else:
+            preloaded_context = build_preloaded_context(repo, issue)
+
+        criteria = ""
+        try:
+            criteria = _extract_acceptance_criteria(
+                issue_text=issue, model_name=model_name,
+                api_base=api_base, api_key=api_key,
+            )
+        except Exception:
+            criteria = ""
+
+        initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if criteria:
+            initial_user = (
+                initial_user
+                + "\n\nAcceptance criteria the patch must satisfy "
+                + "(re-check before finalizing):\n" + criteria + "\n"
+            )
+        if history_hint:
+            initial_user = initial_user + _build_history_intent_block(history_hint)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": initial_user},
         ]
 
         for step in range(1, max_steps + 1):
@@ -1023,6 +1741,44 @@ def solve(
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        patch = get_patch(repo)
+        if patch.strip():
+            try:
+                _run_critique_revise(
+                    repo=repo, messages=messages, issue_text=issue,
+                    model_name=model_name, api_base=api_base, api_key=api_key,
+                    max_tokens=max_tokens, command_timeout=command_timeout,
+                    logs=logs,
+                )
+            except Exception:
+                logs.append("CRITIQUE_REVISE_ERROR:\n" + traceback.format_exc())
+        patch = get_patch(repo)
+        if patch.strip():
+            try:
+                _run_syntax_fix_pass(
+                    repo=repo, messages=messages,
+                    model_name=model_name, api_base=api_base, api_key=api_key,
+                    max_tokens=max_tokens, command_timeout=command_timeout,
+                    logs=logs,
+                )
+            except Exception:
+                logs.append("SYNTAX_FIX_ERROR:\n" + traceback.format_exc())
+        patch = get_patch(repo)
+        if patch.strip():
+            try:
+                _run_polish_pass(
+                    repo=repo, issue_text=issue,
+                    model_name=model_name, api_base=api_base, api_key=api_key,
+                    max_tokens=max_tokens, command_timeout=command_timeout,
+                    logs=logs,
+                )
+            except Exception:
+                logs.append("POLISH_ERROR:\n" + traceback.format_exc())
+            try:
+                _minimize_patch_via_git(repo)
+                _drop_pure_addition_unused_imports(repo)
+            except Exception:
+                logs.append("MINIMIZE_ERROR:\n" + traceback.format_exc())
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
