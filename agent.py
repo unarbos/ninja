@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -68,11 +67,22 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; the
-# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
+
+# Wall-clock budget for the entire solve(), in seconds. The validator enforces a
+# per-task agent_timeout that scales from 120s (min) to 600s (max) per
+# tau_/src/validate.py:_duel_agent_timeout, so we default conservatively under
+# the 120s floor and leave ~20s of headroom for git diff serialization plus
+# container teardown. Tighten further if you observe time_limit_exceeded; relax
+# only when the validator increases its floor.
+DEFAULT_WALL_BUDGET = 100.0
+# Hard floor for "we are out of time" — once remaining budget drops below this,
+# break out and return whatever patch exists rather than starting a new LLM call.
+WALL_HEADROOM_SECONDS = 15.0
+# Per LLM-call timeout. 120s used to swallow the entire 120s task budget; 45s
+# leaves room for a retry plus at least one editing turn after the response.
+DEFAULT_LLM_CALL_TIMEOUT = 45
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -93,18 +103,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 28000
-MAX_PRELOADED_FILES = 8
+MAX_PRELOADED_CONTEXT_CHARS = 14000
+MAX_PRELOADED_FILES = 4
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -281,7 +283,7 @@ def chat_completion(
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
+    timeout: int = DEFAULT_LLM_CALL_TIMEOUT,
     max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
@@ -320,13 +322,13 @@ def chat_completion(
             err_body = e.read().decode("utf-8", errors="replace")
             if 500 <= e.code < 600 and attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(0.25)
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(0.25)
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
         except Exception as e:
@@ -687,7 +689,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(6000, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -786,7 +788,7 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\\w.-])([\\w./-]+\\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\\w.-])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -1295,59 +1297,71 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored against a reference solution: half the score measures how closely your diff matches the reference in location, deleted lines, and added tokens; the other half is an LLM judge that checks correctness and completeness. Both halves reward the same thing: the minimal, precisely-placed change that satisfies every acceptance criterion and nothing more.
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+## Command format
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
-
+Run a bash command:
 <command>
-your bash command here
+bash command here
 </command>
 
-When you are finished, respond with:
-
+Signal completion:
 <final>
-short summary of what you changed
+brief summary of what changed
 </final>
 
-Plan-first discipline: before your first <command>, in the SAME response output
-a short <plan> block listing the target files and which acceptance criterion
-maps to each. Then immediately issue the first <command>(s). Do not split plan
-and commands across turns; that wastes a step.
+## Workflow
 
-Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the similarity score.
-- If file snippets are preloaded in the user prompt, edit those files first.
-  Do not re-read preloaded files.
-- The preload includes companion test files alongside their source partners
-  whenever both exist. When you patch a source file, update the companion test
-  in the SAME response if it is affected — failing to keep tests in sync is
-  the most common reason a patch trails on the similarity score.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
-- Avoid whitespace-only edits, comment-only edits, blank-line shuffling, import
-  reorders, type annotation drive-bys, dead-code removal not asked for by the
-  task, defensive checks not asked for by the task, and unrelated refactors.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- Verification: prefer a single targeted check on a touched file
-  (`python -m py_compile X.py`, `node --check X.js`, `pytest -k name X`,
-  `tsc --noEmit X.ts`). Avoid full installs, full builds, broad test suites.
-- If dependencies are missing or a verification command is slow, keep the patch
-  and finalize instead of spending the whole budget.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
-- Do not use sudo. Do not delete the repository. Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
-- Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+**Plan first**: before your first <command>, emit a short `<plan>` block naming the target file(s) and the exact function/block to change. Then immediately issue the command in the SAME response.
+
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block that needs changing. Do not loop on inspection.
+
+**Edit surgically**: change only the specific lines that implement the fix.
+- One-line substitutions: `sed -i 's/old/new/' file`
+- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
+- Larger edits: write a minimal Python script or use a heredoc
+- Never rewrite an entire function when only 1–3 lines need changing
+
+**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+
+**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it. Keeping test and source in sync is one of the most common ways to improve similarity score.
+
+**Verify cheaply**: one command (`python -m py_compile X.py`, `node --check X.js`, `pytest -k name -x`) after patching. Skip if the suite is slow or unavailable.
+
+**Finish immediately**: once the patch is correct, emit `<final>`. Do not re-read or re-inspect files.
+
+## Scope discipline — what to change
+
+Study the issue precisely:
+- "Fix X in function Y" → change only function Y; do not touch surrounding code
+- "Add feature Z to class C" → add only what Z requires inside C
+- "Bug when condition Q" → fix the specific condition; do not restructure
+
+Use the EXACT variable/function/class names already present in the codebase. Add new imports at the same location as existing imports in the file.
+
+## Scope discipline — what NOT to change
+
+- Whitespace-only, comment-only, or blank-line-only edits
+- Imports not needed by your fix
+- Type annotations not already present in the changed function
+- Refactoring, renaming, or reordering that the issue does not ask for
+- New helper functions or abstractions unless the issue explicitly requires them
+- New files unless the issue explicitly requires them
+- Test files unless the issue requires it OR your source change broke an existing test
+- Error handling, logging, or defensive checks not directly required by the fix
+
+## Style matching
+
+Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
+
+## Preloaded snippets
+
+Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+
+## Safety
+
+No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
 
 
@@ -1355,15 +1369,12 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets:
+Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-
-These files have already been read for you. Re-reading them burns the duel
-budget; patch them directly unless a needed detail is missing.
 """
 
-    return f"""We need fix this issue:
+    return f"""Fix this issue:
 
 {issue}
 
@@ -1371,14 +1382,13 @@ Repository summary:
 
 {repo_summary}
 {context_section}
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit.
 
-If the preloaded snippets identify the target code, start by editing them. Do
-not re-read preloaded files or run broad searches first. If the target is still
-unclear, run one or two focused search/snippet commands, then make the best
-focused patch you can. If multiple files need edits, include every independent
-file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+
+Do not run a broad test suite before editing. After patching, run ONE cheap syntax/unit check if available, then finish with <final>...</final>.
 """
 
 
@@ -1396,8 +1406,17 @@ your command here
 
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+        return (
+            "Budget check: no repo change yet. "
+            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
+            "A precise sed or python -c is better than another grep. Stop exploring."
+        )
+    return (
+        "Hard budget check: still no patch. "
+        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
+        "Do not read files or run tests until after a patch exists. "
+        "Use `sed -i` or a python one-liner to make the targeted edit now."
+    )
 
 
 def build_polish_prompt(junk_summary: str) -> str:
@@ -1422,19 +1441,25 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. Review your draft patch for:\n"
-        "  - any acceptance criterion from the task NOT addressed\n"
-        "  - companion test files that the source change broke or that need updating\n"
-        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
-        "  - newly-introduced bugs or syntax errors\n\n"
+        "Self-check pass. Review your draft patch against these criteria:\n\n"
+        "COMPLETENESS — must all pass:\n"
+        "  - Every acceptance criterion from the task is addressed\n"
+        "  - Companion test files that the source change broke are updated\n"
+        "  - No syntax errors or broken imports introduced\n\n"
+        "SCOPE — must all pass (failures hurt similarity score):\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No type annotation changes not required by the task\n"
+        "  - No refactoring, renaming, or reordering not required by the task\n"
+        "  - No new helper functions not required by the task\n"
+        "  - No defensive checks or error handling not required by the task\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
+        "If the patch passes all criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response that "
         "fix only the listed issues, then end with <final>summary</final>. "
-        "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+        "Revert unneeded hunks with sed or python. Do NOT add new features or scope."
     )
 
 
@@ -1563,21 +1588,46 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+        _wall_start = time.monotonic()
+        wall_budget = DEFAULT_WALL_BUDGET
+
+        def remaining_budget() -> float:
+            return wall_budget - (time.monotonic() - _wall_start)
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
+            if remaining_budget() <= WALL_HEADROOM_SECONDS:
+                logs.append(
+                    f"\nWALL_STOP:\n{remaining_budget():.1f}s left of {wall_budget:.0f}s budget; "
+                    "returning current state."
                 )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+                break
+
+            # Per-call timeout shrinks toward the end so a slow LLM call can't
+            # eat the entire remaining budget.
+            call_timeout = max(8, int(min(DEFAULT_LLM_CALL_TIMEOUT, remaining_budget() - WALL_HEADROOM_SECONDS)))
+
+            response_text = None
+            for _attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                        timeout=call_timeout,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception:
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
+                    if _attempt == 0 and remaining_budget() > WALL_HEADROOM_SECONDS + 5:
+                        time.sleep(0.5)
+
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1663,21 +1713,22 @@ def solve(
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
-                        "\n\nPatch now exists. If more edits are needed, send every "
-                        "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "\n\nPatch now exists. If more edits are needed (other files, companion tests), "
+                        "send EVERY remaining independent edit command in your next response — all at once. "
+                        "Do not split edits across turns. Then verify with one cheap check and emit <final>."
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf the observed snippets are enough to implement the issue, "
-                        "send the complete set of edit commands in your next response."
+                        "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
+                        "edit commands in your next response — all files at once. Use sed or python -c for "
+                        "surgical edits rather than rewriting entire functions."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -1685,12 +1736,15 @@ def solve(
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
+        # success = any non-empty patch. The validator's harness exits non-zero
+        # (→ solver_error classification) when solve() returns success=False, so
+        # we only fail when there's literally nothing to submit.
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
             steps=min(max_steps, step_count),
             cost=total_cost,
-            success=success and bool(patch.strip()),
+            success=bool(patch.strip()),
         ).to_dict()
 
     except Exception:
