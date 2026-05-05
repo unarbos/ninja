@@ -109,6 +109,9 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
+MODEL_NAME = None
+API_BASE = None
+API_KEY = None
 
 @dataclass
 class CommandResult:
@@ -675,9 +678,17 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    model_name = MODEL_NAME
+    api_base = API_BASE
+    api_key = API_KEY
+    if model_name and api_base and api_key:
+        issue_terms = _issue_terms_llm(issue, model=model_name, api_base=api_base, api_key=api_key)
+    else:
+        issue_terms = _issue_terms(issue)
+    terms = issue_terms if issue_terms is not None else _issue_terms(issue)
+    
+    content_hits = _grep_ranked_files(repo, terms)
 
-    terms = _issue_terms(issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -688,8 +699,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
-        if relative_path in symbol_hits:
-            score += 60 + min(40, 8 * symbol_hits[relative_path])
+        if relative_path in content_hits:
+            score += 60 + min(30, 3 * content_hits[relative_path])
         if path_lower in issue_lower:
             score += 35
         if name_lower and name_lower in issue_lower:
@@ -711,69 +722,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         seen.add(relative_path)
         ranked.append(relative_path)
     return ranked
-
-
-_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})(?![A-Za-z0-9_])")
-_SYMBOL_STOP = {
-    "about", "after", "alert", "argument", "before", "build", "called", "change", "check",
-    "class", "code", "command", "config", "context", "default", "expect", "expected",
-    "fail", "false", "field", "fields", "file", "files", "fixed", "function",
-    "given", "global", "hash", "header", "headers", "import",
-    "method", "module", "needed", "needs", "object", "params", "parse", "path",
-    "patch", "production", "project", "property", "public", "remove", "reset",
-    "return", "should", "static", "string", "support", "test", "tests", "their",
-    "there", "thing", "this", "true", "type", "types", "update", "using",
-    "value", "values", "when", "with", "will", "without", "write",
-}
-
-
-def _extract_issue_symbols(text: str) -> List[str]:
-    seen: set[str] = set()
-    out: List[str] = []
-    for match in _SYMBOL_RE.finditer(text):
-        token = match.group(1)
-        lowered = token.lower()
-        if lowered in _SYMBOL_STOP:
-            continue
-        if not (any(c.isupper() for c in token[1:]) or "_" in token):
-            if len(token) < 6:
-                continue
-        if token in seen:
-            continue
-        seen.add(token)
-        out.append(token)
-        if len(out) >= 10:
-            break
-    return out
-
-
-def _symbol_grep_hits(repo: Path, tracked_set: set, text: str) -> Dict[str, int]:
-    symbols = _extract_issue_symbols(text)
-    if not symbols:
-        return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=4,
-            )
-        except Exception:
-            continue
-        if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
-    return hits
 
 
 def _patch_changed_files(patch: str) -> List[str]:
@@ -964,6 +912,114 @@ def _issue_terms(issue: str) -> List[str]:
         terms.append(raw)
     return terms[:40]
 
+def _grep_ranked_files(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """
+    Lightweight content-based ranking using git grep across tracked files.
+    Returns a {relative_path: hit_count} dict for files that match any top terms.
+    """
+    if not terms:
+        return {}
+
+    top_terms = [t for t in terms[:10] if len(t) >= 3]
+    if not top_terms:
+        return {}
+
+    hits: Dict[str, int] = {}
+    # Use -F for literal matching; -- to avoid treating terms as paths.
+    for term in top_terms[:6]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1,
+            )
+        except Exception:
+            continue
+
+        if proc.returncode not in (0, 1):  # 1 means "no matches"
+            continue
+
+        for line in (proc.stdout or "").splitlines()[:250]:
+            # Format: path:line:content
+            path = line.split(":", 1)[0].strip()
+            if not path or not _context_file_allowed(path):
+                continue
+            hits[path] = hits.get(path, 0) + 1
+
+    return hits
+
+def _issue_terms_llm(
+    problem: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    timeout: int = 120,
+) -> List[str]:
+    """
+    Extract search keywords from the issue using the validator-managed OpenAI-compatible endpoint.
+
+    This is intended to run once per solve() and feed better terms into context ranking/search.
+    It falls back to _issue_terms() on any failure.
+    """
+    issue = (problem or "").strip()
+    if not issue:
+        return []
+
+    system = (
+        "Extract search keywords from software issue descriptions.\n"
+        "Return ONLY valid JSON: an array of strings.\n"
+        "Each string should be a short keyword or key phrase (1-4 words) suitable for `git grep`.\n"
+        "Include identifiers, function/class names, filenames, error messages, and domain terms.\n"
+        "Prefer many useful keywords over few. Avoid duplicates."
+    )
+    user = f"Issue:\n{issue}\n\nJSON array of keywords:"
+
+    try:
+        text, _cost, _raw = chat_completion(
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=256,
+            timeout=timeout,
+        )
+    except Exception:
+        return _issue_terms(issue)
+
+    try:
+        data = json.loads((text or "").strip())
+    except Exception:
+        return _issue_terms(issue)
+
+    if not isinstance(data, list):
+        return _issue_terms(issue)
+
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, str):
+            continue
+        value = re.sub(r"\s+", " ", item.strip().strip("\"'`")).lower()
+        if not value:
+            continue
+        if len(value) > 60:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+
+    # Add heuristic terms as a backstop.
+    for t in _issue_terms(issue):
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            cleaned.append(tl)
+
+    return cleaned[:60]
 
 def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
@@ -1126,6 +1182,11 @@ def solve(
     start_time = time.time()
     step_durations: List[float] = []
 
+    global MODEL_NAME, API_BASE, API_KEY
+    MODEL_NAME = model
+    API_BASE = api_base
+    API_KEY = api_key
+
     try:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
@@ -1140,6 +1201,20 @@ def solve(
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if step == max(2, max_steps // 2) and not get_patch(repo).strip():
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Mid-budget check: there is still NO patch.\n\n"
+                            "Your next response MUST create a diff by editing the most likely file(s) now. "
+                            "Do not run more than 1 focused search command before editing. "
+                            "Make the smallest plausible change that addresses the issue.\n\n"
+                            "Reply with one or more <command>...</command> blocks that perform the edits."
+                        ),
+                    }
+                )
 
             try:
                 response_text, cost, _raw = chat_completion(
