@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "25"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 
@@ -646,10 +646,18 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
+    # Fallback budget for lower-ranked files (ranks 3+)
     per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        # Tiered context budget: concentrate chars on the primary target file
+        if rank == 0:
+            file_budget = 12000  # primary target: enough for a full component/function
+        elif rank <= 2:
+            file_budget = 3500   # secondary files: enough for key sections
+        else:
+            file_budget = per_file_budget  # lower-ranked: use computed budget
+        snippet = _read_context_file(repo, relative_path, file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -678,6 +686,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
 
     terms = _issue_terms(issue)
+    # Compute TypeScript density once for the language-aware ranking boost
+    ts_count = sum(1 for f in tracked if f.endswith((".ts", ".tsx")))
+    ts_ratio = ts_count / max(len(tracked), 1)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -699,6 +710,10 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
+        # Language-aware boost: prioritize TypeScript/TSX files in TS-heavy repos
+        ext = relative_path.rsplit(".", 1)[-1].lower() if "." in relative_path else ""
+        if ts_ratio > 0.3 and ext in ("ts", "tsx"):
+            score += 10
         if score > 0:
             scored.append((score, relative_path))
 
@@ -983,49 +998,68 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+Fix the issue by editing files.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+Issue bash commands in this format (up to 16 per response, executed in order):
 
 <command>
 your bash command here
 </command>
 
-When you are finished, respond with:
+When finished, respond with:
 
 <final>
 short summary of what you changed
 </final>
 
+How to approach each task:
+- Read the issue carefully and identify the PRIMARY symbol, function, or class name mentioned
+- Run ONE targeted grep to find its exact location: grep -n "symbol_name" $(git ls-files | grep -E '\\.(ts|tsx|py|js)$') | head -10
+- Read ONLY the relevant section (20-40 lines around the target): sed -n 'N1,N2p' file.ts
+- Make the minimal change that satisfies the issue — edit at exactly the found location
+- Use EXACT identifiers, variable names, and string literals already in the surrounding code — never rename or reformat
+- Match indentation, quote style, and brace placement of the surrounding code exactly
+- If the issue mentions multiple criteria, address ALL of them before finalizing
+- After editing, run one cheap verification (python -m py_compile or tsc --noEmit if available), then finalize
+- Do NOT touch files, functions, or lines that are not directly needed for the fix
+- Do NOT change imports, types, or comments unless the issue specifically requires it
+- If you have not made any edit by your 4th response, make one now — a partial fix is better than no output
+
 Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the diff.
-- If file snippets are already preloaded in the user prompt, edit those files
-  first. Do not re-read preloaded files.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
-- Avoid whitespace-only edits, comment-only edits, import reorders, type
-  annotation drive-bys, dead-code removal not asked for by the task, defensive
-  checks not asked for by the task, and any unrelated refactors.
-- Do not run broad test suites, full builds, or installs. A targeted
-  python -m py_compile / tsc --noEmit <file> / pytest <one file> is fine.
-- After a focused patch and at most one cheap verification or diff review,
+- Before your first <command>, in the SAME response emit a short <plan> block:
+  <plan>
+  target_files: [list them]
+  acceptance_mapping: [criterion → file/symbol]
+  unknowns: [what you'll grep for first]
+  </plan>
+  Then immediately issue the first <command>(s). Do NOT split plan and commands.
+- If preloaded snippets identify the target, edit those files directly. Do NOT
+  re-read preloaded files.
+- By your SECOND response you should usually be editing files.
+- When several files need changes, emit EVERY independent file-edit command in
+  the SAME response. Never split one patch across multiple turns.
+- The smallest diff that satisfies every acceptance criterion wins.
+- After a focused patch + one cheap verification (py_compile/tsc/pytest one file),
   finalize with <final>.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
+- Do not dump generated, minified, binary, lock, or vendored files.
 - Do not use sudo. Do not delete the repository. Do not access secrets.
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - Avoid chmod/file mode changes.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+## ZERO OUTPUT PREVENTION
+Never produce an empty patch. Follow this anti-stall protocol:
+- After your 3rd response: if you have not yet made any file edit, make one now
+- After your 5th response: if total edits are still zero, force an edit to the most likely target file
+- Use `sed -i 's/old/new/' file` for single-line changes, or `python3 -c "..."` for multi-line
+- A minimal correct edit beats a zero-output result every time
+- If you cannot determine the exact fix, make your best approximation at the most likely location
+- Any edit — even a one-line placeholder — is better than finishing with no changes
+
+When multiple files are required:
+- Identify all required files BEFORE starting any edit
+- Edit them in one batch (same response) to minimize round-trips
+- Do not leave required files unedited when you finalize
 """
 
 
