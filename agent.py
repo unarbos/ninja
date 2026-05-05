@@ -64,10 +64,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+# -----------------------------
+# Config
+# -----------------------------
+
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "20"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-
+# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
+# validator wiring. During real validation the validator passes model, api_base,
+# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -81,7 +90,7 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
 MAX_PRELOADED_CONTEXT_CHARS = 32000
@@ -92,7 +101,8 @@ MAX_POLISH_TURNS = 1
 MAX_SELF_CHECK_TURNS = 1
 MAX_SYNTAX_FIX_TURNS = 1
 
-
+# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
+# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -109,6 +119,10 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
+
+# -----------------------------
+# Data structures
+# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -138,6 +152,10 @@ class AgentResult:
             "success": self.success,
         }
 
+
+# -----------------------------
+# Utility
+# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -236,14 +254,22 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
+# -----------------------------
+# OpenAI-compatible client
+# -----------------------------
+
+# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
+# behavior, response parsing, or model-message strategy here. Keep all requests
+# pointed at the api_base/api_key supplied by solve(); the validator proxy
+# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
-    max_retries: int = 1,
+    timeout: int = 90,
+	max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client. Retries once on transient
     transport failures (timeouts, connection errors, HTTP 5xx)."""
@@ -301,6 +327,14 @@ def chat_completion(
     return content, cost, data
 
 
+# -----------------------------
+# Shell execution
+# -----------------------------
+
+# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
+# repo. You may improve command validation, environment handling, timeouts, and
+# output shaping. Keep commands scoped to the repo and avoid secrets or network
+# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -407,6 +441,10 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
+# -----------------------------
+# Action parsing
+# -----------------------------
+
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -426,6 +464,10 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
+
+# -----------------------------
+# Git helpers
+# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -566,8 +608,8 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 
 def get_repo_summary(repo: Path) -> str:
     commands = [
-        "pwd",
-        "git ls-files | awk 'NR<=220 {print} END {if (NR>220) print \"... \" NR-220 \" more tracked files\"}'",
+        "pwd && echo '---' && git log --oneline -5 2>/dev/null | head -5 || true",
+        "git ls-files | awk 'NR<=80 {print} END {if (NR>80) print \"...\" NR-80 \" more tracked files\"}'",
         "git status --short || true",
     ]
 
@@ -646,7 +688,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -981,51 +1023,60 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+# -----------------------------
+# Prompting
+# -----------------------------
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
+# agent. Prompt improvements are encouraged as long as they respect the
+# validator-owned boundaries above.
+SYSTEM_PROMPT = """You are a precise code-patching agent running inside a task repository.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+SCORING (understand this to maximize round wins):
+- 50% of your score is token-level similarity to the reference patch. The biggest
+  factors are: which tokens you add (25%), where you make changes (22%), which
+  original lines you remove (17%), and edit shape (11%). Every unnecessary changed
+  line directly lowers this score. Minimal, targeted changes win.
+- 50% is an LLM judge scoring correctness, completeness, and task alignment.
+  Unrelated churn, empty patches, and timeouts are penalized heavily.
 
+WORKFLOW — aim for 2-4 steps total:
+1. LOCATE the exact code to change. Use:
+     grep -n "symbol_or_term" path/to/file.py
+     cat -n path/to/file.py | head -60
+     grep -rn "term" --include="*.py" .
+   Skip this if the preloaded snippets already show the target.
+2. EDIT using precise python3 or sed. Preferred approaches:
+     python3 << 'EOF'
+     with open('file.py') as f: code = f.read()
+     code = code.replace('exact old text', 'exact new text')
+     with open('file.py', 'w') as f: f.write(code)
+     EOF
+   or for simple single-line changes:
+     sed -i 's/old_pattern/new_pattern/' file.py
+3. VERIFY with `git diff` if you are unsure the edit is correct.
+4. FINALIZE with <final>brief summary</final>.
+
+Command format:
 <command>
-your bash command here
+bash command here
 </command>
 
-When you are finished, respond with:
-
+Finish format:
 <final>
-short summary of what you changed
+brief summary of what changed
 </final>
 
-Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the diff.
-- If file snippets are already preloaded in the user prompt, edit those files
-  first. Do not re-read preloaded files.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
-- Avoid whitespace-only edits, comment-only edits, import reorders, type
-  annotation drive-bys, dead-code removal not asked for by the task, defensive
-  checks not asked for by the task, and any unrelated refactors.
-- Do not run broad test suites, full builds, or installs. A targeted
-  python -m py_compile / tsc --noEmit <file> / pytest <one file> is fine.
-- After a focused patch and at most one cheap verification or diff review,
-  finalize with <final>.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
-- Do not use sudo. Do not delete the repository. Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
-- Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+CRITICAL RULES — violations directly lower your score:
+- Change ONLY the lines the task requires. No cleanup, reformatting, or refactoring.
+- Match existing code style exactly: indentation, quote style, trailing commas, spacing.
+- Do NOT add comments, docstrings, or type annotations unless the task explicitly requires them.
+- Do NOT reorder imports, rename anything, or fix unrelated issues.
+- Do NOT run tests, linters, builds, or package installs.
+- Emit ALL file edits in a SINGLE response — never split across turns.
+- Once your patch exists and looks correct, output <final> immediately.
+- Prefer reading only the relevant section of a file, not the whole file.
+- Never use sudo or destructive host commands.
 """
 
 
@@ -1033,35 +1084,26 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets:
+Preloaded relevant file snippets (already read — do NOT re-read unless a critical detail is missing):
 
 {preloaded_context}
 
-These files have already been read for you. Re-reading them burns the duel
-budget; patch them directly unless a needed detail is missing.
+If these snippets show the exact target code, EDIT IN YOUR FIRST RESPONSE.
+Do not re-read or re-explore these files.
 """
 
-    return f"""We need fix this issue:
-
+    return f"""TASK:
 {issue}
 
-Repository summary:
-
+REPOSITORY:
 {repo_summary}
 {context_section}
-
-Plan-first discipline: before your first <command>, in the SAME response output
-a short <plan> block listing the target files and which acceptance criterion
-maps to each, then immediately issue the first <command>(s). Do not split plan
-and commands across turns; that wastes a step.
-
-If the preloaded snippets identify the target code, start by editing them. Do
-not re-read preloaded files or run broad searches first. If the target is still
-unclear, run one or two focused search/snippet commands, then make the best
-focused patch you can. If multiple files need edits, include every independent
-file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+Instructions:
+- If the preloaded snippets identify the exact code to change → edit immediately.
+- Otherwise → run 1-2 targeted grep/cat commands to locate the target, then edit.
+- Emit ALL required file edits in a SINGLE response.
+- Use python3 or sed for edits; match the existing code style exactly.
+- After editing, output <final>summary</final> to complete.
 """
 
 
@@ -1096,11 +1138,27 @@ your command here
 
 
 def build_budget_pressure_prompt(step: int) -> str:
-    if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+    if step <= 3:
+        return (
+            f"Budget alert: no patch yet after {step} steps. "
+            "Your NEXT command must edit the most likely file(s) based on the issue "
+            "and any observed snippets. Do not run more exploration commands — edit now."
+        )
+    return (
+        "Hard budget stop: a patch must exist NOW. "
+        "Write the minimal best-effort change for the clearest task requirement. "
+        "Do not explore further — make the edit and output <final>...</final>."
+    )
 
 
+# -----------------------------
+# Main agent
+# -----------------------------
+
+# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
+# agent. You may change planning, memory, context collection, repair behavior,
+# test strategy, and stopping criteria. Preserve the solve() signature and
+# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -1138,21 +1196,34 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+        _wall_start = time.monotonic()
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+            if time.monotonic() - _wall_start > 480:
+                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                break
+
+            response_text = None
+            for _attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception:
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
+                    if _attempt == 0:
+                        time.sleep(3)
+
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1203,7 +1274,7 @@ def solve(
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                if step >= 2 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
@@ -1213,16 +1284,8 @@ def solve(
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
-                    if (
-                        patch.strip()
-                        and step >= 8
-                        and _looks_like_patch_review_command(command, result)
-                        and _patch_covers_required_paths(patch, issue)
-                    ):
-                        logs.append(
-                            "\nPATCH_READY:\nPatch exists, covers issue-mentioned paths, "
-                            "and latest command reviewed the diff/status."
-                        )
+                    if patch.strip() and step >= 3 and _looks_like_patch_review_command(command, result):
+                        logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
                         success = True
                         break
 
@@ -1259,7 +1322,7 @@ def solve(
                     observation_text += (
                         "\n\nPatch now exists. If more edits are needed, send every "
                         "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "Otherwise output <final>summary</final> immediately."
                     )
                 elif not success:
                     observation_text += (
@@ -1275,7 +1338,7 @@ def solve(
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -1396,6 +1459,13 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+# -----------------------------
+# CLI for local testing
+# -----------------------------
+
+# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
+# CLI to make local experiments easier, but do not rely on CLI-only behavior for
+# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
