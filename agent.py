@@ -94,6 +94,16 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
+# Wall-clock self-discipline. The validator caps each round at
+# min(max(2*cursor_elapsed + 1, 120), 600); we don't see that ceiling, but a
+# hard 540s cap leaves ~60s of cushion below the absolute max. When less than
+# WALL_CLOCK_FINALIZE_REMAINING_SECONDS remain we prefer "return the current
+# patch" over "queue another refinement turn that won't finish anyway",
+# because a timed-out round is a guaranteed loss for both score halves.
+WALL_CLOCK_HARD_CAP_SECONDS = 540
+WALL_CLOCK_FINALIZE_REMAINING_SECONDS = 60
+WALL_CLOCK_PRESSURE_REMAINING_SECONDS = 120
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -453,6 +463,15 @@ def format_observation(result: CommandResult) -> str:
 
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
+PLAN_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.IGNORECASE | re.DOTALL)
+# Path-like tokens with a known source/test extension. Used to harvest the
+# files the model committed to in its <plan> block so the self-check turn can
+# notice when the patch silently drops a planned target.
+_PLAN_PATH_RE = re.compile(
+    r"[\w][\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|"
+    r"php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml)\b",
+    re.IGNORECASE,
+)
 
 
 def extract_commands(model_text: str) -> List[str]:
@@ -469,6 +488,45 @@ def extract_final(model_text: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip()
+
+
+def extract_plan(model_text: str) -> Optional[str]:
+    """Return the body of the first <plan>...</plan> block, or None."""
+    match = PLAN_RE.search(model_text)
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def extract_planned_paths(plan_text: str, tracked_set: set) -> List[str]:
+    """Return the tracked file paths that appear in a <plan> block, deduped
+    in the order the model named them.
+
+    Models often name targets by basename only (e.g. ``UserServiceTests.cs``),
+    so when an exact path-in-tracked-set match fails we fall back to a unique
+    suffix scan: a single tracked path ending with ``/<token>`` resolves;
+    ambiguous matches (multiple tracked files share the basename) are skipped.
+    """
+    if not plan_text or not tracked_set:
+        return []
+    paths: List[str] = []
+    seen: set = set()
+    for raw in _PLAN_PATH_RE.findall(plan_text):
+        token = raw.strip("`'\"()[]{}:,;").strip()
+        if not token:
+            continue
+        if token in tracked_set:
+            if token not in seen:
+                seen.add(token)
+                paths.append(token)
+            continue
+        candidates = [t for t in tracked_set if t.endswith("/" + token)]
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            if chosen not in seen:
+                seen.add(chosen)
+                paths.append(chosen)
+    return paths
 
 
 # -----------------------------
@@ -677,8 +735,18 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    # Tiered budget: concentrate chars on the most likely target so the model
+    # sees a full function/component for the primary file instead of an even
+    # but shallow split across N files. Lower-ranked files keep the computed
+    # even-split budget so they stay informative without dominating.
+    for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        if rank == 0:
+            file_budget = max(per_file_budget, 12000)
+        elif rank <= 2:
+            file_budget = max(per_file_budget, 3500)
+        else:
+            file_budget = per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -706,6 +774,14 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # Language-density signal: in TS-heavy or Python-heavy repos, prefer the
+    # dominant source extension over docs/configs at the same score so a
+    # generic identifier match in a .md/.json doesn't outrank the actual
+    # implementation file.
+    ts_count = sum(1 for f in tracked if f.endswith((".ts", ".tsx")))
+    ts_ratio = ts_count / max(len(tracked), 1)
+    py_count = sum(1 for f in tracked if f.endswith(".py"))
+    py_ratio = py_count / max(len(tracked), 1)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -713,6 +789,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         path_lower = relative_path.lower()
         name_lower = Path(relative_path).name.lower()
         stem_lower = Path(relative_path).stem.lower()
+        suffix_lower = Path(relative_path).suffix.lower()
         score = 0
         if relative_path in mentioned:
             score += 100
@@ -728,6 +805,11 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Language-density boost.
+        if ts_ratio > 0.3 and suffix_lower in (".ts", ".tsx"):
+            score += 10
+        if py_ratio > 0.3 and suffix_lower == ".py":
+            score += 10
         if score > 0:
             scored.append((score, relative_path))
 
@@ -992,13 +1074,120 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
-def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
-    """All paths the issue explicitly mentions must appear in the patch."""
+def _missing_required_paths(patch: str, issue_text: str) -> List[str]:
+    """Issue-mentioned paths that don't yet appear in the patch, in mention order."""
     required = _extract_issue_path_mentions(issue_text)
     if not required:
-        return True
+        return []
     changed = set(_patch_changed_files(patch))
-    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
+    return [req for req in required if not any(req == c or c.endswith("/" + req) for c in changed)]
+
+
+def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
+    """All paths the issue explicitly mentions must appear in the patch."""
+    return not _missing_required_paths(patch, issue_text)
+
+
+def _companion_test_gap(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    """Return (source_path, test_path) when a patched source file has a tracked
+    companion test that the patch does not also touch.
+
+    Real GitHub-derived tasks almost always need source and test changes
+    together; without the test in lockstep the patch bleeds Cursor-similarity
+    score. Returns None when every patched source either has no companion test
+    or its test partner is already covered by the patch.
+    """
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return None
+    changed_set = set(changed)
+    tracked_set = set(_tracked_files(repo))
+    if not tracked_set:
+        return None
+    for relative_path in changed:
+        partner = _find_test_partner(relative_path, tracked_set)
+        if partner and partner not in changed_set:
+            return (relative_path, partner)
+    return None
+
+
+def _runnable_test_command(test_path: str) -> Optional[str]:
+    """Best-effort focused test command for the given test file.
+
+    Python is the dominant language for validator tasks; we try `pytest`
+    first (preferred), then `python -m pytest`, then `python3 -m pytest`,
+    and fall back to `python -m unittest` for the rare repo without pytest.
+    Other ecosystems (Node, Go, Rust) need project-aware setup that we
+    can't reliably infer from this file alone, so we skip them.
+    """
+    suffix = Path(test_path).suffix.lower()
+    if suffix != ".py":
+        return None
+    quoted = _shell_quote(test_path)
+    return (
+        f"if command -v pytest >/dev/null 2>&1; then pytest -x -q {quoted} 2>&1; "
+        f"elif python -c 'import pytest' >/dev/null 2>&1; then python -m pytest -x -q {quoted} 2>&1; "
+        f"elif python3 -c 'import pytest' >/dev/null 2>&1; then python3 -m pytest -x -q {quoted} 2>&1; "
+        f"else python -m unittest {quoted} 2>&1; fi"
+    )
+
+
+# Substrings that mean "the test runner couldn't even start" — we treat these
+# as ambiguous (probably an environmental issue, not a real regression) so we
+# don't waste a refinement turn quoting environmental noise back at the model.
+_TEST_ENV_NOISE_MARKERS: Tuple[str, ...] = (
+    "modulenotfounderror",
+    "no module named",
+    "command not found",
+    "is not recognized",
+    "importerror",
+    "could not find a version",
+)
+
+
+def _run_companion_test_in_patch(
+    repo: Path,
+    patch: str,
+    command_timeout: int,
+) -> Optional[Tuple[str, str]]:
+    """When a source-test pair is both in the patch, run the test and report
+    the failure tail.
+
+    Returns (test_path, output) only when the test fails with high confidence
+    (a known runner summary indicates failure, or exit code is non-zero with
+    no obvious environmental cause). Returns None when no pair is runnable,
+    the test passes, the test times out, or the failure looks environmental.
+    """
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return None
+    changed_set = set(changed)
+    tracked_set = set(_tracked_files(repo))
+    if not tracked_set:
+        return None
+    pairs_checked = 0
+    for relative_path in changed:
+        if pairs_checked >= 2:
+            break
+        partner = _find_test_partner(relative_path, tracked_set)
+        if not partner or partner not in changed_set:
+            continue
+        cmd = _runnable_test_command(partner)
+        if not cmd:
+            continue
+        pairs_checked += 1
+        result = run_command(cmd, repo, timeout=min(60, max(command_timeout * 3, 30)))
+        if result.timed_out:
+            continue
+        observation = format_observation(result)
+        obs_lower = observation.lower()
+        if _parse_test_summary(observation, cmd) is False:
+            output = (result.stdout or "") + (("\n" + result.stderr) if result.stderr.strip() else "")
+            return (partner, output)
+        if result.exit_code != 0 and not any(m in obs_lower for m in _TEST_ENV_NOISE_MARKERS):
+            output = (result.stdout or "") + (("\n" + result.stderr) if result.stderr.strip() else "")
+            return (partner, output)
+    return None
 
 
 # -----------------------------
@@ -1035,6 +1224,31 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}:{exc.lineno}: {exc.msg}"
     except Exception as exc:
         return f"{relative_path}: parse failure: {exc}"
+
+
+def _check_typescript_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`tsc --noEmit --skipLibCheck file.ts` when tsc is available.
+
+    Falls back to None when tsc is missing — TypeScript repos without a global
+    `tsc` typically still parse fine through node's loader for our purposes,
+    and we'd rather skip the check than drop several seconds on a NotFound.
+    """
+    if not _has_executable("tsc"):
+        return None
+    proc_result = run_command(
+        f"tsc --noEmit --skipLibCheck --allowJs {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT * 2,
+    )
+    if proc_result.exit_code == 0:
+        return None
+    body = (proc_result.stderr or proc_result.stdout or "").strip()
+    if not body:
+        return f"{relative_path}: tsc --noEmit failed"
+    for line in body.splitlines():
+        if line.startswith(relative_path):
+            return f"{relative_path}: {line.split(': ', 1)[-1]}"
+    return f"{relative_path}: {body.splitlines()[-1]}"
 
 
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1086,6 +1300,12 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         result: Optional[str] = None
         if suffix == ".py":
             result = _check_python_syntax_one(repo, relative_path)
+        elif suffix in {".ts", ".tsx"}:
+            # Try tsc first (catches type-shape regressions a parser misses);
+            # fall back to node --check for a pure parse pass when tsc is missing.
+            result = _check_typescript_syntax_one(repo, relative_path)
+            if result is None:
+                result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".json"}:
@@ -1128,30 +1348,63 @@ def _shell_quote(value: str) -> str:
 # the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python — the most common shapes.
+    # Python — covers pytest/unittest layouts including nested test dirs.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    # TypeScript / JavaScript — Jest / Vitest conventions.
+    ("{stem}.py", "tests/unit/test_{stem}.py"),
+    ("{stem}.py", "tests/integration/test_{stem}.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    # TypeScript / JavaScript — Jest / Vitest .test and .spec conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/{stem}.spec.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/__tests__/{stem}.spec.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/{stem}.spec.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/__tests__/{stem}.spec.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
+    ("{stem}.js", "{dir}/{stem}.spec.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "{dir}/__tests__/{stem}.spec.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
+    ("{stem}.jsx", "{dir}/{stem}.spec.jsx"),
+    # C# — xUnit/NUnit/MSTest layouts. .NET tasks usually keep tests in a
+    # parallel project (e.g. `Foo.Infrastructure/Sub/X.cs` ->
+    # `Foo.Tests/Sub/XTests.cs`); the basename-suffix fallback in
+    # _find_test_partner catches that. The templates here cover same-tree.
+    ("{stem}.cs", "{dir}/{stem}Tests.cs"),
+    ("{stem}.cs", "{stem}Tests.cs"),
+    ("{stem}.cs", "Tests/{stem}Tests.cs"),
+    ("{stem}.cs", "tests/{stem}Tests.cs"),
+    ("{stem}.cs", "{dir}/Tests/{stem}Tests.cs"),
+    ("{stem}.cs", "{stem}.Tests/{stem}Tests.cs"),
+    # Other languages — common canonical conventions.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
+    ("{stem}.rs", "tests/{stem}.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    ("{stem}.rb", "{dir}/{stem}_spec.rb"),
 )
 
 
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
+    """Return the most plausible test file for a source path, or None.
+
+    First tries the curated `_TEST_PARTNER_TEMPLATES` (cheap, deterministic).
+    When no template matches we fall back to a basename-suffix scan over the
+    tracked-file set so we can catch cross-project layouts like .NET's
+    `Foo.Infrastructure/Sub/X.cs` -> `Foo.Tests/Sub/XTests.cs` that simple
+    `{stem}/{dir}` substitution can't express. The fallback is conservative:
+    it requires unambiguous candidates (a unique tracked path matching one
+    of the well-known test-name shapes) so we don't push the model toward an
+    unrelated test partner.
+    """
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
@@ -1168,6 +1421,41 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
         candidate = str(Path(candidate))
         if candidate in tracked and _context_file_allowed(candidate):
             return candidate
+
+    # Basename-suffix fallback for cross-project layouts (e.g. .NET parallel).
+    suffix_lower = suffix.lower()
+    fallback_basenames: List[str] = []
+    if suffix_lower == ".cs":
+        fallback_basenames = [f"{stem}Tests.cs", f"{stem}Test.cs"]
+    elif suffix_lower == ".py":
+        fallback_basenames = [f"test_{stem}.py", f"{stem}_test.py"]
+    elif suffix_lower in (".ts", ".tsx", ".js", ".jsx"):
+        fallback_basenames = [
+            f"{stem}.test{suffix_lower}",
+            f"{stem}.spec{suffix_lower}",
+        ]
+    elif suffix_lower == ".go":
+        fallback_basenames = [f"{stem}_test.go"]
+    elif suffix_lower == ".rs":
+        fallback_basenames = [f"{stem}_test.rs"]
+    elif suffix_lower == ".rb":
+        fallback_basenames = [f"{stem}_spec.rb"]
+    elif suffix_lower == ".java":
+        fallback_basenames = [f"{stem}Test.java", f"{stem}Tests.java"]
+    elif suffix_lower == ".kt":
+        fallback_basenames = [f"{stem}Test.kt", f"{stem}Tests.kt"]
+    if not fallback_basenames:
+        return None
+    matches: List[str] = []
+    for basename in fallback_basenames:
+        for tracked_path in tracked:
+            if tracked_path.endswith("/" + basename) or tracked_path == basename:
+                if _context_file_allowed(tracked_path):
+                    matches.append(tracked_path)
+        if matches:
+            break
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -1427,16 +1715,36 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+def build_self_check_prompt(
+    patch: str,
+    issue_text: str,
+    missing_paths: Optional[List[str]] = None,
+) -> str:
+    """Show the model its own draft and ask for a focused self-review.
+
+    If `missing_paths` lists issue-mentioned or planned paths the patch has
+    not touched, the prompt calls them out so the model decides whether to
+    cover them or justify out-of-scope.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+    missing_section = ""
+    if missing_paths:
+        joined = ", ".join(f"`{p}`" for p in missing_paths[:5])
+        missing_section = (
+            "MISSING (the issue or your own plan named these but the patch does NOT touch them yet):\n"
+            f"  {joined}\n"
+            "  - If they need edits to satisfy the task, make them now.\n"
+            "  - If they are genuinely out of scope, end with <final>OK</final> "
+            "and do NOT introduce churn elsewhere.\n\n"
+        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
+        f"{missing_section}"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
@@ -1489,6 +1797,21 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_test_lockstep_prompt(source_path: str, test_path: str) -> str:
+    """When source has a tracked companion test that wasn't updated in lockstep."""
+    return (
+        f"Lockstep gate — your patch edits `{source_path}` but its companion "
+        f"test file `{test_path}` is untouched. Real GitHub-derived tasks "
+        "almost always need source and test changes together; the test was "
+        "preloaded for you. Update it ONLY if the source change requires a "
+        "behavior change in the test, matching the existing test's style and "
+        "assertion shape exactly. If the test does not need to change, end "
+        "with `<final>OK</final>` immediately and do NOT introduce churn. "
+        "Otherwise emit the minimal edit commands and end with "
+        "`<final>summary</final>`."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1519,6 +1842,18 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
+    # Phase-3 awareness state. solve_start_time anchors a wall-clock self-cap;
+    # planned_target_paths is harvested once from the model's first <plan>
+    # block so the self-check turn can flag silently-dropped planned files;
+    # wall_clock_pressure_sent gates a single deadline-pressure nudge.
+    solve_start_time = time.time()
+    planned_target_paths: List[str] = []
+    wall_clock_pressure_sent = False
+
+    def remaining_wall_clock_seconds() -> float:
+        """Seconds left until our self-cap. Negative when we've blown past it."""
+        return WALL_CLOCK_HARD_CAP_SECONDS - (time.time() - solve_start_time)
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1537,10 +1872,17 @@ def solve(
         means the caller can declare success. The order is:
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+            3. test-aware — when a source-test pair is in the patch, run the
+               test and quote any failure tail; otherwise, when source has an
+               unedited companion test, push the model to update it lockstep
+            4. self-check — show the diff and flag issue-mentioned paths AND
+               planned-but-untouched paths the patch has not covered
+        Each refinement runs at most once per cycle. We also short-circuit
+        when wall-clock budget is too tight to spend another turn.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used
+        if remaining_wall_clock_seconds() < WALL_CLOCK_FINALIZE_REMAINING_SECONDS:
+            return False
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1567,12 +1909,55 @@ def solve(
                 )
                 return True
 
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            # Preferred: run the companion test if both source+test are in the
+            # patch; quote the failure tail to the model if it fails.
+            failure = _run_companion_test_in_patch(repo, patch, command_timeout)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+            # Fallback: source touched but companion test partner unedited.
+            gap = _companion_test_gap(repo, patch)
+            if gap is not None:
+                source_path, test_path = gap
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_lockstep_prompt(source_path, test_path),
+                    f"TEST_LOCKSTEP_QUEUED:\n  source={source_path} test={test_path}",
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
+            # Combine paths the issue explicitly mentions with paths the
+            # model named in its own <plan> block. A plan target the patch
+            # hasn't touched is a strong signal the model abandoned its
+            # own roadmap.
+            missing = _missing_required_paths(patch, issue)
+            if planned_target_paths:
+                changed_paths = _patch_changed_files(patch)
+                changed_set = set(changed_paths)
+                for planned in planned_target_paths:
+                    already_listed = planned in missing
+                    covered = planned in changed_set or any(
+                        c == planned or c.endswith("/" + planned) for c in changed_paths
+                    )
+                    if not already_listed and not covered:
+                        missing.append(planned)
+            marker = "SELF_CHECK_QUEUED"
+            if missing:
+                marker += "\n  missing=" + ",".join(missing[:5])
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
-                "SELF_CHECK_QUEUED",
+                build_self_check_prompt(patch, issue, missing),
+                marker,
             )
             return True
 
@@ -1590,13 +1975,14 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > 480:
-                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+            if remaining_wall_clock_seconds() <= 0:
+                logs.append(
+                    "\nWALL_CLOCK_EXCEEDED:\n"
+                    "Self-cap elapsed; aborting before this step to return current patch."
+                )
                 break
 
             response_text = None
@@ -1621,6 +2007,16 @@ def solve(
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
+
+            # Capture <plan> targets from the first response so the self-check
+            # turn can flag silently-dropped files later in the loop.
+            if step == 1 and not planned_target_paths:
+                plan_text = extract_plan(response_text)
+                if plan_text:
+                    plan_targets = extract_planned_paths(plan_text, set(_tracked_files(repo)))
+                    if plan_targets:
+                        planned_target_paths.extend(plan_targets)
+                        logs.append(f"\nPLAN_PARSED:\n  files={','.join(plan_targets[:8])}")
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
@@ -1721,8 +2117,38 @@ def solve(
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+            # Wall-clock finalize: if a patch already exists and remaining is
+            # too tight for another full model+commands round, prefer the
+            # current patch over a timed-out round (which would zero both
+            # score halves).
+            if (
+                get_patch(repo).strip()
+                and remaining_wall_clock_seconds() < WALL_CLOCK_FINALIZE_REMAINING_SECONDS
+            ):
+                logs.append(
+                    "\nWALL_CLOCK_FINALIZE:\n"
+                    "Returning current patch under self-cap deadline."
+                )
+                success = True
+                break
+
+            if not get_patch(repo).strip():
+                if (
+                    not wall_clock_pressure_sent
+                    and remaining_wall_clock_seconds() < WALL_CLOCK_PRESSURE_REMAINING_SECONDS
+                ):
+                    wall_clock_pressure_sent = True
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Wall-clock pressure: the validator round is close to timing out. "
+                            "Make the smallest plausible patch RIGHT NOW using the snippets you "
+                            "already have, then end with <final>summary</final>. Do not run more "
+                            "searches."
+                        ),
+                    })
+                elif step in {2, 4}:
+                    messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
@@ -1755,41 +2181,107 @@ def solve(
         ).to_dict()
 
 
+# Explicit summary patterns from the major test runners. When one of these
+# matches we have a cleanly-bounded count of passes/fails/errors and can stop
+# guessing from loose markers like "ok" or "success" appearing in unrelated
+# log lines (which is otherwise triggered by file content like "lookup",
+# "book", "tokens" inside `cat > file.py` heredocs).
+_TEST_SUMMARY_PATTERNS: Tuple[Tuple["re.Pattern[str]", "re.Pattern[str]"], ...] = (
+    # pytest summary line: "===== 12 passed in 0.34s ====="
+    (
+        re.compile(r"=+\s*\d+\s+passed(?:[^\n=]*?)\s+in\s+\d", re.IGNORECASE),
+        re.compile(r"\b\d+\s+(failed|errors?)\b", re.IGNORECASE),
+    ),
+    # jest / vitest: "Tests:       4 passed, 4 total"
+    (
+        re.compile(r"^\s*tests?:\s+\d+\s+passed", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*tests?:[^\n]*\b\d+\s+(failed|todo)", re.IGNORECASE | re.MULTILINE),
+    ),
+    # mocha: "12 passing"
+    (
+        re.compile(r"^\s*\d+\s+passing\b", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*\d+\s+failing\b", re.IGNORECASE | re.MULTILINE),
+    ),
+    # go test: "ok  \tpkg\t0.123s" or final "PASS"; failures use "--- FAIL" / "FAIL\t".
+    (
+        re.compile(r"(?m)^(?:ok\s+\S+|PASS)\s*$"),
+        re.compile(r"(?m)^(?:--- FAIL|FAIL\b)"),
+    ),
+    # cargo test: "test result: ok. N passed; 0 failed"
+    (
+        re.compile(r"test\s+result:\s+ok\.\s+\d+\s+passed", re.IGNORECASE),
+        re.compile(r"test\s+result:\s+failed", re.IGNORECASE),
+    ),
+    # rspec: "5 examples, 0 failures"
+    (
+        re.compile(r"^\s*\d+\s+examples?,\s+0\s+failures?\b", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*\d+\s+examples?,\s+\d+\s+failures?\b", re.IGNORECASE | re.MULTILINE),
+    ),
+)
+
+
+def _parse_test_summary(observation: str, command: str) -> Optional[bool]:
+    """Return True when an explicit pass summary is present and no fail
+    summary, False when an explicit fail summary appears, or None when no
+    runner summary line is detected.
+    """
+    if not _looks_like_verification_command(command):
+        return None
+    for pass_re, fail_re in _TEST_SUMMARY_PATTERNS:
+        fail_match = fail_re.search(observation)
+        pass_match = pass_re.search(observation)
+        if fail_match:
+            return False
+        if pass_match:
+            return True
+    return None
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
+    """Return True only when we have HIGH confidence the latest command was a
+    real verification step that passed.
+
+    The legacy fallback accepted any exit-0 command whose observation merely
+    contained the substring "ok" or "success" anywhere — which falsely fires
+    on `cat > file.py` whenever the file content has identifiers like
+    `lookup`, `book`, `token`, `mock`, and on `grep` when a matched line
+    contains those substrings. Combined with the system prompt asking the
+    model to batch independent edits in one response, the substring trap
+    triggered AUTO_STOP mid-batch and dropped half the planned files. We
+    now only auto-stop when:
+        - a known runner summary line confirms a pass, or
+        - the last command was an actual verification command (pytest,
+          jest, tsc, go test, etc.) and exited 0 with no failure marker.
+    Anything else (cat, grep, sed, echo, ls, mkdir, edits) no longer
+    triggers early termination.
+    """
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-    ]
-
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
+    summary = _parse_test_summary(observation, command)
+    if summary is True and (exit_code is None or exit_code == 0):
+        return True
+    if summary is False:
+        return False
 
     if exit_code is not None and exit_code != 0:
         return False
+    if not _looks_like_verification_command(command):
+        return False
 
-    has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
+    bad_markers = (
+        " failed",
+        " failures",
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+    )
+    if any(marker in lower for marker in bad_markers):
+        return False
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
-        has_bad = True
-
-    if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
-        return True
-
-    return (exit_code == 0 or has_good) and has_good and not has_bad
+        return False
+    return True
 
 
 def _looks_like_verification_command(command: str) -> bool:
@@ -1798,11 +2290,18 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
         r"\bpytest\b",
         r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
+        r"\bpython\d*(\.\d+)?\s+-m\s+unittest\b",
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r"\bnpx\s+tsc\b",
+        r"\bnpx\s+(tsc|jest|vitest|mocha)\b",
         r"\btsc\b",
+        r"\bjest\b",
+        r"\bvitest\b",
+        r"\bmocha\b",
+        r"\bphpunit\b",
+        r"\b(?:bundle\s+exec\s+)?rspec\b",
+        r"\bdotnet\s+test\b",
         r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
         r"\bmvn\s+test\b",
