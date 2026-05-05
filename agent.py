@@ -265,10 +265,11 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
+    max_retries: int = 2,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """
-    Minimal OpenAI-compatible /v1/chat/completions client using urllib.
-    """
+    """OpenAI-compatible /v1/chat/completions client. Retries with exponential
+    backoff on transient transport failures (timeouts, connection errors,
+    HTTP 5xx). One transient flake should not lose the entire round."""
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
@@ -285,17 +286,33 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+    data: Optional[Dict[str, Any]] = None
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+            break
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if 500 <= e.code < 600 and attempt < max_retries:
+                last_error = e
+                time.sleep(min(8.0, 2.0 ** attempt))
+                continue
+            raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            if attempt < max_retries:
+                last_error = e
+                time.sleep(min(8.0, 2.0 ** attempt))
+                continue
+            raise RuntimeError(f"Model request failed: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}") from e
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Model request failed: {e}") from e
+    if data is None:
+        raise RuntimeError(f"Model request failed after retries: {last_error}")
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
