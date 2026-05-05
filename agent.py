@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -101,7 +102,6 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_LOGIC_CHECK_TURNS = 1  # verify arithmetic direction, control flow, ref placement
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1098,19 +1098,16 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
-    try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
-    except Exception:
-        return False
+    """Cheap PATH lookup via `shutil.which`.
+
+    The previous implementation invoked the bash built-in ``command -v``
+    via ``subprocess.run([... ], shell=False)``. ``command`` is not a real
+    binary, so this raised ``FileNotFoundError`` on most systems and the
+    bare ``except`` returned False unconditionally — silently disabling
+    every gate that depended on it (``node --check`` syntax checks, the
+    new companion-test runner, etc.). ``shutil.which`` is stdlib and does
+    the right PATH lookup with no subprocess at all."""
+    return shutil.which(name) is not None
 
 
 def _shell_quote(value: str) -> str:
@@ -1246,35 +1243,51 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
-    to ranking, never the only signal.
-    """
+    Previously this issued one ``git grep`` per symbol — up to 12 sequential
+    subprocesses, each with its own 4-second timeout. On large repos that
+    burned ~30s of wall-clock budget on context ranking alone, before the
+    inner agent had even seen the issue. We now batch every symbol into one
+    invocation with multiple ``-e`` patterns and count distinct symbol
+    matches per file in Python.
+
+    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a
+    *boost* to ranking, never the only signal."""
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
+
+    args = ["git", "grep", "-I", "-F"]
     for symbol in symbols:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=4,
-            )
-        except Exception:
+        args.extend(["-e", symbol])
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return {}
+    if proc.returncode not in (0, 1):
+        return {}
+
+    distinct: Dict[str, set] = {}
+    for line in proc.stdout.splitlines():
+        if ":" not in line:
             continue
-        if proc.returncode not in (0, 1):
+        relative_path, content = line.split(":", 1)
+        if relative_path not in tracked_set:
             continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
-    return hits
+        if not _context_file_allowed(relative_path):
+            continue
+        bucket = distinct.setdefault(relative_path, set())
+        for symbol in symbols:
+            if symbol in content:
+                bucket.add(symbol)
+    return {relative_path: len(symbols_seen)
+            for relative_path, symbols_seen in distinct.items() if symbols_seen}
 
 
 # -----------------------------
@@ -1306,10 +1319,7 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block that:
-1. Lists EVERY file, component, page, endpoint, or UI element the task requires changing.
-2. Maps each requirement to its target file/function.
-Then immediately issue the edit command(s).
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
@@ -1346,25 +1356,6 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-- CSS/style values not explicitly required by the task — do NOT invent or change color values, spacing, or other style properties unless the task specifies them. Use existing values from adjacent code.
-- Real data or content — NEVER replace existing data, arrays, or objects with placeholder/dummy values.
-
-## Logic verification — mandatory after every edit
-
-After each edit, mentally trace through the changed code and verify:
-
-1. **Arithmetic direction**: If you compute a difference (A - B), confirm that A and B are in the correct order. A reversed sign produces a wrong result even when all other logic is correct.
-2. **Control flow**: Check for early returns or guard clauses that might skip required behavior. For example, returning early when a list is empty can prevent a "blocked" section from displaying even when it should.
-3. **Variable/prop targeting**: Confirm you are reading from the right source — the prop passed in, not a stale state copy; the correct object field, not a sibling field with a similar name.
-4. **Ref/element placement**: For UI code using refs (React, etc.), confirm the ref is attached to the container element that encloses the trigger, not to the dropdown or child element itself.
-5. **Required headers/imports**: When you add a new type, function, or symbol from a library, add the corresponding `#include`, `import`, or `require` in the same file. A missing include is a compilation error.
-
-## Completeness — mandatory before emitting <final>
-
-Before emitting `<final>`, verify against every acceptance criterion:
-- Every page, route, endpoint, component, and file mentioned in the task has been touched.
-- Every behavioral requirement (e.g., "show X when Y is empty", "return Z field in response") is implemented.
-- If the task lists N items to change, confirm exactly N items have been changed.
 
 ## Style matching
 
@@ -1397,22 +1388,15 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-**Step 0 — Before planning, enumerate every requirement:**
-Read the ENTIRE issue and acceptance criteria above. Then write a numbered checklist of EVERY distinct item that must change: every file, page, route, endpoint, component, field, and behavior. This list is your completeness contract — every item must be addressed before you emit <final>.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-**Step 1 — Strategy:**
-The fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-**Step 2 — Logic verification (mandatory for every edit):**
-After each edit, confirm: (a) arithmetic signs are in the correct direction, (b) no early return skips required behavior, (c) you are reading from the correct variable/prop (not a stale copy), (d) refs are attached to the correct element, (e) new symbols have their required imports/headers.
-
-**Step 3 — Multi-file edits:**
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
-**Step 4 — Verify:**
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then check your requirement checklist from Step 0 — every item must be checked off. Then finish with <final>...</final>.
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
 
 
@@ -1467,29 +1451,20 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
-        "LOGIC VERIFICATION (LLM judge weight — highest impact):\n"
-        "  - **Arithmetic direction**: For every A - B or A + B you wrote, confirm A and B are in the right order. A reversed sign is a critical bug.\n"
-        "  - **Control flow**: Could any early return, guard clause, or conditional skip required behavior? E.g., returning early when a list is empty can prevent a section from displaying.\n"
-        "  - **Variable/prop targeting**: Are you reading from the right source? Confirm you use the prop passed in (not stale state), the correct field (not a similarly-named sibling), and the correct component instance.\n"
-        "  - **Ref/element placement**: For UI refs, is the ref attached to the container that wraps both the trigger AND the content? A ref on the dropdown itself (instead of the parent) breaks outside-click detection.\n"
-        "  - **Required headers/imports**: For every new type, function, or symbol you use, is there a matching #include, import, or require? A missing include causes a compile error.\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - Go back to the acceptance criteria. List every requirement. Is EACH ONE addressed?\n"
-        "  - Every page, route, endpoint, component, and file mentioned in the task has been touched.\n"
-        "  - Companion tests broken by the source change are updated.\n"
-        "  - No syntax errors or broken imports introduced.\n\n"
+        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Companion tests broken by the source change are updated\n"
+        "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks.\n"
-        "  - No CSS/style value changes not required by the task.\n"
-        "  - No real data replaced with placeholder/dummy values.\n"
-        "  - No type annotation changes not required by the task.\n"
-        "  - No refactoring, renaming, or reordering not required by the task.\n"
-        "  - No new helper functions or defensive checks not required by the task.\n\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No type annotation changes not required by the task\n"
+        "  - No refactoring, renaming, or reordering not required by the task\n"
+        "  - No new helper functions or defensive checks not required by the task\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -1528,40 +1503,93 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
-def build_logic_check_prompt(patch: str, issue_text: str) -> str:
-    """Ask the model to verify logic direction, control flow, and structural correctness."""
-    truncated = (
-        patch
-        if len(patch) <= 3000
-        else patch[:1500] + "\n...[truncated]...\n" + patch[-1200:]
+# -----------------------------
+# Companion-test runner for the test-fix refinement turn
+# -----------------------------
+#
+# build_test_fix_prompt only matters if we actually run the companion test.
+# The previous loop never did, so the test-fix turn was dead code. Here we
+# detect the touched source files in the current patch, find their
+# companion test (using the same _find_test_partner that already drives
+# preloaded context), pick a runner that's actually installed, and run it
+# with a tight per-file timeout. A single failure is enough to fire the
+# test-fix turn — diagnostic noise from extra files isn't useful to the
+# model.
+
+_TEST_RUN_TIMEOUT_SECONDS = 30
+
+
+def _companion_test_command(test_path: str) -> Optional[str]:
+    """Return a runnable test command for `test_path`, or None if we don't
+    have a runner for that language available on PATH.
+
+    For Python we deliberately require the ``pytest`` binary itself to be
+    on PATH rather than falling back to ``python -m pytest``: an installed
+    Python without the pytest distribution exits non-zero with
+    ``No module named pytest``, which the test-fix gate would mistake for
+    a genuine test failure and burn a refinement turn on. Quoting goes
+    through ``_shell_quote`` so paths with spaces are safe."""
+    suffix = Path(test_path).suffix.lower()
+    quoted = _shell_quote(test_path)
+    if suffix == ".py" and _has_executable("pytest"):
+        return f"pytest {quoted} -x -q --no-header --disable-warnings"
+    if suffix in {".ts", ".tsx", ".js", ".jsx"} and _has_executable("npx"):
+        return f"npx --no-install jest {quoted} --runInBand --passWithNoTests"
+    if suffix == ".go" and _has_executable("go"):
+        directory = str(Path(test_path).parent) or "."
+        return f"go test -count 1 -timeout 25s ./{directory}"
+    return None
+
+
+def _has_test_failure_markers(observation: str) -> bool:
+    """String-level fallback for runners that report failures without a
+    non-zero exit (rare, but pytest plugins and custom test harnesses do
+    this)."""
+    lower = observation.lower()
+    bad = (
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+        " failed",
+        " failures",
+        " errors ",
     )
-    return (
-        "Logic verification pass. Before finalizing, check each of these failure modes "
-        "that the LLM judge penalizes heavily:\n\n"
-        "1. **Arithmetic direction** — For every subtraction A - B you wrote, confirm A and B "
-        "are in the correct order. A reversed sign produces a wrong numerical result even when "
-        "everything else is correct. If unsure, trace through with a concrete example.\n\n"
-        "2. **Early-return / guard-clause traps** — Scan for any `if list.empty: return` or "
-        "similar guard that could silently skip required behavior. For example, returning early "
-        "when a saved-items list is empty might prevent a 'blocked' section from being displayed "
-        "even when it should always show.\n\n"
-        "3. **Variable/prop source** — Confirm each read is from the intended source: "
-        "prop (not stale state), correct field (not a similarly-named sibling), correct "
-        "component instance. Verify you did not accidentally update state where the task "
-        "requires reading from a prop.\n\n"
-        "4. **Ref and element placement** — For UI code using refs, confirm the ref is on the "
-        "outermost container that wraps both the toggle trigger AND the content — not on the "
-        "content/dropdown itself. A misplaced ref breaks outside-click detection.\n\n"
-        "5. **Required includes/imports** — For every new type, function, or symbol added, "
-        "confirm the required `#include`, `import`, or `require` is present in that file.\n\n"
-        "Your patch:\n```diff\n"
-        f"{truncated}\n```\n\n"
-        "Task:\n"
-        f"{issue_text[:1500]}\n\n"
-        "If all five checks pass with no issues found, respond exactly:\n<final>OK</final>\n\n"
-        "If you find a problem, emit the minimal corrective <command> block(s) to fix it, "
-        "then end with <final>summary</final>."
-    )
+    return any(marker in lower for marker in bad)
+
+
+def _patch_companion_tests(repo: Path, patch: str) -> List[Tuple[str, str]]:
+    """Pair each source file in the patch with its companion test path and
+    a runnable command. Source files whose partner isn't tracked, or whose
+    language has no available runner, are skipped silently."""
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return []
+    pairs: List[Tuple[str, str]] = []
+    seen_partners: set = set()
+    for source_path in _patch_changed_files(patch):
+        partner = _find_test_partner(source_path, tracked)
+        if partner is None or partner in seen_partners:
+            continue
+        command = _companion_test_command(partner)
+        if command is None:
+            continue
+        seen_partners.add(partner)
+        pairs.append((partner, command))
+    return pairs
+
+
+def _run_companion_tests(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    """Run companion tests one at a time and return (test_path, observation)
+    on the FIRST failure. Returns None when every runnable test passed (or
+    when nothing was runnable). Times out per file via run_command's own
+    timeout enforcement (exit_code 124 is treated as failure)."""
+    for test_path, command in _patch_companion_tests(repo, patch):
+        result = run_command(command, repo, timeout=_TEST_RUN_TIMEOUT_SECONDS)
+        observation = format_observation(result)
+        if result.exit_code == 0 and not _has_test_failure_markers(observation):
+            continue
+        return test_path, observation
+    return None
 
 
 # -----------------------------
@@ -1594,7 +1622,7 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    logic_check_turns_used = 0
+    test_fix_turns_used = 0
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1611,12 +1639,19 @@ def solve(
 
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+            1. polish    — drop low-signal hunks the model still emitted
+            2. syntax    — quote any parser error back at the model
+            3. test-fix  — actually run the companion test; if it fails,
+                           hand the failure tail back to the model
+            4. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per solve. Cheap mechanical gates
+        run before expensive ones (test-fix can spawn a subprocess for up
+        to _TEST_RUN_TIMEOUT_SECONDS per partner test). A passing real test
+        is stronger evidence than self-grading, so test-fix gates the
+        self-check rather than the other way around.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, logic_check_turns_used
+        nonlocal polish_turns_used, self_check_turns_used
+        nonlocal syntax_fix_turns_used, test_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1643,14 +1678,17 @@ def solve(
                 )
                 return True
 
-        if logic_check_turns_used < MAX_LOGIC_CHECK_TURNS:
-            logic_check_turns_used += 1
-            queue_refinement_turn(
-                assistant_text,
-                build_logic_check_prompt(patch, issue),
-                "LOGIC_CHECK_QUEUED",
-            )
-            return True
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _run_companion_tests(repo, patch)
+            if failure is not None:
+                test_path, observation = failure
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, observation),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -1840,7 +1878,26 @@ def solve(
         ).to_dict()
 
 
+_GOOD_TEST_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b\d+\s+passed\b"),          # pytest "5 passed"
+    re.compile(r"\ball\s+(?:tests\s+)?passed\b"),
+    re.compile(r"\btest(?:s)?\s+passed\b"),
+    re.compile(r"(?m)^ok\s"),                 # go test "ok\t..."
+    re.compile(r"(?m)^ok\s*$"),               # bare "ok" line
+    re.compile(r"\bpass\b(?!\w)"),            # jest/vitest "PASS" (lowercased)
+    re.compile(r"\bsucce(?:ss|eded|eds)\b"),  # avoids "successor"-style false hits
+)
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
+    """Decide whether a command observation looks like a passing test run.
+
+    The previous implementation matched bare substrings like ``"ok"`` and
+    ``"success"`` which fired on words such as ``took``, ``stock``,
+    ``looks`` and ``successor`` whenever the test runner happened to print
+    them. We now require word-anchored matches against runner-shaped
+    fragments, and treat exit_code 0 + a verification-shaped command as
+    the strongest signal."""
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
@@ -1856,17 +1913,10 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "exception",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
-
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(pattern.search(lower) for pattern in _GOOD_TEST_PATTERNS)
     has_bad = any(marker in lower for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
