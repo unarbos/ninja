@@ -1348,6 +1348,9 @@ Discipline:
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+- When you read or edit a file, check its imports for related files that may
+  also need changes. Breadth across multiple files scores higher than depth in
+  one file.
 """
 
 
@@ -1618,6 +1621,23 @@ def solve(
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
+                # Import-following: after a file edit, show imports for related files
+                if result.exit_code == 0 and any(kw in command for kw in ["sed -i", "cat >", "tee ", "cat <<", "printf "]):
+                    edited_file = None
+                    for token in reversed(command.split()):
+                        if "/" in token and not token.startswith("-"):
+                            edited_file = token.strip("'\"")
+                            break
+                    if edited_file:
+                        import_result = run_command(
+                            f"grep -E '^import |^from .+ import |require\\(' {edited_file} 2>/dev/null | head -10",
+                            repo, timeout=5,
+                        )
+                        if import_result.exit_code == 0 and import_result.stdout.strip():
+                            observations.append(
+                                f"IMPORTS in {edited_file} (related files may need changes):\n{import_result.stdout.strip()}"
+                            )
+
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
@@ -1665,19 +1685,21 @@ def solve(
                     observation_text += (
                         "\n\nPatch now exists. If more edits are needed, send every "
                         "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "Do not spend separate turns editing one file at a time. "
+                        "Check imports in edited files for related files that also need changes."
                     )
                 elif not success:
                     observation_text += (
                         "\n\nIf the observed snippets are enough to implement the issue, "
-                        "send the complete set of edit commands in your next response."
+                        "send the complete set of edit commands in your next response. "
+                        "Check imports for related files that may also need changes."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
