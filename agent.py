@@ -923,7 +923,7 @@ def _run_critique_revise(
     *,
     repo: Path,
     messages: List[Dict[str, str]],
-    issue: str,
+    issue_text: str,
     model_name: str,
     api_base: str,
     api_key: str,
@@ -938,7 +938,7 @@ def _run_critique_revise(
     critique_prompt = (
         "Self-critique gate. Below is the unified diff you produced for the "
         "issue.\n\n```diff\n" + _truncate(initial_patch, 8000) + "\n```\n\n"
-        "Issue recap:\n" + _truncate(issue, 4000) + "\n\n"
+        "Issue recap:\n" + _truncate(issue_text, 4000) + "\n\n"
         "Audit the diff against the issue. For each item you flag, quote the "
         "specific line of the diff that is wrong and say what it should be. "
         "List any: (1) bugs introduced, (2) acceptance criteria from the "
@@ -1188,7 +1188,7 @@ def solve(
                 _run_critique_revise(
                     repo=repo,
                     messages=messages,
-                    issue=issue,
+                    issue_text=issue,
                     model_name=model_name,
                     api_base=api_base,
                     api_key=api_key,
