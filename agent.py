@@ -93,6 +93,7 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+MAX_CONSECUTIVE_IDENTICAL_COMMANDS = 2
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -1489,6 +1490,27 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_validation_required_prompt() -> str:
+    return (
+        "You produced a patch, but there is no clear successful functional check yet. "
+        "Run one targeted validation command now (focused test preferred), then finalize."
+    )
+
+
+def build_repeat_command_repair_prompt(command: str) -> str:
+    return (
+        "You are repeating the same command without new signal:\n"
+        f"`{command}`\n\n"
+        "Issue one DIFFERENT high-value command that advances the fix "
+        "(targeted edit, targeted test, or focused file inspection)."
+    )
+
+
+def _normalize_command_for_repeat_check(command: str) -> str:
+    normalized = re.sub(r"\s+", " ", command.strip().lower())
+    return normalized[:400]
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1515,10 +1537,13 @@ def solve(
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
     success = False
+    had_successful_check = False
     consecutive_no_command = 0
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    validation_prompt_queued = False
+    command_history: List[str] = []
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1627,6 +1652,14 @@ def solve(
 
             if not commands:
                 if final is not None:
+                    if get_patch(repo).strip() and not had_successful_check and not validation_prompt_queued:
+                        validation_prompt_queued = True
+                        queue_refinement_turn(
+                            response_text,
+                            build_validation_required_prompt(),
+                            "VALIDATION_REQUIRED",
+                        )
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
@@ -1653,10 +1686,24 @@ def solve(
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                command_key = _normalize_command_for_repeat_check(command)
+                command_history.append(command_key)
+                if (
+                    len(command_history) > MAX_CONSECUTIVE_IDENTICAL_COMMANDS
+                    and len(set(command_history[-(MAX_CONSECUTIVE_IDENTICAL_COMMANDS + 1) :])) == 1
+                ):
+                    prompt = build_repeat_command_repair_prompt(command)
+                    observation = f"SKIPPED_REPEATED_COMMAND:\n{prompt}"
+                    observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
+                    logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                    continue
+
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                if _looks_like_successful_test_output(observation, command):
+                    had_successful_check = True
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -1689,6 +1736,14 @@ def solve(
                 )
 
             if final is not None and get_patch(repo).strip():
+                if not had_successful_check and not validation_prompt_queued:
+                    validation_prompt_queued = True
+                    queue_refinement_turn(
+                        response_text,
+                        build_validation_required_prompt(),
+                        "VALIDATION_REQUIRED",
+                    )
+                    continue
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
