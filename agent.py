@@ -91,9 +91,6 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-# Plain literals (not env-driven): the bigger preload budget is the whole point
-# of this candidate, and it would be self-defeating to let an out-of-band env
-# var silently shrink it back down on the validator's machine.
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 28000
 MAX_PRELOADED_FILES = 8
