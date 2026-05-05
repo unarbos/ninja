@@ -79,13 +79,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_CONTEXT_CHARS = 40000
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 MAX_POLISH_TURNS = 1
@@ -242,7 +242,7 @@ def chat_completion(
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
+    timeout: int = 90,
     max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client. Retries once on transient
@@ -646,7 +646,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -1065,6 +1065,42 @@ editing. After a patch exists, run one cheap verification if possible, then fini
 """
 
 
+def _check_python_syntax(repo: Path, patch: str) -> List[str]:
+    """Best-effort parse of touched .py files; returns error notes."""
+    import ast as _ast
+    errors: List[str] = []
+    for changed_path in _patch_changed_files(patch):
+        if not changed_path.endswith(".py"):
+            continue
+        try:
+            full = (repo / changed_path).resolve()
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            src = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        try:
+            _ast.parse(src)
+        except SyntaxError as e:
+            errors.append(f"{changed_path}:{e.lineno}: {e.msg}")
+        except Exception as e:
+            errors.append(f"{changed_path}: parse failure: {e}")
+    return errors
+
+
+def build_syntax_fix_prompt(errors: List[str]) -> str:
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Syntax check failed on touched Python file(s):\n  {bullets}\n\n"
+        "Issue the smallest possible fix command(s) to restore parseable Python. "
+        "Do NOT introduce new edits, do NOT refactor. Then end with <final>summary</final>."
+    )
+
+
 def build_self_check_prompt(patch: str, text: str) -> str:
     truncated = patch if len(patch) <= 4000 else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     return (
@@ -1138,21 +1174,34 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+         _wall_start = time.monotonic()
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+            if time.monotonic() - _wall_start > 480:
+                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                break
+
+            response_text = None
+            for _attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception:
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
+                    if _attempt == 0:
+                        time.sleep(3)
+
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1176,6 +1225,14 @@ def solve(
                         messages.append({"role": "assistant", "content": response_text})
                         messages.append({"role": "user", "content": build_self_check_prompt(patch, issue)})
                         continue
+                    if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                        syntax_errors = _check_python_syntax(repo, patch)
+                        if syntax_errors:
+                            syntax_fix_turns_used += 1
+                            logs.append("\nSYNTAX_GATE_TRIPPED:\n  " + "\n  ".join(syntax_errors))
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_errors)})
+                            continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
                     success = True
                     break
