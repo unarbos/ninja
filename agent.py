@@ -76,13 +76,13 @@ DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 # the 120s floor and leave ~20s of headroom for git diff serialization plus
 # container teardown. Tighten further if you observe time_limit_exceeded; relax
 # only when the validator increases its floor.
-DEFAULT_WALL_BUDGET = float(os.environ.get("AGENT_WALL_BUDGET", "100"))
+DEFAULT_WALL_BUDGET = 100.0
 # Hard floor for "we are out of time" — once remaining budget drops below this,
 # break out and return whatever patch exists rather than starting a new LLM call.
-WALL_HEADROOM_SECONDS = float(os.environ.get("AGENT_WALL_HEADROOM", "15"))
+WALL_HEADROOM_SECONDS = 15.0
 # Per LLM-call timeout. 120s used to swallow the entire 120s task budget; 45s
 # leaves room for a retry plus at least one editing turn after the response.
-DEFAULT_LLM_CALL_TIMEOUT = int(os.environ.get("AGENT_LLM_CALL_TIMEOUT", "45"))
+DEFAULT_LLM_CALL_TIMEOUT = 45
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
