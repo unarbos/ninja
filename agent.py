@@ -101,6 +101,8 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_COVERAGE_NUDGES = 1    # tell the model which issue-mentioned paths are still untouched
+MAX_CRITERIA_NUDGES = 1    # tell the model which issue acceptance-criteria look unaddressed
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1073,6 +1075,226 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
+# -----------------------------
+# Issue-mentioned path coverage
+# -----------------------------
+#
+# The LLM diff judge frequently dings king for "missing X / lacks Y / omits Z"
+# when the issue lists multiple checkpoints. The path-coverage gate surfaces
+# which issue-named paths are still untouched in the draft so the model can
+# either edit them or explicitly explain why no edit was needed.
+
+
+def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
+    required = _extract_issue_path_mentions(issue_text)
+    if not required:
+        return []
+    changed = set(_patch_changed_files(patch))
+    missing: List[str] = []
+    for req in required:
+        if not any(req == c or c.endswith("/" + req) for c in changed):
+            missing.append(req)
+    return missing
+
+
+# -----------------------------
+# Acceptance-criterion coverage
+# -----------------------------
+#
+# Multi-bullet issues often have several checkpoints; the path-coverage gate
+# only sees files. This module extracts checkpoint sentences from the issue
+# and surfaces those whose content keywords don't appear in the patch's added
+# lines yet.
+
+
+_MAX_CRITERIA = 8
+_MAX_CRITERION_CHARS = 220
+_CRITERION_STOP = frozenset({
+    "a", "an", "and", "as", "at", "be", "but", "by", "do", "for", "from",
+    "if", "in", "is", "it", "of", "on", "or", "so", "that", "the", "this",
+    "to", "we", "with", "we", "our", "must", "should", "shall", "can", "may",
+    "will", "implement", "add", "support", "ensure", "make", "use", "create",
+    "fix", "update", "change", "set", "include", "handle", "allow", "also",
+    "when", "where", "which", "who", "what", "all", "any", "each", "every",
+    "task", "issue", "code",
+})
+
+
+def _extract_acceptance_criteria(issue_text: str) -> List[str]:
+    if not issue_text:
+        return []
+    lines = issue_text.splitlines()
+    bullets: List[str] = []
+    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
+    for line in lines:
+        m = bullet_re.match(line)
+        if not m:
+            continue
+        text = m.group(1).strip()
+        if len(text) < 6:
+            continue
+        bullets.append(text[:_MAX_CRITERION_CHARS])
+        if len(bullets) >= _MAX_CRITERIA:
+            break
+    if bullets:
+        return bullets
+    sentences = re.split(r"(?<=[.!?])\s+", issue_text)
+    imperative_re = re.compile(
+        r"\b(must|should|shall|implement|add|support|ensure|create|fix|update|"
+        r"return|expose|wire|require|render|emit|reject|accept|disable|enable|"
+        r"validate|persist|store|load|cache|rename|remove|delete|register)\b",
+        re.IGNORECASE,
+    )
+    for sentence in sentences:
+        s = sentence.strip()
+        if len(s) < 12 or len(s) > _MAX_CRITERION_CHARS:
+            continue
+        if imperative_re.search(s):
+            bullets.append(s[:_MAX_CRITERION_CHARS])
+            if len(bullets) >= _MAX_CRITERIA:
+                break
+    return bullets
+
+
+def _criterion_keywords(criterion: str) -> List[str]:
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}", criterion)
+    keywords: List[str] = []
+    seen: set[str] = set()
+    for tok in raw_tokens:
+        norm = tok.strip("./-")
+        if not norm:
+            continue
+        if norm.lower() in _CRITERION_STOP:
+            continue
+        if len(norm) < 4 and not (norm[0].isupper() or "." in norm):
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        keywords.append(norm)
+    return keywords
+
+
+def _patch_added_text(patch: str) -> str:
+    if not patch:
+        return ""
+    added: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    return "\n".join(added)
+
+
+def _keyword_in_text(keyword: str, lower_text: str) -> bool:
+    k = keyword.lower()
+    if k in lower_text:
+        return True
+    if "." in k:
+        stem = k.split(".", 1)[0]
+        if len(stem) >= 4 and stem in lower_text:
+            return True
+    return False
+
+
+def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
+    criteria = _extract_acceptance_criteria(issue_text)
+    if not criteria:
+        return []
+    added = _patch_added_text(patch)
+    if not added:
+        return list(criteria)
+    added_lower = added.lower()
+    unaddressed: List[str] = []
+    for crit in criteria:
+        keywords = _criterion_keywords(crit)
+        if not keywords:
+            continue
+        threshold = 2 if len(keywords) >= 6 else 1
+        hits = sum(1 for k in keywords if _keyword_in_text(k, added_lower))
+        if hits < threshold:
+            unaddressed.append(crit)
+    return unaddressed[:_MAX_CRITERIA]
+
+
+# -----------------------------
+# Brace-balance check (extends syntax gate to non-Python/JS/JSON languages)
+# -----------------------------
+
+
+_BRACE_BALANCE_SUFFIXES = {
+    ".ts", ".tsx", ".jsx", ".java", ".kt", ".kts",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+    ".cs", ".go", ".rs", ".scala", ".swift", ".php",
+    ".groovy", ".dart", ".m", ".mm",
+}
+
+
+def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1088,8 +1310,13 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_python_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
+            if result is None and suffix == ".js":
+                # node was unavailable; fall back to brace balance check.
+                result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        elif suffix in _BRACE_BALANCE_SUFFIXES:
+            result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; syntax errors will surface at runtime.
         if result:
             errors.append(result)
@@ -1186,6 +1413,105 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+# -----------------------------
+# Targeted-test runner
+# -----------------------------
+#
+# `_find_test_partner` and `build_test_fix_prompt` are already in the harness
+# but no gate ever invokes a runner. Real GitHub-derived tasks frequently
+# come with companion-test changes, and the LLM judge rewards verified-
+# correct patches. This module actually executes the discovered tests and
+# returns (passed?, output) so a refinement gate can hand the failure back
+# to the model. Tools missing → silent no-op so go/rust/etc. tasks are not
+# penalized.
+
+
+_TARGETED_TEST_TIMEOUT_SECONDS = 45
+
+
+def _run_targeted_tests(
+    repo: Path,
+    test_files: List[str],
+    timeout: int = _TARGETED_TEST_TIMEOUT_SECONDS,
+) -> Tuple[bool, str]:
+    if not test_files:
+        return True, ""
+    py_tests = [f for f in test_files if f.endswith(".py")]
+    js_tests = [
+        f for f in test_files
+        if f.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"))
+    ]
+    out_lines: List[str] = []
+    all_passed = True
+    if py_tests and _has_executable("python3"):
+        try:
+            res = subprocess.run(
+                ["python3", "-m", "pytest", "-x", "--tb=short", "-q"] + py_tests,
+                capture_output=True, text=True, timeout=timeout, cwd=str(repo),
+            )
+            out_lines.append(f"=== pytest {' '.join(py_tests[:5])} ===")
+            out_lines.append((res.stdout or "")[-1500:])
+            if (res.stderr or "").strip():
+                out_lines.append("STDERR: " + res.stderr.strip()[-400:])
+            if res.returncode != 0:
+                all_passed = False
+        except subprocess.TimeoutExpired:
+            out_lines.append(f"pytest TIMEOUT after {timeout}s")
+            all_passed = False
+        except Exception as exc:
+            out_lines.append(f"pytest invocation error: {exc}")
+    if js_tests:
+        runner_argv: Optional[List[str]] = None
+        if _has_executable("npx"):
+            runner_argv = ["npx", "--no-install", "jest", "--passWithNoTests"]
+        elif _has_executable("node"):
+            runner_argv = ["node", "--test"]
+        if runner_argv:
+            try:
+                res = subprocess.run(
+                    runner_argv + js_tests,
+                    capture_output=True, text=True, timeout=timeout, cwd=str(repo),
+                )
+                out_lines.append(f"=== {' '.join(runner_argv)} {' '.join(js_tests[:5])} ===")
+                out_lines.append((res.stdout or "")[-1500:])
+                if (res.stderr or "").strip():
+                    out_lines.append("STDERR: " + res.stderr.strip()[-400:])
+                if res.returncode != 0:
+                    all_passed = False
+            except subprocess.TimeoutExpired:
+                out_lines.append(f"js test TIMEOUT after {timeout}s")
+                all_passed = False
+            except Exception as exc:
+                out_lines.append(f"js test error: {exc}")
+    return all_passed, "\n".join(out_lines)
+
+
+def _is_test_path(path: str) -> bool:
+    parts = [p.lower() for p in Path(path).parts]
+    return any(seg in {"tests", "test", "__tests__", "spec", "specs"} for seg in parts)
+
+
+def _discover_tests_for_patch(repo: Path, patch: str, tracked: set) -> List[str]:
+    if not patch:
+        return []
+    changed = _patch_changed_files(patch)
+    discovered: List[str] = []
+    seen: set = set()
+    for rel in changed:
+        if _is_test_path(rel) and (repo / rel).is_file():
+            if rel not in seen:
+                discovered.append(rel)
+                seen.add(rel)
+    for rel in changed:
+        if _is_test_path(rel):
+            continue
+        partner = _find_test_partner(rel, tracked)
+        if partner and partner not in seen:
+            discovered.append(partner)
+            seen.add(partner)
+    return discovered
 
 
 # -----------------------------
@@ -1427,6 +1753,42 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
+def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
+    """Tell the model which issue-mentioned paths are still untouched."""
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    return (
+        "Coverage gap — the task explicitly mentions these path(s) but your "
+        "current patch does NOT touch them:\n"
+        f"  {bullets}\n\n"
+        "Open each of those paths now (cat -n) and then issue the edit "
+        "commands needed to satisfy the task for them. Do not start "
+        "unrelated work and do not stop early until you have either edited "
+        "each path or confirmed via inspection that no edit is required.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+
+def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
+    """Tell the model which acceptance-criterion checkpoints look unaddressed."""
+    bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
+    return (
+        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
+        "the task are NOT clearly reflected in your patch's added lines:\n"
+        f"  {bullets}\n\n"
+        "For each one, decide:\n"
+        "  (a) you already addressed it but the keywords differ -> respond "
+        "with <final>summary</final> and explain why in the summary; OR\n"
+        "  (b) it really IS missing -> issue the additional <command> blocks "
+        "needed to satisfy it, then end with <final>summary</final>.\n\n"
+        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
+        "code. Add only what is required to cover the listed criteria.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -1519,6 +1881,9 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    coverage_nudges_used = 0
+    criteria_nudges_used = 0
+    test_fix_turns_used = 0
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1540,7 +1905,7 @@ def solve(
             3. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, test_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1566,6 +1931,55 @@ def solve(
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            # Only fire when there's something concrete to surface and we
+            # actually extracted multiple criteria — single-criterion issues
+            # are already handled by path-coverage / self-check.
+            if unaddressed and len(_extract_acceptance_criteria(issue)) >= 2:
+                criteria_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:80] for c in unaddressed[:3]),
+                )
+                return True
+
+        # Targeted-test gate: actually run pytest/jest on the discovered
+        # companion tests for the touched source files. Silent no-op when no
+        # test runner is available or no test partners exist (go/rust/etc.).
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            try:
+                tracked_set = set(_tracked_files(repo))
+            except Exception:
+                tracked_set = set()
+            test_files = _discover_tests_for_patch(repo, patch, tracked_set)
+            if test_files:
+                slice_to_run = test_files[:3]
+                try:
+                    passed, output = _run_targeted_tests(repo, slice_to_run)
+                except Exception:
+                    passed, output = True, ""
+                if not passed and output:
+                    test_fix_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_test_fix_prompt(slice_to_run[0], output),
+                        "TEST_FIX_QUEUED:\n  " + ", ".join(slice_to_run),
+                    )
+                    return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
