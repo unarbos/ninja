@@ -70,7 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
 # validator proxy owns temperature/top-p/etc. and overwrites them server-side.
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -87,10 +87,14 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
+
+# Keep at most this many messages in the conversation window (system + user pairs).
+# Older middle messages are trimmed to avoid context overflow on long runs.
+_MAX_CONTEXT_MESSAGES = 22
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -225,7 +229,7 @@ def chat_completion(
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
+    timeout: int = 300,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """
     Minimal OpenAI-compatible /v1/chat/completions client using urllib.
@@ -472,17 +476,52 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
-        "find . -maxdepth 2 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name 'test*' -o -name '*test*' -o -name 'Makefile' -o -name 'pytest.ini' -o -name 'package.json' \\) | sed 's#^./##' | sort",
+        (
+            "find . -maxdepth 3 -type f \\( -name '*.py' -o -name '*.js' -o -name '*.ts' "
+            "-o -name '*.rb' -o -name '*.go' -o -name '*.java' -o -name '*.c' -o -name '*.cpp' "
+            "-o -name '*.rs' -o -name 'Makefile' -o -name 'pytest.ini' "
+            "-o -name 'package.json' -o -name 'setup.py' -o -name 'pyproject.toml' \\) "
+            "| grep -v '__pycache__\\|node_modules\\|\\.git\\|\\.pytest_cache' "
+            "| sed 's#^./##' | sort | head -60"
+        ),
         "find . -maxdepth 1 -type f | sed 's#^./##' | sort",
+        "git log --oneline -8 2>/dev/null || true",
         "git status --short || true",
+        "cat pytest.ini setup.cfg pyproject.toml 2>/dev/null | head -40 || true",
     ]
 
     parts = []
     for cmd in commands:
-        res = run_command(cmd, repo, timeout=10)
+        res = run_command(cmd, repo, timeout=15)
         parts.append(format_observation(res))
 
     return "\n\n".join(parts)
+
+
+# -----------------------------
+# Context management
+# -----------------------------
+
+def _trim_messages(
+    messages: List[Dict[str, str]],
+    max_messages: int = _MAX_CONTEXT_MESSAGES,
+) -> List[Dict[str, str]]:
+    """
+    Trim conversation history to prevent context overflow.
+
+    Always preserves:
+    - messages[0]: system prompt
+    - messages[1]: initial user task
+
+    Trims the oldest middle exchanges when the conversation grows too long.
+    """
+    if len(messages) <= max_messages:
+        return messages
+    # Keep system + initial task message, then take the most recent remainder
+    anchor = messages[:2]
+    keep_count = max_messages - 2
+    recent = messages[-keep_count:]
+    return anchor + recent
 
 
 # -----------------------------
@@ -492,75 +531,104 @@ def get_repo_summary(repo: Path) -> str:
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are an expert coding agent. Your goal is to efficiently fix issues in a repository.
+SYSTEM_PROMPT = """You are an expert software engineer fixing GitHub issues with precise, minimal code changes.
 
-INTERACTION FORMAT:
-- Communicate ONLY through bash commands wrapped in <command>...</command> tags
-- When finished (code is fixed and tests pass), respond with <final>summary</final>
+WORKFLOW:
+1. ANALYZE: Read the issue and extract key identifiers (function names, class names, error messages, file hints)
+2. LOCATE: Use grep to find relevant code; read target files COMPLETELY before editing
+3. FIX: Make the smallest correct change that addresses the issue
+4. VERIFY: Run only the specific relevant tests to confirm correctness
+5. FINALIZE: Submit immediately with <final>brief summary</final>
 
-STRATEGY:
-1. UNDERSTAND: Locate the relevant files mentioned in the issue
-2. INSPECT: Read files to understand the bug (use: cat, grep, head, tail)
-3. ANALYZE: Identify the root cause with minimal commands
-4. FIX: Make precise, minimal code changes
-5. VERIFY: Run tests to confirm the fix works
-6. FINALIZE: When all tests pass, respond with <final>...</final>
+COMMAND FORMAT - one command per response:
+<command>
+bash command here
+</command>
 
-CRITICAL RULES:
-- Make SMALL, TARGETED changes. Avoid touching unrelated code
-- ALWAYS run the relevant test suite AFTER making changes
-- Inspect files BEFORE editing them to understand context
-- Use efficient commands (grep, head, tail) to survey code
-- Stop unnecessary exploration - focus on the issue
-- Do NOT use sudo, do NOT delete critical files
-- Do NOT modify test files themselves
-- Do NOT access secrets or hidden test data
-- Do NOT make external network calls
-- You have limited steps - be efficient and decisive
-- If tests pass, you MUST finalize immediately
+When the fix is verified:
+<final>brief description of what was changed and why</final>
 
-COMMON TOOLS:
-- grep -r "pattern" . : Find code patterns
-- find . -name "*.py" -type f : List Python files
-- cat filename : View file contents
-- pytest, npm test, make test : Run test suites
-- git diff : Show your changes
-- sed, awk, python -c : Transform code inline
+EDITING RULES (critical for quality):
+- Read any file COMPLETELY before editing it: cat -n filename
+- Change ONLY the lines the issue requires; preserve all surrounding code
+- Match existing code style exactly: indentation, quotes, spacing, naming
+- Do NOT add comments, docstrings, or error handling unless the issue requires it
+- Do NOT reorder imports, rename variables, or reformat unrelated code
+- Do NOT fix unrelated issues even if you notice them
+- Use sed -i for targeted single-line replacements
+- Use python3 -c with open() for multi-line or complex edits
+- Process files in alphabetical order; edit top-to-bottom within each file
 
-EFFICIENCY TIPS:
-- Use grep to search for error messages or function names
-- Run full test suite FIRST to understand failures
-- Look at test expectations to understand required behavior
-- Make ONE focused fix, test it, then finalize if successful
-- Do not iterate endlessly - if stuck after 5 attempts on same issue, try different approach
+EXPLORATION:
+- grep -rn "pattern" --include="*.py" . : find relevant code
+- grep -rn "pattern" . : search all files
+- cat -n filename : read file with line numbers
+- find . -name "*.py" -type f | sort : list source files
+- git diff : review current changes
+
+TESTING:
+- Run ONLY the specific relevant test: python -m pytest tests/test_X.py -x -q
+- Do NOT run the full test suite unless needed to understand failures
+- Do NOT modify test files
+- Stop immediately once tests pass
+
+EFFICIENCY:
+- Extract keywords from the issue first, then grep for them
+- Read files fully once rather than partially multiple times
+- Make one focused fix, verify it, then finalize
+- Do not re-explore after making a successful fix
 """
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str) -> str:
-    return f"""You must fix this GitHub issue efficiently:
+    return f"""Fix this GitHub issue with the minimal, correct code change.
 
 ISSUE:
 {issue}
 
-REPOSITORY STATE:
+REPOSITORY OVERVIEW:
 {repo_summary}
 
-IMMEDIATE TASKS:
-1. First, find and run the test suite to see what's failing
-2. Locate the bug by inspecting relevant source files
-3. Make a minimal fix to the code
-4. Verify tests pass
-5. When tests pass, respond with <final>summary</final>
+START HERE:
+1. Identify the key function/class/file names mentioned or implied in the issue
+2. Run: grep -rn "key_term" --include="*.py" . (or appropriate extension)
+3. Read the relevant file fully: cat -n filename
+4. Understand exactly which lines need to change
+5. Make the precise minimal fix
+6. Run the specific relevant test to confirm
+7. Submit with <final>what changed</final>
 
-Be methodical and efficient - you have limited steps. Start with running tests to understand the failures.
+Focus: every unnecessary line change reduces quality. Make the minimal correct fix only.
 """
 
 
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
-Continue by issuing exactly one bash command in this format:
+Continue by issuing exactly one bash command:
 
+<command>
+your command here
+</command>
+
+If you have already identified the fix location, make the edit now.
+If not, search for the relevant code:
+<command>
+grep -rn "key_term" --include="*.py" .
+</command>
+"""
+
+
+def build_stuck_recovery_prompt(step: int, max_steps: int) -> str:
+    remaining = max_steps - step
+    return f"""You have {remaining} steps remaining. Focus now.
+
+If you have not yet found the relevant file: grep for the key terms from the issue.
+If you found the file but have not edited it: make the edit now using sed or python3.
+If you edited the code: run the relevant test to verify.
+If tests pass: submit with <final>summary</final>.
+
+Issue one focused command:
 <command>
 your command here
 </command>
@@ -594,6 +662,7 @@ def solve(
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
+    steps_since_last_change = 0
 
     try:
         repo = _repo_path(repo_path)
@@ -606,8 +675,13 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary)},
         ]
 
+        last_patch_hash = ""
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            # Trim messages to avoid context overflow
+            messages = _trim_messages(messages, max_messages=_MAX_CONTEXT_MESSAGES)
 
             try:
                 response_text, cost, _raw = chat_completion(
@@ -651,12 +725,29 @@ def solve(
             messages.append({"role": "assistant", "content": response_text})
             messages.append({"role": "user", "content": observation})
 
-            if step >= 4:
-                patch = get_patch(repo)
-                if patch.strip() and _looks_like_successful_test_output(observation):
-                    logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
+            # Track whether the patch is changing
+            current_patch = get_patch(repo)
+            current_patch_hash = str(hash(current_patch))
+            if current_patch_hash != last_patch_hash:
+                last_patch_hash = current_patch_hash
+                steps_since_last_change = 0
+            else:
+                steps_since_last_change += 1
+
+            # Auto-stop: patch exists and recent command looks like passing tests
+            if step >= 3 and current_patch.strip():
+                if _looks_like_successful_test_output(observation):
+                    logs.append("\nAUTO_STOP:\nPatch exists and latest command showed passing tests.")
                     success = True
                     break
+
+            # Inject a recovery nudge when the agent seems stuck (no patch change for 5+ steps)
+            if steps_since_last_change >= 5 and step < max_steps - 2:
+                messages.append({
+                    "role": "user",
+                    "content": build_stuck_recovery_prompt(step, max_steps),
+                })
+                steps_since_last_change = 0
 
         patch = get_patch(repo)
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
@@ -689,37 +780,41 @@ def solve(
 def _looks_like_successful_test_output(observation: str) -> bool:
     lower = observation.lower()
 
+    # Strong failure signals
     bad_markers = [
         " failed",
         " failures",
-        " error",
-        " errors",
         "traceback",
         "assertionerror",
         "syntaxerror",
-        "exception",
         "exit_code:\n1",
         "exit_code:\n2",
         "exit_code:\n124",
         "failed:",
         "failures:",
         "error:",
-        "stderr:",
+        "importerror",
+        "modulenotfounderror",
     ]
 
+    # Strong success signals (test runners)
     good_markers = [
         " passed",
-        " all passed",
-        " exit_code:\n0",
-        "ok",
-        "success",
+        "all tests passed",
         "tests passed",
         "passed all",
+        "exit_code:\n0",
+        "ok\n",
         "test session starts",
+        " passed,",
     ]
 
     has_good = any(marker in lower for marker in good_markers)
     has_bad = any(marker in lower for marker in bad_markers)
+
+    # Exit code 0 + "passed" is the strongest positive signal
+    if "exit_code:\n0" in lower and "passed" in lower:
+        return True
 
     return has_good and not has_bad
 
