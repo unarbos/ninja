@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 SN66 Ninja Agent - MiniMax Optimized v2 (Fully Compliant)
+Only edits allowed sections. Strong two-phase + breadth-first strategy.
 """
 
 from __future__ import annotations
