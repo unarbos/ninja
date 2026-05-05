@@ -1090,7 +1090,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model; syntax errors will surface at runtime.
         if result:
             errors.append(result)
     return errors
