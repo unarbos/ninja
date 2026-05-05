@@ -88,8 +88,8 @@ DEFAULT_API_KEY = (
     or os.environ.get("OPENAI_API_KEY", "")
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
-DEFAULT_MAX_COMMANDS_PER_TURN = int(os.environ.get("AGENT_MAX_COMMANDS_PER_TURN", "8"))
-DEFAULT_HTTP_RETRY_ATTEMPTS = int(os.environ.get("AGENT_HTTP_RETRY_ATTEMPTS", "3"))
+DEFAULT_MAX_COMMANDS_PER_TURN = 8
+DEFAULT_HTTP_RETRY_ATTEMPTS = 3
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
@@ -335,7 +335,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             timeout=timeout,
             executable="/bin/bash",
             env={
-                **os.environ,
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
+                "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
+                "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
                 "PYTHONUNBUFFERED": "1",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
                 "GIT_PAGER": "cat",
@@ -562,7 +565,7 @@ Rules:
 """
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, prelocalized: str = "") -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     parts = [
         "We need to fix this issue:",
         "",
@@ -572,8 +575,8 @@ def build_initial_user_prompt(issue: str, repo_summary: str, prelocalized: str =
         "",
         repo_summary,
     ]
-    if prelocalized.strip():
-        parts.extend(["", "Files referenced by the issue (pre-loaded):", "", prelocalized])
+    if preloaded_context.strip():
+        parts.extend(["", "Files referenced by the issue (pre-loaded):", "", preloaded_context])
     parts.extend([
         "",
         "Start by reading any unfamiliar files in batched <command> blocks. Then plan, edit, and verify.",
@@ -584,7 +587,10 @@ def build_initial_user_prompt(issue: str, repo_summary: str, prelocalized: str =
 _FILE_HINT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_./-]*\.(?:py|js|ts|jsx|tsx|go|rs|java|kt|c|h|cpp|hpp|rb|sh|yml|yaml|json|toml|md|html|css))\b")
 
 
-def prelocalize_files_from_issue(repo: Path, issue: str, max_files: int = 8, max_bytes_per_file: int = 4000) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> str:
+    max_files = MAX_PRELOADED_FILES if "MAX_PRELOADED_FILES" in globals() else 8
+    max_bytes_per_file = 4000
+
     candidates: List[str] = []
     seen: set[str] = set()
     for match in _FILE_HINT_RE.findall(issue):
@@ -712,11 +718,11 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        prelocalized = prelocalize_files_from_issue(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, prelocalized)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         for step in range(1, max_steps + 1):
