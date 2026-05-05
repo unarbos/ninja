@@ -84,13 +84,14 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_CONTEXT_CHARS = 22000
+MAX_PRELOADED_FILES = 6
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 MAX_POLISH_TURNS = 1
-MAX_SELF_CHECK_TURNS = 1
+MAX_SELF_CHECK_TURNS = 0   # disabled — v2 data showed it causes over-editing
 MAX_SYNTAX_FIX_TURNS = 1
+MAX_PATCH_BLOCK_BYTES = 64000  # cap on a single <patch> block; rejects pathological inputs
 
 
 DANGEROUS_PATTERNS = [
@@ -409,6 +410,10 @@ def format_observation(result: CommandResult) -> str:
 
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
+# Direct unified-diff action — model emits a complete patch in one block.
+# Validated with `git apply --check` before apply, so malformed diffs
+# fail fast instead of corrupting the working tree.
+PATCH_BLOCK_RE = re.compile(r"<patch>\s*(.*?)\s*</patch>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_commands(model_text: str) -> List[str]:
@@ -425,6 +430,142 @@ def extract_final(model_text: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip()
+
+
+def extract_patches(model_text: str) -> List[str]:
+    """Pull every <patch>...</patch> block; tolerate ```diff fencing inside."""
+    out: List[str] = []
+    for match in PATCH_BLOCK_RE.finditer(model_text):
+        body = match.group(1).strip()
+        # Some models wrap the diff in ```diff ... ``` even inside <patch>.
+        body = re.sub(r"^```(?:diff|patch)?\s*\n", "", body, count=1)
+        body = re.sub(r"\n```\s*$", "", body, count=1).strip()
+        if body and len(body.encode("utf-8")) <= MAX_PATCH_BLOCK_BYTES:
+            out.append(body)
+    return out
+
+
+@dataclass
+class PatchApplyResult:
+    succeeded: bool
+    method: str            # "git_apply" | "git_apply_3way" | "rejected"
+    error: str = ""
+    files_touched: int = 0
+    lines_added: int = 0
+    lines_removed: int = 0
+
+
+@dataclass
+class DiffStyle:
+    """Quick structural metrics for the working-tree diff. Fed back to the
+    model as a 'how Cursor-like is your diff right now?' signal so the model
+    can self-correct if it's drifting toward a too-big patch."""
+    files: int = 0
+    hunks: int = 0
+    lines_added: int = 0
+    lines_removed: int = 0
+    plus_minus_ratio: float = 0.0   # >>1 means net-additive (often bad), <<1 net-removing (often bad too)
+
+
+def _compute_diff_style(patch: str) -> DiffStyle:
+    if not patch.strip():
+        return DiffStyle()
+    files = sum(1 for line in patch.splitlines() if line.startswith("diff --git "))
+    hunks = sum(1 for line in patch.splitlines() if line.startswith("@@"))
+    added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+    ratio = (added / removed) if removed else (float(added) if added else 0.0)
+    return DiffStyle(files=files, hunks=hunks, lines_added=added, lines_removed=removed, plus_minus_ratio=ratio)
+
+
+def _format_diff_style_observation(style: DiffStyle) -> str:
+    """Human-readable diff metrics. Includes a guidance flag when the diff
+    looks meaningfully larger than typical reference patches (1-2 files,
+    1-3 hunks, <30 changed lines)."""
+    if style.files == 0:
+        return "DIFF_STYLE: no patch yet."
+
+    flag = ""
+    if style.files > 3:
+        flag = " (LARGER THAN TYPICAL REFERENCE — consider whether all files are necessary)"
+    elif style.lines_added + style.lines_removed > 60:
+        flag = " (>60 changed lines — consider whether the patch can be smaller)"
+
+    return (
+        f"DIFF_STYLE: {style.files} file(s), {style.hunks} hunk(s), "
+        f"+{style.lines_added}/-{style.lines_removed}{flag}"
+    )
+
+
+def apply_unified_diff(diff_text: str, repo: Path) -> PatchApplyResult:
+    """Apply a model-emitted unified diff via `git apply`, with a few graceful fallbacks.
+
+    Try strategies in order:
+      1. `git apply --whitespace=fix` — strict, catches malformed diffs early
+      2. `git apply --3way` — falls back when context lines drift
+      3. give up
+
+    Returns a structured result so the caller can surface errors back to the
+    model without catastrophically failing the loop.
+    """
+    if not diff_text.strip():
+        return PatchApplyResult(succeeded=False, method="rejected", error="empty diff body")
+
+    # Normalize trailing newline — `git apply` is picky.
+    body = diff_text if diff_text.endswith("\n") else diff_text + "\n"
+    diff_path = repo / ".pilot_pending.diff"
+    diff_path.write_text(body, encoding="utf-8")
+
+    flags_to_try = [
+        ["--whitespace=fix"],
+        ["--whitespace=fix", "--3way"],
+        ["--whitespace=fix", "-p0"],
+    ]
+    last_error = ""
+    for flags in flags_to_try:
+        # Pre-flight check first so we know the diff parses.
+        check = subprocess.run(
+            ["git", "apply", "--check", *flags, str(diff_path)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+        if check.returncode != 0:
+            last_error = check.stderr.strip() or check.stdout.strip()
+            continue
+
+        proc = subprocess.run(
+            ["git", "apply", *flags, str(diff_path)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            try:
+                diff_path.unlink()
+            except Exception:
+                pass
+            files_touched = sum(1 for line in body.splitlines() if line.startswith("diff --git "))
+            lines_added = sum(1 for line in body.splitlines() if line.startswith("+") and not line.startswith("+++"))
+            lines_removed = sum(1 for line in body.splitlines() if line.startswith("-") and not line.startswith("---"))
+            return PatchApplyResult(
+                succeeded=True,
+                method="git_apply" if "--3way" not in flags else "git_apply_3way",
+                files_touched=files_touched,
+                lines_added=lines_added,
+                lines_removed=lines_removed,
+            )
+        last_error = proc.stderr.strip() or proc.stdout.strip()
+
+    try:
+        diff_path.unlink()
+    except Exception:
+        pass
+    return PatchApplyResult(succeeded=False, method="rejected", error=last_error[:600])
 
 
 def ensure_git_repo(repo: Path) -> None:
@@ -983,49 +1124,118 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+Your sole goal is to produce a unified diff that fixes the issue. The diff is
+scored on two equally-weighted dimensions:
+  1) Similarity to a reference patch produced by Cursor for this same task.
+  2) An LLM judge's quality assessment of correctness, minimality, and style.
+Both reward the SAME thing: the smallest, most surgical, style-matched fix.
+Every line you add or remove that the reference patch does not touch is a
+direct cost — it can only ever lower your score, never raise it.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+You have THREE action types. Use the right tool for the job:
 
-<command>
-your bash command here
-</command>
+  <command>bash command</command>   — for exploration (grep, sed -n, ls)
+  <patch>unified diff</patch>       — for the FIX itself (preferred)
+  <final>summary</final>            — when done
 
-When you are finished, respond with:
+The <patch> action takes a complete unified diff and applies it via
+`git apply` (with 3-way fallback). It is STRONGLY PREFERRED for the actual
+fix because:
+  1. Cursor (whose patches you are scored against for similarity) emits
+     unified diffs natively, not bash sed loops. Your <patch> output ends
+     up structurally identical to a Cursor patch.
+  2. One <patch> block + one <final> = the entire fix in 1-2 turns. No
+     multi-step bash drift, no whitespace accidents from sed.
+  3. Multi-file fixes go in a single <patch> block with one `diff --git`
+     header per file — exactly what the reference patch looks like.
 
-<final>
-short summary of what you changed
-</final>
+Plan-first protocol: in your FIRST response, output a short <plan> block,
+then in the SAME response either a <patch> block (if you can write the
+exact fix from preloaded context) or one <command> (if you need to look
+at one more file first). Do NOT spend a turn on plan + exploration alone.
+
+Use <command> ONLY when:
+  - the preloaded files are insufficient and you need to look at one more
+  - you genuinely need to RUN a verification (python -m py_compile,
+    targeted pytest)
+
+For everything else, use <patch>. After a <patch> applies cleanly and (if
+relevant) one verification passes, finalize with <final>.
+
+Style examples — these are the shape of patches that score highly. Match this
+style: minimal, single-hunk-per-file when possible, no drive-by edits.
+
+EXAMPLE A (off-by-one) ↓
+```diff
+--- a/stream.py
++++ b/stream.py
+@@ def pairs(seq):
+     seq = list(seq)
+-    for i in range(len(seq) - 2):
++    for i in range(len(seq) - 1):
+         yield (seq[i], seq[i + 1])
+```
+
+EXAMPLE B (missing default for nested-dict lookup) ↓
+```diff
+--- a/pricing.py
++++ b/pricing.py
+@@ def lookup_price(item, currency):
+-    return PRICES[item][currency]
++    return PRICES.get(item, {}).get(currency)
+```
+
+EXAMPLE C (greedy regex → non-greedy) ↓
+```diff
+--- a/html_utils.py
++++ b/html_utils.py
+@@
+-_TAG_RE = re.compile(r"<.+>")
++_TAG_RE = re.compile(r"<.+?>")
+```
+
+What these examples have in common — your patches should too:
+- ONE focused hunk per file. Hunks that bundle unrelated edits hurt similarity.
+- Smallest viable change: change the operator, the constant, the regex, the
+  default — not the surrounding scaffolding.
+- Identical indentation, quoting, naming as the surrounding code.
+
+NEGATIVE SPACE — what reference patches almost NEVER contain. Each of these
+ADDS to your diff size without adding similarity, so each one COSTS score.
+Your patch should have NONE of these unless the issue explicitly demands it:
+
+  ❌ A new docstring on the function you fixed ("now handles X")
+  ❌ A new # comment above your change explaining what you did
+  ❌ A type annotation added because you noticed it was missing
+  ❌ Renaming a variable because the old name bothered you
+  ❌ Reformatting a line that was technically over 80 cols
+  ❌ Reorganizing imports
+  ❌ Adding a defensive `if x is None: raise` not asked for
+  ❌ Removing a TODO comment unrelated to the bug
+  ❌ Trailing-comma additions in dict/list literals
+  ❌ Converting `'` to `"` (or vice versa) for "consistency"
+  ❌ Adding logging calls or print debugging
+  ❌ Updating a CHANGELOG you weren't asked to update
+
+If you find yourself wanting to add any of these, STOP. The reference patch
+doesn't have them. Adding them lowers similarity score for zero benefit.
 
 Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the diff.
-- If file snippets are already preloaded in the user prompt, edit those files
-  first. Do not re-read preloaded files.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
+- Edit preloaded files first; do not re-read them.
+- If the target is unclear, ONE focused grep/sed -n then edit. No loops.
+- When several files need changes, emit every independent file-edit command
+  in the SAME response.
 - Avoid whitespace-only edits, comment-only edits, import reorders, type
-  annotation drive-bys, dead-code removal not asked for by the task, defensive
-  checks not asked for by the task, and any unrelated refactors.
-- Do not run broad test suites, full builds, or installs. A targeted
-  python -m py_compile / tsc --noEmit <file> / pytest <one file> is fine.
-- After a focused patch and at most one cheap verification or diff review,
-  finalize with <final>.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
+  annotation drive-bys, dead-code removal not asked for by the task,
+  defensive checks not asked for by the task, unrelated refactors.
+- After ONE cheap verification (python -m py_compile / tsc --noEmit /
+  targeted pytest), finalize with <final>. Do not run broad test suites.
+- Do not dump generated, minified, binary, lock, or vendored files.
 - Do not use sudo. Do not delete the repository. Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
+- Do not make network calls except through the validator inference proxy.
 - Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+- Do not chmod / file-mode change.
+- You may use python, sed, cat, grep, find, pytest, npm, etc.
 """
 
 
@@ -1041,7 +1251,7 @@ These files have already been read for you. Re-reading them burns the duel
 budget; patch them directly unless a needed detail is missing.
 """
 
-    return f"""We need fix this issue:
+    return f"""Issue to fix:
 
 {issue}
 
@@ -1050,18 +1260,41 @@ Repository summary:
 {repo_summary}
 {context_section}
 
-Plan-first discipline: before your first <command>, in the SAME response output
-a short <plan> block listing the target files and which acceptance criterion
-maps to each, then immediately issue the first <command>(s). Do not split plan
-and commands across turns; that wastes a step.
+Plan-first protocol (mandatory):
+Your FIRST response must contain BOTH a <plan> block AND either a <patch>
+or one <command>.
 
-If the preloaded snippets identify the target code, start by editing them. Do
-not re-read preloaded files or run broad searches first. If the target is still
-unclear, run one or two focused search/snippet commands, then make the best
-focused patch you can. If multiple files need edits, include every independent
-file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+The <plan> block must list:
+  - the SINGLE smallest code change that resolves the acceptance criteria
+  - the EXACT file path + function/symbol you will edit
+  - one sentence: why this is the minimal fix (no surplus changes)
+
+Reference patches for tasks like this are usually 1-10 changed lines across
+1-2 files. If your plan exceeds that scope, reconsider — you are likely about
+to lose similarity score by editing things the reference patch does not.
+
+After the plan, prefer <patch> if you can write the exact diff from the
+preloaded context. Use <command> only when you genuinely need to look at one
+more file before you can write the patch correctly.
+
+Format example for the IDEAL first response (most cases):
+
+<plan>
+Target: src/foo.py, function `parse_url`. Replace `s.split("?")` with
+`s.split("?", 1)` so embedded `?` in fragments don't break splitting.
+Minimal: 1 line, 1 file. Reference patches for parse-fix issues like this
+typically touch only the offending line.
+</plan>
+
+<patch>
+--- a/src/foo.py
++++ b/src/foo.py
+@@ def parse_url(s: str) -> tuple[str, str]:
+-    return s.split("?")
++    return s.split("?", 1)
+</patch>
+
+<final>Limit query-string split to first '?' so fragment-embedded '?' don't break parsing.</final>
 """
 
 
@@ -1159,6 +1392,54 @@ def solve(
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
+            patches = extract_patches(response_text)
+
+            # NEW: process direct unified-diff <patch> blocks first. Each block
+            # is applied via `git apply` (with whitespace fix + 3way fallback).
+            # Outcomes are appended to observations so the model sees whether
+            # its diff applied cleanly without needing a separate verification.
+            if patches:
+                messages.append({"role": "assistant", "content": response_text})
+                patch_observations: List[str] = []
+                for patch_idx, diff_text in enumerate(patches, 1):
+                    apply_result = apply_unified_diff(diff_text, repo)
+                    if apply_result.succeeded:
+                        patch_observations.append(
+                            f"PATCH {patch_idx}/{len(patches)} APPLIED via {apply_result.method}: "
+                            f"{apply_result.files_touched} file(s), "
+                            f"+{apply_result.lines_added}/-{apply_result.lines_removed}"
+                        )
+                        logs.append(
+                            f"\nPATCH_APPLIED ({apply_result.method}): "
+                            f"+{apply_result.lines_added}/-{apply_result.lines_removed} "
+                            f"in {apply_result.files_touched} file(s)"
+                        )
+                    else:
+                        patch_observations.append(
+                            f"PATCH {patch_idx}/{len(patches)} REJECTED: {apply_result.error[:300]}"
+                        )
+                        logs.append(f"\nPATCH_REJECTED: {apply_result.error[:200]}")
+
+                # Append diff-style score so the model gets real-time
+                # feedback on whether its overall patch is too big.
+                style = _compute_diff_style(get_patch(repo))
+                patch_observations.append(_format_diff_style_observation(style))
+
+                # If <final> was emitted alongside the patch and we have a real diff, accept.
+                if final is not None and get_patch(repo).strip():
+                    junk = _diff_junk_summary(get_patch(repo))
+                    if junk and polish_turns_used < MAX_POLISH_TURNS:
+                        polish_turns_used += 1
+                        logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
+                        messages.append({"role": "user", "content": "\n\n".join(patch_observations) + "\n\n" + build_polish_prompt(junk)})
+                        continue
+                    logs.append("\nFINAL_SUMMARY:\n" + final)
+                    success = True
+                    break
+
+                # Otherwise feed observations back, model can iterate or final.
+                messages.append({"role": "user", "content": "\n\n".join(patch_observations)})
+                continue
 
             if not commands:
                 if final is not None:
