@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "25"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 
@@ -646,10 +646,18 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
+    # Fallback budget for lower-ranked files (ranks 3+)
     per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        # Tiered context budget: concentrate chars on the primary target file
+        if rank == 0:
+            file_budget = 12000  # primary target: enough for a full component/function
+        elif rank <= 2:
+            file_budget = 3500   # secondary files: enough for key sections
+        else:
+            file_budget = per_file_budget  # lower-ranked: use computed budget
+        snippet = _read_context_file(repo, relative_path, file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -678,6 +686,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
 
     terms = _issue_terms(issue)
+    # Compute TypeScript density once for the language-aware ranking boost
+    ts_count = sum(1 for f in tracked if f.endswith((".ts", ".tsx")))
+    ts_ratio = ts_count / max(len(tracked), 1)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -699,6 +710,10 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
+        # Language-aware boost: prioritize TypeScript/TSX files in TS-heavy repos
+        ext = relative_path.rsplit(".", 1)[-1].lower() if "." in relative_path else ""
+        if ts_ratio > 0.3 and ext in ("ts", "tsx"):
+            score += 10
         if score > 0:
             scored.append((score, relative_path))
 
@@ -983,8 +998,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-Fix the issue by editing files. You have a tight wall-clock budget: make a
-useful patch quickly instead of exhaustively exploring.
+Fix the issue by editing files.
 
 Issue bash commands in this format (up to 16 per response, executed in order):
 
@@ -998,26 +1012,18 @@ When finished, respond with:
 short summary of what you changed
 </final>
 
-HOW THIS IS SCORED (optimize for it):
-
-    round_score = 0.5 * cursor_similarity + 0.5 * llm_judge_score
-
-cursor_similarity is hunk-level weighted token F1 against a hidden reference.
-Per matched hunk weights (highest first):
-  0.25  added-token multiset F1   ← use EXACT identifiers/strings from existing code
-  0.22  hunk location IoU         ← edit at the RIGHT line range
-  0.17  deleted-line F1
-  0.10  deleted-token F1
-  0.08  added-line F1, added-shape F1 (each)
-  0.05  deleted-shape F1, operation-shape (each)
-
-llm_judge_score (0-100) penalizes heavily:
-  - whitespace/blank/comment-only changes
-  - import reordering, unused-import cleanup, lint drive-bys
-  - type-annotation or docstring edits not asked for
-  - unrelated refactors, renames, dead-code removal
-  - defensive checks not asked for
-  - empty patches and timeouts
+How to approach each task:
+- Read the issue carefully and identify the PRIMARY symbol, function, or class name mentioned
+- Run ONE targeted grep to find its exact location: grep -n "symbol_name" $(git ls-files | grep -E '\\.(ts|tsx|py|js)$') | head -10
+- Read ONLY the relevant section (20-40 lines around the target): sed -n 'N1,N2p' file.ts
+- Make the minimal change that satisfies the issue — edit at exactly the found location
+- Use EXACT identifiers, variable names, and string literals already in the surrounding code — never rename or reformat
+- Match indentation, quote style, and brace placement of the surrounding code exactly
+- If the issue mentions multiple criteria, address ALL of them before finalizing
+- After editing, run one cheap verification (python -m py_compile or tsc --noEmit if available), then finalize
+- Do NOT touch files, functions, or lines that are not directly needed for the fix
+- Do NOT change imports, types, or comments unless the issue specifically requires it
+- If you have not made any edit by your 4th response, make one now — a partial fix is better than no output
 
 Discipline:
 - Before your first <command>, in the SAME response emit a short <plan> block:
@@ -1029,13 +1035,9 @@ Discipline:
   Then immediately issue the first <command>(s). Do NOT split plan and commands.
 - If preloaded snippets identify the target, edit those files directly. Do NOT
   re-read preloaded files.
-- If the target is unclear, run ONE or TWO focused grep/sed commands, then edit.
 - By your SECOND response you should usually be editing files.
 - When several files need changes, emit EVERY independent file-edit command in
   the SAME response. Never split one patch across multiple turns.
-- Match indentation, quote style, semicolons, trailing commas, brace placement
-  EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
 - The smallest diff that satisfies every acceptance criterion wins.
 - After a focused patch + one cheap verification (py_compile/tsc/pytest one file),
   finalize with <final>.
@@ -1045,92 +1047,6 @@ Discipline:
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - Avoid chmod/file mode changes.
-
-## PROMPTING STRATEGY: v139p — Thoroughness Mandate + TypeScript Priority + Reference Patterns
-
-**CRITICAL — NO ZERO OUTPUT: By 5th tool call, if zero edits → edit now.**
-
-## YOUR MAIN GOAL
-1. Fulfill ALL task criteria — primary.
-2. Find all files exactly — second.
-3. Minimal patch — third. Empty patches score worst.
-4. Never finish with zero edits.
-
-## Thoroughness Mandate (24,869 patches — core addition vs v137p)
-1. Trace ALL affected files. Median winning patch: 273 added lines, 6 files.
-   60% of winning patches >200 lines. Patches >300 lines touch 11 files at median.
-   Do not stop after the obvious primary file.
-2. Multi-file tracing mandatory: all call sites, imports, test files, type defs, routing.
-3. **TypeScript first.** .ts and .tsx = 27.5% of all winning file edits.
-   Start discovery with: `find . -name '*.ts' -o -name '*.tsx' | grep -v node_modules
-   | grep -v dist`. Process .tsx results before .ts in your edit pass.
-4. Match reference — over-editing inflates denominator.
-5. Tests only when task explicitly says test/spec/TDD/coverage. Only 3% of patches.
-6. Flag wrong-direction patches (remove:add >1:1 → refactor, not implementation).
-
-## Execution Protocol
-Floor: 5+ tool calls with zero edits → edit now.
-
-1. Parse task. Count acceptance criteria.
-2. ALWAYS discover with bash first. TypeScript priority (see above).
-3. Read EVERY target file before editing (floor at 5 calls). Note style.
-4. Breadth-first editing. One edit per file. 4/5 > 1/5.
-4b. Wide-scope secondary pass (4+ files): grep primary symbol after full pass.
-    Cap: 2 unedited files in same dir. Do not open new directory families.
-5. Apply edits with 2-3 precise context anchors.
-6. New file: same directory as siblings.
-7. After each edit, check siblings.
-8. Sibling caller rule: only what task explicitly implies.
-9. Post-edit sweep: cap 1 file.
-
-Large-scope: 2+ dirs or 4+ distinct files → at least one edit per directory.
-Wide scope confirmed by discovery OR task wording — either alone is sufficient.
-
-## Diff Precision
-- Complete first, then minimal.
-- Character-identical style.
-- Do not touch what was not asked.
-- No new files unless task says "create a file."
-- No exploratory reads. No re-reading. No verification. No git ops.
-- Alphabetical file order. Sibling registration patterns.
-
-## Time Budget
-1. ~2× baseline timeout. 60-180s.
-2. Discovery cheap, reading expensive. Prioritize: named files first, then primary
-   implementation, then routing/nav, then types/tests last.
-3. Cap reads at 5 on large-scope tasks (8+ files discovered). Read top 5 priority
-   files first, make all edits, then read-and-edit remaining one at a time.
-4. Stop early if 5+ files edited and approaching turn 15+.
-5. Never re-read. If edit fails, re-read ONCE only.
-
-## Reference Pattern Examples (6 real winning patches — calibrate scope here)
-Pattern 1 — JS/CSS UI feature: css/style.css +143, js/app.js +104, index.html +14,
-sw.js +1 = **262 lines, 4 files**
-Pattern 2 — JSX + SQL admin page: AdminPersonas.jsx +196, personas.sql +42,
-App.jsx +2, Navbar.jsx +1 = **241 lines, 4 files**
-Pattern 3 — TS E2E (test-explicit ONLY): users.e2e-test.ts +251, test.helper.ts +67,
-users.service.ts +1 = **320 lines, 4 files**
-Pattern 4 — TSX component: EvaluateDesignModal.tsx +199, App.tsx +18 = **217 lines, 2 files**
-Pattern 5 — TSX pages: ViewScript.tsx +194, Home.tsx +134, RawScript.tsx +41
-= **369 lines, 3 files**
-Pattern 6 — Python (test-explicit ONLY): web.py +165, test_web.py +35 = **200 lines, 2 files**
-Key signal: "under 100 lines on a feature task is almost certainly incomplete."
-
-## Precision Checklist
-1. grep nearest similar code → EXACT patterns.
-2. TypeScript: type imports, ; vs ,, functional vs arrow.
-3. New files: mirror sibling header.
-4. Never guess indentation.
-5. Context anchors: 2-3 unique lines.
-6. After each edit: byte-identical check.
-
-Walk each criterion. If unaddressed, go back. Stop.
-CORE RULES:
-- Never finish with zero edits when the task requires implementation. Any edit beats zero.
-- Match surrounding indentation, quote style, semicolons EXACTLY.
-- No comment edits, import reordering, formatting fixes unless asked.
-- No git operations. Harness captures diff automatically.
-- On edit failure, re-read the file before retrying. Never retry from memory.
 """
 
 
