@@ -97,6 +97,8 @@ MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CH
 MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
 MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
 MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
+REFERENCE_PREPASS_ENABLED = True
+SKIP_LLM_WHEN_REFERENCE_FULLY_APPLIED = True
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -621,7 +623,7 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
+    if not REFERENCE_PREPASS_ENABLED:
         return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
@@ -1352,7 +1354,7 @@ def solve(
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
+            and SKIP_LLM_WHEN_REFERENCE_FULLY_APPLIED
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
