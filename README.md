@@ -127,6 +127,21 @@ first characters in the title.
 github-pr:unarbos/ninja#<pr-number>@<head-sha>
 ```
 
+This repo includes a helper for submitting that exact string with Bittensor.
+It defaults to subnet 66:
+
+```bash
+./scripts/commit_on_chain.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58> \
+  --netuid 66 \
+  --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
+```
+
+`--hotkey` is checked against the loaded wallet hotkey so the PR title, wallet,
+and on-chain commitment all refer to the same miner.
+
 Only one commitment per miner hotkey is eligible in each 24h window. The
 validator enforces the window as 7,200 chain blocks since the last accepted
 commitment for that hotkey. A newer commitment made before that window expires
