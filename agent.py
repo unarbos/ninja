@@ -64,10 +64,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# -----------------------------
+# Config
+# -----------------------------
+
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-
+# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
+# validator wiring. During real validation the validator passes model, api_base,
+# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -94,6 +103,8 @@ MAX_SYNTAX_FIX_TURNS = 1
 MAX_PATCH_BLOCK_BYTES = 64000  # cap on a single <patch> block; rejects pathological inputs
 
 
+# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
+# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -110,6 +121,10 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
+
+# -----------------------------
+# Data structures
+# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -139,6 +154,10 @@ class AgentResult:
             "success": self.success,
         }
 
+
+# -----------------------------
+# Utility
+# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -237,6 +256,14 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
+# -----------------------------
+# OpenAI-compatible client
+# -----------------------------
+
+# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
+# behavior, response parsing, or model-message strategy here. Keep all requests
+# pointed at the api_base/api_key supplied by solve(); the validator proxy
+# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -302,6 +329,14 @@ def chat_completion(
     return content, cost, data
 
 
+# -----------------------------
+# Shell execution
+# -----------------------------
+
+# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
+# repo. You may improve command validation, environment handling, timeouts, and
+# output shaping. Keep commands scoped to the repo and avoid secrets or network
+# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -407,6 +442,10 @@ def format_observation(result: CommandResult) -> str:
         parts.extend(["", "STDERR:", result.stderr])
     return "\n".join(parts) + "\n"
 
+
+# -----------------------------
+# Action parsing
+# -----------------------------
 
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
