@@ -92,15 +92,20 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_COMMANDS_PER_RESPONSE = 6
+MAX_TOOL_CALLS = 26
+WALL_BUDGET_S = 165.0
+FORCE_FINAL_FRACTION = 0.75
+COVERAGE_THRESHOLD = 0.5
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_SELF_CHECK_TURNS = 0   # disabled: extra LLM call near deadline causes timeouts
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_COVERAGE_TURNS = 1     # nudge unedited preloaded files when below threshold
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -932,6 +937,11 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
+    # Guard: if stripping wipes the whole patch but the original was non-empty,
+    # the original was a legitimate comment/whitespace-only fix — return it as-is
+    # rather than score 0 by emitting nothing.
+    if not result.strip() and diff_output.strip():
+        return diff_output
     return result
 
 
@@ -1094,6 +1104,72 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
+
+
+def _run_test_partner(repo: Path, test_path: str, timeout: int = 5) -> Optional[str]:
+    """Run a single companion test with the cheapest runner available.
+
+    Returns failure tail (≤2400 chars) if the test fails, otherwise None.
+    Silently returns None if the runner is missing, times out, or the file
+    extension is not supported.
+    """
+    suffix = Path(test_path).suffix.lower()
+    cmd: Optional[List[str]] = None
+    if suffix == ".py":
+        if _has_executable("pytest"):
+            cmd = ["pytest", "-x", "--tb=short", "-q", test_path]
+        else:
+            return None
+    elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        if _has_executable("jest"):
+            cmd = ["jest", "--bail", "--silent", test_path]
+        elif _has_executable("vitest"):
+            cmd = ["vitest", "run", "--silent", test_path]
+        else:
+            return None
+    else:
+        return None
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if proc.returncode == 0:
+        return None
+    output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if not output:
+        return None
+    if len(output) > 2400:
+        output = output[-2400:]
+    return output
+
+
+def _choose_test_partner_to_check(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    """Pick first patch-touched source with discoverable test partner; run it.
+
+    Returns (test_path, failure_tail) on test failure, else None.
+    """
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return None
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return None
+    for src in changed:
+        partner = _find_test_partner(src, tracked)
+        if not partner:
+            continue
+        failure = _run_test_partner(repo, partner)
+        if failure:
+            return partner, failure
+    return None
 
 
 def _has_executable(name: str) -> bool:
@@ -1283,11 +1359,7 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
-
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+SYSTEM_PROMPT = """You are a surgical coding agent. Identify the root cause, fix it precisely and completely, and add nothing else.
 
 ## Command format
 
@@ -1489,6 +1561,17 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_coverage_prompt(missing: List[str]) -> str:
+    """Nudge the model when it has not edited preloaded files likely in scope."""
+    listing = "\n".join(f"  - {p}" for p in missing[:8])
+    return (
+        "Coverage check: the following preloaded files are likely in scope but you "
+        f"have NOT edited them yet:\n{listing}\n\n"
+        "If they require changes, edit each one minimally in this single response. "
+        "If they are not relevant, ignore this and emit <final>summary</final>."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1519,6 +1602,9 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
+    coverage_turns_used = 0
+    scope_files: List[str] = []
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1530,19 +1616,22 @@ def solve(
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
-    def maybe_queue_refinement(assistant_text: str) -> bool:
-        """If the current patch warrants a refinement turn, queue it.
+    def _refinement_budget_ok() -> bool:
+        """Refuse to queue refinements past 85% of wall budget."""
+        return (time.monotonic() - _wall_start) < WALL_BUDGET_S * 0.85
 
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+    def maybe_queue_refinement(assistant_text: str) -> bool:
+        """Queue a refinement turn if warranted.
+
+        Order: polish -> syntax -> coverage -> test_fix -> self_check.
+        Each runs at most once per solve. All gated by the 85% wall budget.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal test_fix_turns_used, coverage_turns_used
         patch = get_patch(repo)
         if not patch.strip():
+            return False
+        if not _refinement_budget_ok():
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -1567,6 +1656,31 @@ def solve(
                 )
                 return True
 
+        if coverage_turns_used < MAX_COVERAGE_TURNS and scope_files:
+            edited = set(_patch_changed_files(patch))
+            missing = [p for p in scope_files if p not in edited]
+            covered = (len(scope_files) - len(missing)) / len(scope_files)
+            if covered < COVERAGE_THRESHOLD and missing:
+                coverage_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_prompt(missing),
+                    f"COVERAGE_TURN_QUEUED: {covered:.0%} of {len(scope_files)} scope files edited",
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            test_failure = _choose_test_partner_to_check(repo, patch)
+            if test_failure is not None:
+                test_path, failure_tail = test_failure
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, failure_tail),
+                    f"TEST_FIX_QUEUED: {test_path}",
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
@@ -1584,6 +1698,12 @@ def solve(
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        try:
+            _ranked = _rank_context_files(repo, issue)
+            _tracked = set(_tracked_files(repo))
+            scope_files = _augment_with_test_partners(_ranked, _tracked)[:MAX_PRELOADED_FILES]
+        except Exception:
+            scope_files = []
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -1591,13 +1711,29 @@ def solve(
         ]
 
         _wall_start = time.monotonic()
+        _force_final_injected = False
+        _total_commands = 0
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > 480:
-                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+            _elapsed = time.monotonic() - _wall_start
+            if _elapsed > WALL_BUDGET_S:
+                logs.append(f"\nWALL_STOP:\nWall budget {WALL_BUDGET_S:.0f}s elapsed; returning current state.")
                 break
+            if (
+                not _force_final_injected
+                and _elapsed > WALL_BUDGET_S * FORCE_FINAL_FRACTION
+                and get_patch(repo).strip()
+            ):
+                _force_final_injected = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time low. Stop reading. Apply any remaining edits to the preloaded "
+                        "scope files in this single response and emit <final>summary</final>."
+                    ),
+                })
 
             response_text = None
             for _attempt in range(2):
@@ -1654,9 +1790,18 @@ def solve(
 
             for command_index, command in enumerate(command_batch, 1):
                 result = run_command(command, repo, timeout=command_timeout)
+                _total_commands += 1
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                if _total_commands >= MAX_TOOL_CALLS:
+                    logs.append(
+                        f"\nTOOL_CALL_STOP: hit {_total_commands} commands (budget {MAX_TOOL_CALLS}); finalizing."
+                    )
+                    if get_patch(repo).strip():
+                        success = True
+                    break
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -1719,6 +1864,9 @@ def solve(
                 messages.append({"role": "user", "content": observation_text})
 
             if success:
+                break
+
+            if _total_commands >= MAX_TOOL_CALLS:
                 break
 
             if not get_patch(repo).strip() and step in {2, 4}:
