@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+                      
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -64,10 +64,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+                               
+        
+                               
+
+                                                                              
+                                                                       
+                                                                              
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-
+                                                                             
+                                                                                
+                                                                     
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -79,20 +88,21 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
 MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 MAX_POLISH_TURNS = 1
 MAX_SELF_CHECK_TURNS = 1
 MAX_SYNTAX_FIX_TURNS = 1
 
-
+                                                                              
+                                                         
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -109,6 +119,10 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
+
+                               
+                 
+                               
 
 @dataclass
 class CommandResult:
@@ -138,6 +152,10 @@ class AgentResult:
             "success": self.success,
         }
 
+
+                               
+         
+                               
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -236,6 +254,14 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
+                               
+                          
+                               
+
+                                                                          
+                                                                               
+                                                                          
+                                                         
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -301,6 +327,14 @@ def chat_completion(
     return content, cost, data
 
 
+                               
+                 
+                               
+
+                                                                               
+                                                                               
+                                                                               
+                                               
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -407,6 +441,10 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
+                               
+                
+                               
+
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -426,6 +464,10 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
+
+                               
+             
+                               
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -492,8 +534,13 @@ def get_patch(repo: Path) -> str:
 
 
 def _strip_junk_hunks_per_file(diff_output: str) -> str:
+    """Drop whitespace-only, blank-only, and comment-only hunks from
+    files that ALSO contain a substantive hunk. Single-file pure-junk
+    diffs are kept as-is so the agent never silently emits an empty
+    patch."""
     if not diff_output.strip():
         return diff_output
+
     blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
     out: List[str] = []
     for block in blocks:
@@ -879,15 +926,31 @@ def _diff_junk_summary(patch: str) -> str:
     return "; ".join(deduped[:10])
 
 
-def build_polish_prompt(junk_summary: str) -> str:
-    return (
-        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
-        "Revert ONLY those hunks (use sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder imports, "
-        "do not touch unrelated lines. Then respond with <final>summary</final>. "
-        "If you cannot cleanly revert without breaking the substantive edits, "
-        "respond with <final>summary</final> immediately and keep the patch as-is."
-    )
+def _check_python_syntax(repo: Path, patch: str) -> List[str]:
+    """Best-effort parse of touched .py files; returns error notes."""
+    import ast as _ast
+    errors: List[str] = []
+    for changed_path in _patch_changed_files(patch):
+        if not changed_path.endswith(".py"):
+            continue
+        try:
+            full = (repo / changed_path).resolve()
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            src = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        try:
+            _ast.parse(src)
+        except SyntaxError as e:
+            errors.append(f"{changed_path}:{e.lineno}: {e.msg}")
+        except Exception as e:
+            errors.append(f"{changed_path}: parse failure: {e}")
+    return errors
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -981,6 +1044,13 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
+                               
+           
+                               
+
+                                                                              
+                                                                       
+                                   
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
 You must fix the issue by editing files in the repo. You have a tight wall-clock
@@ -1065,21 +1135,41 @@ editing. After a patch exists, run one cheap verification if possible, then fini
 """
 
 
-def build_self_check_prompt(patch: str, text: str) -> str:
+def build_polish_prompt(junk_summary: str) -> str:
+    return (
+        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
+        "Revert ONLY those hunks (use sed/cat/python to restore the original "
+        "lines). Do not add new edits, do not refactor, do not reorder imports, "
+        "do not touch unrelated lines. Then respond with <final>summary</final>. "
+        "If you cannot cleanly revert without breaking the substantive edits, "
+        "respond with <final>summary</final> immediately and keep the patch as-is."
+    )
+
+
+def build_self_check_prompt(patch: str, issue: str) -> str:
     truncated = patch if len(patch) <= 4000 else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     return (
-        "Self-check pass. Review your draft patch for:\n"
+        "Self-check pass. Review your draft patch for these problems:\n"
         "  - any acceptance criterion from the task NOT addressed\n"
-        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
-        "  - newly introduced bugs or syntax errors\n\n"
+        "  - any unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
+        "  - any newly introduced bug or syntax error\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
-        f"{text[:2000]}\n\n"
+        f"{issue[:2000]}\n\n"
         "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
         "If something is wrong, in the SAME response emit corrective <command> "
         "blocks that fix only the listed issues, then end with <final>summary</final>. "
         "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+    )
+
+
+def build_syntax_fix_prompt(errors: List[str]) -> str:
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Syntax check failed on touched Python file(s):\n  {bullets}\n\n"
+        "Issue the smallest possible fix command(s) to restore parseable Python. "
+        "Do NOT introduce new edits, do NOT refactor. Then end with <final>summary</final>."
     )
 
 
@@ -1101,6 +1191,14 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+                               
+            
+                               
+
+                                                                               
+                                                                              
+                                                                          
+                                                            
 def solve(
     repo_path: str,
     issue: str,
@@ -1176,6 +1274,14 @@ def solve(
                         messages.append({"role": "assistant", "content": response_text})
                         messages.append({"role": "user", "content": build_self_check_prompt(patch, issue)})
                         continue
+                    if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                        syntax_errors = _check_python_syntax(repo, patch)
+                        if syntax_errors:
+                            syntax_fix_turns_used += 1
+                            logs.append("\nSYNTAX_GATE_TRIPPED:\n  " + "\n  ".join(syntax_errors))
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_errors)})
+                            continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
                     success = True
                     break
@@ -1396,6 +1502,13 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+                               
+                       
+                               
+
+                                                                                
+                                                                                
+             
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
