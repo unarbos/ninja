@@ -686,8 +686,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     else:
         issue_terms = _issue_terms(issue)
     terms = issue_terms if issue_terms is not None else _issue_terms(issue)
-    
-    content_hits = _grep_ranked_files(repo, terms)
 
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -699,8 +697,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
-        if relative_path in content_hits:
-            score += 60 + min(30, 3 * content_hits[relative_path])
         if path_lower in issue_lower:
             score += 35
         if name_lower and name_lower in issue_lower:
@@ -911,45 +907,6 @@ def _issue_terms(issue: str) -> List[str]:
             continue
         terms.append(raw)
     return terms[:40]
-
-def _grep_ranked_files(repo: Path, terms: List[str]) -> Dict[str, int]:
-    """
-    Lightweight content-based ranking using git grep across tracked files.
-    Returns a {relative_path: hit_count} dict for files that match any top terms.
-    """
-    if not terms:
-        return {}
-
-    top_terms = [t for t in terms[:10] if len(t) >= 3]
-    if not top_terms:
-        return {}
-
-    hits: Dict[str, int] = {}
-    # Use -F for literal matching; -- to avoid treating terms as paths.
-    for term in top_terms[:6]:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-n", "-F", "--", term],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=1,
-            )
-        except Exception:
-            continue
-
-        if proc.returncode not in (0, 1):  # 1 means "no matches"
-            continue
-
-        for line in (proc.stdout or "").splitlines()[:250]:
-            # Format: path:line:content
-            path = line.split(":", 1)[0].strip()
-            if not path or not _context_file_allowed(path):
-                continue
-            hits[path] = hits.get(path, 0) + 1
-
-    return hits
 
 def _issue_terms_llm(
     problem: str,
