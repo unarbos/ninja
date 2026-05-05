@@ -64,7 +64,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+# v16 config changes: MAX_STEPS 25→30, MAX_TOKENS 6144→8192, CONVERSATION 60000→80000
+# v18: MAX_STEPS 30→40 (more headroom for refinement turns + longer tasks)
+# Preload budget kept unchanged (debate rejected king's reduction)
+# v20: C1 remove line-count mandates (cursor_sim-aware surgical patching)
+#      C2 adaptive TS context budget (uniform 3200 when TS>5 files && ratio>35%)
+#      C3 symbol threshold 6→4, max 10→12, new stop words for TS generics
+#      C4 CORRECTNESS AUDIT block in self-check (P0 LLM judge fix)
+#      C5 progressive output commitment (defensive patch at step 8 & 16)
+#      C6 .test.ts before .spec.ts in companion test templates (R2 finding)
+#      C7 DISCARDED: no hunk-ordering; file-ordering only (regression fix)
+#      C8 TypeScript import chain follow-through in SYSTEM_PROMPT
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 
@@ -79,13 +90,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_OBSERVATION_CHARS = 9000
+MAX_TOTAL_LOG_CHARS = 180000
+MAX_CONVERSATION_CHARS = 80000
+MAX_PRELOADED_CONTEXT_CHARS = 32000   # kept from v5; debate rejected king's 28000
+MAX_PRELOADED_FILES = 10              # kept from v5; debate rejected king's 8
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 MAX_POLISH_TURNS = 1
@@ -488,10 +499,19 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
-    return _strip_junk_hunks_per_file(cleaned)
+    # Change 1: use _strip_low_signal_hunks (drops entire file blocks when all hunks are junk)
+    return _strip_low_signal_hunks(cleaned)
 
 
-def _strip_junk_hunks_per_file(diff_output: str) -> str:
+# v16 Change 1: Renamed from _strip_junk_hunks_per_file and fixed to drop entire
+# file blocks when ALL hunks are junk, instead of keeping the junk block.
+def _strip_low_signal_hunks(diff_output: str) -> str:
+    """Strip hunks that are whitespace-only, comment-only, or blank-only.
+
+    If every hunk in a file block is junk, drop the entire file block
+    (not just the individual hunks). This prevents accidentally whitespace-edited
+    unrelated files from polluting the diff.
+    """
     if not diff_output.strip():
         return diff_output
     blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
@@ -521,7 +541,10 @@ def _strip_junk_hunks_per_file(diff_output: str) -> str:
             ):
                 continue
             substantive.append(hunk_text)
-        out.append(header + "".join(substantive) if substantive else block)
+        # v16 fix: if all hunks are junk, drop the entire file block entirely
+        if substantive:
+            out.append(header + "".join(substantive))
+        # else: drop entire block — no substantive hunks in this file
     result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
@@ -562,6 +585,241 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     if path.suffix == ".pyc":
         return True
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+
+
+_COMMENT_LINE_PREFIXES = ("#", "//", ";", "--", "%")
+_BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
+
+
+def _line_is_comment(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if any(stripped.startswith(p) for p in _COMMENT_LINE_PREFIXES):
+        return True
+    if _BLOCK_COMMENT_RE.match(line):
+        return True
+    if stripped.startswith('"""') or stripped.startswith("'''"):
+        return True
+    return False
+
+
+def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
+    if not added and not removed:
+        return False
+    a = sorted(s.strip() for s in added if s.strip())
+    r = sorted(s.strip() for s in removed if s.strip())
+    if not a and not r:
+        return True
+    return a == r
+
+
+def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    if not body:
+        return False
+    return all(_line_is_comment(line) for line in body)
+
+
+def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    return not body and bool(added or removed)
+
+
+# v16: renamed from _diff_junk_summary to _diff_low_signal_summary
+def _diff_low_signal_summary(patch: str) -> str:
+    if not patch.strip():
+        return ""
+    notes: List[str] = []
+    current_file = "?"
+    current_added: List[str] = []
+    current_removed: List[str] = []
+
+    def flush() -> None:
+        if not current_added and not current_removed:
+            return
+        if _hunk_is_blank_only(current_added, current_removed):
+            notes.append(f"{current_file}: blank-line-only hunk")
+            return
+        if _hunk_is_whitespace_only(current_added, current_removed):
+            notes.append(f"{current_file}: whitespace-only hunk")
+            return
+        if _hunk_is_comment_only(current_added, current_removed):
+            notes.append(f"{current_file}: comment-only hunk")
+            return
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            current_added, current_removed = [], []
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+        elif line.startswith("@@"):
+            flush()
+            current_added, current_removed = [], []
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            current_removed.append(line[1:])
+
+    flush()
+    seen: set = set()
+    deduped: List[str] = []
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "; ".join(deduped[:10])
+
+
+# -----------------------------
+# Change 2: Companion test discovery
+# -----------------------------
+# When the agent edits src/foo.py and a tests/test_foo.py exists in the repo,
+# having the test in the initial context lets the model update both files in a
+# single response — fewer turns, cleaner patch.
+#
+# Pollution guard: only augment when the issue mentions test-related keywords.
+# This prevents the model from making spurious test file changes on pure
+# algorithmic fix tasks where the reference patch doesn't touch tests.
+
+_TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
+    # Python — the most common shapes.
+    ("{stem}.py", "tests/test_{stem}.py"),
+    ("{stem}.py", "test_{stem}.py"),
+    ("{stem}.py", "{dir}/test_{stem}.py"),
+    ("{stem}.py", "{dir}/tests/test_{stem}.py"),
+    ("{stem}.py", "tests/{stem}_test.py"),
+    # TypeScript / JavaScript — Jest / Vitest conventions.
+    # C6: .test.ts comes BEFORE .spec.ts (R2 data: .test.ts is 3× more common than .spec.ts)
+    ("{stem}.ts", "{dir}/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
+    ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/{stem}.spec.ts"),
+    ("{stem}.ts", "{dir}/__tests__/{stem}.spec.ts"),
+    ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/{stem}.spec.tsx"),
+    ("{stem}.tsx", "{dir}/__tests__/{stem}.spec.tsx"),
+    ("{stem}.js", "{dir}/{stem}.test.js"),
+    ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
+    # Other languages — single canonical convention each.
+    ("{stem}.go", "{dir}/{stem}_test.go"),
+    ("{stem}.rs", "{dir}/{stem}_test.rs"),
+    ("{stem}.rb", "spec/{stem}_spec.rb"),
+)
+
+
+def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
+    """Return the most plausible test file for a source path, or None.
+
+    Skips files that are themselves test files (avoids test-of-test loops).
+    """
+    path = Path(relative_path)
+    name_lower = path.name.lower()
+    if "test" in name_lower or "spec" in name_lower:
+        return None
+    stem = path.stem
+    suffix = path.suffix
+    if not stem or not suffix:
+        return None
+    parent = str(path.parent) if str(path.parent) not in {".", ""} else ""
+    for source_template, test_template in _TEST_PARTNER_TEMPLATES:
+        if not source_template.endswith(suffix):
+            continue
+        candidate = test_template.format(stem=stem, dir=parent).lstrip("/")
+        candidate = str(Path(candidate))
+        if candidate in tracked and _context_file_allowed(candidate):
+            return candidate
+    return None
+
+
+def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
+    """Slot each ranked source file's companion test immediately after it.
+
+    This ensures source + test appear adjacent in the preloaded context,
+    making it obvious to the model that both need updating together.
+    """
+    if not tracked:
+        return files
+    augmented: List[str] = []
+    seen: set = set()
+    for relative_path in files:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+        partner = _find_test_partner(relative_path, tracked)
+        if partner and partner not in seen:
+            augmented.append(partner)
+            seen.add(partner)
+    return augmented
+
+
+# -----------------------------
+# Change 3: Python syntax checking
+# -----------------------------
+# Catches syntax-broken patches before finalization. Uses ast.parse (stdlib,
+# no subprocess needed for Python). Node.js and JSON checking deferred to v17.
+
+_SYNTAX_TIMEOUT = 6  # seconds, per-file cap for future non-Python checkers
+
+
+def _has_executable(name: str) -> bool:
+    """Quick shell command -v check; cheaper than a Python import probe."""
+    try:
+        proc = subprocess.run(
+            ["command", "-v", name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+            shell=False,
+        )
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+    except Exception:
+        return False
+
+
+def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Return an error string if the file has a Python syntax error, else None."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    try:
+        import ast as _ast
+        _ast.parse(source)
+        return None
+    except SyntaxError as exc:
+        return f"{relative_path}:{exc.lineno}: {exc.msg}"
+    except Exception as exc:
+        return f"{relative_path}: parse failure: {exc}"
+
+
+def _check_syntax(repo: Path, patch: str) -> List[str]:
+    """Python-only syntax check on touched files.
+
+    Returns a flat list of error strings (empty = all files parse cleanly).
+    Node.js / JSON checking deferred to v17.
+    """
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            result = _check_python_syntax_one(repo, relative_path)
+            if result:
+                errors.append(result)
+    return errors
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -644,12 +902,43 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if not files:
         return ""
 
+    # v18 S4: Companion test augmentation is now UNCONDITIONAL.
+    # Always preload companion tests so the model is aware of them for all tasks.
+    # King study confirms unconditional loading improves completeness on all task types.
+    tracked_set = set(_tracked_files(repo))
+    files = _augment_with_test_partners(files, tracked_set)
+
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    # C2: Detect TypeScript-heavy repos for adaptive context budget.
+    # Angular/React multi-module repos need breadth (many files seen) over depth (one file fully).
+    # Uniform budget loads ~10 files vs tiered budget's 3-5 effective files.
+    tracked_files_list = _tracked_files(repo)
+    ts_file_count = sum(1 for f in tracked_files_list if f.endswith((".ts", ".tsx")))
+    ts_ratio = ts_file_count / max(len(tracked_files_list), 1)
+    _ts_uniform_mode = ts_file_count > 5 and ts_ratio > 0.35
+
+    if _ts_uniform_mode:
+        # Uniform budget: 3200 chars per file — loads ~10 files covering the full dependency graph
+        _uniform_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    else:
+        # Tiered budget (original): concentrate chars on primary target (Python/single-file tasks)
+        _tiered_fallback = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+
+    for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        if _ts_uniform_mode:
+            # C2: Uniform budget for TypeScript-heavy repos — breadth over depth
+            file_budget = _uniform_budget
+        else:
+            # Original tiered budget: concentrate chars on the primary target file
+            if rank == 0:
+                file_budget = 12000  # primary target: enough for a full component/function
+            elif rank <= 2:
+                file_budget = 3500   # secondary files: enough for key sections
+            else:
+                file_budget = _tiered_fallback  # lower-ranked: use computed budget
+        snippet = _read_context_file(repo, relative_path, file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -699,6 +988,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
+        # C2: Removed the blanket +10 TS density boost — it over-ranks .ts files over
+        # .json/.scss/.html config files that the reference patch actually touches.
+        # The C2 adaptive uniform budget handles TS-heavy repos more accurately.
         if score > 0:
             scored.append((score, relative_path))
 
@@ -713,13 +1005,13 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     return ranked
 
 
-_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})(?![A-Za-z0-9_])")
+_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
 _SYMBOL_STOP = {
     "about", "after", "alert", "argument", "before", "build", "called", "change", "check",
-    "class", "code", "command", "config", "context", "default", "expect", "expected",
-    "fail", "false", "field", "fields", "file", "files", "fixed", "function",
-    "given", "global", "hash", "header", "headers", "import",
-    "method", "module", "needed", "needs", "object", "params", "parse", "path",
+    "class", "code", "command", "config", "context", "data", "default", "expect", "expected",
+    "fail", "false", "field", "fields", "file", "files", "fixed", "form", "function",
+    "given", "global", "hash", "header", "headers", "import", "item",
+    "list", "method", "module", "name", "needed", "needs", "object", "page", "params", "parse", "path",
     "patch", "production", "project", "property", "public", "remove", "reset",
     "return", "should", "static", "string", "support", "test", "tests", "their",
     "there", "thing", "this", "true", "type", "types", "update", "using",
@@ -736,13 +1028,13 @@ def _extract_issue_symbols(text: str) -> List[str]:
         if lowered in _SYMBOL_STOP:
             continue
         if not (any(c.isupper() for c in token[1:]) or "_" in token):
-            if len(token) < 6:
+            if len(token) < 4:  # C3: lowered from 6 to catch 4-5 char TS identifiers (auth, role, user, cycle)
                 continue
         if token in seen:
             continue
         seen.add(token)
         out.append(token)
-        if len(out) >= 10:
+        if len(out) >= 12:  # C3: raised from 10 to 12 for broader TypeScript coverage
             break
     return out
 
@@ -791,103 +1083,6 @@ def _patch_covers_required_paths(patch: str, text: str) -> bool:
         return True
     changed = set(_patch_changed_files(patch))
     return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
-
-
-_COMMENT_LINE_PREFIXES = ("#", "//", ";", "--", "%")
-_BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
-
-
-def _line_is_comment(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if any(stripped.startswith(p) for p in _COMMENT_LINE_PREFIXES):
-        return True
-    if _BLOCK_COMMENT_RE.match(line):
-        return True
-    if stripped.startswith('"""') or stripped.startswith("'''"):
-        return True
-    return False
-
-
-def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
-    if not added and not removed:
-        return False
-    a = sorted(s.strip() for s in added if s.strip())
-    r = sorted(s.strip() for s in removed if s.strip())
-    if not a and not r:
-        return True
-    return a == r
-
-
-def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
-    body = [line for line in added + removed if line.strip()]
-    if not body:
-        return False
-    return all(_line_is_comment(line) for line in body)
-
-
-def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
-    body = [line for line in added + removed if line.strip()]
-    return not body and bool(added or removed)
-
-
-def _diff_junk_summary(patch: str) -> str:
-    if not patch.strip():
-        return ""
-    notes: List[str] = []
-    current_file = "?"
-    current_added: List[str] = []
-    current_removed: List[str] = []
-
-    def flush() -> None:
-        if not current_added and not current_removed:
-            return
-        if _hunk_is_blank_only(current_added, current_removed):
-            notes.append(f"{current_file}: blank-line-only hunk")
-            return
-        if _hunk_is_whitespace_only(current_added, current_removed):
-            notes.append(f"{current_file}: whitespace-only hunk")
-            return
-        if _hunk_is_comment_only(current_added, current_removed):
-            notes.append(f"{current_file}: comment-only hunk")
-            return
-
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            flush()
-            current_added, current_removed = [], []
-            parts = line.split()
-            if len(parts) >= 4 and parts[3].startswith("b/"):
-                current_file = parts[3][2:]
-        elif line.startswith("@@"):
-            flush()
-            current_added, current_removed = [], []
-        elif line.startswith("+") and not line.startswith("+++"):
-            current_added.append(line[1:])
-        elif line.startswith("-") and not line.startswith("---"):
-            current_removed.append(line[1:])
-
-    flush()
-    seen: set = set()
-    deduped: List[str] = []
-    for note in notes:
-        if note in seen:
-            continue
-        seen.add(note)
-        deduped.append(note)
-    return "; ".join(deduped[:10])
-
-
-def build_polish_prompt(junk_summary: str) -> str:
-    return (
-        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
-        "Revert ONLY those hunks (use sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder imports, "
-        "do not touch unrelated lines. Then respond with <final>summary</final>. "
-        "If you cannot cleanly revert without breaking the substantive edits, "
-        "respond with <final>summary</final> immediately and keep the patch as-is."
-    )
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -981,51 +1176,139 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+# Change 3: syntax fix prompt builder
+def build_syntax_fix_prompt(errors: List[str]) -> str:
+    """Quote parser error output back at the model and demand a minimal repair."""
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
+        "Issue the smallest possible fix command(s) to restore parseable code. "
+        "Do NOT introduce new edits, do NOT refactor. Then end with "
+        "<final>summary</final>."
+    )
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+# v17 R2 strategy: inverted minimalism mandate, multi-file mandate, import discipline,
+# scope guidance, token mirroring, hunk ordering, context discipline, trace surface.
+# v18: S1 dual-scoring awareness, S2 functional test requirement, S3 upgraded self-check,
+# S4 unconditional companion tests. INTERLEAVE PROTOCOL kept (our competitive edge).
+# v19: C1 king-style opening, C2 style matching, C3 partial repo guidance, C4 FEATURE/
+# REMOVAL/REQUIREMENTS checks in self-check, C5 patch ordering, C6 exact-values, C7
+# king-style post-patch observation, C8 context floor 1200->1500, C9 scope guidance,
+# C10 binary/generated file skip rule.
+SYSTEM_PROMPT = """This task is scored 50% on patch similarity to a Cursor IDE baseline (line-level LCS)
+and 50% by an LLM judge comparing correctness and completeness. Both axes matter:
+a patch that is correct AND complete scores high even when similarity is modest.
+
+Read the full issue FIRST before planning. Understand what tokens are added/removed
+(the judge score reflects 0-100 quality). Prioritize: fix root cause, cover all
+mentioned requirements, match the existing code style exactly.
+
+You are a surgical coding agent running inside a repository.
+
+Fix the issue by editing files.
+
+Issue bash commands in this format (up to 16 per response, executed in order):
 
 <command>
 your bash command here
 </command>
 
-When you are finished, respond with:
+When finished, respond with:
 
 <final>
 short summary of what you changed
 </final>
 
+## PLAN-FIRST DISCIPLINE
+Before your first <command>, in the SAME response output a <plan> block:
+<plan>
+target_files: [list them]
+acceptance_mapping: [criterion → file/symbol]
+affected_surface: [all files that import/use the changed symbols]
+unknowns: [what you'll grep for first]
+</plan>
+Then immediately issue the first <command>(s). Do not split plan and commands.
+
+How to approach each task:
+- Read the issue carefully and identify the PRIMARY symbol, function, or class name mentioned
+- Run ONE targeted grep to find its exact location: grep -n "symbol_name" $(git ls-files | grep -E '\\.(ts|tsx|py|js)$') | head -10
+- Read ONLY the relevant section (20-40 lines around the target): sed -n 'N1,N2p' file.ts
+- Implement the full scope the task requires — edit every file that needs changing, add all necessary functions and imports
+- Use EXACT identifiers, variable names, and string literals already in the surrounding code — never rename or reformat
+- Match indentation, quote style, and brace placement of the surrounding code exactly
+- If the issue mentions multiple criteria, address ALL of them before finalizing
+- If the issue mentions tests/specs/coverage, also find and update the companion test file
+- Run the most targeted real functional test available (pytest -k name, python test_file.py, node test). A passing test is REQUIRED evidence of correctness. Only finalize without a test if no test file exists after searching.
+- Edit every file in the affected surface: source files, components that import them, type definitions, barrel/index files, and relevant tests. Do not limit your patch to a single entry-point file.
+- When your patch introduces new functions, types, or classes, always add the required import/require at the top of each file. Do not reorder or reorganize existing imports — only add new ones for new symbols.
+- Implement each requirement precisely, in the minimum correct code that fully satisfies it. Do not pad for length — cursor_similarity = LCS / max(your_diff, reference_diff), so a surgical 80-line patch that matches 20 reference lines scores 0.25, while a padded 400-line patch matching the same 20 lines scores only 0.05. Write exactly what the fix requires, no more.
+- Important: the repository may have missing dependencies or incomplete imports. This is
+  expected — write all required code anyway. If imports fail, note the required package
+  and continue. Produce a complete, working implementation even in a partial codebase.
+  Do not let missing node_modules, broken pip packages, or failed test runners stop you.
+- If you have not made any edit by your 4th response, make one now — a partial fix is better than no output
+- After drafting your initial patch, ask: are there other files that import the changed symbol? Any index/barrel re-exports? Any type definitions that need updating? Any tests that test the function? If yes — patch those too.
+
 Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the diff.
-- If file snippets are already preloaded in the user prompt, edit those files
-  first. Do not re-read preloaded files.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
-- Avoid whitespace-only edits, comment-only edits, import reorders, type
-  annotation drive-bys, dead-code removal not asked for by the task, defensive
-  checks not asked for by the task, and any unrelated refactors.
-- Do not run broad test suites, full builds, or installs. A targeted
-  python -m py_compile / tsc --noEmit <file> / pytest <one file> is fine.
-- After a focused patch and at most one cheap verification or diff review,
-  finalize with <final>.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
+- If preloaded snippets identify the target, edit those files directly. Do NOT
+  re-read preloaded files.
+- When companion test files are preloaded alongside their source, update the
+  companion test in the SAME response if it is affected.
+- By your SECOND response you should usually be editing files.
+- When several files need changes, emit EVERY independent file-edit command in
+  the SAME response. Never split one patch across multiple turns.
+- A patch that covers the full affected surface scores higher than a minimal one. Missing files and missing propagation are the primary failure modes.
+- Match identifier and string tokens to (a) exact function/class/variable names named in the task description, and (b) identifiers already in the surrounding code. Use the precise names from the issue, not paraphrases.
+- Avoid whitespace-only edits, comment-only edits, blank-line shuffling, import
+  reorders, type annotation drive-bys, dead-code removal not asked for by the
+  task, defensive checks not asked for by the task, and unrelated refactors.
+- Within each file, generate hunks in top-to-bottom order: import additions first, then top-level declarations, then function/method bodies.
+- Use 4–8 lines of surrounding context per hunk (the standard git diff style). Do not include large blocks of unchanged code beyond what is needed for the diff to apply cleanly.
+- Do not dump generated, minified, binary, lock, or vendored files.
 - Do not use sudo. Do not delete the repository. Do not access secrets.
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - Avoid chmod/file mode changes.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+- Patch scope: write ONLY the lines needed to correctly implement the change. The
+  cursor similarity score penalizes unnecessary lines (both additions and context).
+  Surgical, minimal patches that fully solve the issue score highest. Do not pad
+  patches to meet an arbitrary line count.
+- Skip: never modify binary files, auto-generated files (*.lock, *.min.js, build/*),
+  or migration files unless the issue specifically mentions them.
+
+TypeScript imports: when adding a new function, component, or class to a TypeScript/TSX file:
+1. Add the import in every file that uses it — never leave an implicit or missing import.
+2. Check if the file is re-exported from an index.ts or barrel file — if so, add it there too.
+3. Use the exact same import style (named vs default, relative path format) as surrounding imports.
+Missing imports are the #1 TypeScript compilation error and cause the LLM judge to penalize the patch.
+
+Style matching: When editing TypeScript/JavaScript, match existing spacing, brace style,
+variable naming conventions, and CSS/tailwind class ordering exactly. The judge awards
+higher scores when the patch is indistinguishable from existing code style. Use
+surrounding code as the style reference — do not import your own conventions.
+
+Exact value matching: use the precise values from the issue description (colors,
+dimensions, strings, class names). Do not paraphrase or approximate. If the issue
+says "border-radius: 8px", use exactly that, not "0.5rem" or "rounded-lg".
+
+File ordering: the primary file (the one with the most changes) should appear first in
+your patch before auxiliary files. Within each file, use natural top-to-bottom order:
+imports first, then declarations, then function bodies. Do not reorder hunks within a file.
+
+## INTERLEAVE PROTOCOL
+Do not finish all your reading before writing. Interleave reads and edits:
+- Read 2-3 relevant files → make your first edit immediately
+- Read the next 2-3 files → edit again
+- Continue alternating until all required files are addressed
+
+Anti-stall trigger:
+- By your 4th response: if you have zero edits, make one now — any edit beats no edit
+- On tasks with multiple named files or multiple criteria: start editing after your second file read, not after reading everything
+- If you find yourself stuck reading, stop and edit the most likely file now
+
+Zero-output is the worst outcome. A partial fix is better than no fix.
 """
 
 
@@ -1041,9 +1324,11 @@ These files have already been read for you. Re-reading them burns the duel
 budget; patch them directly unless a needed detail is missing.
 """
 
-    return f"""We need fix this issue:
+    return f"""Fix this issue:
 
 {issue}
+
+IMPORTANT: Read the ENTIRE issue and identify every requirement before writing code. The LLM judge penalizes incomplete solutions.
 
 Repository summary:
 
@@ -1060,18 +1345,45 @@ not re-read preloaded files or run broad searches first. If the target is still
 unclear, run one or two focused search/snippet commands, then make the best
 focused patch you can. If multiple files need edits, include every independent
 file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+editing. After a patch exists, run the most targeted real functional test
+available (pytest tests/test_X.py -x -q, go test ./..., node test_file.js).
+A passing test is REQUIRED evidence of correctness. Only finalize without a
+test if no test file exists after searching. Then finish with <final>...</final>.
 """
 
 
 def build_self_check_prompt(patch: str, text: str) -> str:
+    # v18 S3: Upgraded with CORRECTNESS/COMPLETENESS/SCOPE structure.
+    # v19 C4: Added FEATURE CHECK, REMOVAL CHECK, REQUIREMENTS AUDIT sections.
+    # Requires functional test run if not already done (REQUIRED evidence).
     truncated = patch if len(patch) <= 4000 else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     return (
-        "Self-check pass. Review your draft patch for:\n"
-        "  - any acceptance criterion from the task NOT addressed\n"
-        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
-        "  - newly introduced bugs or syntax errors\n\n"
+        "Self-check pass. Review your patch carefully:\n\n"
+        "## CORRECTNESS AUDIT (highest LLM judge impact):\n"
+        "1. Re-read the issue. What is the EXACT expected output/behavior?\n"
+        "2. Trace through your code changes: do they produce that exact output?\n"
+        "3. Check all values, strings, numbers, and type names against the issue description exactly.\n"
+        "4. If any logic is unclear, run a targeted test to verify.\n"
+        "If you find a logic error, fix it now \u2014 wrong logic in the correct file scores 0 on the judge.\n\n"
+        "## FEATURE CHECK: If the issue adds new functionality, did you create ALL required\n"
+        "  files/routes/handlers/services? List each requirement and confirm it's implemented.\n"
+        "## REMOVAL CHECK: If the issue removes or deprecates something, is the old code\n"
+        "  actually removed (not just commented out)?\n"
+        "## REQUIREMENTS AUDIT: Re-read the original issue. List every explicit requirement.\n"
+        "  Confirm each one is addressed in the current patch. (LLM judge weight \u2014 high impact)\n\n"
+        "## CORRECTNESS: Does the patch correctly implement what the issue asks? Any wrong assumptions?\n"
+        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
+        "  - Are edge cases mentioned in the issue handled?\n"
+        "  - If you have not yet run a functional test, run "
+        "`pytest tests/test_<module>.py -x -q` or equivalent NOW. "
+        "A passing test is REQUIRED evidence of correctness.\n\n"
+        "## COMPLETENESS: Are ALL affected files patched? Any call sites, imports, or test files missed?\n"
+        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Are companion tests updated if source behaviour changed?\n\n"
+        "## SCOPE: Is the patch unnecessarily large (unrelated changes)? Remove any unrelated edits.\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No imports not needed for the fix\n"
+        "  - No refactoring beyond what the fix requires\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -1080,6 +1392,17 @@ def build_self_check_prompt(patch: str, text: str) -> str:
         "If something is wrong, in the SAME response emit corrective <command> "
         "blocks that fix only the listed issues, then end with <final>summary</final>. "
         "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+    )
+
+
+def build_polish_prompt(junk_summary: str) -> str:
+    return (
+        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
+        "Revert ONLY those hunks (use sed/cat/python to restore the original "
+        "lines). Do not add new edits, do not refactor, do not reorder imports, "
+        "do not touch unrelated lines. Then respond with <final>summary</final>. "
+        "If you cannot cleanly revert without breaking the substantive edits, "
+        "respond with <final>summary</final> immediately and keep the patch as-is."
     )
 
 
@@ -1096,9 +1419,22 @@ your command here
 
 
 def build_budget_pressure_prompt(step: int) -> str:
+    # v19 C3: added partial repo guidance (RC1 fix)
     if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+        return (
+            "Budget check: you have not changed the repo yet. Your next command should edit "
+            "the most likely file(s) directly. The repo may be an incomplete stub \u2014 that is "
+            "expected. Missing node_modules, missing imports, or broken tests do NOT mean you "
+            "should keep exploring. Write the complete implementation using what you know from "
+            "the issue and preloaded snippets. A partial edit scores higher than zero."
+        )
+    return (
+        "Hard budget check: there is still no patch. Your next command MUST produce code edits. "
+        "If the repo is incomplete or tests cannot run: do NOT spend more steps on setup. "
+        "Write the full implementation for every requirement in the issue using reasonable "
+        "assumptions for missing context. A complete-but-unrunnable patch ALWAYS beats no patch. "
+        "Use sed or python -c to edit files right now."
+    )
 
 
 def solve(
@@ -1122,9 +1458,10 @@ def solve(
     consecutive_no_command = 0
     polish_turns_used = 0
     self_check_turns_used = 0
-    syntax_fix_turns_used = 0
+    syntax_fix_turns_used = 0  # Change 3: track syntax fix turns
     start_time = time.time()
     step_durations: List[float] = []
+    _wall_start = time.monotonic()  # v18 F3: wall-clock guard
 
     try:
         repo = _repo_path(repo_path)
@@ -1133,26 +1470,100 @@ def solve(
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
+        # C5: Progressive output commitment — save non-empty patch at checkpoints
+        # to avoid zero-sim timeouts if the agent is cut off at WALL_STOP.
+        _defensive_patch: str = ""
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+        # v18 F1: maybe_queue_refinement — call before every AUTO_STOP/PATCH_READY exit.
+        # Returns True if a refinement turn was queued (outer loop continues),
+        # False if all refinements are exhausted (caller should finalize).
+        def maybe_queue_refinement(resp_text: str) -> bool:
+            nonlocal polish_turns_used, syntax_fix_turns_used, self_check_turns_used
+            current_patch = get_patch(repo)
+            if not current_patch.strip():
+                return False
+            # Polish check
+            junk = _diff_low_signal_summary(current_patch)
+            if junk and polish_turns_used < MAX_POLISH_TURNS:
+                polish_turns_used += 1
+                logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
+                messages.append({"role": "user", "content": build_polish_prompt(junk)})
+                return True
+            # Syntax fix check
+            if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                syntax_errors = _check_syntax(repo, current_patch)
+                if syntax_errors:
+                    syntax_fix_turns_used += 1
+                    logs.append("\nSYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors))
+                    messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_errors)})
+                    return True
+            # Self-check (guaranteed once per task)
+            if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+                self_check_turns_used += 1
+                logs.append("\nSELF_CHECK_TURN_QUEUED")
+                messages.append({"role": "user", "content": build_self_check_prompt(current_patch, issue)})
+                return True
+            return False
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+            # C5: Progressive output commitment — save patch at step 8 and 16 checkpoints
+            # so WALL_STOP has something to return even if later steps time out.
+            if step in (8, 16):
+                _checkpoint_patch = get_patch(repo)
+                if _checkpoint_patch.strip():
+                    _defensive_patch = _checkpoint_patch
+                    logs.append(f"\nCHECKPOINT_PATCH_SAVED (step {step}): {len(_defensive_patch)} chars")
+
+            # v18 F3: wall-clock guard — return partial patch before hard timeout
+            if time.monotonic() - _wall_start > 480:
+                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                # C5: use defensive patch if current state is empty
+                if not get_patch(repo).strip() and _defensive_patch:
+                    logs.append("\nUSING_DEFENSIVE_PATCH: restoring last non-empty checkpoint patch")
+                    # Apply the defensive patch by writing it out — restore via git apply
+                    try:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tf:
+                            tf.write(_defensive_patch)
+                            tf_path = tf.name
+                        subprocess.run(
+                            ['git', 'apply', '--whitespace=nowarn', tf_path],
+                            cwd=str(repo), capture_output=True, text=True, timeout=15
+                        )
+                        os.unlink(tf_path)
+                    except Exception as _e:
+                        logs.append(f"\nDEFENSIVE_PATCH_RESTORE_FAILED: {_e}")
+                break
+
+            # v18 F5: model retry — retry once after 3s on transient API failure
+            response_text = None
+            _model_last_exc = ""
+            for _model_attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    _model_last_exc = ""
+                    break
+                except Exception:
+                    _model_last_exc = traceback.format_exc()
+                    logs.append(f"MODEL_ERROR (attempt {_model_attempt + 1}/2):\n{_model_last_exc}")
+                    if _model_attempt == 0:
+                        time.sleep(3)
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1163,13 +1574,22 @@ def solve(
             if not commands:
                 if final is not None:
                     patch = get_patch(repo)
-                    junk = _diff_junk_summary(patch) if patch.strip() else ""
+                    junk = _diff_low_signal_summary(patch) if patch.strip() else ""
                     if junk and polish_turns_used < MAX_POLISH_TURNS:
                         polish_turns_used += 1
                         logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
                         messages.append({"role": "assistant", "content": response_text})
                         messages.append({"role": "user", "content": build_polish_prompt(junk)})
                         continue
+                    # Change 3: syntax check between polish and self-check
+                    if patch.strip() and syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                        syntax_errors = _check_syntax(repo, patch)
+                        if syntax_errors:
+                            syntax_fix_turns_used += 1
+                            logs.append("\nSYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors))
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_errors)})
+                            continue
                     if patch.strip() and self_check_turns_used < MAX_SELF_CHECK_TURNS:
                         self_check_turns_used += 1
                         logs.append("\nSELF_CHECK_TURN_QUEUED")
@@ -1196,6 +1616,7 @@ def solve(
             messages.append({"role": "assistant", "content": response_text})
             observations: List[str] = []
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
+            _refinement_queued = False  # v18 F1: set when maybe_queue_refinement fires
 
             for command_index, command in enumerate(command_batch, 1):
                 result = run_command(command, repo, timeout=command_timeout)
@@ -1205,11 +1626,18 @@ def solve(
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
+                    # v18 F1: try to queue a refinement turn before finalizing
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
+                        if maybe_queue_refinement(response_text):
+                            _refinement_queued = True
+                            break
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
                         break
                     if patch.strip() and result.timed_out:
+                        if maybe_queue_refinement(response_text):
+                            _refinement_queued = True
+                            break
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
@@ -1219,6 +1647,9 @@ def solve(
                         and _looks_like_patch_review_command(command, result)
                         and _patch_covers_required_paths(patch, issue)
                     ):
+                        if maybe_queue_refinement(response_text):
+                            _refinement_queued = True
+                            break
                         logs.append(
                             "\nPATCH_READY:\nPatch exists, covers issue-mentioned paths, "
                             "and latest command reviewed the diff/status."
@@ -1226,40 +1657,66 @@ def solve(
                         success = True
                         break
 
+            # v18 F1: if a refinement was queued, skip observation append and continue
+            if _refinement_queued:
+                if success:
+                    break
+                continue
+
             if len(commands) > len(command_batch):
                 observations.append(
                     f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
                     "Continue with one command at a time if more work remains."
                 )
 
+            # Change 3: syntax_fix_pending added alongside polish_pending/self_check_pending
             polish_pending = False
+            syntax_fix_pending = False
+            syntax_fix_errors_pending: List[str] = []
             self_check_pending = False
             if final is not None and get_patch(repo).strip():
                 patch_now = get_patch(repo)
-                junk = _diff_junk_summary(patch_now)
+                junk = _diff_low_signal_summary(patch_now)
                 if junk and polish_turns_used < MAX_POLISH_TURNS:
                     polish_pending = True
                     polish_turns_used += 1
                     logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
-                elif self_check_turns_used < MAX_SELF_CHECK_TURNS:
-                    self_check_pending = True
-                    self_check_turns_used += 1
-                    logs.append("\nSELF_CHECK_TURN_QUEUED")
                 else:
-                    logs.append("\nFINAL_SUMMARY:\n" + final)
-                    success = True
+                    # Syntax check between polish and self-check
+                    if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                        s_errs = _check_syntax(repo, patch_now)
+                        if s_errs:
+                            syntax_fix_pending = True
+                            syntax_fix_errors_pending = s_errs
+                            syntax_fix_turns_used += 1
+                            logs.append("\nSYNTAX_FIX_QUEUED:\n  " + "\n  ".join(s_errs))
+                    if not syntax_fix_pending and self_check_turns_used < MAX_SELF_CHECK_TURNS:
+                        self_check_pending = True
+                        self_check_turns_used += 1
+                        logs.append("\nSELF_CHECK_TURN_QUEUED")
+                    elif not syntax_fix_pending:
+                        logs.append("\nFINAL_SUMMARY:\n" + final)
+                        success = True
 
             if observations:
                 observation_text = "\n\n".join(observations)
                 if polish_pending:
-                    observation_text += "\n\n" + build_polish_prompt(_diff_junk_summary(get_patch(repo)))
+                    observation_text += "\n\n" + build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))
+                elif syntax_fix_pending:
+                    observation_text += "\n\n" + build_syntax_fix_prompt(syntax_fix_errors_pending)
                 elif self_check_pending:
                     observation_text += "\n\n" + build_self_check_prompt(get_patch(repo), issue)
                 elif not success and get_patch(repo).strip():
                     observation_text += (
-                        "\n\nPatch now exists. If more edits are needed, send every "
-                        "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "\n\nPatch now exists. Next steps (all in ONE response):\n"
+                        "1. Any remaining file edits or companion test updates.\n"
+                        "2. Run the most targeted functional test available "
+                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, `node test_file.js`, etc.) "
+                        "to verify correctness \u2014 the LLM judge rewards passing tests.\n"
+                        "3. Emit <final>summary</final>.\n"
+                        "Strongly preferred: after patching, run the most targeted test available "
+                        "(`pytest -k test_name`, `python test_file.py`, `node test.js`). "
+                        "A passing test proves correctness and significantly improves the judge score."
                     )
                 elif not success:
                     observation_text += (
@@ -1268,7 +1725,9 @@ def solve(
                     )
                 messages.append({"role": "user", "content": observation_text})
             elif polish_pending:
-                messages.append({"role": "user", "content": build_polish_prompt(_diff_junk_summary(get_patch(repo)))})
+                messages.append({"role": "user", "content": build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))})
+            elif syntax_fix_pending:
+                messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_fix_errors_pending)})
             elif self_check_pending:
                 messages.append({"role": "user", "content": build_self_check_prompt(get_patch(repo), issue)})
 
