@@ -646,7 +646,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    # Fallback budget for lower-ranked files (ranks 3+)
     per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
@@ -1046,8 +1045,7 @@ Discipline:
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes.
-"""
+- Avoid chmod/file mode changes."""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
