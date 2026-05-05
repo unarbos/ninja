@@ -287,15 +287,38 @@ def chat_completion(
 
     req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Model request failed: {e}") from e
+    # Retry transient 429/5xx with backoff so a single network blip mid-solve
+    # does not waste the whole budget. Validator-side budget_exceeded 429s are
+    # hard-failed since retries cannot recover from those.
+    max_attempts = 3
+    last_error: Optional[Exception] = None
+    data: Optional[Dict[str, Any]] = None
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+            last_error = None
+            break
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if e.code == 429 and "budget_exceeded" in err_body:
+                raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                time.sleep(min(8.0, 1.5 ** attempt))
+                last_error = e
+                continue
+            raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_attempts - 1:
+                time.sleep(min(8.0, 1.5 ** attempt))
+                last_error = e
+                continue
+            raise RuntimeError(f"Model request failed: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}") from e
+    if data is None:
+        raise RuntimeError(f"Model request failed after {max_attempts} retries: {last_error}")
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
