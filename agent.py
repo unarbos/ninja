@@ -1046,11 +1046,12 @@ Discipline:
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - Avoid chmod/file mode changes.
-## ZERO OUTPUT PREVENTION
-- If you have made 2+ responses with no edits, your NEXT action MUST be an edit — not a read, not a search
-- Use `sed -i` for targeted replacements or `python3 -c "..."` for small changes
-- Any edit beats zero: if unsure, make the minimal one-line change to the most likely file
-- Multiple criteria = multiple files: address all of them before finalizing"""
+## TASK PRIORITY ORDER
+1. Fulfill ALL acceptance criteria from the issue — this is the primary objective
+2. Find and edit ALL files the task explicitly names or implies — second
+3. Keep the patch minimal — third (but never at the cost of #1 or #2)
+4. Never finish without at least one edit — any edit beats empty output
+5. If unsure which file to edit first, pick the one most directly named in the issue"""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
