@@ -1161,6 +1161,13 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
+# -----------------------------
+# Prompting
+# -----------------------------
+
+# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
+# agent. Prompt improvements are encouraged as long as they respect the
+# validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
 Your goal is to produce a unified diff that fixes the issue and is easy to
@@ -1387,6 +1394,14 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+# -----------------------------
+# Main agent
+# -----------------------------
+
+# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
+# agent. You may change planning, memory, context collection, repair behavior,
+# test strategy, and stopping criteria. Preserve the solve() signature and
+# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -1730,6 +1745,13 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+# -----------------------------
+# CLI for local testing
+# -----------------------------
+
+# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
+# CLI to make local experiments easier, but do not rely on CLI-only behavior for
+# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
