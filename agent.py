@@ -63,19 +63,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# -----------------------------
-# Config
-# -----------------------------
-
-# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; the
-# validator proxy overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
-# validator wiring. During real validation the validator passes model, api_base,
-# and api_key into solve(). Keep this code compatible with that path.
+
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -96,9 +87,8 @@ MAX_PRELOADED_CONTEXT_CHARS = 12000
 MAX_PRELOADED_FILES = 4
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+MAX_POLISH_TURNS = 1
 
-# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
-# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -115,10 +105,6 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
-
-# -----------------------------
-# Data structures
-# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -148,10 +134,6 @@ class AgentResult:
             "success": self.success,
         }
 
-
-# -----------------------------
-# Utility
-# -----------------------------
 
 _MAX_LINE_LENGTH = 500
 
@@ -272,14 +254,6 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
-# -----------------------------
-# OpenAI-compatible client
-# -----------------------------
-
-# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
-# behavior, response parsing, or model-message strategy here. Keep all requests
-# pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model and sampling parameters server-side.
 _RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 _MAX_API_RETRIES = 3
 
@@ -346,14 +320,6 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
-# Shell execution
-# -----------------------------
-
-# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
-# repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
 _HEAVY_CMD_RE = re.compile(
     r"\b(?:pip\s+install|npm\s+install|npm\s+ci|yarn\s+install|yarn\s+add|"
     r"pnpm\s+install|pnpm\s+add|apt-get|brew\s+install|cargo\s+build|"
@@ -487,10 +453,6 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
-
 _THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
@@ -548,10 +510,6 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
-
-# -----------------------------
-# Git helpers
-# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -722,6 +680,64 @@ def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
     return all(_line_is_comment(line) for line in body)
 
 
+def _diff_junk_summary(patch: str) -> str:
+    if not patch.strip():
+        return ""
+    notes: List[str] = []
+    current_file = "?"
+    current_added: List[str] = []
+    current_removed: List[str] = []
+
+    def flush() -> None:
+        if not current_added and not current_removed:
+            return
+        if _hunk_is_blank_only(current_added, current_removed):
+            notes.append(f"{current_file}: blank-line-only hunk")
+            return
+        if _hunk_is_whitespace_only(current_added, current_removed):
+            notes.append(f"{current_file}: whitespace-only hunk")
+            return
+        if _hunk_is_comment_only(current_added, current_removed):
+            notes.append(f"{current_file}: comment-only hunk")
+            return
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            current_added, current_removed = [], []
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+        elif line.startswith("@@"):
+            flush()
+            current_added, current_removed = [], []
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            current_removed.append(line[1:])
+
+    flush()
+    seen: set = set()
+    deduped: List[str] = []
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "; ".join(deduped[:10])
+
+
+def build_polish_prompt(junk_summary: str) -> str:
+    return (
+        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
+        "Revert ONLY those hunks (use sed/cat/python to restore the original "
+        "lines). Do not add new edits, do not refactor, do not reorder imports, "
+        "do not touch unrelated lines. Then respond with <final>summary</final>. "
+        "If you cannot cleanly revert without breaking the substantive edits, "
+        "respond with <final>summary</final> immediately and keep the patch as-is."
+    )
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     if path.suffix == ".pyc":
@@ -840,6 +856,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+
     terms = _issue_terms(issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -851,6 +869,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
+        if relative_path in symbol_hits:
+            score += 60 + min(40, 8 * symbol_hits[relative_path])
         if path_lower in issue_lower:
             score += 35
         if name_lower and name_lower in issue_lower:
@@ -949,6 +969,86 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
+_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})(?![A-Za-z0-9_])")
+_SYMBOL_STOP = {
+    "about", "after", "alert", "argument", "before", "build", "called", "change", "check",
+    "class", "code", "command", "config", "context", "default", "expect", "expected",
+    "fail", "false", "field", "fields", "file", "files", "fixed", "function",
+    "given", "global", "hash", "header", "headers", "import",
+    "method", "module", "needed", "needs", "object", "params", "parse", "path",
+    "patch", "production", "project", "property", "public", "remove", "reset",
+    "return", "should", "static", "string", "support", "test", "tests", "their",
+    "there", "thing", "this", "true", "type", "types", "update", "using",
+    "value", "values", "when", "with", "will", "without", "write",
+}
+
+
+def _extract_issue_symbols(text: str) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for match in _SYMBOL_RE.finditer(text):
+        token = match.group(1)
+        lowered = token.lower()
+        if lowered in _SYMBOL_STOP:
+            continue
+        if not (any(c.isupper() for c in token[1:]) or "_" in token):
+            if len(token) < 6:
+                continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _symbol_grep_hits(repo: Path, tracked_set: set, text: str) -> Dict[str, int]:
+    symbols = _extract_issue_symbols(text)
+    if not symbols:
+        return {}
+    hits: Dict[str, int] = {}
+    for symbol in symbols:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", symbol],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 1
+    return hits
+
+
+def _patch_changed_files(patch: str) -> List[str]:
+    seen: List[str] = []
+    for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
+        path = match.group(2)
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def _patch_covers_required_paths(patch: str, text: str) -> bool:
+    required = _extract_issue_path_mentions(text)
+    if not required:
+        return True
+    changed = set(_patch_changed_files(patch))
+    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
+
+
 def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
@@ -965,13 +1065,6 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
-# -----------------------------
-# Prompting
-# -----------------------------
-
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
 SYSTEM_PROMPT = """You are an expert coding agent running inside a repository. You fix issues by editing files.
 
 You have a tight wall-clock budget. Make a useful patch quickly — do not exhaustively explore.
@@ -1128,10 +1221,6 @@ def build_budget_pressure_prompt(step: int, max_steps: int) -> str:
     return ""
 
 
-# -----------------------------
-# Edge-case detection helpers
-# -----------------------------
-
 _READ_ONLY_CMD_RE = re.compile(
     r"^\s*(?:cat|head|tail|less|more|grep|rg|ag|ack|find|fd|ls|tree|wc|file|stat|"
     r"git\s+(?:log|show|diff|status|ls-files|blame)|pwd|echo|type|which|"
@@ -1155,14 +1244,6 @@ def _normalize_command_for_dedup(command: str) -> str:
     return re.sub(r"\s+", " ", command.strip().lower())
 
 
-# -----------------------------
-# Main agent
-# -----------------------------
-
-# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
-# agent. You may change planning, memory, context collection, repair behavior,
-# test strategy, and stopping criteria. Preserve the solve() signature and
-# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -1184,6 +1265,7 @@ def solve(
     consecutive_no_command = 0
     recent_commands: List[str] = []
     consecutive_read_only = 0
+    polish_turns_used = 0
 
     try:
         repo = _repo_path(repo_path)
@@ -1237,6 +1319,13 @@ def solve(
                 if final is not None:
                     patch = get_patch(repo)
                     if patch.strip():
+                        junk = _diff_junk_summary(patch)
+                        if junk and polish_turns_used < MAX_POLISH_TURNS:
+                            polish_turns_used += 1
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_polish_prompt(junk)})
+                            logs.append(f"\nPOLISH_TURN:\n{junk}")
+                            continue
                         logs.append("\nFINAL_SUMMARY:\n" + final)
                         success = True
                         break
@@ -1296,7 +1385,11 @@ def solve(
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
-                    if patch.strip() and _looks_like_successful_test_output(observation, command):
+                    if (
+                        patch.strip()
+                        and _looks_like_successful_test_output(observation, command)
+                        and _patch_covers_required_paths(patch, issue)
+                    ):
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
                         break
@@ -1316,8 +1409,14 @@ def solve(
                 )
 
             if final is not None and get_patch(repo).strip():
-                logs.append("\nFINAL_SUMMARY:\n" + final)
-                success = True
+                junk = _diff_junk_summary(get_patch(repo))
+                if junk and polish_turns_used < MAX_POLISH_TURNS:
+                    polish_turns_used += 1
+                    messages.append({"role": "user", "content": build_polish_prompt(junk)})
+                    logs.append(f"\nPOLISH_TURN:\n{junk}")
+                else:
+                    logs.append("\nFINAL_SUMMARY:\n" + final)
+                    success = True
 
             if observations:
                 observation_text = "\n\n".join(observations)
@@ -1471,13 +1570,6 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-# -----------------------------
-# CLI for local testing
-# -----------------------------
-
-# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
-# CLI to make local experiments easier, but do not rely on CLI-only behavior for
-# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
