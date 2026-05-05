@@ -55,6 +55,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -513,8 +514,10 @@ def apply_unified_diff(diff_text: str, repo: Path) -> PatchApplyResult:
 
     # Normalize trailing newline — `git apply` is picky.
     body = diff_text if diff_text.endswith("\n") else diff_text + "\n"
-    diff_path = repo / ".pilot_pending.diff"
-    diff_path.write_text(body, encoding="utf-8")
+    # Write to temp file outside the repo to avoid showing up in git status
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False, encoding="utf-8") as f:
+        f.write(body)
+        diff_path = Path(f.name)
 
     flags_to_try = [
         ["--whitespace=fix"],
@@ -546,7 +549,7 @@ def apply_unified_diff(diff_text: str, repo: Path) -> PatchApplyResult:
         )
         if proc.returncode == 0:
             try:
-                diff_path.unlink()
+                os.unlink(str(diff_path))
             except Exception:
                 pass
             files_touched = sum(1 for line in body.splitlines() if line.startswith("diff --git "))
@@ -562,7 +565,7 @@ def apply_unified_diff(diff_text: str, repo: Path) -> PatchApplyResult:
         last_error = proc.stderr.strip() or proc.stdout.strip()
 
     try:
-        diff_path.unlink()
+        os.unlink(str(diff_path))
     except Exception:
         pass
     return PatchApplyResult(succeeded=False, method="rejected", error=last_error[:600])
@@ -973,7 +976,7 @@ def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
     return not body and bool(added or removed)
 
 
-def _diff_junk_summary(patch: str) -> str:
+def _diff_low_signal_summary(patch: str) -> str:
     if not patch.strip():
         return ""
     notes: List[str] = []
@@ -1421,7 +1424,7 @@ def solve(
 
                 # If <final> was emitted alongside the patch and we have a real diff, accept.
                 if final is not None and get_patch(repo).strip():
-                    junk = _diff_junk_summary(get_patch(repo))
+                    junk = _diff_low_signal_summary(get_patch(repo))
                     if junk and polish_turns_used < MAX_POLISH_TURNS:
                         polish_turns_used += 1
                         logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
@@ -1438,7 +1441,7 @@ def solve(
             if not commands:
                 if final is not None:
                     patch = get_patch(repo)
-                    junk = _diff_junk_summary(patch) if patch.strip() else ""
+                    junk = _diff_low_signal_summary(patch) if patch.strip() else ""
                     if junk and polish_turns_used < MAX_POLISH_TURNS:
                         polish_turns_used += 1
                         logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
@@ -1511,7 +1514,7 @@ def solve(
             self_check_pending = False
             if final is not None and get_patch(repo).strip():
                 patch_now = get_patch(repo)
-                junk = _diff_junk_summary(patch_now)
+                junk = _diff_low_signal_summary(patch_now)
                 if junk and polish_turns_used < MAX_POLISH_TURNS:
                     polish_pending = True
                     polish_turns_used += 1
