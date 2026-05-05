@@ -513,6 +513,9 @@ Rules:
 - Work directly in the repository.
 - Prefer small, targeted changes.
 - Inspect files before editing them.
+- After each edit, confirm it landed by running `git diff --stat <file>`; if the diff is empty, re-read the file and retry with the exact byte-for-byte original snippet.
+- For edits, prefer `python3 -c "..."` with an `assert OLD in s` guard so a missed pattern raises instead of silently no-opping; `sed -i` is fine for trivial single-token swaps; reserve heredocs for rewriting short whole files and use a unique delimiter.
+- Do not discard your own work: avoid `git checkout -- <path>`, `git restore`, `git reset --hard`, `git clean`, or `git stash`. If an edit is wrong, fix it forward with another targeted edit.
 - Run relevant tests when possible.
 - Do not use sudo.
 - Do not delete the repository.
@@ -538,13 +541,46 @@ Start by inspecting the relevant files. Then edit the repo and run tests.
 
 
 def build_no_command_repair_prompt() -> str:
-    return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
+    return """Your previous response did not contain a <command>...</command> or <final>...</final> block.
 
-Continue by issuing exactly one bash command in this format:
+Please continue by issuing exactly one bash command:
 
 <command>
 your command here
 </command>
+
+If the patch is already complete, emit instead:
+
+<final>
+short summary of what you changed
+</final>
+"""
+
+
+def build_destructive_revert_repair_prompt(file_hint: str = "") -> str:
+    target = f" ({file_hint})" if file_hint else ""
+    return f"""Your last command was a destructive git operation (checkout/restore/reset/clean/stash){target}, which discards edits already made in this session.
+
+Please re-apply the change with a forward edit instead, for example:
+
+<command>
+python3 -c "import pathlib; p=pathlib.Path('FILE'); s=p.read_text(); assert 'OLD' in s, 'not found'; p.write_text(s.replace('OLD','NEW'))"
+</command>
+
+If 'not found' fires, re-read the file (`sed -n '1,80p' FILE`) and copy the exact original snippet into OLD.
+"""
+
+
+def build_repeated_heredoc_failure_prompt() -> str:
+    return """Your last heredoc commands failed (parse error, unterminated, or empty diff).
+
+Please switch to a one-liner edit:
+
+<command>
+python3 -c "import pathlib; p=pathlib.Path('FILE'); s=p.read_text(); assert 'OLD' in s, 'not found'; p.write_text(s.replace('OLD','NEW'))"
+</command>
+
+Use single quotes outside and escape internal single quotes as '\\''. For multi-line snippets use literal \\n inside the Python string, or split the change into 2-3 separate one-liners.
 """
 
 
@@ -586,6 +622,9 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary)},
         ]
 
+        inspection_only_streak = 0
+        heredoc_fail_streak = 0
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -626,10 +665,35 @@ def solve(
             messages.append({"role": "assistant", "content": response_text})
             messages.append({"role": "user", "content": observation})
 
+            if "<<" in command:
+                obs_lower = observation.lower()
+                heredoc_failed = (
+                    "exit_code:\n0" not in observation
+                    or "syntaxerror" in obs_lower
+                    or "indentationerror" in obs_lower
+                    or "unterminated" in obs_lower
+                )
+                heredoc_fail_streak = heredoc_fail_streak + 1 if heredoc_failed else 0
+            else:
+                heredoc_fail_streak = 0
+
+            if heredoc_fail_streak >= 2:
+                messages.append({"role": "user", "content": build_repeated_heredoc_failure_prompt()})
+                heredoc_fail_streak = 0
+
+            if _is_write_command(command):
+                inspection_only_streak = 0
+            else:
+                inspection_only_streak += 1
+
             if step >= 6:
                 patch = get_patch(repo)
                 if patch.strip() and _looks_like_successful_test_output(observation):
                     logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
+                    success = True
+                    break
+                if patch.strip() and inspection_only_streak >= 3:
+                    logs.append("\nAUTO_STOP:\nPatch exists, last 3 turns were inspection-only.")
                     success = True
                     break
 
@@ -661,35 +725,58 @@ def solve(
         ).to_dict()
 
 
+_WRITE_RE = re.compile(
+    r"(^|[\s;&|])(sed\s+-i|tee\s|>>?\s|patch\s|cp\s|mv\s|rm\s|"
+    r"git\s+(apply|checkout|reset|restore|mv|rm)|"
+    r"python\s+-c\s.*open\(.+['\"][wa])"
+)
+
+
+def _is_write_command(command: str) -> bool:
+    if not command:
+        return False
+    cmd = command.strip()
+    if cmd.startswith(("cat ", "ls ", "grep ", "find ", "head ", "tail ",
+                       "wc ", "diff ", "git diff", "git log", "git status", "git show")):
+        return False
+    return bool(_WRITE_RE.search(cmd))
+
+
 def _looks_like_successful_test_output(observation: str) -> bool:
-    lower = observation.lower()
+    """Return True only when output is clearly from a real test runner that passed."""
+    if not observation or len(observation) < 8:
+        return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-        "exit_code:\n1",
-        "exit_code:\n2",
-        "exit_code:\n124",
+    bad_patterns = [
+        r"\bFAIL(ED|URE|URES)?\b",
+        r"\bERROR(S)?\b",
+        r"\bTraceback\b",
+        r"\bAssertionError\b",
+        r"\bSyntaxError\b",
+        r"\bException\b",
+        r"exit_code:\s*\n?\s*[1-9]\d*",
+        r"\b\d+\s+failed\b",
+        r"\b\d+\s+error(s)?\b",
     ]
+    for pat in bad_patterns:
+        if re.search(pat, observation):
+            return False
 
-    good_markers = [
-        " passed",
-        " all passed",
-        " exit_code:\n0",
-        "ok",
-        "success",
+    good_patterns = [
+        r"={3,}[^\n=]*\b\d+\s+passed[^\n=]*={3,}",
+        r"Ran\s+\d+\s+tests?\s+in\s+[\d.]+s\s*\n+OK\b",
+        r"(?m)^ok\s+\S+/\S+\s+[\d.]+s",
+        r"(?m)^PASS\s*$",
+        r"\bTests?:\s+\d+\s+passed\b",
+        r"\b\d+\s+passing\b",
+        r"test result:\s*ok\.\s*\d+\s+passed",
+        r"\bAll\s+\d+\s+tests?\s+passed\b",
     ]
+    for pat in good_patterns:
+        if re.search(pat, observation):
+            return True
 
-    has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-
-    return has_good and not has_bad
+    return False
 
 
 # -----------------------------
