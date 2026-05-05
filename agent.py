@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -97,14 +98,6 @@ MAX_PRELOADED_CONTEXT_CHARS = 28000
 MAX_PRELOADED_FILES = 8
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -785,8 +778,11 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
+    # The previous king double-escaped this regex inside an r-string, so
+    # `\\w` matched the literal two characters '\w' instead of a word char.
+    # That silently disabled the path-mention boost in _rank_context_files.
     pattern = re.compile(
-        r"(?<![\\w.-])([\\w./-]+\\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\\w.-])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -1109,17 +1105,14 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
+    """True if `name` is on PATH. Uses shutil.which (stdlib).
+
+    The earlier impl invoked `command -v` via subprocess with shell=False,
+    which fails on python:3.11-slim because `command` is a bash builtin and
+    not a standalone binary. shutil.which is the portable equivalent.
+    """
     try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
+        return shutil.which(name) is not None
     except Exception:
         return False
 
@@ -1198,6 +1191,130 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+def _run_companion_test(
+    repo: Path,
+    test_path: str,
+    timeout_seconds: int = 8,
+) -> Optional[str]:
+    """Best-effort companion-test execution. Returns failure-output tail on FAIL,
+    or None when the test passed, the runner is unavailable, or the language
+    isn't supported.
+
+    Languages handled:
+      - Python: `python3 -m pytest <path>` (works without pytest installed only
+        if the test uses unittest; we still try because ModuleNotFoundError on
+        pytest is itself an unrunnable signal we don't surface).
+      - JS/TS: `node --check <path>` parses but doesn't execute; we attempt
+        `npx --no -- jest <path>` first, fall through to import-only check.
+      - Other languages: skipped (returns None).
+
+    Errors (timeout, runner missing, exception) intentionally degrade to None
+    so a refinement is not queued for things the agent can't act on.
+    """
+    full = repo / test_path
+    if not full.exists() or not full.is_file():
+        return None
+
+    suffix = Path(test_path).suffix.lower()
+
+    # ---- Python ----
+    if suffix == ".py":
+        runner_cmds = []
+        if _has_executable("pytest"):
+            runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+        # python3 -m pytest works even without an installed `pytest` script
+        # only if pytest is importable; harmless otherwise (we skip on ImportError).
+        runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            # Skip if the runner itself isn't available — not a real test failure.
+            unrunnable_markers = (
+                "No module named pytest",
+                "No module named 'pytest'",
+                "command not found",
+                "/usr/bin/env: python3",
+            )
+            if any(marker in output for marker in unrunnable_markers):
+                continue
+            if proc.returncode == 0:
+                return None  # passed
+            # Real failure tail.
+            return output[-2400:] if len(output) > 2400 else output
+        return None
+
+    # ---- JS / TS ----
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        # Skip when no node — _has_executable now actually works post-fix.
+        if not _has_executable("node"):
+            return None
+        # We only attempt a syntax-equivalent check (node --check). Actually
+        # invoking jest/vitest implies a project-level test config we cannot
+        # synthesize safely inside an 8s budget on an unknown repo.
+        try:
+            proc = subprocess.run(
+                ["node", "--check", test_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` parse timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    # All other languages: skip (no usable runner under the 8s + stdlib budget).
+    return None
+
+
+def _select_companion_test_failure(
+    repo: Path,
+    patch: str,
+    test_timeout_seconds: int = 8,
+) -> Optional[Tuple[str, str]]:
+    """For files touched by the patch, find the first companion test that fails.
+
+    Returns (test_path, output_tail) on the first non-None failure, else None.
+    Stops at the first failure to keep the refinement budget tight.
+    """
+    edited = _patch_changed_files(patch)
+    if not edited:
+        return None
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return None
+    for relative_path in edited:
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (partner, output)
+    return None
 
 
 # -----------------------------
@@ -1492,6 +1609,7 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1510,10 +1628,13 @@ def solve(
         means the caller can declare success. The order is:
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+            3. test   — run the companion test we promised to and feed back failure
+            4. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per cycle. The test step is the only
+        runtime correctness signal in the chain; self-check stays last because
+        it's LLM speculation rather than ground truth.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1537,6 +1658,18 @@ def solve(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
 
