@@ -90,7 +90,6 @@ MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 MAX_POLISH_TURNS = 1
 MAX_SELF_CHECK_TURNS = 0   # disabled — v2 data showed it causes over-editing
-MAX_SYNTAX_FIX_TURNS = 1
 MAX_PATCH_BLOCK_BYTES = 64000  # cap on a single <patch> block; rejects pathological inputs
 
 
@@ -1369,7 +1368,6 @@ def solve(
     consecutive_no_command = 0
     polish_turns_used = 0
     self_check_turns_used = 0
-    syntax_fix_turns_used = 0
     start_time = time.time()
     step_durations: List[float] = []
 
