@@ -1385,21 +1385,34 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+        _wall_start = time.monotonic()
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+            if time.monotonic() - _wall_start > 480:
+                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                break
+
+            response_text = None
+            for _attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception:
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
+                    if _attempt == 0:
+                        time.sleep(3)
+
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
