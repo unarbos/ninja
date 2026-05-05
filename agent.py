@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -886,6 +887,164 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+def _patch_signature(repo: Path) -> str:
+    p = get_patch(repo)
+    return hashlib.sha1(p.encode("utf-8", errors="replace")).hexdigest() if p else ""
+
+
+def _chat_with_retry(
+    *,
+    messages: List[Dict[str, str]],
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    attempts: int = 2,
+) -> Optional[str]:
+    last_response: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response, _, _ = chat_completion(
+                messages=_messages_for_request(messages),
+                model=model_name, api_base=api_base, api_key=api_key,
+                max_tokens=max_tokens,
+            )
+            if response and response.strip():
+                return response
+            last_response = response
+        except Exception:
+            last_response = None
+            if attempt < attempts:
+                time.sleep(1)
+    return last_response
+
+
+def _run_critique_revise(
+    *,
+    repo: Path,
+    messages: List[Dict[str, str]],
+    issue: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    max_tokens: int,
+    command_timeout: int,
+    logs: List[str],
+    max_revise_steps: int = 4,
+) -> None:
+    initial_patch = get_patch(repo)
+    if not initial_patch.strip():
+        return
+    critique_prompt = (
+        "Self-critique gate. Below is the unified diff you produced for the "
+        "issue.\n\n```diff\n" + _truncate(initial_patch, 8000) + "\n```\n\n"
+        "Issue recap:\n" + _truncate(issue, 4000) + "\n\n"
+        "Audit the diff against the issue. For each item you flag, quote the "
+        "specific line of the diff that is wrong and say what it should be. "
+        "List any: (1) bugs introduced, (2) acceptance criteria from the "
+        "issue not addressed, (3) missing edge-case handling, (4) unrelated "
+        "churn that should be removed. Be concrete and short. If the diff "
+        "fully and minimally addresses the issue with no defects, respond "
+        "with exactly: DONE"
+    )
+    messages.append({"role": "user", "content": critique_prompt})
+    response = _chat_with_retry(
+        messages=messages, model_name=model_name,
+        api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+    )
+    if response is None:
+        return
+    logs.append("\n\n===== CRITIQUE =====\n" + response)
+    messages.append({"role": "assistant", "content": response})
+    head_token = response.strip().splitlines()[0].strip().upper() if response.strip() else ""
+    if head_token == "DONE" or response.strip()[:4].upper() == "DONE":
+        return
+    revise_prompt = (
+        "Now revise the patch to fix every issue you listed. Issue the "
+        "necessary file edits as <command>...</command> blocks. Group "
+        "independent edits into a single response. Keep changes minimal and "
+        "scoped to the issue. End with <final>summary</final> when done."
+    )
+    messages.append({"role": "user", "content": revise_prompt})
+    last_sig = _patch_signature(repo)
+    no_progress_streak = 0
+    did_revise = False
+    for revise_step in range(1, max_revise_steps + 1):
+        logs.append(f"\n\n===== REVISE STEP {revise_step} =====\n")
+        response = _chat_with_retry(
+            messages=messages, model_name=model_name,
+            api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+        )
+        if response is None:
+            return
+        logs.append("MODEL_RESPONSE:\n" + response)
+        commands = extract_commands(response)
+        final = extract_final(response)
+        messages.append({"role": "assistant", "content": response})
+        if not commands:
+            if final is not None:
+                logs.append("\nREVISE_FINAL:\n" + final)
+            break
+        observations: List[str] = []
+        for i, cmd in enumerate(commands[:MAX_COMMANDS_PER_RESPONSE], 1):
+            r = run_command(cmd, repo, timeout=command_timeout)
+            obs = format_observation(r)
+            observations.append(f"OBSERVATION {i}/{len(commands)}:\n{obs}")
+            logs.append(f"\nOBSERVATION {i}/{len(commands)}:\n{obs}")
+        if observations:
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+        new_sig = _patch_signature(repo)
+        if new_sig != last_sig:
+            did_revise = True
+            last_sig = new_sig
+            no_progress_streak = 0
+        else:
+            no_progress_streak += 1
+            if no_progress_streak >= 2:
+                logs.append("\nREVISE_NO_PROGRESS:\nPatch unchanged for 2 revise steps; stopping.")
+                return
+        if final is not None and get_patch(repo).strip():
+            break
+    if did_revise:
+        second_critique = (
+            "Second-pass audit on the revised diff:\n\n```diff\n"
+            + _truncate(get_patch(repo), 8000) + "\n```\n\n"
+            "Confirm every issue from the first critique is now resolved. If "
+            "anything still remains, output the EXACT remaining issue in one "
+            "sentence and the EXACT file path and edit to apply. If nothing "
+            "remains, respond with exactly: DONE"
+        )
+        messages.append({"role": "user", "content": second_critique})
+        response = _chat_with_retry(
+            messages=messages, model_name=model_name,
+            api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+        )
+        if response is None:
+            return
+        logs.append("\n\n===== SECOND_CRITIQUE =====\n" + response)
+        messages.append({"role": "assistant", "content": response})
+        if response.strip()[:4].upper() == "DONE":
+            return
+        messages.append({"role": "user", "content": (
+            "Apply the remaining fix you described as one or more "
+            "<command>...</command> blocks now, then end with <final>summary"
+            "</final>."
+        )})
+        response = _chat_with_retry(
+            messages=messages, model_name=model_name,
+            api_base=api_base, api_key=api_key, max_tokens=max_tokens,
+        )
+        if response is None:
+            return
+        logs.append("\n\n===== FINAL_REVISE =====\n" + response)
+        messages.append({"role": "assistant", "content": response})
+        commands = extract_commands(response)
+        for i, cmd in enumerate(commands[:MAX_COMMANDS_PER_RESPONSE], 1):
+            r = run_command(cmd, repo, timeout=command_timeout)
+            obs = format_observation(r)
+            logs.append(f"\nOBSERVATION {i}/{len(commands)}:\n{obs}")
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1023,6 +1182,22 @@ def solve(
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        patch = get_patch(repo)
+        if patch.strip():
+            try:
+                _run_critique_revise(
+                    repo=repo,
+                    messages=messages,
+                    issue=issue,
+                    model_name=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                    command_timeout=command_timeout,
+                    logs=logs,
+                )
+            except Exception:
+                logs.append("CRITIQUE_REVISE_ERROR:\n" + traceback.format_exc())
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
