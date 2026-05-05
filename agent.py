@@ -70,7 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
 # validator proxy owns temperature/top-p/etc. and overwrites them server-side.
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "20"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -87,13 +87,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CHARS", "12000"))
-MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
+MAX_CONVERSATION_CHARS = 80000
+MAX_PRELOADED_CONTEXT_CHARS = 20000
+MAX_PRELOADED_FILES = 6
 MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
 MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
 
@@ -550,8 +550,8 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 
 def get_repo_summary(repo: Path) -> str:
     commands = [
-        "pwd",
-        "git ls-files | awk 'NR<=220 {print} END {if (NR>220) print \"... \" NR-220 \" more tracked files\"}'",
+        "pwd && echo '---' && git log --oneline -5 2>/dev/null | head -5 || true",
+        "git ls-files | awk 'NR<=80 {print} END {if (NR>80) print \"...\" NR-80 \" more tracked files\"}'",
         "git status --short || true",
     ]
 
@@ -630,7 +630,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -660,6 +660,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             mentioned.append(normalized)
 
     terms = _issue_terms(issue)
+    identifiers = _issue_identifiers(issue)
+    content_scores = _content_grep_scores(repo, terms + identifiers)
+
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -679,6 +682,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
+        score += content_scores.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -691,6 +695,31 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         seen.add(relative_path)
         ranked.append(relative_path)
     return ranked
+
+
+def _content_grep_scores(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """Score files by whether their contents contain key issue terms."""
+    key_terms = [t for t in terms if len(t) >= 4][:14]
+    if not key_terms:
+        return {}
+    pattern = "|".join(re.escape(t) for t in key_terms)
+    try:
+        proc = subprocess.run(
+            ["grep", "-ril", "-E", "--", pattern, "."],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=6,
+        )
+    except Exception:
+        return {}
+    scores: Dict[str, int] = {}
+    for line in proc.stdout.splitlines():
+        path = line.strip().lstrip("./")
+        if path and _context_file_allowed(path):
+            scores[path] = 12
+    return scores
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -768,6 +797,32 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
+def _issue_identifiers(issue: str) -> List[str]:
+    """Extract likely code identifiers (camelCase, snake_case, backtick-quoted) from issue."""
+    found: List[str] = []
+    seen: set[str] = set()
+
+    for m in re.finditer(r"`([^`\n]{2,60})`", issue):
+        word = m.group(1).strip()
+        if word and word not in seen and len(word) >= 3:
+            found.append(word)
+            seen.add(word)
+
+    for m in re.finditer(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+){1,})\b", issue):
+        word = m.group(1)
+        if word not in seen and len(word) >= 4:
+            found.append(word)
+            seen.add(word)
+
+    for m in re.finditer(r"\b([A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)\b", issue):
+        word = m.group(1)
+        if word not in seen and len(word) >= 4:
+            found.append(word)
+            seen.add(word)
+
+    return found[:15]
+
+
 def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
@@ -791,49 +846,53 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+SYSTEM_PROMPT = """You are a precise code-patching agent running inside a task repository.
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+SCORING (understand this to maximize round wins):
+- 50% of your score is token-level similarity to the reference patch. The biggest
+  factors are: which tokens you add (25%), where you make changes (22%), which
+  original lines you remove (17%), and edit shape (11%). Every unnecessary changed
+  line directly lowers this score. Minimal, targeted changes win.
+- 50% is an LLM judge scoring correctness, completeness, and task alignment.
+  Unrelated churn, empty patches, and timeouts are penalized heavily.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+WORKFLOW — aim for 2-4 steps total:
+1. LOCATE the exact code to change. Use:
+     grep -n "symbol_or_term" path/to/file.py
+     cat -n path/to/file.py | head -60
+     grep -rn "term" --include="*.py" .
+   Skip this if the preloaded snippets already show the target.
+2. EDIT using precise python3 or sed. Preferred approaches:
+     python3 << 'EOF'
+     with open('file.py') as f: code = f.read()
+     code = code.replace('exact old text', 'exact new text')
+     with open('file.py', 'w') as f: f.write(code)
+     EOF
+   or for simple single-line changes:
+     sed -i 's/old_pattern/new_pattern/' file.py
+3. VERIFY with `git diff` if you are unsure the edit is correct.
+4. FINALIZE with <final>brief summary</final>.
 
+Command format:
 <command>
-your bash command here
+bash command here
 </command>
 
-When you are finished, respond with:
-
+Finish format:
 <final>
-short summary of what you changed
+brief summary of what changed
 </final>
 
-Rules:
-- Work directly in the repository.
-- Prefer small, targeted changes.
-- If relevant file snippets are already in the prompt, edit those files first;
-  do not spend a turn re-reading them.
-- If the target is not clear, run one or two focused search/snippet commands,
-  then edit. Avoid broad inspection loops.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit all independent file-edit commands in
-  the same response. Do not split one planned patch into one file per turn.
-- Avoid dumping huge generated, minified, binary, lock, or vendored files.
-- Make edits as soon as the relevant code is clear.
-- Run the cheapest relevant verification you can. Prefer syntax/type/unit checks
-  for touched files over full installs, full builds, or broad test suites.
-- If dependencies are missing or a verification command is slow, keep the patch
-  and finish instead of spending the whole budget.
-- After a focused patch and one useful verification or diff review, finalize.
-- Do not use sudo.
-- Do not delete the repository.
-- Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
-- Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes and unrelated formatting churn.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+CRITICAL RULES — violations directly lower your score:
+- Change ONLY the lines the task requires. No cleanup, reformatting, or refactoring.
+- Match existing code style exactly: indentation, quote style, trailing commas, spacing.
+- Do NOT add comments, docstrings, or type annotations unless the task explicitly requires them.
+- Do NOT reorder imports, rename anything, or fix unrelated issues.
+- Do NOT run tests, linters, builds, or package installs.
+- Emit ALL file edits in a SINGLE response — never split across turns.
+- Once your patch exists and looks correct, output <final> immediately.
+- Prefer reading only the relevant section of a file, not the whole file.
+- Never use sudo or destructive host commands.
 """
 
 
@@ -841,30 +900,26 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets:
+Preloaded relevant file snippets (already read — do NOT re-read unless a critical detail is missing):
 
 {preloaded_context}
 
-These files have already been read for you. Re-reading them burns the duel
-budget; patch them directly unless a needed detail is missing.
+If these snippets show the exact target code, EDIT IN YOUR FIRST RESPONSE.
+Do not re-read or re-explore these files.
 """
 
-    return f"""We need fix this issue:
-
+    return f"""TASK:
 {issue}
 
-Repository summary:
-
+REPOSITORY:
 {repo_summary}
 {context_section}
-
-If the preloaded snippets identify the target code, start by editing them. Do
-not re-read preloaded files or run broad searches first. If the target is still
-unclear, run one or two focused search/snippet commands, then make the best
-focused patch you can. If multiple files need edits, include every independent
-file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+Instructions:
+- If the preloaded snippets identify the exact code to change → edit immediately.
+- Otherwise → run 1-2 targeted grep/cat commands to locate the target, then edit.
+- Emit ALL required file edits in a SINGLE response.
+- Use python3 or sed for edits; match the existing code style exactly.
+- After editing, output <final>summary</final> to complete.
 """
 
 
@@ -881,9 +936,17 @@ your command here
 
 
 def build_budget_pressure_prompt(step: int) -> str:
-    if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+    if step <= 3:
+        return (
+            f"Budget alert: no patch yet after {step} steps. "
+            "Your NEXT command must edit the most likely file(s) based on the issue "
+            "and any observed snippets. Do not run more exploration commands — edit now."
+        )
+    return (
+        "Hard budget stop: a patch must exist NOW. "
+        "Write the minimal best-effort change for the clearest task requirement. "
+        "Do not explore further — make the edit and output <final>...</final>."
+    )
 
 
 # -----------------------------
@@ -977,7 +1040,7 @@ def solve(
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                if step >= 2 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
@@ -987,7 +1050,7 @@ def solve(
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
+                    if patch.strip() and step >= 3 and _looks_like_patch_review_command(command, result):
                         logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
                         success = True
                         break
@@ -1004,11 +1067,12 @@ def solve(
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                patch_now = get_patch(repo)
+                if not success and patch_now.strip():
                     observation_text += (
                         "\n\nPatch now exists. If more edits are needed, send every "
                         "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "Otherwise output <final>summary</final> immediately."
                     )
                 elif not success:
                     observation_text += (
@@ -1020,7 +1084,7 @@ def solve(
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
