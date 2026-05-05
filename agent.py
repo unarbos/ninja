@@ -102,6 +102,23 @@ MAX_SELF_CHECK_TURNS = 0   # disabled — v2 data showed it causes over-editing
 MAX_SYNTAX_FIX_TURNS = 1
 MAX_PATCH_BLOCK_BYTES = 64000  # cap on a single <patch> block; rejects pathological inputs
 
+# Forker note — features removed in this revision and the tradeoff:
+#   * Multi-language post-edit syntax gate (py_compile / tsc / node --check
+#     loop with up to MAX_SYNTAX_FIX_TURNS repair turns).
+#   * Companion-test partner augmentation in build_preloaded_context (each
+#     ranked source file pulled its sibling test file into preload).
+# Why removed: when edits arrive as a single <patch> block, `git apply --check`
+# already surfaces structural problems before the diff lands, and the
+# diff-style feedback in _format_diff_style_observation pushes back on
+# over-editing. Both helpers were aimed at the multi-step sed/cat regime that
+# the <patch> path largely replaces.
+# When to restore: if you reintroduce sed/cat-driven editing, or you observe
+# patches that apply cleanly but break compile/parse on the validator side,
+# put the syntax gate back. If preloaded context is missing the tests that the
+# bug actually exercises, restore the partner augmentation. The
+# MAX_SYNTAX_FIX_TURNS knob is intentionally kept so the gate can be wired
+# back in without churning Config.
+
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1251,34 +1268,22 @@ them. Each of these is a common reviewer complaint: extra surface area to
 diff-review, often introduces unrelated regressions, and pollutes git blame
 with changes unrelated to the bug. Keep your patch to the bug at hand:
 
-  ❌ A new docstring on the function you fixed ("now handles X")
-     — review burden, easy to leave inconsistent with future edits
-  ❌ A new # comment above your change explaining what you did
-     — git history already explains; comment rots
-  ❌ A type annotation added because you noticed it was missing
-     — separate concern; do it in its own PR
   ❌ Renaming a variable because the old name bothered you
-     — unrelated to the bug; fragments diff
-  ❌ Reformatting a line that was technically over 80 cols
-     — formatter's job, not the bug fix's
-  ❌ Reorganizing imports
-     — separate concern; muddies blame
+     — unrelated refactor; fragments the diff and risks breaking callers
+  ❌ A type annotation added because you noticed it was missing
+     — separate concern; an incorrect annotation can introduce a real bug
   ❌ Adding a defensive `if x is None: raise` not asked for
-     — speculative; might mask real bugs
-  ❌ Removing a TODO comment unrelated to the bug
-     — drive-by edit; do it separately
-  ❌ Trailing-comma additions in dict/list literals
-     — formatter's job
-  ❌ Converting `'` to `"` (or vice versa) for "consistency"
-     — formatter's job; not a bug
+     — speculative; can mask the real bug or change observable behavior
   ❌ Adding logging calls or print debugging
-     — leftovers from local debugging; clean before commit
+     — debugging leftovers; can leak data and changes program output
+  ❌ Removing a TODO comment unrelated to the bug
+     — drive-by edit; do it in its own change
   ❌ Updating a CHANGELOG you weren't asked to update
      — release notes are a separate workflow
 
 If you find yourself wanting to add any of these, STOP. They're separate
-concerns from the bug fix. Each one ADDS review burden and risks
-introducing new bugs in code that wasn't asked to change.
+concerns from the bug fix and each one risks introducing regressions in
+code that wasn't asked to change.
 
 Discipline:
 - Edit preloaded files first; do not re-read them.
