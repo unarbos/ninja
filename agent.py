@@ -1148,7 +1148,7 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
 # LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
 # CLI to make local experiments easier, but do not rely on CLI-only behavior for
 # validation.
-def _parse_args(argv: List[str]) -> Dict[str, Any]:
+def _parse_args(argv: List[str]) -> Dict[str, Any]: 
     import argparse
 
     parser = argparse.ArgumentParser(description="Run portable single-file coding agent.")
