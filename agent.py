@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Portable single-file SWE-style coding agent harness.
+Portable single-file SWE-style coding agent harness..
 
 Contract:
     The validator imports this file and calls:
