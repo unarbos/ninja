@@ -182,3 +182,6 @@ The validator separately compares king and challenger patches for copy detection
 When a PR challenger becomes king, the validator merges that PR into
 `unarbos/ninja:main`; future miners branch from that new base harness. Validator
 weights are assigned to the winning hotkey on the next allowed weight-set epoch.
+
+
+!!!
