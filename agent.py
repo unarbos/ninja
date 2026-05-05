@@ -87,7 +87,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -556,18 +556,6 @@ def extract_final(model_text: str) -> Optional[str]:
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
     if git_dir.exists():
-        subprocess.run(
-            "git checkout -- . >/dev/null 2>&1; "
-            "git clean -fd >/dev/null 2>&1; "
-            "git reset HEAD >/dev/null 2>&1 || true",
-            cwd=str(repo),
-            shell=True,
-            executable="/bin/bash",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-        )
         return
 
     subprocess.run(
@@ -625,7 +613,8 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(diff_output)
+    return _strip_junk_hunks_per_file(cleaned)
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -655,6 +644,82 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_junk_hunks_per_file(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
+            out.append(block)
+            continue
+        parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = parts[0]
+        hunks = [chunk for chunk in parts[1:] if chunk]
+        substantive: List[str] = []
+        for hunk_text in hunks:
+            added: List[str] = []
+            removed: List[str] = []
+            for line in hunk_text.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    added.append(line[1:])
+                elif line.startswith("-") and not line.startswith("---"):
+                    removed.append(line[1:])
+            if (
+                _hunk_is_blank_only(added, removed)
+                or _hunk_is_whitespace_only(added, removed)
+                or _hunk_is_comment_only(added, removed)
+            ):
+                continue
+            substantive.append(hunk_text)
+        out.append(header + "".join(substantive) if substantive else block)
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+_COMMENT_LINE_PREFIXES = ("#", "//", ";", "--", "%")
+_BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
+
+
+def _line_is_comment(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if any(stripped.startswith(p) for p in _COMMENT_LINE_PREFIXES):
+        return True
+    if _BLOCK_COMMENT_RE.match(line):
+        return True
+    if stripped.startswith('"""') or stripped.startswith("'''"):
+        return True
+    return False
+
+
+def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    return not body and bool(added or removed)
+
+
+def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
+    if not added and not removed:
+        return False
+    a = sorted(s.strip() for s in added if s.strip())
+    r = sorted(s.strip() for s in removed if s.strip())
+    if not a and not r:
+        return True
+    return a == r
+
+
+def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    if not body:
+        return False
+    return all(_line_is_comment(line) for line in body)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
