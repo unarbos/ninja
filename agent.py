@@ -96,6 +96,7 @@ MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CH
 MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
 MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
 MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
+MAX_PATCH_SNIPPET_CHARS = int(os.environ.get("AGENT_MAX_PATCH_SNIPPET_CHARS", "9000"))
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -113,6 +114,12 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
+    # Avoid direct network egress from the sandboxed agent; inference must go through api_base.
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bnc\b",
+    r"\bnetcat\b",
+    r"\btelnet\b",
 ]
 
 
@@ -623,8 +630,8 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
-    files = _rank_context_files(repo, issue)
+def build_preloaded_context(repo: Path, issue: str, issue_terms: Optional[List[str]] = None) -> str:
+    files = _rank_context_files(repo, issue, issue_terms=issue_terms)
     if not files:
         return ""
 
@@ -645,7 +652,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, issue: str, issue_terms: Optional[List[str]] = None) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
@@ -659,7 +666,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    terms = _issue_terms(issue)
+    terms = issue_terms if issue_terms is not None else _issue_terms(issue)
+    content_hits = _grep_ranked_files(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -679,6 +687,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
+        if relative_path in content_hits:
+            score += 60 + min(30, 3 * content_hits[relative_path])
         if score > 0:
             scored.append((score, relative_path))
 
@@ -708,6 +718,46 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _grep_ranked_files(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """
+    Lightweight content-based ranking using git grep across tracked files.
+    Returns a {relative_path: hit_count} dict for files that match any top terms.
+    """
+    if not terms:
+        return {}
+
+    top_terms = [t for t in terms[:10] if len(t) >= 3]
+    if not top_terms:
+        return {}
+
+    hits: Dict[str, int] = {}
+    # Use -F for literal matching; -- to avoid treating terms as paths.
+    for term in top_terms[:6]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1,
+            )
+        except Exception:
+            continue
+
+        if proc.returncode not in (0, 1):  # 1 means "no matches"
+            continue
+
+        for line in (proc.stdout or "").splitlines()[:250]:
+            # Format: path:line:content
+            path = line.split(":", 1)[0].strip()
+            if not path or not _context_file_allowed(path):
+                continue
+            hits[path] = hits.get(path, 0) + 1
+
+    return hits
 
 
 def _context_file_allowed(relative_path: str) -> bool:
@@ -768,6 +818,77 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
+def _issue_terms_llm(
+    issue: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    timeout: int = 120,
+) -> List[str]:
+    """
+    Extract search keywords from the issue using the validator-managed OpenAI-compatible endpoint.
+
+    This is intended to run once per solve() and feed better terms into context ranking/search.
+    It falls back to _issue_terms() on any failure.
+    """
+    issue = (issue or "").strip()
+    if not issue:
+        return []
+
+    system = (
+        "Extract search keywords from software issue descriptions.\n"
+        "Return ONLY valid JSON: an array of strings.\n"
+        "Each string should be a short keyword or key phrase (1-4 words) suitable for `git grep`.\n"
+        "Include identifiers, function/class names, filenames, error messages, and domain terms.\n"
+        "Prefer many useful keywords over few. Avoid duplicates."
+    )
+    user = f"Issue:\n{issue}\n\nJSON array of keywords:"
+
+    try:
+        text, _cost, _raw = chat_completion(
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=256,
+            timeout=timeout,
+        )
+    except Exception:
+        return _issue_terms(issue)
+
+    try:
+        data = json.loads((text or "").strip())
+    except Exception:
+        return _issue_terms(issue)
+
+    if not isinstance(data, list):
+        return _issue_terms(issue)
+
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, str):
+            continue
+        value = re.sub(r"\s+", " ", item.strip().strip("\"'`")).lower()
+        if not value:
+            continue
+        if len(value) > 60:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+
+    # Add heuristic terms as a backstop.
+    for t in _issue_terms(issue):
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            cleaned.append(tl)
+
+    return cleaned[:60]
+
+
 def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
@@ -812,6 +933,7 @@ short summary of what you changed
 Rules:
 - Work directly in the repository.
 - Prefer small, targeted changes.
+- If you reach the midpoint of your step budget and there is still no patch, STOP exploring and make the smallest plausible code edit that addresses the issue. Do not spend more steps on inspection without creating a diff.
 - If relevant file snippets are already in the prompt, edit those files first;
   do not spend a turn re-reading them.
 - If the target is not clear, run one or two focused search/snippet commands,
@@ -886,6 +1008,96 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+def build_search_phase_prompt(repo: Path, issue: str, issue_terms: Optional[List[str]] = None) -> str:
+    suggested = _suggest_search_commands(repo, issue, issue_terms=issue_terms)
+    hint = "\n".join(f"- {cmd}" for cmd in suggested) if suggested else "- git grep -n \"<keyword>\" -- ."
+    return f"""Context is unclear. Before editing, run 1–2 focused search/snippet commands to find the right file(s), then edit.
+
+Suggested commands:
+{hint}
+
+Rules:
+- Keep it focused (no broad directory dumps).
+- Prefer `git grep`/`rg`/`ls` and narrow `sed -n 'start,endp' file` snippets.
+"""
+
+
+def _suggest_search_commands(repo: Path, issue: str, issue_terms: Optional[List[str]] = None) -> List[str]:
+    terms = issue_terms if issue_terms is not None else _issue_terms(issue)
+    if not terms:
+        return []
+    # Prefer the most distinctive terms first.
+    top = [t for t in terms if len(t) >= 4][:3]
+    if not top:
+        top = [terms[0]]
+    quoted = [t.replace('"', "") for t in top]
+    cmds: List[str] = []
+    for t in quoted[:2]:
+        cmds.append(f'git grep -n "{t}" -- . | head -n 50')
+    cmds.append("git status --short && git diff --stat")
+    return cmds[:3]
+
+
+def build_patch_reflection_prompt(patch: str, issue: str) -> str:
+    snippet = _truncate(patch, MAX_PATCH_SNIPPET_CHARS)
+    return f"""Current patch (truncated if large):
+
+```diff
+{snippet}
+```
+
+Check: does this fully resolve the issue below? If not, refine the patch. Prefer the smallest targeted changes and avoid unrelated refactors.
+
+Issue:
+{issue}
+"""
+
+
+def _patch_touches_relevant_files(issue: str, patch: str) -> bool:
+    """
+    Heuristic guard against premature finishing: require the patch to touch either
+    an explicitly mentioned path or a file whose name/stem appears in the issue.
+    """
+    if not patch.strip():
+        return False
+    changed_files = set(re.findall(r"(?m)^\+\+\+ b/(.+)$", patch))
+    if not changed_files:
+        changed_files = set(re.findall(r"(?m)^diff --git a/.+ b/(.+)$", patch))
+
+    mentioned = {m.strip("./") for m in _extract_issue_path_mentions(issue)}
+    if mentioned and any(f in mentioned for f in changed_files):
+        return True
+
+    issue_lower = issue.lower()
+    for f in changed_files:
+        name = Path(f).name.lower()
+        stem = Path(f).stem.lower()
+        if name and name in issue_lower:
+            return True
+        if stem and len(stem) >= 4 and stem in issue_lower:
+            return True
+    return False
+
+
+def _suggest_verification_command(repo: Path, patch: str) -> str:
+    """
+    Cheap, best-effort verification suggestion based on changed file extensions.
+    This does not run verification automatically; it guides the model.
+    """
+    changed = set(re.findall(r"(?m)^\+\+\+ b/(.+)$", patch))
+    exts = {Path(p).suffix.lower() for p in changed}
+
+    if ".py" in exts:
+        return "python -m py_compile $(git ls-files '*.py')"
+    if exts & {".js", ".jsx", ".ts", ".tsx"}:
+        return "npm test --if-present || npm run build --if-present || true"
+    if ".go" in exts:
+        return "go test ./..."
+    if ".rs" in exts:
+        return "cargo test"
+    return "git diff --stat && git diff"
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -913,21 +1125,39 @@ def solve(
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
+    verification_ran_ok = False
 
     try:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        issue_terms = _issue_terms_llm(issue, model=model_name, api_base=api_base, api_key=api_key)
+        preloaded_context = build_preloaded_context(repo, issue, issue_terms=issue_terms)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
+        if not preloaded_context.strip():
+            messages.append({"role": "user", "content": build_search_phase_prompt(repo, issue, issue_terms=issue_terms)})
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+            # Mid-budget enforcement: if there's still no diff halfway through, force an edit now.
+            if step == max(2, max_steps // 2) and not get_patch(repo).strip():
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Mid-budget check: there is still NO patch.\n\n"
+                            "Your next response MUST create a diff by editing the most likely file(s) now. "
+                            "Do not run more than 1 focused search command before editing. "
+                            "Make the smallest plausible change that addresses the issue.\n\n"
+                            "Reply with one or more <command>...</command> blocks that perform the edits."
+                        ),
+                    }
+                )
 
             try:
                 response_text, cost, _raw = chat_completion(
@@ -976,6 +1206,8 @@ def solve(
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                if _looks_like_verification_command(command) and result.exit_code == 0:
+                    verification_ran_ok = True
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -991,6 +1223,8 @@ def solve(
                         logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
                         success = True
                         break
+                    if patch.strip():
+                        messages.append({"role": "user", "content": build_patch_reflection_prompt(patch, issue)})
 
             if len(commands) > len(command_batch):
                 observations.append(
@@ -999,8 +1233,22 @@ def solve(
                 )
 
             if final is not None and get_patch(repo).strip():
-                logs.append("\nFINAL_SUMMARY:\n" + final)
-                success = True
+                patch = get_patch(repo)
+                if verification_ran_ok or _patch_touches_relevant_files(issue, patch):
+                    logs.append("\nFINAL_SUMMARY:\n" + final)
+                    success = True
+                else:
+                    cmd = _suggest_verification_command(repo, patch)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You attempted to finish, but the patch may not target the issue clearly and no successful verification was observed.\n\n"
+                                f"Run one cheap verification (suggested):\n\n<command>\n{cmd}\n</command>\n\n"
+                                "Then, if needed, refine the patch and finish with <final>...</final>."
+                            ),
+                        }
+                    )
 
             if observations:
                 observation_text = "\n\n".join(observations)
