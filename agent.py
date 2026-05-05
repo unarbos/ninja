@@ -100,11 +100,11 @@ MAX_COMMANDS_PER_RESPONSE = 12
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
-HTTP_MAX_RETRIES = int(os.environ.get("AGENT_HTTP_MAX_RETRIES", "3"))
-HTTP_RETRY_BASE_BACKOFF = float(os.environ.get("AGENT_HTTP_RETRY_BACKOFF", "1.0"))
-MAX_STEP_RETRIES = int(os.environ.get("AGENT_MAX_STEP_RETRIES", "2"))
-WALL_CLOCK_BUDGET_SECONDS = float(os.environ.get("AGENT_WALL_CLOCK_BUDGET_SECONDS", "540"))
-WALL_CLOCK_RESERVE_SECONDS = float(os.environ.get("AGENT_WALL_CLOCK_RESERVE_SECONDS", "20"))
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_BASE_BACKOFF = 1
+MAX_STEP_RETRIES = 2
+WALL_CLOCK_BUDGET_SECONDS = 540
+WALL_CLOCK_RESERVE_SECONDS = 20
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
