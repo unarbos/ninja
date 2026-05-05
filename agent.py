@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -62,20 +63,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+__version__ = "1.2.0"
 
-# -----------------------------
-# Config
-# -----------------------------
 
-# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; the
-# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
-# validator wiring. During real validation the validator passes model, api_base,
-# and api_key into solve(). Keep this code compatible with that path.
+
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -87,18 +81,22 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CHARS", "12000"))
-MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
-MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
-MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
+MAX_POLISH_TURNS = 1
+MAX_SELF_CHECK_TURNS = 1
+MAX_SYNTAX_FIX_TURNS = 1
+MAX_TEST_FIX_TURNS = 1
+SYNTAX_CHECK_TIMEOUT = 8
 
-# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
-# weaken it to run destructive host/container operations.
+
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -115,10 +113,6 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
-
-# -----------------------------
-# Data structures
-# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -148,10 +142,6 @@ class AgentResult:
             "success": self.success,
         }
 
-
-# -----------------------------
-# Utility
-# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -250,14 +240,6 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
-# -----------------------------
-# OpenAI-compatible client
-# -----------------------------
-
-# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
-# behavior, response parsing, or model-message strategy here. Keep all requests
-# pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -265,10 +247,11 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
+    max_retries: int = 2,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """
-    Minimal OpenAI-compatible /v1/chat/completions client using urllib.
-    """
+    """OpenAI-compatible /v1/chat/completions client. Retries with exponential
+    backoff on transient transport failures (timeouts, connection errors,
+    HTTP 5xx). One transient flake should not lose the entire round."""
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
@@ -285,17 +268,33 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+    data: Optional[Dict[str, Any]] = None
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+            break
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if 500 <= e.code < 600 and attempt < max_retries:
+                last_error = e
+                time.sleep(min(8.0, 2.0 ** attempt))
+                continue
+            raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            if attempt < max_retries:
+                last_error = e
+                time.sleep(min(8.0, 2.0 ** attempt))
+                continue
+            raise RuntimeError(f"Model request failed: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}") from e
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Model request failed: {e}") from e
+    if data is None:
+        raise RuntimeError(f"Model request failed after retries: {last_error}")
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
@@ -307,14 +306,6 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
-# Shell execution
-# -----------------------------
-
-# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
-# repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -421,10 +412,6 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
-
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -444,10 +431,6 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
-
-# -----------------------------
-# Git helpers
-# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -509,7 +492,45 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(diff_output)
+    return _strip_low_signal_hunks(cleaned)
+
+
+def _strip_low_signal_hunks(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
+            out.append(block)
+            continue
+        parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = parts[0]
+        hunks = [chunk for chunk in parts[1:] if chunk]
+        substantive: List[str] = []
+        for hunk_text in hunks:
+            added: List[str] = []
+            removed: List[str] = []
+            for line in hunk_text.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    added.append(line[1:])
+                elif line.startswith("-") and not line.startswith("---"):
+                    removed.append(line[1:])
+            if (
+                _hunk_is_blank_only(added, removed)
+                or _hunk_is_whitespace_only(added, removed)
+                or _hunk_is_comment_only(added, removed)
+            ):
+                continue
+            substantive.append(hunk_text)
+        out.append(header + "".join(substantive) if substantive else block)
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -659,6 +680,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+
     terms = _issue_terms(issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -670,6 +693,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
+        if relative_path in symbol_hits:
+            score += 60 + min(40, 8 * symbol_hits[relative_path])
         if path_lower in issue_lower:
             score += 35
         if name_lower and name_lower in issue_lower:
@@ -690,7 +715,361 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             continue
         seen.add(relative_path)
         ranked.append(relative_path)
-    return ranked
+    return _augment_with_test_partners(ranked, tracked_set)
+
+
+_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})(?![A-Za-z0-9_])")
+_SYMBOL_STOP = {
+    "about", "after", "alert", "argument", "before", "build", "called", "change", "check",
+    "class", "code", "command", "config", "context", "default", "expect", "expected",
+    "fail", "false", "field", "fields", "file", "files", "fixed", "function",
+    "given", "global", "hash", "header", "headers", "import",
+    "method", "module", "needed", "needs", "object", "params", "parse", "path",
+    "patch", "production", "project", "property", "public", "remove", "reset",
+    "return", "should", "static", "string", "support", "test", "tests", "their",
+    "there", "thing", "this", "true", "type", "types", "update", "using",
+    "value", "values", "when", "with", "will", "without", "write",
+}
+
+
+def _extract_issue_symbols(text: str) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for match in _SYMBOL_RE.finditer(text):
+        token = match.group(1)
+        lowered = token.lower()
+        if lowered in _SYMBOL_STOP:
+            continue
+        if not (any(c.isupper() for c in token[1:]) or "_" in token):
+            if len(token) < 6:
+                continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= 12:
+            break
+    return out
+
+
+def _symbol_grep_hits(repo: Path, tracked_set: set, text: str) -> Dict[str, int]:
+    symbols = _extract_issue_symbols(text)
+    if not symbols:
+        return {}
+    hits: Dict[str, int] = {}
+    for symbol in symbols:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", symbol],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 1
+    return hits
+
+
+_TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
+    ("{stem}.py",  "tests/test_{stem}.py"),
+    ("{stem}.py",  "test_{stem}.py"),
+    ("{stem}.py",  "{dir}/test_{stem}.py"),
+    ("{stem}.py",  "{dir}/tests/test_{stem}.py"),
+    ("{stem}.py",  "tests/{stem}_test.py"),
+    ("{stem}.ts",  "{dir}/{stem}.test.ts"),
+    ("{stem}.ts",  "{dir}/__tests__/{stem}.test.ts"),
+    ("{stem}.ts",  "tests/{stem}.test.ts"),
+    ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
+    ("{stem}.js",  "{dir}/{stem}.test.js"),
+    ("{stem}.js",  "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
+    ("{stem}.go",  "{dir}/{stem}_test.go"),
+    ("{stem}.rs",  "{dir}/{stem}_test.rs"),
+    ("{stem}.rb",  "spec/{stem}_spec.rb"),
+)
+
+
+def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
+    path = Path(relative_path)
+    name_lower = path.name.lower()
+    if "test" in name_lower or "spec" in name_lower:
+        return None
+    stem = path.stem
+    suffix = path.suffix
+    if not stem or not suffix:
+        return None
+    parent = str(path.parent) if str(path.parent) not in {".", ""} else ""
+    for source_template, test_template in _TEST_PARTNER_TEMPLATES:
+        if not source_template.endswith(suffix):
+            continue
+        candidate = test_template.format(stem=stem, dir=parent).lstrip("/")
+        candidate = str(Path(candidate))
+        if candidate in tracked and _context_file_allowed(candidate):
+            return candidate
+    return None
+
+
+def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
+    if not tracked:
+        return files
+    augmented: List[str] = []
+    seen: set = set()
+    for relative_path in files:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+        partner = _find_test_partner(relative_path, tracked)
+        if partner and partner not in seen:
+            augmented.append(partner)
+            seen.add(partner)
+    return augmented
+
+
+def _patch_changed_files(patch: str) -> List[str]:
+    seen: List[str] = []
+    for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
+        path = match.group(2)
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def _patch_covers_required_paths(patch: str, text: str) -> bool:
+    required = _extract_issue_path_mentions(text)
+    if not required:
+        return True
+    changed = set(_patch_changed_files(patch))
+    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
+
+
+_COMMENT_LINE_PREFIXES = ("#", "//", ";", "--", "%")
+_BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
+
+
+def _line_is_comment(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if any(stripped.startswith(p) for p in _COMMENT_LINE_PREFIXES):
+        return True
+    if _BLOCK_COMMENT_RE.match(line):
+        return True
+    if stripped.startswith('"""') or stripped.startswith("'''"):
+        return True
+    return False
+
+
+def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
+    if not added and not removed:
+        return False
+    a = sorted(s.strip() for s in added if s.strip())
+    r = sorted(s.strip() for s in removed if s.strip())
+    if not a and not r:
+        return True
+    return a == r
+
+
+def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    if not body:
+        return False
+    return all(_line_is_comment(line) for line in body)
+
+
+def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
+    body = [line for line in added + removed if line.strip()]
+    return not body and bool(added or removed)
+
+
+def _diff_low_signal_summary(patch: str) -> str:
+    if not patch.strip():
+        return ""
+    notes: List[str] = []
+    current_file = "?"
+    current_added: List[str] = []
+    current_removed: List[str] = []
+
+    def flush() -> None:
+        if not current_added and not current_removed:
+            return
+        if _hunk_is_blank_only(current_added, current_removed):
+            notes.append(f"{current_file}: blank-line-only hunk")
+            return
+        if _hunk_is_whitespace_only(current_added, current_removed):
+            notes.append(f"{current_file}: whitespace-only hunk")
+            return
+        if _hunk_is_comment_only(current_added, current_removed):
+            notes.append(f"{current_file}: comment-only hunk")
+            return
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            current_added, current_removed = [], []
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+        elif line.startswith("@@"):
+            flush()
+            current_added, current_removed = [], []
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            current_removed.append(line[1:])
+
+    flush()
+    seen: set = set()
+    deduped: List[str] = []
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "; ".join(deduped[:10])
+
+
+def _has_executable(name: str) -> bool:
+    import shutil as _shutil
+    return _shutil.which(name) is not None
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    try:
+        import ast as _ast
+        _ast.parse(source)
+        return None
+    except SyntaxError as exc:
+        return f"{relative_path}:{exc.lineno}: {exc.msg}"
+    except Exception as exc:
+        return f"{relative_path}: parse failure: {exc}"
+
+
+def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    if not _has_executable("node"):
+        return None
+    proc = subprocess.run(
+        ["node", "--check", relative_path],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=SYNTAX_CHECK_TIMEOUT,
+    )
+    if proc.returncode == 0:
+        return None
+    body = (proc.stderr or proc.stdout or "").strip().splitlines()
+    msg = body[-1] if body else "node --check failed"
+    return f"{relative_path}: {msg}"
+
+
+def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        json.loads(full.read_text(encoding="utf-8", errors="replace"))
+        return None
+    except json.JSONDecodeError as exc:
+        return f"{relative_path}:{exc.lineno}: {exc.msg}"
+    except Exception as exc:
+        return f"{relative_path}: parse failure: {exc}"
+
+
+def _check_syntax(repo: Path, patch: str) -> List[str]:
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        result: Optional[str] = None
+        if suffix == ".py":
+            result = _check_python_syntax_one(repo, relative_path)
+        elif suffix in {".js", ".mjs", ".cjs"}:
+            result = _check_node_syntax_one(repo, relative_path)
+        elif suffix == ".json":
+            result = _check_json_syntax_one(repo, relative_path)
+        if result:
+            errors.append(result)
+    return errors
+
+
+def build_polish_prompt(junk_summary: str) -> str:
+    return (
+        f"Cleanup pass. Your draft contains hunks that hurt diff quality:\n  {junk_summary}\n\n"
+        "Revert ONLY those hunks (use sed/cat/python to restore the original "
+        "lines). Do not add new edits, do not refactor, do not reorder imports, "
+        "do not touch unrelated lines. Then respond with <final>summary</final>. "
+        "If you cannot cleanly revert without breaking the substantive edits, "
+        "respond with <final>summary</final> immediately and keep the patch as-is."
+    )
+
+
+def build_self_check_prompt(patch: str, text: str) -> str:
+    truncated = patch if len(patch) <= 4000 else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
+    return (
+        "Self-check pass. Review your draft patch for:\n"
+        "  - any acceptance criterion from the task NOT addressed\n"
+        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
+        "  - newly introduced bugs or syntax errors\n\n"
+        "Your patch:\n```diff\n"
+        f"{truncated}\n```\n\n"
+        "Task:\n"
+        f"{text[:2000]}\n\n"
+        "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
+        "If something is wrong, in the SAME response emit corrective <command> "
+        "blocks that fix only the listed issues, then end with <final>summary</final>. "
+        "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+    )
+
+
+def build_syntax_fix_prompt(errors: List[str]) -> str:
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
+        "Issue the smallest possible fix command(s) to restore parseable code. "
+        "Do NOT introduce new edits, do NOT refactor. Then end with <final>summary</final>."
+    )
+
+
+def build_test_fix_prompt(test_path: str, output: str) -> str:
+    tail = output[-2400:] if len(output) > 2400 else output
+    return (
+        f"Companion test still failing after your patch: `{test_path}`.\n\n"
+        "Test output (tail):\n```\n"
+        f"{tail}\n```\n\n"
+        "Fix the cause: usually either the source patch is incomplete or the "
+        "test needs to be updated to match the new behavior. Issue the minimal "
+        "<command> blocks needed, then end with <final>summary</final>."
+    )
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -784,13 +1163,6 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
-# -----------------------------
-# Prompting
-# -----------------------------
-
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
 You must fix the issue by editing files in the repo. You have a tight wall-clock
@@ -809,30 +1181,42 @@ When you are finished, respond with:
 short summary of what you changed
 </final>
 
-Rules:
-- Work directly in the repository.
-- Prefer small, targeted changes.
-- If relevant file snippets are already in the prompt, edit those files first;
-  do not spend a turn re-reading them.
-- If the target is not clear, run one or two focused search/snippet commands,
-  then edit. Avoid broad inspection loops.
-- By your second response you should usually be editing the most likely files.
-- When several files need changes, emit all independent file-edit commands in
-  the same response. Do not split one planned patch into one file per turn.
-- Avoid dumping huge generated, minified, binary, lock, or vendored files.
-- Make edits as soon as the relevant code is clear.
-- Run the cheapest relevant verification you can. Prefer syntax/type/unit checks
-  for touched files over full installs, full builds, or broad test suites.
+Plan-first discipline: before your first <command>, in the SAME response output
+a short <plan> block listing the target files and which acceptance criterion
+maps to each. Then immediately issue the first <command>(s). Do not split plan
+and commands across turns; that wastes a step.
+
+Discipline:
+- Work directly in the repository. Prefer the smallest diff that satisfies every
+  acceptance criterion. Surplus lines hurt the similarity score.
+- If file snippets are preloaded in the user prompt, edit those files first.
+  Do not re-read preloaded files.
+- The preload includes companion test files alongside their source partners
+  whenever both exist. When you patch a source file, update the companion test
+  in the SAME response if it is affected: keeping tests in sync with the source
+  edit is the most common reason a patch trails on similarity.
+- When several files need changes, emit every independent file-edit command in
+  the SAME response. Do not split one planned patch into one file per turn.
+- Match indentation, quote style, semicolons, trailing commas, blank-line
+  patterns, and brace placement EXACTLY from surrounding code.
+- Match identifier and string tokens to what the surrounding code already uses.
+- Avoid whitespace-only edits, comment-only edits, blank-line shuffling, import
+  reorders, type annotation drive-bys, dead-code removal not asked for by the
+  task, defensive checks not asked for by the task, and unrelated refactors.
+- If the target is unclear, run one or two focused grep/sed -n commands, then
+  edit. Do not loop on inspection.
+- Verification: prefer a single targeted check on a touched file
+  (`python -m py_compile X.py`, `node --check X.js`, `pytest -k name X`,
+  `tsc --noEmit X.ts`). Avoid full installs, full builds, broad test suites.
 - If dependencies are missing or a verification command is slow, keep the patch
-  and finish instead of spending the whole budget.
-- After a focused patch and one useful verification or diff review, finalize.
-- Do not use sudo.
-- Do not delete the repository.
-- Do not access secrets.
+  and finalize instead of spending the whole budget.
+- After a focused patch and at most one cheap verification, finalize with <final>.
+- Do not dump huge generated, minified, binary, lock, or vendored files.
+- Do not use sudo. Do not delete the repository. Do not access secrets.
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes and unrelated formatting churn.
+- Avoid chmod/file mode changes.
 - You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
 """
 
@@ -886,14 +1270,6 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
-# -----------------------------
-# Main agent
-# -----------------------------
-
-# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
-# agent. You may change planning, memory, context collection, repair behavior,
-# test strategy, and stopping criteria. Preserve the solve() signature and
-# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -913,6 +1289,11 @@ def solve(
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
+    polish_turns_used = 0
+    self_check_turns_used = 0
+    syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
+    last_test_failure: Optional[Tuple[str, str]] = None
 
     try:
         repo = _repo_path(repo_path)
@@ -950,6 +1331,37 @@ def solve(
 
             if not commands:
                 if final is not None:
+                    patch = get_patch(repo)
+                    if patch.strip():
+                        junk = _diff_low_signal_summary(patch)
+                        if junk and polish_turns_used < MAX_POLISH_TURNS:
+                            polish_turns_used += 1
+                            logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_polish_prompt(junk)})
+                            continue
+                        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                            errs = _check_syntax(repo, patch)
+                            if errs:
+                                syntax_fix_turns_used += 1
+                                logs.append("\nSYNTAX_FIX_QUEUED:\n  " + "\n  ".join(errs))
+                                messages.append({"role": "assistant", "content": response_text})
+                                messages.append({"role": "user", "content": build_syntax_fix_prompt(errs)})
+                                continue
+                        if last_test_failure and test_fix_turns_used < MAX_TEST_FIX_TURNS:
+                            test_path, output_tail = last_test_failure
+                            test_fix_turns_used += 1
+                            logs.append("\nTEST_FIX_QUEUED:\n  " + test_path)
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_test_fix_prompt(test_path, output_tail)})
+                            last_test_failure = None
+                            continue
+                        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+                            self_check_turns_used += 1
+                            logs.append("\nSELF_CHECK_QUEUED")
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": build_self_check_prompt(patch, issue)})
+                            continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
                     success = True
                     break
@@ -979,6 +1391,15 @@ def solve(
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
+                    if (
+                        patch.strip()
+                        and _looks_like_verification_command(command)
+                        and (result.exit_code or 0) != 0
+                    ):
+                        last_test_failure = (
+                            command.strip().splitlines()[0][:160] if command else "(unknown)",
+                            observation,
+                        )
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
@@ -987,8 +1408,16 @@ def solve(
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
-                        logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
+                    if (
+                        patch.strip()
+                        and step >= 8
+                        and _looks_like_patch_review_command(command, result)
+                        and _patch_covers_required_paths(patch, issue)
+                    ):
+                        logs.append(
+                            "\nPATCH_READY:\nPatch exists, covers issue-mentioned paths, "
+                            "and latest command reviewed the diff/status."
+                        )
                         success = True
                         break
 
@@ -998,13 +1427,47 @@ def solve(
                     "Continue with one command at a time if more work remains."
                 )
 
+            polish_pending = False
+            syntax_pending = False
+            testfix_pending = False
+            self_check_pending = False
             if final is not None and get_patch(repo).strip():
-                logs.append("\nFINAL_SUMMARY:\n" + final)
-                success = True
+                patch_now = get_patch(repo)
+                junk = _diff_low_signal_summary(patch_now)
+                if junk and polish_turns_used < MAX_POLISH_TURNS:
+                    polish_pending = True
+                    polish_turns_used += 1
+                    logs.append("\nPOLISH_TURN_QUEUED:\n" + junk)
+                else:
+                    syntax_errs = _check_syntax(repo, patch_now) if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS else []
+                    if syntax_errs:
+                        syntax_pending = syntax_errs
+                        syntax_fix_turns_used += 1
+                        logs.append("\nSYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errs))
+                    elif last_test_failure and test_fix_turns_used < MAX_TEST_FIX_TURNS:
+                        testfix_pending = last_test_failure
+                        test_fix_turns_used += 1
+                        last_test_failure = None
+                        logs.append("\nTEST_FIX_QUEUED:\n  " + testfix_pending[0])
+                    elif self_check_turns_used < MAX_SELF_CHECK_TURNS:
+                        self_check_pending = True
+                        self_check_turns_used += 1
+                        logs.append("\nSELF_CHECK_QUEUED")
+                    else:
+                        logs.append("\nFINAL_SUMMARY:\n" + final)
+                        success = True
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                if polish_pending:
+                    observation_text += "\n\n" + build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))
+                elif syntax_pending:
+                    observation_text += "\n\n" + build_syntax_fix_prompt(syntax_pending)
+                elif testfix_pending:
+                    observation_text += "\n\n" + build_test_fix_prompt(testfix_pending[0], testfix_pending[1])
+                elif self_check_pending:
+                    observation_text += "\n\n" + build_self_check_prompt(get_patch(repo), issue)
+                elif not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. If more edits are needed, send every "
                         "remaining independent file-edit command in your next response. "
@@ -1016,6 +1479,14 @@ def solve(
                         "send the complete set of edit commands in your next response."
                     )
                 messages.append({"role": "user", "content": observation_text})
+            elif polish_pending:
+                messages.append({"role": "user", "content": build_polish_prompt(_diff_low_signal_summary(get_patch(repo)))})
+            elif syntax_pending:
+                messages.append({"role": "user", "content": build_syntax_fix_prompt(syntax_pending)})
+            elif testfix_pending:
+                messages.append({"role": "user", "content": build_test_fix_prompt(testfix_pending[0], testfix_pending[1])})
+            elif self_check_pending:
+                messages.append({"role": "user", "content": build_self_check_prompt(get_patch(repo), issue)})
 
             if success:
                 break
@@ -1141,13 +1612,6 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-# -----------------------------
-# CLI for local testing
-# -----------------------------
-
-# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
-# CLI to make local experiments easier, but do not rely on CLI-only behavior for
-# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
