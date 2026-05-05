@@ -281,7 +281,7 @@ def chat_completion(
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
+    timeout: int = 90,
     max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
