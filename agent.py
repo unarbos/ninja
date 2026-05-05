@@ -106,7 +106,7 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 
-# LLM-judge stability guards: large destructive/off-scope patches lose heavily.
+# Patch-hygiene guards: large destructive or off-scope patches are usually wrong.
 MAX_ALLOWED_DELETED_FILES = 2
 MAX_ALLOWED_NEW_FILES = 6
 MAX_DOCS_FILE_TOUCHES = 1
@@ -1100,7 +1100,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model on file-type detection.
         if result:
             errors.append(result)
     return errors
@@ -1288,7 +1288,7 @@ def _symbol_grep_hits(
 
 
 def _diff_risk_summary(patch: str) -> Dict[str, int]:
-    """Summarize risky diff shapes that correlate with low LLM judge scores."""
+    """Summarize risky diff shapes that correlate with poor patch quality."""
     stats = {"files": 0, "deleted_files": 0, "new_files": 0, "docs_files": 0, "lock_files": 0}
     current_path = ""
     seen_paths: set[str] = set()
@@ -1312,7 +1312,7 @@ def _diff_risk_summary(patch: str) -> Dict[str, int]:
     return stats
 
 
-def _patch_passes_llm_guardrails(patch: str, issue_text: str) -> Tuple[bool, str]:
+def _patch_passes_quality_guards(patch: str, issue_text: str) -> Tuple[bool, str]:
     """Reject high-risk off-target patches before declaring success."""
     if not patch.strip():
         return False, "empty patch"
@@ -1335,7 +1335,7 @@ def _patch_passes_llm_guardrails(patch: str, issue_text: str) -> Tuple[bool, str
 
 def build_guardrail_repair_prompt(reason: str) -> str:
     return (
-        "Guardrail check failed for LLM-judge quality: " + reason + "\n\n"
+        "Patch-hygiene guard fired: " + reason + "\n\n"
         "Revise the patch to be minimal and on-task: avoid broad deletes, avoid "
         "docs/lockfile churn unless explicitly required, and ensure issue-mentioned "
         "paths are touched. Emit corrective <command> blocks, then <final>summary</final>."
@@ -1373,7 +1373,7 @@ and commands across turns; that wastes a step.
 
 Discipline:
 - Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus/off-target lines hurt both similarity and LLM judge score.
+  acceptance criterion. Surplus/off-target lines dilute the focused diff.
 - If file snippets are preloaded in the user prompt, edit those files first.
   Do not re-read preloaded files.
 - The preload includes companion test files alongside their source partners
@@ -1593,7 +1593,7 @@ def solve(
                 )
                 return True
 
-        ok, reason = _patch_passes_llm_guardrails(patch, issue)
+        ok, reason = _patch_passes_quality_guards(patch, issue)
         if not ok:
             queue_refinement_turn(
                 assistant_text,
