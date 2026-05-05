@@ -71,8 +71,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
 # validator proxy owns temperature/top-p/etc. and overwrites them server-side.
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -90,13 +90,13 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CHARS", "12000"))
-MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
-MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
-MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
+MAX_CONVERSATION_CHARS = 60000
+MAX_PRELOADED_CONTEXT_CHARS = 12000
+MAX_PRELOADED_FILES = 4
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 REFERENCE_PREPASS_ENABLED = True
 SKIP_LLM_WHEN_REFERENCE_FULLY_APPLIED = True
 
