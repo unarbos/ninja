@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -98,13 +97,16 @@ MAX_PRELOADED_FILES = 8
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
+# transient model error or stuck loop directly costs us rounds. Be aggressive
+# about retrying instead of returning early with no edits.
+# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
+# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_BASE_BACKOFF = 1.0
+MAX_STEP_RETRIES = 2
+WALL_CLOCK_BUDGET_SECONDS = 540.0
+WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -282,14 +284,13 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = 1,
+    max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
 
-    Retries once on transient transport failures (timeout, connection reset,
-    HTTP 5xx). Client-side errors (4xx) bail out immediately because retrying
-    won't change the outcome and burns wall-clock budget that the agent needs
-    for actual editing.
+    Retries with exponential backoff on transient transport failures (timeout,
+    connection reset, HTTP 5xx, HTTP 429). Client-side 4xx (other than 429) bail
+    out immediately because retrying won't change the outcome.
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
@@ -318,17 +319,24 @@ def chat_completion(
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if 500 <= e.code < 600 and attempt < max_retries:
+            retryable = (500 <= e.code < 600) or e.code == 429
+            if retryable and attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
+        except json.JSONDecodeError as e:
+            if attempt < max_retries:
+                last_error = e
+                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
+                continue
+            raise RuntimeError(f"Model returned non-JSON: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
 
@@ -786,7 +794,7 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\\w.-])([\\w./-]+\\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\\w.-])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -1492,6 +1500,14 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    consecutive_model_errors = 0
+    solve_started_at = time.monotonic()
+
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1566,20 +1582,60 @@ def solve(
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
                 )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
                 break
 
+            response_text: Optional[str] = None
+            for retry_attempt in range(MAX_STEP_RETRIES + 1):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception as exc:
+                    logs.append(
+                        f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
+                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
+                    )
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
+                        time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
+                        continue
+                    break
+
+            if response_text is None:
+                consecutive_model_errors += 1
+                # If we already have any patch staged in the repo, stop early
+                # and return that patch rather than wiping everything because
+                # the proxy hiccuped. Empty patches score 0; partial patches
+                # can still earn cursor-similarity credit.
+                if get_patch(repo).strip():
+                    logs.append(
+                        "MODEL_ERROR_RECOVER:\nReturning best partial patch "
+                        "after persistent model errors."
+                    )
+                    success = True
+                    break
+                if consecutive_model_errors >= 3 or out_of_time():
+                    logs.append(
+                        "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
+                        "errors -- ending loop."
+                    )
+                    break
+                # No patch yet but still time/budget; ride out and try again.
+                continue
+
+            consecutive_model_errors = 0
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
             commands = extract_commands(response_text)
