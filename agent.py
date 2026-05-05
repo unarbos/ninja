@@ -287,15 +287,38 @@ def chat_completion(
 
     req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Model request failed: {e}") from e
+    # Retry transient 429/5xx with backoff so a single network blip mid-solve
+    # does not waste the whole budget. budget_exceeded is hard-failed since
+    # retries cannot recover from validator-side budget caps.
+    max_attempts = 3
+    last_error: Optional[Exception] = None
+    data: Optional[Dict[str, Any]] = None
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+            last_error = None
+            break
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if e.code == 429 and "budget_exceeded" in err_body:
+                raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                time.sleep(min(8.0, 1.5 ** attempt))
+                last_error = e
+                continue
+            raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_attempts - 1:
+                time.sleep(min(8.0, 1.5 ** attempt))
+                last_error = e
+                continue
+            raise RuntimeError(f"Model request failed: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}") from e
+    if data is None:
+        raise RuntimeError(f"Model request failed after {max_attempts} retries: {last_error}")
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
@@ -539,6 +562,69 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _scrub_trailing_whitespace_lines(repo: Path) -> int:
+    """For every modified file, restore lines that differ from HEAD only in
+    trailing whitespace. Cursor's reference diff never contains
+    whitespace-only changes, so these lines are pure denominator inflation in
+    the changed-line score. Returns the number of files actually rewritten.
+
+    Uses `git show HEAD:<path>` which reads the parent state already present in
+    the repo; never reaches the network and never touches secrets.
+    """
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+    )
+    fixed = 0
+    for rel in (proc.stdout or "").splitlines():
+        rel = rel.strip()
+        if not rel or ".." in rel:
+            continue
+        target = repo / rel
+        if not target.is_file():
+            continue
+        head = subprocess.run(
+            ["git", "show", f"HEAD:{rel}"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            errors="replace",
+        )
+        if head.returncode != 0:
+            continue
+        original = head.stdout
+        try:
+            current = target.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if original == current:
+            continue
+        orig_lines = original.split("\n")
+        curr_lines = current.split("\n")
+        if len(orig_lines) != len(curr_lines):
+            continue
+        cleaned = []
+        changed = False
+        for o, c in zip(orig_lines, curr_lines):
+            if o == c:
+                cleaned.append(c)
+            elif o.rstrip(" \t") == c.rstrip(" \t"):
+                cleaned.append(o)
+                changed = True
+            else:
+                cleaned.append(c)
+        if changed:
+            target.write_text("\n".join(cleaned), encoding="utf-8")
+            fixed += 1
+    return fixed
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1022,6 +1108,17 @@ def solve(
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # Post-loop cosmetic scrub: revert lines that differ from HEAD only in
+        # trailing whitespace. Such lines never match the reference diff but
+        # still inflate the changed-line denominator. Reading from HEAD uses
+        # the parent state already in /work/repo (no network, no fetch).
+        try:
+            scrubbed = _scrub_trailing_whitespace_lines(repo)
+            if scrubbed:
+                logs.append(f"\nCOSMETIC_SCRUB: restored trailing-whitespace on {scrubbed} file(s)")
+        except Exception:
+            logs.append("COSMETIC_SCRUB_ERROR:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
