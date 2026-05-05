@@ -1133,13 +1133,6 @@ CORE RULES:
 - No comment edits, import reordering, formatting fixes unless asked.
 - No git operations. Harness captures diff automatically.
 - On edit failure, re-read the file before retrying. Never retry from memory.
-## Non-English Instructions
-The task description may be in any language (Korean, Japanese, Russian, Hebrew, Indonesian, etc.). Your job is identical.
-Three English anchors are always present:
-1. `Acceptance criteria:` header is always in English — find it and read each bullet as a required deliverable.
-2. File paths are always in English inside backtick spans — scan for `path/to/file.ext`.
-3. Symbol/variable names in code blocks are always English.
-Extract intent from these anchors. Never output in a foreign language.
 """
 
 
