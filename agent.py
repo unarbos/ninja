@@ -512,7 +512,8 @@ short summary of what you changed
 
 Rules:
 - Work directly in the repository.
-- Prefer small, targeted changes.
+- Prefer small, targeted changes: minimal unified diff, only what the issue demands.
+- Match the project’s style (indentation, quotes) so fixes stay easy to score against the baseline.
 - Inspect files before editing them.
 - Run relevant tests when possible.
 - Do not use sudo.
@@ -526,7 +527,7 @@ Rules:
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str) -> str:
-    return f"""We need fix this issue:
+    return f"""We need to fix this issue:
 
 {issue}
 
