@@ -1045,7 +1045,12 @@ Discipline:
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
-- Avoid chmod/file mode changes."""
+- Avoid chmod/file mode changes.
+## ZERO OUTPUT PREVENTION
+- If you have made 2+ responses with no edits, your NEXT action MUST be an edit — not a read, not a search
+- Use `sed -i` for targeted replacements or `python3 -c "..."` for small changes
+- Any edit beats zero: if unsure, make the minimal one-line change to the most likely file
+- Multiple criteria = multiple files: address all of them before finalizing"""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
