@@ -115,7 +115,7 @@ checks that the committed SHA matches the current PR head SHA.
 Validation tasks are generated from real GitHub commits, but miner duel scores
 are compared against the validator's Cursor baseline solution for each task.
 The mined GitHub reference patch is still used to construct and filter tasks;
-the round score is 2/3 Cursor-baseline similarity plus 1/3 LLM diff judgment
+the round score is 1/2 Cursor-baseline similarity plus 1/2 LLM diff judgment
 of the king and challenger patches.
 
 Cursor is only the measuring stick. The challenger does not need to beat Cursor
@@ -123,6 +123,10 @@ directly; it only needs more decisive round wins than the current king.
 
 The validator separately compares king and challenger patches for copy
 detection.
+
+When a PR challenger becomes king, the validator merges that PR into
+`unarbos/ninja:main`; future miners branch from that new base harness. Validator
+weights are assigned to the winning hotkey on the next allowed weight-set epoch.
 
 ## What Belongs Here
 
