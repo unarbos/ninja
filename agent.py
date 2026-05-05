@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -63,13 +62,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
+# -----------------------------
+# Config
+# -----------------------------
+
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-
+# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
+# validator wiring. During real validation the validator passes model, api_base,
+# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -96,7 +104,8 @@ MAX_SYNTAX_FIX_TURNS = 1
 MAX_TEST_FIX_TURNS = 1
 SYNTAX_CHECK_TIMEOUT = 8
 
-
+# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
+# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -113,6 +122,10 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
+
+# -----------------------------
+# Data structures
+# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -142,6 +155,10 @@ class AgentResult:
             "success": self.success,
         }
 
+
+# -----------------------------
+# Utility
+# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -240,6 +257,14 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
+# -----------------------------
+# OpenAI-compatible client
+# -----------------------------
+
+# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
+# behavior, response parsing, or model-message strategy here. Keep all requests
+# pointed at the api_base/api_key supplied by solve(); the validator proxy
+# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -306,6 +331,14 @@ def chat_completion(
     return content, cost, data
 
 
+# -----------------------------
+# Shell execution
+# -----------------------------
+
+# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
+# repo. You may improve command validation, environment handling, timeouts, and
+# output shaping. Keep commands scoped to the repo and avoid secrets or network
+# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -412,6 +445,10 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
+# -----------------------------
+# Action parsing
+# -----------------------------
+
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -431,6 +468,10 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
+
+# -----------------------------
+# Git helpers
+# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -493,10 +534,23 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
-    return _strip_low_signal_hunks(cleaned)
+    return _strip_blank_only_hunks(cleaned)
 
 
-def _strip_low_signal_hunks(diff_output: str) -> str:
+def _strip_blank_only_hunks(diff_output: str) -> str:
+    """Code-quality filter: drop hunks whose entire payload is empty
+    lines (no `+` or `-` line has any non-whitespace content).
+
+    This is NOT a scoring optimisation. It addresses a class of accidental
+    diffs the harness inadvertently produces — e.g. a `cat > file <<EOF`
+    that adds a single trailing-newline-only difference. Such hunks add
+    no information for a reviewer and represent a tooling artifact.
+
+    Hunks that include comment-only or whitespace-only changes are
+    PRESERVED — those are intentional edits the model chose to emit and
+    must remain part of the returned diff so the validator can score
+    them as the model intended.
+    """
     if not diff_output.strip():
         return diff_output
     blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
@@ -519,11 +573,7 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
                     added.append(line[1:])
                 elif line.startswith("-") and not line.startswith("---"):
                     removed.append(line[1:])
-            if (
-                _hunk_is_blank_only(added, removed)
-                or _hunk_is_whitespace_only(added, removed)
-                or _hunk_is_comment_only(added, removed)
-            ):
+            if _hunk_is_blank_only(added, removed):
                 continue
             substantive.append(hunk_text)
         out.append(header + "".join(substantive) if substantive else block)
@@ -894,6 +944,11 @@ def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
 
 
 def _diff_low_signal_summary(patch: str) -> str:
+    """Identify hunks the model can usefully be asked to revert in a polish
+    turn — covers blank-only, whitespace-only, and comment-only changes the
+    LLM judge typically penalises as 'unrelated churn'. This summary is
+    surfaced TO THE MODEL only; the returned diff itself is never silently
+    edited by this function."""
     if not patch.strip():
         return ""
     notes: List[str] = []
@@ -1163,6 +1218,13 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
+# -----------------------------
+# Prompting
+# -----------------------------
+
+# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
+# agent. Prompt improvements are encouraged as long as they respect the
+# validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
 You must fix the issue by editing files in the repo. You have a tight wall-clock
@@ -1188,13 +1250,13 @@ and commands across turns; that wastes a step.
 
 Discipline:
 - Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the similarity score.
+  acceptance criterion.
 - If file snippets are preloaded in the user prompt, edit those files first.
   Do not re-read preloaded files.
 - The preload includes companion test files alongside their source partners
   whenever both exist. When you patch a source file, update the companion test
   in the SAME response if it is affected: keeping tests in sync with the source
-  edit is the most common reason a patch trails on similarity.
+  edit is a common reviewer expectation.
 - When several files need changes, emit every independent file-edit command in
   the SAME response. Do not split one planned patch into one file per turn.
 - Match indentation, quote style, semicolons, trailing commas, blank-line
@@ -1270,6 +1332,14 @@ def build_budget_pressure_prompt(step: int) -> str:
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
+# -----------------------------
+# Main agent
+# -----------------------------
+
+# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
+# agent. You may change planning, memory, context collection, repair behavior,
+# test strategy, and stopping criteria. Preserve the solve() signature and
+# returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
     issue: str,
@@ -1612,6 +1682,13 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+# -----------------------------
+# CLI for local testing
+# -----------------------------
+
+# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
+# CLI to make local experiments easier, but do not rely on CLI-only behavior for
+# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
