@@ -88,13 +88,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "6144"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 28000
-MAX_PRELOADED_FILES = 8
+MAX_CONVERSATION_CHARS = 70000
+MAX_PRELOADED_CONTEXT_CHARS = 22000
+MAX_PRELOADED_FILES = 6
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -106,13 +106,11 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+# LLM-judge stability guards: large destructive/off-scope patches lose heavily.
+MAX_ALLOWED_DELETED_FILES = 2
+MAX_ALLOWED_NEW_FILES = 6
+MAX_DOCS_FILE_TOUCHES = 1
+MAX_LOCKFILE_TOUCHES = 0
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1288,6 +1286,61 @@ def _symbol_grep_hits(
     return hits
 
 
+
+def _diff_risk_summary(patch: str) -> Dict[str, int]:
+    """Summarize risky diff shapes that correlate with low LLM judge scores."""
+    stats = {"files": 0, "deleted_files": 0, "new_files": 0, "docs_files": 0, "lock_files": 0}
+    current_path = ""
+    seen_paths: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
+            if m:
+                current_path = m.group(2)
+                if current_path not in seen_paths:
+                    seen_paths.add(current_path)
+                    stats["files"] += 1
+                    lp = current_path.lower()
+                    if lp.endswith(("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "cargo.lock", "go.sum")):
+                        stats["lock_files"] += 1
+                    if lp.startswith("docs/") or "/docs/" in lp or lp.endswith(".md"):
+                        stats["docs_files"] += 1
+        elif line.startswith("deleted file mode "):
+            stats["deleted_files"] += 1
+        elif line.startswith("new file mode "):
+            stats["new_files"] += 1
+    return stats
+
+
+def _patch_passes_llm_guardrails(patch: str, issue_text: str) -> Tuple[bool, str]:
+    """Reject high-risk off-target patches before declaring success."""
+    if not patch.strip():
+        return False, "empty patch"
+    risk = _diff_risk_summary(patch)
+    reasons: List[str] = []
+    if risk["deleted_files"] > MAX_ALLOWED_DELETED_FILES:
+        reasons.append(f"too many deleted files ({risk['deleted_files']}>{MAX_ALLOWED_DELETED_FILES})")
+    if risk["new_files"] > MAX_ALLOWED_NEW_FILES:
+        reasons.append(f"too many new files ({risk['new_files']}>{MAX_ALLOWED_NEW_FILES})")
+    if risk["docs_files"] > MAX_DOCS_FILE_TOUCHES:
+        reasons.append(f"too many docs-file touches ({risk['docs_files']}>{MAX_DOCS_FILE_TOUCHES})")
+    if risk["lock_files"] > MAX_LOCKFILE_TOUCHES:
+        reasons.append(f"lockfile churn ({risk['lock_files']}>{MAX_LOCKFILE_TOUCHES})")
+    if not _patch_covers_required_paths(patch, issue_text):
+        reasons.append("missing issue-mentioned path coverage")
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, ""
+
+
+def build_guardrail_repair_prompt(reason: str) -> str:
+    return (
+        "Guardrail check failed for LLM-judge quality: " + reason + "\n\n"
+        "Revise the patch to be minimal and on-task: avoid broad deletes, avoid "
+        "docs/lockfile churn unless explicitly required, and ensure issue-mentioned "
+        "paths are touched. Emit corrective <command> blocks, then <final>summary</final>."
+    )
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -1320,7 +1373,7 @@ and commands across turns; that wastes a step.
 
 Discipline:
 - Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the similarity score.
+  acceptance criterion. Surplus/off-target lines hurt both similarity and LLM judge score.
 - If file snippets are preloaded in the user prompt, edit those files first.
   Do not re-read preloaded files.
 - The preload includes companion test files alongside their source partners
@@ -1539,6 +1592,15 @@ def solve(
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
+
+        ok, reason = _patch_passes_llm_guardrails(patch, issue)
+        if not ok:
+            queue_refinement_turn(
+                assistant_text,
+                build_guardrail_repair_prompt(reason),
+                "GUARDRAIL_FIX_QUEUED",
+            )
+            return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
