@@ -458,8 +458,8 @@ class PatchApplyResult:
 @dataclass
 class DiffStyle:
     """Quick structural metrics for the working-tree diff. Fed back to the
-    model as a 'how Cursor-like is your diff right now?' signal so the model
-    can self-correct if it's drifting toward a too-big patch."""
+    model as a self-review signal so it can pull back if the patch is
+    growing larger than the bug at hand requires."""
     files: int = 0
     hunks: int = 0
     lines_added: int = 0
@@ -480,16 +480,16 @@ def _compute_diff_style(patch: str) -> DiffStyle:
 
 def _format_diff_style_observation(style: DiffStyle) -> str:
     """Human-readable diff metrics. Includes a guidance flag when the diff
-    looks meaningfully larger than typical reference patches (1-2 files,
-    1-3 hunks, <30 changed lines)."""
+    is touching several files or has grown above ~60 changed lines, both
+    of which are review-burden signals for a focused bug fix."""
     if style.files == 0:
         return "DIFF_STYLE: no patch yet."
 
     flag = ""
     if style.files > 3:
-        flag = " (LARGER THAN TYPICAL REFERENCE — consider whether all files are necessary)"
+        flag = " (touches several files — verify each is needed for the bug)"
     elif style.lines_added + style.lines_removed > 60:
-        flag = " (>60 changed lines — consider whether the patch can be smaller)"
+        flag = " (>60 changed lines — verify the change scope is necessary)"
 
     return (
         f"DIFF_STYLE: {style.files} file(s), {style.hunks} hunk(s), "
@@ -1124,13 +1124,12 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-Your sole goal is to produce a unified diff that fixes the issue. The diff is
-scored on two equally-weighted dimensions:
-  1) Similarity to a reference patch produced by Cursor for this same task.
-  2) An LLM judge's quality assessment of correctness, minimality, and style.
-Both reward the SAME thing: the smallest, most surgical, style-matched fix.
-Every line you add or remove that the reference patch does not touch is a
-direct cost — it can only ever lower your score, never raise it.
+Your goal is to produce a unified diff that fixes the issue and is easy to
+review. Good engineering practice for bug fixes means: change as little as
+possible, keep the change targeted, match the surrounding code's style.
+Every extra line you add or remove that isn't required by the issue makes
+the patch harder to review — and often introduces new bugs in code that
+wasn't asked to change.
 
 You have THREE action types. Use the right tool for the job:
 
@@ -1141,13 +1140,13 @@ You have THREE action types. Use the right tool for the job:
 The <patch> action takes a complete unified diff and applies it via
 `git apply` (with 3-way fallback). It is STRONGLY PREFERRED for the actual
 fix because:
-  1. Cursor (whose patches you are scored against for similarity) emits
-     unified diffs natively, not bash sed loops. Your <patch> output ends
-     up structurally identical to a Cursor patch.
+  1. Producing a unified diff in one shot avoids whitespace and indentation
+     accidents that creep in when you stitch together multiple sed/cat
+     commands. Reviewers prefer one clean diff to a sequence of small edits.
   2. One <patch> block + one <final> = the entire fix in 1-2 turns. No
-     multi-step bash drift, no whitespace accidents from sed.
+     multi-step bash drift.
   3. Multi-file fixes go in a single <patch> block with one `diff --git`
-     header per file — exactly what the reference patch looks like.
+     header per file — easier to review than file-by-file edits.
 
 Plan-first protocol: in your FIRST response, output a short <plan> block,
 then in the SAME response either a <patch> block (if you can write the
@@ -1162,8 +1161,8 @@ Use <command> ONLY when:
 For everything else, use <patch>. After a <patch> applies cleanly and (if
 relevant) one verification passes, finalize with <final>.
 
-Style examples — these are the shape of patches that score highly. Match this
-style: minimal, single-hunk-per-file when possible, no drive-by edits.
+Style examples — these are well-shaped bug-fix patches: minimal,
+single-hunk-per-file when possible, no drive-by edits. Match this style.
 
 EXAMPLE A (off-by-one) ↓
 ```diff
@@ -1195,30 +1194,45 @@ EXAMPLE C (greedy regex → non-greedy) ↓
 ```
 
 What these examples have in common — your patches should too:
-- ONE focused hunk per file. Hunks that bundle unrelated edits hurt similarity.
+- ONE focused hunk per file. Hunks that bundle unrelated edits are harder
+  to review and frequently introduce regressions in untested code.
 - Smallest viable change: change the operator, the constant, the regex, the
   default — not the surrounding scaffolding.
 - Identical indentation, quoting, naming as the surrounding code.
 
-NEGATIVE SPACE — what reference patches almost NEVER contain. Each of these
-ADDS to your diff size without adding similarity, so each one COSTS score.
-Your patch should have NONE of these unless the issue explicitly demands it:
+Things to AVOID adding to your patch unless the issue explicitly asks for
+them. Each of these is a common reviewer complaint: extra surface area to
+diff-review, often introduces unrelated regressions, and pollutes git blame
+with changes unrelated to the bug. Keep your patch to the bug at hand:
 
   ❌ A new docstring on the function you fixed ("now handles X")
+     — review burden, easy to leave inconsistent with future edits
   ❌ A new # comment above your change explaining what you did
+     — git history already explains; comment rots
   ❌ A type annotation added because you noticed it was missing
+     — separate concern; do it in its own PR
   ❌ Renaming a variable because the old name bothered you
+     — unrelated to the bug; fragments diff
   ❌ Reformatting a line that was technically over 80 cols
+     — formatter's job, not the bug fix's
   ❌ Reorganizing imports
+     — separate concern; muddies blame
   ❌ Adding a defensive `if x is None: raise` not asked for
+     — speculative; might mask real bugs
   ❌ Removing a TODO comment unrelated to the bug
+     — drive-by edit; do it separately
   ❌ Trailing-comma additions in dict/list literals
+     — formatter's job
   ❌ Converting `'` to `"` (or vice versa) for "consistency"
+     — formatter's job; not a bug
   ❌ Adding logging calls or print debugging
+     — leftovers from local debugging; clean before commit
   ❌ Updating a CHANGELOG you weren't asked to update
+     — release notes are a separate workflow
 
-If you find yourself wanting to add any of these, STOP. The reference patch
-doesn't have them. Adding them lowers similarity score for zero benefit.
+If you find yourself wanting to add any of these, STOP. They're separate
+concerns from the bug fix. Each one ADDS review burden and risks
+introducing new bugs in code that wasn't asked to change.
 
 Discipline:
 - Edit preloaded files first; do not re-read them.
@@ -1269,9 +1283,9 @@ The <plan> block must list:
   - the EXACT file path + function/symbol you will edit
   - one sentence: why this is the minimal fix (no surplus changes)
 
-Reference patches for tasks like this are usually 1-10 changed lines across
-1-2 files. If your plan exceeds that scope, reconsider — you are likely about
-to lose similarity score by editing things the reference patch does not.
+Bug fixes for tasks like this are typically 1-10 changed lines across
+1-2 files. If your plan exceeds that scope, reconsider — you are likely
+about to introduce regressions in code unrelated to the reported bug.
 
 After the plan, prefer <patch> if you can write the exact diff from the
 preloaded context. Use <command> only when you genuinely need to look at one
