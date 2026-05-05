@@ -70,7 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
 # validator proxy owns temperature/top-p/etc. and overwrites them server-side.
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "20"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -92,6 +92,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
+MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CHARS", "12000"))
+MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
 MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
 MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
 
@@ -561,6 +563,227 @@ def get_repo_summary(repo: Path) -> str:
     return "\n\n".join(parts)
 
 
+TEXT_FILE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".java",
+    ".js",
+    ".jsx",
+    ".json",
+    ".kt",
+    ".md",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".vue",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+
+CONTEXT_SKIP_PARTS = {
+    ".git",
+    ".next",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+
+SECRETISH_PARTS = {
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "credentials",
+    "secret",
+    "secrets",
+}
+
+
+def build_preloaded_context(repo: Path, issue: str) -> str:
+    files = _rank_context_files(repo, issue)
+    if not files:
+        return ""
+
+    parts: List[str] = []
+    used = 0
+    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+
+    for relative_path in files[:MAX_PRELOADED_FILES]:
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        if not snippet.strip():
+            continue
+        block = f"### {relative_path}\n```\n{snippet}\n```"
+        if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+            break
+        parts.append(block)
+        used += len(block)
+
+    return "\n\n".join(parts)
+
+
+def _rank_context_files(repo: Path, issue: str) -> List[str]:
+    tracked = _tracked_files(repo)
+    if not tracked:
+        return []
+
+    issue_lower = issue.lower()
+    path_mentions = _extract_issue_path_mentions(issue)
+    mentioned: List[str] = []
+    tracked_set = set(tracked)
+    for mention in path_mentions:
+        normalized = mention.strip("./")
+        if normalized in tracked_set and _context_file_allowed(normalized):
+            mentioned.append(normalized)
+
+    terms = _issue_terms(issue)
+    scored: List[Tuple[int, str]] = []
+    for relative_path in tracked:
+        if not _context_file_allowed(relative_path):
+            continue
+        path_lower = relative_path.lower()
+        name_lower = Path(relative_path).name.lower()
+        stem_lower = Path(relative_path).stem.lower()
+        score = 0
+        if relative_path in mentioned:
+            score += 100
+        if path_lower in issue_lower:
+            score += 35
+        if name_lower and name_lower in issue_lower:
+            score += 24
+        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+            score += 16
+        score += sum(3 for term in terms if term in path_lower)
+        if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
+            score += sum(2 for term in terms if term in path_lower)
+        if score > 0:
+            scored.append((score, relative_path))
+
+    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    ranked: List[str] = []
+    seen: set[str] = set()
+    for relative_path in mentioned + [path for _score, path in scored]:
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        ranked.append(relative_path)
+    return ranked
+
+
+def _tracked_files(repo: Path) -> List[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _context_file_allowed(relative_path: str) -> bool:
+    path = Path(relative_path)
+    parts_lower = {part.lower() for part in path.parts}
+    name_lower = path.name.lower()
+    if parts_lower & CONTEXT_SKIP_PARTS:
+        return False
+    if name_lower.startswith(".env") or name_lower in SECRETISH_PARTS or parts_lower & SECRETISH_PARTS:
+        return False
+    if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
+        return False
+    return True
+
+
+def _extract_issue_path_mentions(issue: str) -> List[str]:
+    pattern = re.compile(
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
+        re.IGNORECASE,
+    )
+    mentions: List[str] = []
+    for match in pattern.finditer(issue):
+        value = match.group(1).strip("`'\"()[]{}:,;")
+        if value and value not in mentions:
+            mentions.append(value)
+    return mentions
+
+
+def _issue_terms(issue: str) -> List[str]:
+    stop = {
+        "about",
+        "after",
+        "also",
+        "before",
+        "change",
+        "code",
+        "file",
+        "from",
+        "have",
+        "issue",
+        "make",
+        "need",
+        "should",
+        "that",
+        "their",
+        "there",
+        "this",
+        "update",
+        "using",
+        "when",
+        "with",
+    }
+    terms: List[str] = []
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
+        if raw in stop or raw in terms:
+            continue
+        terms.append(raw)
+    return terms[:40]
+
+
+def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return ""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    return _truncate(text, max_chars)
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -589,9 +812,13 @@ short summary of what you changed
 Rules:
 - Work directly in the repository.
 - Prefer small, targeted changes.
-- Search first, then inspect only the relevant snippets before editing.
-- Spend at most 3 commands on broad inspection. By command 4 you should usually
-  be editing the most likely files.
+- If relevant file snippets are already in the prompt, edit those files first;
+  do not spend a turn re-reading them.
+- If the target is not clear, run one or two focused search/snippet commands,
+  then edit. Avoid broad inspection loops.
+- By your second response you should usually be editing the most likely files.
+- When several files need changes, emit all independent file-edit commands in
+  the same response. Do not split one planned patch into one file per turn.
 - Avoid dumping huge generated, minified, binary, lock, or vendored files.
 - Make edits as soon as the relevant code is clear.
 - Run the cheapest relevant verification you can. Prefer syntax/type/unit checks
@@ -610,7 +837,18 @@ Rules:
 """
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str) -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+    context_section = ""
+    if preloaded_context.strip():
+        context_section = f"""
+Preloaded likely relevant tracked-file snippets:
+
+{preloaded_context}
+
+These files have already been read for you. Re-reading them burns the duel
+budget; patch them directly unless a needed detail is missing.
+"""
+
     return f"""We need fix this issue:
 
 {issue}
@@ -618,11 +856,15 @@ def build_initial_user_prompt(issue: str, repo_summary: str) -> str:
 Repository summary:
 
 {repo_summary}
+{context_section}
 
-Start by locating the relevant files with search/listing commands. Inspect the
-smallest useful snippets, then make the best focused patch you can. Do not run
-a broad test suite before editing. After a patch exists, run one cheap
-verification if possible, then finish with <final>...</final>.
+If the preloaded snippets identify the target code, start by editing them. Do
+not re-read preloaded files or run broad searches first. If the target is still
+unclear, run one or two focused search/snippet commands, then make the best
+focused patch you can. If multiple files need edits, include every independent
+file edit command in the same response. Do not run a broad test suite before
+editing. After a patch exists, run one cheap verification if possible, then finish with
+<final>...</final>.
 """
 
 
@@ -639,7 +881,7 @@ your command here
 
 
 def build_budget_pressure_prompt(step: int) -> str:
-    if step < 6:
+    if step < 4:
         return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
     return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
@@ -677,10 +919,11 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
+        preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         for step in range(1, max_steps + 1):
@@ -760,12 +1003,24 @@ def solve(
                 success = True
 
             if observations:
-                messages.append({"role": "user", "content": "\n\n".join(observations)})
+                observation_text = "\n\n".join(observations)
+                if not success and get_patch(repo).strip():
+                    observation_text += (
+                        "\n\nPatch now exists. If more edits are needed, send every "
+                        "remaining independent file-edit command in your next response. "
+                        "Do not spend separate turns editing one file at a time."
+                    )
+                elif not success:
+                    observation_text += (
+                        "\n\nIf the observed snippets are enough to implement the issue, "
+                        "send the complete set of edit commands in your next response."
+                    )
+                messages.append({"role": "user", "content": observation_text})
 
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {4, 6}:
+            if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
