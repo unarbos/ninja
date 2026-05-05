@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -68,9 +67,6 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; the
-# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
@@ -93,18 +89,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 28000
-MAX_PRELOADED_FILES = 8
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -671,7 +659,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          X_test.go for X.go, etc.) are slotted in right after their source
          partner. Real GitHub-derived tasks almost always need source+test
          changes together; without the test in context the agent patches only
-         the source and bleeds Cursor-similarity score.
+         the source and misses the companion test update.
 
       2. Files that match identifier-shaped symbols extracted from the issue
          text get a substantial rank boost via `_symbol_grep_hits`. This
@@ -687,7 +675,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -786,7 +774,7 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\\w.-])([\\w./-]+\\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\\w.-])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -849,7 +837,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # Hunk classifiers + diff hygiene
 # -----------------------------
 #
-# Two failure modes hurt the 2/3 Cursor-similarity score: drive-by whitespace /
+# Two failure modes produce low-quality patches: drive-by whitespace /
 # comment / blank-line edits, and patches that cover the wrong files. The
 # helpers below detect both. They're applied at two stages:
 #
@@ -1102,7 +1090,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model; syntax errors will surface at runtime.
         if result:
             errors.append(result)
     return errors
@@ -1295,59 +1283,77 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a coding agent running inside a repository.
+SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
+1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
+2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
 
-You must fix the issue by editing files in the repo. You have a tight wall-clock
-budget, so make a useful patch quickly instead of exhaustively exploring.
+Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
 
-You interact only by issuing bash commands. The environment will run your command
-and return stdout/stderr. Use this exact format when you want to run a command:
+## Command format
 
+Run a bash command:
 <command>
-your bash command here
+bash command here
 </command>
 
-When you are finished, respond with:
-
+Signal completion:
 <final>
-short summary of what you changed
+brief summary of what changed
 </final>
 
-Plan-first discipline: before your first <command>, in the SAME response output
-a short <plan> block listing the target files and which acceptance criterion
-maps to each. Then immediately issue the first <command>(s). Do not split plan
-and commands across turns; that wastes a step.
+## Workflow
 
-Discipline:
-- Work directly in the repository. Prefer the smallest diff that satisfies every
-  acceptance criterion. Surplus lines hurt the similarity score.
-- If file snippets are preloaded in the user prompt, edit those files first.
-  Do not re-read preloaded files.
-- The preload includes companion test files alongside their source partners
-  whenever both exist. When you patch a source file, update the companion test
-  in the SAME response if it is affected — failing to keep tests in sync is
-  the most common reason a patch trails on the similarity score.
-- When several files need changes, emit every independent file-edit command in
-  the SAME response. Do not split one planned patch into one file per turn.
-- Match indentation, quote style, semicolons, trailing commas, blank-line
-  patterns, and brace placement EXACTLY from surrounding code.
-- Match identifier and string tokens to what the surrounding code already uses.
-- Avoid whitespace-only edits, comment-only edits, blank-line shuffling, import
-  reorders, type annotation drive-bys, dead-code removal not asked for by the
-  task, defensive checks not asked for by the task, and unrelated refactors.
-- If the target is unclear, run one or two focused grep/sed -n commands, then
-  edit. Do not loop on inspection.
-- Verification: prefer a single targeted check on a touched file
-  (`python -m py_compile X.py`, `node --check X.js`, `pytest -k name X`,
-  `tsc --noEmit X.ts`). Avoid full installs, full builds, broad test suites.
-- If dependencies are missing or a verification command is slow, keep the patch
-  and finalize instead of spending the whole budget.
-- Do not dump huge generated, minified, binary, lock, or vendored files.
-- Do not use sudo. Do not delete the repository. Do not access secrets.
-- Do not make network calls except through the validator-provided inference proxy.
-- Do not modify hidden tests or evaluator files.
-- Do not stop after only explaining; actually edit the code.
-- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+
+**Edit surgically**: change only the lines that implement the fix.
+- One-line substitutions: `sed -i 's/old/new/' file`
+- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
+- Larger edits: a minimal Python script or heredoc
+- Never rewrite an entire function when only 1–3 lines need changing
+
+**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+
+**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+
+## Scope discipline — what to change
+
+Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
+- "Fix X in function Y" → change only function Y
+- "Add feature Z to class C" → add only what Z requires inside C
+- "Bug when condition Q" → fix the condition that causes it, do not restructure
+
+Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+
+## Scope discipline — what NOT to change
+
+- Whitespace-only, comment-only, or blank-line-only edits
+- Imports not needed by your fix
+- Type annotations not already present in the changed function
+- Refactoring, renaming, or reordering the issue does not ask for
+- New helper functions or abstractions unless the issue explicitly requires them
+- New files unless the issue explicitly requires them
+- Test files unless the issue requires it OR your source change broke an existing test
+- Error handling, logging, or defensive checks not directly required by the fix
+
+## Style matching
+
+Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
+
+## Preloaded snippets
+
+Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+
+## Safety
+
+No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
 
 
@@ -1355,15 +1361,12 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets:
+Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-
-These files have already been read for you. Re-reading them burns the duel
-budget; patch them directly unless a needed detail is missing.
 """
 
-    return f"""We need fix this issue:
+    return f"""Fix this issue:
 
 {issue}
 
@@ -1371,14 +1374,15 @@ Repository summary:
 
 {repo_summary}
 {context_section}
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-If the preloaded snippets identify the target code, start by editing them. Do
-not re-read preloaded files or run broad searches first. If the target is still
-unclear, run one or two focused search/snippet commands, then make the best
-focused patch you can. If multiple files need edits, include every independent
-file edit command in the same response. Do not run a broad test suite before
-editing. After a patch exists, run one cheap verification if possible, then finish with
-<final>...</final>.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+
+If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
 
 
@@ -1396,8 +1400,17 @@ your command here
 
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+        return (
+            "Budget check: no repo change yet. "
+            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
+            "A precise sed or python -c is better than another grep. Stop exploring."
+        )
+    return (
+        "Hard budget check: still no patch. "
+        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
+        "Do not read files or run tests until after a patch exists. "
+        "Use `sed -i` or a python one-liner to make the targeted edit now."
+    )
 
 
 def build_polish_prompt(junk_summary: str) -> str:
@@ -1422,19 +1435,30 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. Review your draft patch for:\n"
-        "  - any acceptance criterion from the task NOT addressed\n"
-        "  - companion test files that the source change broke or that need updating\n"
-        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
-        "  - newly-introduced bugs or syntax errors\n\n"
+        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
+        "with the reference — review your patch against all three:\n\n"
+        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
+        "  - Are edge cases mentioned in the issue handled?\n"
+        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
+        "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Companion tests broken by the source change are updated\n"
+        "  - No syntax errors or broken imports introduced\n\n"
+        "SCOPE (similarity score weight — medium impact):\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No type annotation changes not required by the task\n"
+        "  - No refactoring, renaming, or reordering not required by the task\n"
+        "  - No new helper functions or defensive checks not required by the task\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response that "
-        "fix only the listed issues, then end with <final>summary</final>. "
-        "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
+        "Otherwise emit corrective <command> blocks in the SAME response "
+        "(run missing tests, fix root causes, revert scope-creep hunks), "
+        "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
     )
 
 
@@ -1453,12 +1477,15 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
     return (
-        f"Companion test still failing after your patch: `{test_path}`.\n\n"
+        f"Companion test is failing after your patch: `{test_path}`.\n\n"
         "Test output (tail):\n```\n"
         f"{tail}\n```\n\n"
-        "Fix the cause — usually either the source patch is incomplete or the "
-        "test needs to be updated to match the new behavior. Issue the minimal "
-        "<command> blocks needed, then end with <final>summary</final>."
+        "Diagnose first: is the source patch incomplete (missing part of the fix), "
+        "or does the test itself need updating to match new correct behaviour?\n"
+        "- If the source fix is incomplete, extend it now.\n"
+        "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
+        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
+        "then end with <final>summary</final>."
     )
 
 
@@ -1563,21 +1590,34 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
+        _wall_start = time.monotonic()
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            try:
-                response_text, cost, _raw = chat_completion(
-                    messages=_messages_for_request(messages),
-                    model=model_name,
-                    api_base=api_base,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                )
-                if cost is not None and total_cost is not None:
-                    total_cost += cost
-            except Exception:
-                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+            if time.monotonic() - _wall_start > 480:
+                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                break
+
+            response_text = None
+            for _attempt in range(2):
+                try:
+                    response_text, cost, _raw = chat_completion(
+                        messages=_messages_for_request(messages),
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                    )
+                    if cost is not None and total_cost is not None:
+                        total_cost += cost
+                    break
+                except Exception:
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
+                    if _attempt == 0:
+                        time.sleep(3)
+
+            if response_text is None:
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1663,14 +1703,18 @@ def solve(
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
-                        "\n\nPatch now exists. If more edits are needed, send every "
-                        "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "\n\nPatch now exists. Next steps (all in ONE response):\n"
+                        "1. Any remaining file edits or companion test updates.\n"
+                        "2. Run the most targeted functional test available "
+                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
+                        "to verify correctness — the LLM judge rewards passing tests.\n"
+                        "3. Emit <final>summary</final>."
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf the observed snippets are enough to implement the issue, "
-                        "send the complete set of edit commands in your next response."
+                        "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
+                        "edit commands in your next response — all files at once, covering EVERY requirement "
+                        "in the issue. Use sed or python -c for surgical edits."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
