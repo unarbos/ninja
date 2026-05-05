@@ -198,7 +198,7 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
 
     head = messages[:2]
     tail: List[Dict[str, str]] = []
-    budget = max(8000, MAX_CONVERSATION_CHARS - _message_chars(head) - 400)
+    budget = max(6000, MAX_CONVERSATION_CHARS - _message_chars(head) - 400)
     used = 0
     for message in reversed(messages[2:]):
         size = len(message.get("content") or "") + 32
