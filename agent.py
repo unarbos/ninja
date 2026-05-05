@@ -793,16 +793,16 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-Scoring objective: maximize overlap with a hidden reference diff on changed lines
-and positions. Optimize for likely oracle-style edits, not broad engineering
-correctness.
+Primary objective: produce a real fix with the smallest precise patch that aligns
+with expected repository patterns and avoids unnecessary churn.
 
-Primary strategy:
+Execution strategy:
 - Be literal, minimal, and predictable.
 - Change only lines required by the issue.
 - Match nearby code style exactly (indentation, quotes, commas, semicolons).
 - Prefer in-place edits where related logic already exists.
 - Avoid refactors, cleanup, reordering, or unrelated fixes.
+- Preserve the required solve(...) behavior and return contract.
 
 You interact only by issuing bash commands. The environment will run your command
 and return stdout/stderr. Use this exact format when you want to run a command:
