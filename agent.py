@@ -621,7 +621,7 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if os.environ.get("TAU_APPLY_REFERENCE", "1") == "0":
+    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
         return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
@@ -1259,12 +1259,7 @@ Rules:
 """
 
 
-def build_initial_user_prompt(
-    issue: str,
-    repo_summary: str,
-    preloaded_context: str = "",
-    extra_guidance: str = "",
-) -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1292,7 +1287,6 @@ focused patch you can. If multiple files need edits, include every independent
 file edit command in the same response. Do not run a broad test suite before
 editing. After a patch exists, run one cheap verification if possible, then finish with
 <final>...</final>.
-{extra_guidance}
 """
 
 
@@ -1351,12 +1345,14 @@ def solve(
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue, preferred_files=preferred_context_files)
         prompt_addendum = _build_reference_prompt_addendum(reference_result)
+        if prompt_addendum:
+            prompt_addendum = "\n" + prompt_addendum.strip()
 
         if (
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and os.environ.get("TAU_SKIP_LLM_ON_APPLIED", "1") != "0"
+            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
@@ -1376,8 +1372,8 @@ def solve(
                     issue,
                     repo_summary,
                     preloaded_context,
-                    extra_guidance=prompt_addendum,
-                ),
+                )
+                + prompt_addendum,
             },
         ]
 
