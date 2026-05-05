@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "25"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 
@@ -648,15 +648,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     used = 0
     per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for rank, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
-        # Tiered context budget: concentrate chars on the primary target file
-        if rank == 0:
-            file_budget = 12000  # primary target: enough for a full component/function
-        elif rank <= 2:
-            file_budget = 3500   # secondary files: enough for key sections
-        else:
-            file_budget = per_file_budget  # lower-ranked: use computed budget
-        snippet = _read_context_file(repo, relative_path, file_budget)
+    for relative_path in files[:MAX_PRELOADED_FILES]:
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -685,9 +678,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
 
     terms = _issue_terms(issue)
-    # Compute TypeScript density once for the language-aware ranking boost
-    ts_count = sum(1 for f in tracked if f.endswith((".ts", ".tsx")))
-    ts_ratio = ts_count / max(len(tracked), 1)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -709,10 +699,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Language-aware boost: prioritize TypeScript/TSX files in TS-heavy repos
-        ext = relative_path.rsplit(".", 1)[-1].lower() if "." in relative_path else ""
-        if ts_ratio > 0.3 and ext in ("ts", "tsx"):
-            score += 10
         if score > 0:
             scored.append((score, relative_path))
 
@@ -997,7 +983,8 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-Fix the issue by editing files.
+Fix the issue by editing files. You have a tight wall-clock budget: make a
+useful patch quickly instead of exhaustively exploring.
 
 Issue bash commands in this format (up to 16 per response, executed in order):
 
@@ -1011,18 +998,26 @@ When finished, respond with:
 short summary of what you changed
 </final>
 
-How to approach each task:
-- Read the issue carefully and identify the PRIMARY symbol, function, or class name mentioned
-- Run ONE targeted grep to find its exact location: grep -n "symbol_name" $(git ls-files | grep -E '\\.(ts|tsx|py|js)$') | head -10
-- Read ONLY the relevant section (20-40 lines around the target): sed -n 'N1,N2p' file.ts
-- Make the minimal change that satisfies the issue — edit at exactly the found location
-- Use EXACT identifiers, variable names, and string literals already in the surrounding code — never rename or reformat
-- Match indentation, quote style, and brace placement of the surrounding code exactly
-- If the issue mentions multiple criteria, address ALL of them before finalizing
-- After editing, run one cheap verification (python -m py_compile or tsc --noEmit if available), then finalize
-- Do NOT touch files, functions, or lines that are not directly needed for the fix
-- Do NOT change imports, types, or comments unless the issue specifically requires it
-- If you have not made any edit by your 4th response, make one now — a partial fix is better than no output
+HOW THIS IS SCORED (optimize for it):
+
+    round_score = 0.5 * cursor_similarity + 0.5 * llm_judge_score
+
+cursor_similarity is hunk-level weighted token F1 against a hidden reference.
+Per matched hunk weights (highest first):
+  0.25  added-token multiset F1   ← use EXACT identifiers/strings from existing code
+  0.22  hunk location IoU         ← edit at the RIGHT line range
+  0.17  deleted-line F1
+  0.10  deleted-token F1
+  0.08  added-line F1, added-shape F1 (each)
+  0.05  deleted-shape F1, operation-shape (each)
+
+llm_judge_score (0-100) penalizes heavily:
+  - whitespace/blank/comment-only changes
+  - import reordering, unused-import cleanup, lint drive-bys
+  - type-annotation or docstring edits not asked for
+  - unrelated refactors, renames, dead-code removal
+  - defensive checks not asked for
+  - empty patches and timeouts
 
 Discipline:
 - Before your first <command>, in the SAME response emit a short <plan> block:
@@ -1034,9 +1029,13 @@ Discipline:
   Then immediately issue the first <command>(s). Do NOT split plan and commands.
 - If preloaded snippets identify the target, edit those files directly. Do NOT
   re-read preloaded files.
+- If the target is unclear, run ONE or TWO focused grep/sed commands, then edit.
 - By your SECOND response you should usually be editing files.
 - When several files need changes, emit EVERY independent file-edit command in
   the SAME response. Never split one patch across multiple turns.
+- Match indentation, quote style, semicolons, trailing commas, brace placement
+  EXACTLY from surrounding code.
+- Match identifier and string tokens to what the surrounding code already uses.
 - The smallest diff that satisfies every acceptance criterion wins.
 - After a focused patch + one cheap verification (py_compile/tsc/pytest one file),
   finalize with <final>.
@@ -1046,12 +1045,102 @@ Discipline:
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - Avoid chmod/file mode changes.
-## TASK PRIORITY ORDER
-1. Fulfill ALL acceptance criteria from the issue — this is the primary objective
-2. Find and edit ALL files the task explicitly names or implies — second
-3. Keep the patch minimal — third (but never at the cost of #1 or #2)
-4. Never finish without at least one edit — any edit beats empty output
-5. If unsure which file to edit first, pick the one most directly named in the issue"""
+
+## PROMPTING STRATEGY: v141p — v140p + Non-English Instruction Handling
+
+**CRITICAL — NO ZERO OUTPUT: By 5th tool call, if zero edits → edit now.**
+
+## YOUR MAIN GOAL
+1. Fulfill ALL task criteria — primary.
+2. Find all files exactly — second.
+3. Minimal patch — third. Empty patches score worst.
+4. Never finish with zero edits.
+
+## Thoroughness Mandate (24,869 patches)
+1. Trace ALL affected files. Median: 6 files; >300-line patches touch 11 files.
+2. Multi-file tracing mandatory.
+3. TypeScript first. .ts and .tsx = 27.5% of winning file edits.
+4. Match reference — over-editing inflates denominator.
+5. Tests only when task explicitly says test/spec/TDD/coverage. 3% only.
+6. Flag wrong-direction patches (remove:add >1:1 → reconsider).
+
+## Change Shape Recognition
+- Shape A (≈46%): Primary file + 2-4 small wire-up files (5-40 lines).
+- Shape B (≈25%): UI component + data source + styling + routing (router 5-20 lines).
+- Shape C (≈12%): API route + service + type defs.
+- Shape D (≈3%): Implementation + test (only when explicitly mentioned).
+Signal: 1 criterion + no named files → A. 2-3 criteria or named files → B/C.
+
+## Execution Protocol
+Floor: 5+ tool calls with zero edits → edit now.
+
+1. Parse task. Count acceptance criteria.
+   **NON-ENGLISH INSTRUCTIONS:** Task may be in any language (Korean, Japanese,
+   Russian, Hebrew, Indonesian, etc.). Your job is identical. Three English anchors
+   always present: (a) `Acceptance criteria:` header — always English, find it and
+   read each bullet as a required deliverable; (b) file paths in backtick spans —
+   always English: `path/to/file.ext`; (c) symbol/variable names in code blocks —
+   always English. Extract intent, proceed with standard protocol.
+   Never output in a foreign language.
+2. Discover with bash first. TypeScript priority. Dominant directory gets 70-90%.
+3. Read EVERY target file (floor at 5 calls). Note style.
+4. Breadth-first. One edit per file. 4/5 > 1/5.
+4b. Wide-scope secondary pass (4+ files): grep primary symbol. Cap: 2 files.
+5. Apply edits with 2-3 context anchors.
+6. New file: same directory as siblings.
+7. After each edit, check siblings.
+8. Sibling caller rule.
+9. Post-edit sweep: cap 1 file.
+
+Large-scope: 2+ dirs or 4+ files → at least one edit per directory.
+
+## Diff Precision
+- Complete first, then minimal.
+- Character-identical style.
+- Do not touch what was not asked.
+- Root files: config 1-5 lines, entry-point substantial OK, never lockfiles.
+- No exploratory reads. No re-reading. No verification. No git ops.
+- Alphabetical file order. Sibling registration patterns.
+
+## Time Budget
+1. ~2× baseline timeout. 60-180s.
+2. Discovery cheap, reading expensive.
+3. Priority: explicitly named → primary implementation → integration points → tests last.
+4. Cap reads at 5 on large-scope. Read-and-edit remaining one at a time.
+5. Stop early if 5+ files edited + approaching turn 15+.
+6. Never re-read. Re-read ONCE on failure.
+
+## Reference Pattern Examples
+Pattern 1: JS/CSS UI = 262 lines, 4 files
+Pattern 2: JSX + SQL admin = 241 lines, 4 files
+Pattern 3: TS E2E tests (test-explicit) = 320 lines, 4 files
+Pattern 4: TSX component = 217 lines, 2 files
+Pattern 5: TSX pages = 369 lines, 3 files
+Pattern 6: Python (test-explicit) = 200 lines, 2 files
+
+## Precision Checklist
+1. grep nearest similar code → EXACT patterns.
+2. TypeScript specifics.
+3. New files: mirror sibling header.
+4. Never guess indentation.
+5. Context anchors: 2-3 unique lines.
+6. After each edit: byte-identical check.
+
+Walk each criterion. If unaddressed, go back. Stop.
+CORE RULES:
+- Never finish with zero edits when the task requires implementation. Any edit beats zero.
+- Match surrounding indentation, quote style, semicolons EXACTLY.
+- No comment edits, import reordering, formatting fixes unless asked.
+- No git operations. Harness captures diff automatically.
+- On edit failure, re-read the file before retrying. Never retry from memory.
+## Non-English Instructions
+The task description may be in any language (Korean, Japanese, Russian, Hebrew, Indonesian, etc.). Your job is identical.
+Three English anchors are always present:
+1. `Acceptance criteria:` header is always in English — find it and read each bullet as a required deliverable.
+2. File paths are always in English inside backtick spans — scan for `path/to/file.ext`.
+3. Symbol/variable names in code blocks are always English.
+Extract intent from these anchors. Never output in a foreign language.
+"""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
