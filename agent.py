@@ -123,15 +123,15 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
-    r"(?:^|[;&|]\s*)shutdown\b",
-    r"(?:^|[;&|]\s*)reboot\b",
-    r"(?:^|[;&|]\s*)mkfs\b",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bmkfs\b",
     r"\bdd\s+if=",
     r":\(\)\s*\{\s*:\|:\s*&\s*\};:",
-    r"(?:^|[;&|]\s*)mount\b",
-    r"(?:^|[;&|]\s*)umount\b",
-    r"(?:^|[;&|]\s*)iptables\b",
-    r"(?:^|[;&|]\s*)nft\b",
+    r"\bmount\b",
+    r"\bumount\b",
+    r"\biptables\b",
+    r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
 ]
@@ -257,7 +257,7 @@ def _resolve_inference_config(
 def _is_dangerous_command(command: str) -> Optional[str]:
     lowered = command.strip()
     for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, lowered, flags=re.MULTILINE):
+        if re.search(pattern, lowered):
             return pattern
     return None
 
