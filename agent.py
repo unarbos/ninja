@@ -93,11 +93,14 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+WALL_CLOCK_BUDGET_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_BUDGET_SECONDS", "540"))
+WALL_CLOCK_RESERVE_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_RESERVE_SECONDS", "30"))
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
+MAX_COVERAGE_NUDGES = 1    # list issue-mentioned paths still absent from diff
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
@@ -992,11 +995,19 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
+    return len(_uncovered_required_paths(patch, issue_text)) == 0
+
+
+def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     required = _extract_issue_path_mentions(issue_text)
     if not required:
-        return True
+        return []
     changed = set(_patch_changed_files(patch))
-    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
+    missing: List[str] = []
+    for req in required:
+        if not any(req == c or c.endswith("/" + req) for c in changed):
+            missing.append(req)
+    return missing
 
 
 # -----------------------------
@@ -1011,6 +1022,111 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
+
+_BRACE_LANG_SUFFIXES = frozenset(
+    {
+        ".cs", ".java", ".go", ".rs", ".kt", ".kts", ".scala",
+        ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh", ".m", ".mm",
+    }
+)
+
+
+def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
+    stack: List[Tuple[str, int]] = []
+    line = 1
+    i = 0
+    n = len(source)
+    state = "code"
+    opener_to_closer = {"{": "}", "[": "]", "(": ")"}
+    closer_to_opener = {"}": "{", "]": "[", ")": "("}
+    while i < n:
+        c = source[i]
+        if c == "\n":
+            line += 1
+        if state == "code":
+            if c == "/" and i + 1 < n:
+                nxt = source[i + 1]
+                if nxt == "/":
+                    state = "line_comment"
+                    i += 2
+                    continue
+                if nxt == "*":
+                    state = "block_comment"
+                    i += 2
+                    continue
+            if c == '"':
+                state = "str_dbl"; i += 1; continue
+            if c == "'":
+                state = "str_sgl"; i += 1; continue
+            if c == "`":
+                state = "str_raw"; i += 1; continue
+            if c in opener_to_closer:
+                stack.append((c, line))
+            elif c in closer_to_opener:
+                if not stack:
+                    return line, f"unexpected closing '{c}'"
+                last_open, open_line = stack[-1]
+                if last_open != closer_to_opener[c]:
+                    expected_close = opener_to_closer[last_open]
+                    return line, f"mismatched closing '{c}' for opening '{last_open}' from line {open_line}; expected '{expected_close}'"
+                stack.pop()
+            i += 1
+            continue
+        if state == "line_comment":
+            i += 1
+            if c == "\n":
+                state = "code"
+            continue
+        if state == "block_comment":
+            if c == "*" and i + 1 < n and source[i + 1] == "/":
+                state = "code"; i += 2; continue
+            i += 1
+            continue
+        if state == "str_dbl":
+            if c == "\\" and i + 1 < n:
+                i += 2; continue
+            if c == '"':
+                state = "code"
+            i += 1
+            continue
+        if state == "str_sgl":
+            if c == "\\" and i + 1 < n:
+                i += 2; continue
+            if c == "'":
+                state = "code"
+            i += 1
+            continue
+        if state == "str_raw":
+            if c == "`":
+                state = "code"
+            i += 1
+            continue
+    if stack:
+        last_open, open_line = stack[-1]
+        return open_line, f"unclosed '{last_open}' (expected '{opener_to_closer[last_open]}')"
+    return None
+
+
+def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in _BRACE_LANG_SUFFIXES:
+        return None
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    err = _delimiter_balance_error(text)
+    if err is not None:
+        line, detail = err
+        return f"{relative_path}:{line}: delimiter imbalance: {detail}"
+    return None
 
 
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1088,6 +1204,9 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_node_syntax_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        bb = _check_brace_balance_one(repo, relative_path)
+        if bb:
+            errors.append(bb)
         # Other suffixes: trust the model; syntax errors will surface at runtime.
         if result:
             errors.append(result)
@@ -1411,6 +1530,20 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+def build_coverage_nudge_prompt(missing_paths: List[str]) -> str:
+    lines = ", ".join(f"`{p}`" for p in missing_paths[:14])
+    if len(missing_paths) > 14:
+        lines += f", … (+{len(missing_paths) - 14} more)"
+    return (
+        "Coverage nudge — the issue names file path(s) that still have ZERO changes in "
+        "your draft diff: "
+        f"{lines}.\n\n"
+        "Touch each listed path with the minimal edit that satisfies what the "
+        "issue asks for (same response if possible). "
+        "Do not stop until every listed path appears in git diff."
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final."""
     return (
@@ -1514,7 +1647,9 @@ def solve(
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
+    consecutive_model_errors = 0
     polish_turns_used = 0
+    coverage_nudges_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
 
@@ -1534,11 +1669,12 @@ def solve(
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
+            2. coverage — issue-mentioned paths missing from diff
+            3. syntax — quote any parser error back at the model
+            4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, coverage_nudges_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1551,6 +1687,17 @@ def solve(
                     assistant_text,
                     build_polish_prompt(junk),
                     f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing_files = _uncovered_required_paths(patch, issue)
+            if missing_files:
+                coverage_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing_files),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + "\n  ".join(missing_files),
                 )
                 return True
 
@@ -1593,7 +1740,8 @@ def solve(
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > 480:
+            elapsed = time.monotonic() - _wall_start
+            if elapsed > max(1, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS):
                 logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
                 break
 
@@ -1616,9 +1764,23 @@ def solve(
                         time.sleep(3)
 
             if response_text is None:
+                consecutive_model_errors += 1
+                partial_patch = get_patch(repo)
+                if partial_patch.strip():
+                    logs.append(
+                        "\nMODEL_ERROR_RECOVER:\nPersistent model error; returning best partial patch."
+                    )
+                    success = True
+                    break
+                if consecutive_model_errors < 3:
+                    logs.append(
+                        "\nMODEL_ERROR_RETRY:\nNo patch yet; continuing to next step after model failure."
+                    )
+                    continue
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
+            consecutive_model_errors = 0
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
