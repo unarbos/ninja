@@ -2,7 +2,6 @@
 """
 Portable single-file SWE-style coding agent harness..
 
-
 Contract:
     The validator imports this file and calls:
 
@@ -15,7 +14,6 @@ Contract:
             api_key="per-run-proxy-token"
         )
 
-
     It returns:
         {
             "patch": "... unified git diff ...",
@@ -24,7 +22,6 @@ Contract:
             "cost": float | None,
             "success": bool,
         }
-
 
 Design goals:
     - Single file.
@@ -80,7 +77,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
-# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
@@ -763,8 +759,6 @@ def chat_completion(
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
 
-
-    # Never add miner-controlled sampling (temperature, top_p, penalties, seed).
     payload = {
         "model": model_name,
         "messages": messages,
@@ -1902,4 +1896,3 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
