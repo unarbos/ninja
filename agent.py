@@ -89,8 +89,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_CONTEXT_CHARS = 36000
+MAX_PRELOADED_FILES = 14
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -112,6 +112,7 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_CONSISTENCY_CHECK_TURNS = 1  # verify multi-file import/export/call consistency
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
@@ -693,9 +694,10 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          the source and misses the companion test update.
 
       2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
+         text get a substantial rank boost via `_symbol_grep_hits`, with extra
+         weight for declaration/export lines. This catches the common case
+         where the bug is described by function or class name without
+         mentioning the file path.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -1687,6 +1689,11 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
+    Declaration/export matches count more than incidental references. Many JS,
+    TS, C#, Java, Python, and Ruby tasks name the function/class/type in the
+    issue without naming a file; ranking the defining file above callers is the
+    highest-leverage context improvement here.
+
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
@@ -1697,7 +1704,7 @@ def _symbol_grep_hits(
     for symbol in symbols:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
+                ["git", "grep", "-n", "-F", "-m", "20", "--", symbol],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1708,14 +1715,44 @@ def _symbol_grep_hits(
             continue
         if proc.returncode not in (0, 1):
             continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
+        for raw_line in proc.stdout.splitlines():
+            parts = raw_line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            relative_path, _line_no, line_text = parts
             if not relative_path or relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            hits[relative_path] = hits.get(relative_path, 0) + _symbol_line_weight(symbol, line_text)
     return hits
+
+
+def _symbol_line_weight(symbol: str, line_text: str) -> int:
+    """Weight a grep hit: declaration/export lines are more valuable than uses."""
+    if _line_declares_symbol(symbol, line_text):
+        return 4
+    return 1
+
+
+def _line_declares_symbol(symbol: str, line_text: str) -> bool:
+    sym = re.escape(symbol)
+    stripped = line_text.strip()
+    patterns = (
+        # JavaScript / TypeScript / Svelte / Vue script blocks.
+        rf"\bexport\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|interface|type|enum)\s+{sym}\b",
+        rf"\bexport\s*\{{[^}}\n]*\b{sym}\b",
+        rf"\b(?:async\s+)?function\s+{sym}\b",
+        rf"\b(?:const|let|var|type|interface|enum)\s+{sym}\b",
+        rf"\bclass\s+{sym}\b",
+        rf"\b{sym}\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)",
+        # Python / Ruby.
+        rf"\bdef\s+{sym}\b",
+        # C# / Java / Kotlin-style classes and methods.
+        rf"\b(?:public|private|protected|internal|static|abstract|sealed|final|open|data|record)\s+(?:class|interface|enum|record|struct)\s+{sym}\b",
+        rf"\b(?:public|private|protected|internal|static|async|virtual|override|final|open|suspend)\s+[\w<>\[\]?.,]+\s+{sym}\s*\(",
+    )
+    return any(re.search(pattern, stripped) for pattern in patterns)
 
 
 # -----------------------------
@@ -1747,9 +1784,11 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Include observed line numbers/ranges when you have them. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+
+**Pre-edit intent**: immediately before any edit command, write `EDIT INTENT: file:line-line function/block -> exact change`. If line numbers are not available yet, name the exact function/block and old text you will change. After editing, use `git diff` or the test failure output to verify the hunk landed in that intended region; if it drifted, fix or revert it before final.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -1818,7 +1857,7 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, state the intended file/function/line region before editing, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -1927,6 +1966,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
+        "  - Patch hunks landed in the exact file/function/line region you intended before editing\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -1974,6 +2014,58 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+_CONSISTENCY_EXTS = {
+    ".cs", ".go", ".java", ".js", ".jsx", ".kt", ".php", ".py", ".rb",
+    ".rs", ".svelte", ".ts", ".tsx", ".vue",
+}
+
+
+def _patch_needs_consistency_check(patch: str) -> bool:
+    """True for multi-code-file patches where cross-file drift is plausible."""
+    code_files = [
+        path for path in _patch_changed_files(patch)
+        if Path(path).suffix.lower() in _CONSISTENCY_EXTS
+    ]
+    if len(code_files) < 2:
+        return False
+    return True
+
+
+def build_consistency_check_prompt(patch: str, issue_text: str) -> str:
+    """Ask for a targeted cross-file consistency review after batch edits."""
+    changed = _patch_changed_files(patch)
+    code_changed = [
+        path for path in changed
+        if Path(path).suffix.lower() in _CONSISTENCY_EXTS
+    ]
+    path_list = "\n  ".join(f"- {path}" for path in code_changed[:10]) or "(none)"
+    truncated = (
+        patch
+        if len(patch) <= 3500
+        else patch[:1800] + "\n...[truncated]...\n" + patch[-1300:]
+    )
+    return (
+        "Multi-file consistency pass. Your patch touches multiple code files; "
+        "this is where strong patches often lose points through a mismatched "
+        "import/export, stale call signature, or source/test expectation drift.\n\n"
+        "Touched code files:\n"
+        f"  {path_list}\n\n"
+        "Review the changed hunks and verify:\n"
+        "  - imported/exported names and namespaces still exist\n"
+        "  - call sites match changed function signatures and return shapes\n"
+        "  - source and companion tests describe the same intended behaviour\n"
+        "  - no file has a partial update while its sibling still uses the old contract\n\n"
+        "Current patch:\n```diff\n"
+        f"{truncated}\n```\n\n"
+        "Task:\n"
+        f"{issue_text[:1600]}\n\n"
+        "If everything is consistent, respond exactly:\n<final>OK</final>\n\n"
+        "If not, issue ONLY the minimal corrective <command> blocks needed to "
+        "make the touched files agree, then end with <final>summary</final>. "
+        "Do not add unrelated cleanup or refactors."
     )
 
 
@@ -2050,6 +2142,7 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    consistency_check_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
@@ -2081,10 +2174,12 @@ def solve(
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
             3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
+            4. criteria-nudge — name acceptance criteria that look unaddressed
+            5. consistency — verify multi-file edits agree on contracts
+            6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, consistency_check_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2153,6 +2248,15 @@ def solve(
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
+
+        if consistency_check_turns_used < MAX_CONSISTENCY_CHECK_TURNS and _patch_needs_consistency_check(patch):
+            consistency_check_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_consistency_check_prompt(patch, issue),
+                "CONSISTENCY_CHECK_QUEUED",
+            )
+            return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
