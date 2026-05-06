@@ -67,8 +67,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -84,13 +84,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "12288"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_CONVERSATION_CHARS = 100000
+MAX_PRELOADED_CONTEXT_CHARS = 40000
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -102,17 +102,17 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
+WALL_CLOCK_BUDGET_SECONDS = 600.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_POLISH_TURNS = 2       # strip whitespace/comment/blank-only hunks
+MAX_SELF_CHECK_TURNS = 2   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_TEST_FIX_TURNS = 2     # repair the companion test we ran ourselves
+MAX_COVERAGE_NUDGES = 2    # tell model which issue-mentioned paths are still untouched
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -598,6 +598,7 @@ def get_repo_summary(repo: Path) -> str:
         "pwd",
         "git ls-files | awk 'NR<=220 {print} END {if (NR>220) print \"... \" NR-220 \" more tracked files\"}'",
         "git status --short || true",
+        "find . -maxdepth 3 -type d ! -path '*/.git/*' ! -path '*/node_modules/*' ! -path '*/__pycache__/*' ! -path '*/.venv/*' | sort | head -60",
     ]
 
     parts = []
@@ -1404,7 +1405,7 @@ def _symbol_grep_hits(
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
+1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed. Character-identical changes score highest. Even a single extra trailing space or off-by-one line shift reduces similarity.
 2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
 
 Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
@@ -1434,6 +1435,7 @@ brief summary of what changed
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
 - Larger edits: a minimal Python script or heredoc
 - Never rewrite an entire function when only 1–3 lines need changing
+- Avoid trailing whitespace in edits — sed and heredocs can add it silently
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
@@ -1509,27 +1511,36 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
-If the patch is complete, respond with <final>summary</final>. Otherwise continue
-by issuing exactly one bash command in this format:
+If the patch is complete and correct, respond with <final>summary of changes</final>.
+Otherwise, issue exactly ONE bash command in this format:
 
 <command>
 your command here
 </command>
-"""
+
+Do NOT respond without either a <command> or <final> block."""
+
 
 
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "STOP exploring. Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
+            "A precise sed or python -c is better than another grep. Every step without an edit wastes budget."
+        )
+    if step < 8:
+        return (
+            "Hard budget check: still no patch. "
+            "Your next command MUST make a code change to the most obvious location. "
+            "Do not read files or run tests until after a patch exists. "
+            "Use `sed -i` or a python one-liner to make the targeted edit now. "
+            "An imperfect patch now is better than no patch later."
         )
     return (
-        "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        "CRITICAL: You are deep in the budget with no patch. "
+        "Issue your BEST edit command RIGHT NOW based on what you know. "
+        "Do not explore. Do not verify. Just edit. An imperfect patch scores higher than an empty patch."
     )
 
 
@@ -1866,7 +1877,7 @@ def solve(
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                if step >= 3 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
@@ -1880,7 +1891,7 @@ def solve(
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
+                    if patch.strip() and step >= 6 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
                             # Required path not yet touched — keep working instead of accepting.
                             continue
@@ -1912,24 +1923,26 @@ def solve(
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
-                        "1. Any remaining file edits or companion test updates.\n"
+                        "1. Any remaining file edits or companion test updates needed to satisfy ALL requirements in the issue.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
                         "to verify correctness — the LLM judge rewards passing tests.\n"
-                        "3. Emit <final>summary</final>."
+                        "3. If the patch is complete and tests pass, emit <final>summary</final>. "
+                        "Do NOT re-read files you have already edited."
                     )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
                         "edit commands in your next response — all files at once, covering EVERY requirement "
-                        "in the issue. Use sed or python -c for surgical edits."
+                        "in the issue. Use sed or python -c for surgical edits. "
+                        "If you still need to locate the exact code, run ONE targeted grep or cat command, then edit immediately."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 5}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -2006,18 +2019,23 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
         r"\bpytest\b",
         r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
+        r"\bpython\d*(\.\d+)?\s+-c\b",
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bnpx\s+tsc\b",
         r"\btsc\b",
-        r"\bgo\s+test\b",
+        r"\bgo\s+(test|vet)\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
         r"\bmvn\s+test\b",
         r"\bgradle(w)?\s+test\b",
         r"\bmake\s+(test|check|lint)\b",
         r"\bruff\b",
         r"\beslint\b",
+        r"\bflake8\b",
+        r"\bmypy\b",
+        r"\bperl\s+-c\b",
+        r"\bruby\s+-c\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
