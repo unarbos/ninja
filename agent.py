@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Portable single-file SWE-style coding agent harness.
-
 Contract:
     The validator imports this file and calls:
 
@@ -67,6 +65,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
@@ -93,17 +94,21 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-WALL_CLOCK_BUDGET_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_BUDGET_SECONDS", "540"))
-WALL_CLOCK_RESERVE_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_RESERVE_SECONDS", "30"))
+
+# Wall-clock cap so one slow inference step cannot blow past validator deadlines.
+WALL_CLOCK_BUDGET_SECONDS = 540
+WALL_CLOCK_RESERVE_SECONDS = 30
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_COVERAGE_NUDGES = 1    # list issue-mentioned paths still absent from diff
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_COVERAGE_NUDGES = 1    # explicitly list issue paths still absent from diff
+MAX_CRITERIA_NUDGES = 1    # remind model about issue criteria not evidenced in diff
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_SELF_CHECK_TURNS = 1   # holistic self-review vs task
+MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves (reserved / prompts)
+MAX_HAIL_MARY_TURNS = 1    # last-resort forced minimal patch to avoid empty-patch forfeits
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -121,6 +126,12 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
+    r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
 
 
@@ -258,6 +269,10 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
+def _http_status_retryable(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
 # -----------------------------
 # OpenAI-compatible client
 # -----------------------------
@@ -275,11 +290,7 @@ def chat_completion(
     timeout: int = 120,
     max_retries: int = 2,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """OpenAI-compatible /v1/chat/completions client.
-
-    Retries on transient transport/proxy failures (timeout, connection reset,
-    HTTP retryable statuses like 429/5xx, and occasional JSON decode errors).
-    """
+    """OpenAI-compatible /v1/chat/completions client with robust transient retries."""
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
@@ -296,42 +307,42 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    data: Optional[Dict[str, Any]] = None
+    max_attempts = max_retries + 1
+    backoff_sec = 1.2
     last_error: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
+
+    for attempt in range(max_attempts):
         req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 data = json.loads(raw)
-            break
+            try:
+                content = data["choices"][0]["message"]["content"] or ""
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"Unexpected model response shape: {data}") from e
+            usage = data.get("usage") or {}
+            cost = 0.0 if usage else None
+            return content, cost, data
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if e.code in {408, 409, 425, 429, 500, 502, 503, 504} and attempt < max_retries:
+            if attempt + 1 < max_attempts and _http_status_retryable(e.code):
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(backoff_sec * (attempt + 1))
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as e:
-            if attempt < max_retries:
-                last_error = e
-                time.sleep(1.0)
+            last_error = e
+            if attempt + 1 < max_attempts:
+                time.sleep(backoff_sec * (attempt + 1))
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
 
-    if data is None:
-        raise RuntimeError(f"Model request failed after retries: {last_error}")
-
-    try:
-        content = data["choices"][0]["message"]["content"] or ""
-    except Exception as e:
-        raise RuntimeError(f"Unexpected model response shape: {data}") from e
-
-    usage = data.get("usage") or {}
-    cost = 0.0 if usage else None
-    return content, cost, data
+    raise RuntimeError(f"Model request failed after retries: {last_error}")
 
 
 # -----------------------------
@@ -354,6 +365,16 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             duration_sec=0.0,
         )
 
+    if len(command) > 8000:
+        return CommandResult(
+            command=command[:300] + "...",
+            exit_code=126,
+            stdout="",
+            stderr="Blocked oversized command for safety.",
+            duration_sec=0.0,
+            blocked=True,
+        )
+
     blocked_pattern = _is_dangerous_command(command)
     if blocked_pattern:
         return CommandResult(
@@ -365,6 +386,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             blocked=True,
         )
 
+    adaptive_timeout = timeout
+    if _looks_like_verification_command(command):
+        adaptive_timeout = max(timeout, min(45, timeout * 2))
+
     start = time.time()
 
     try:
@@ -375,7 +400,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            timeout=adaptive_timeout,
             executable="/bin/bash",
             env=_command_env(),
         )
@@ -400,7 +425,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             command=command,
             exit_code=124,
             stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stderr=_truncate(
+                stderr + f"\nCommand timed out after {adaptive_timeout}s.",
+                MAX_OBSERVATION_CHARS,
+            ),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -457,7 +485,21 @@ FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_commands(model_text: str) -> List[str]:
-    return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    tagged = [
+        match.group(1).strip()
+        for match in ACTION_RE.finditer(model_text)
+        if match.group(1).strip()
+    ]
+    if tagged:
+        return tagged
+
+    fence = re.search(r"```(?:bash|sh)?\s*(.*?)```", model_text, flags=re.IGNORECASE | re.DOTALL)
+    if not fence:
+        return []
+    inner = fence.group(1).strip()
+    if not inner or len(inner) > 2000:
+        return []
+    return [inner]
 
 
 def extract_command(model_text: str) -> Optional[str]:
@@ -660,7 +702,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          X_test.go for X.go, etc.) are slotted in right after their source
          partner. Real GitHub-derived tasks almost always need source+test
          changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
+         the source and bleeds Cursor-similarity score.
 
       2. Files that match identifier-shaped symbols extracted from the issue
          text get a substantial rank boost via `_symbol_grep_hits`. This
@@ -676,7 +718,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -838,7 +880,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # Hunk classifiers + diff hygiene
 # -----------------------------
 #
-# Two failure modes produce low-quality patches: drive-by whitespace /
+# Two failure modes hurt the 2/3 Cursor-similarity score: drive-by whitespace /
 # comment / blank-line edits, and patches that cover the wrong files. The
 # helpers below detect both. They're applied at two stages:
 #
@@ -999,39 +1041,44 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
 
 
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
+    """Issue paths explicitly mentioned but not touched in the unified diff."""
     required = _extract_issue_path_mentions(issue_text)
     if not required:
         return []
     changed = set(_patch_changed_files(patch))
     missing: List[str] = []
     for req in required:
-        if not any(req == c or c.endswith("/" + req) for c in changed):
+        covered = any(req == c or c.endswith("/" + req) for c in changed)
+        if not covered:
             missing.append(req)
     return missing
 
 
-# -----------------------------
-# Multi-language syntax gate
-# -----------------------------
-#
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
-
-
-_SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
-
 _BRACE_LANG_SUFFIXES = frozenset(
     {
-        ".cs", ".java", ".go", ".rs", ".kt", ".kts", ".scala",
-        ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh", ".m", ".mm",
+        ".cs",
+        ".java",
+        ".go",
+        ".rs",
+        ".kt",
+        ".kts",
+        ".scala",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".c",
+        ".h",
+        ".hpp",
+        ".hh",
+        ".m",
+        ".mm",
     }
 )
 
 
 def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
+    """Return first unmatched delimiter as (line, message), or None."""
+
     stack: List[Tuple[str, int]] = []
     line = 1
     i = 0
@@ -1039,10 +1086,12 @@ def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
     state = "code"
     opener_to_closer = {"{": "}", "[": "]", "(": ")"}
     closer_to_opener = {"}": "{", "]": "[", ")": "("}
+
     while i < n:
         c = source[i]
         if c == "\n":
             line += 1
+
         if state == "code":
             if c == "/" and i + 1 < n:
                 nxt = source[i + 1]
@@ -1055,55 +1104,76 @@ def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
                     i += 2
                     continue
             if c == '"':
-                state = "str_dbl"; i += 1; continue
+                state = "str_dbl"
+                i += 1
+                continue
             if c == "'":
-                state = "str_sgl"; i += 1; continue
+                state = "str_sgl"
+                i += 1
+                continue
             if c == "`":
-                state = "str_raw"; i += 1; continue
+                state = "str_raw"
+                i += 1
+                continue
             if c in opener_to_closer:
                 stack.append((c, line))
             elif c in closer_to_opener:
                 if not stack:
                     return line, f"unexpected closing '{c}'"
+                expected_open = closer_to_opener[c]
                 last_open, open_line = stack[-1]
-                if last_open != closer_to_opener[c]:
+                if last_open != expected_open:
                     expected_close = opener_to_closer[last_open]
-                    return line, f"mismatched closing '{c}' for opening '{last_open}' from line {open_line}; expected '{expected_close}'"
+                    return line, (
+                        f"mismatched closing '{c}' for opening '{last_open}' "
+                        f"from line {open_line}; expected '{expected_close}'"
+                    )
                 stack.pop()
             i += 1
             continue
+
         if state == "line_comment":
             i += 1
             if c == "\n":
                 state = "code"
             continue
+
         if state == "block_comment":
             if c == "*" and i + 1 < n and source[i + 1] == "/":
-                state = "code"; i += 2; continue
+                state = "code"
+                i += 2
+                continue
             i += 1
             continue
+
         if state == "str_dbl":
             if c == "\\" and i + 1 < n:
-                i += 2; continue
+                i += 2
+                continue
             if c == '"':
                 state = "code"
             i += 1
             continue
+
         if state == "str_sgl":
             if c == "\\" and i + 1 < n:
-                i += 2; continue
+                i += 2
+                continue
             if c == "'":
                 state = "code"
             i += 1
             continue
+
         if state == "str_raw":
             if c == "`":
                 state = "code"
             i += 1
             continue
+
     if stack:
         last_open, open_line = stack[-1]
-        return open_line, f"unclosed '{last_open}' (expected '{opener_to_closer[last_open]}')"
+        expected_close = opener_to_closer[last_open]
+        return open_line, f"unclosed '{last_open}' (expected '{expected_close}')"
     return None
 
 
@@ -1124,9 +1194,23 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         return None
     err = _delimiter_balance_error(text)
     if err is not None:
-        line, detail = err
-        return f"{relative_path}:{line}: delimiter imbalance: {detail}"
+        err_line, detail = err
+        return f"{relative_path}:{err_line}: delimiter imbalance: {detail}"
     return None
+
+
+# -----------------------------
+# Multi-language syntax gate
+# -----------------------------
+#
+# The previous king's syntax check was Python-only. Real validator tasks come
+# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
+# JSON, YAML, etc. This module checks each touched file with the cheapest
+# available tool, falling back gracefully when tools are missing. Errors come
+# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
+
+
+_SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
 
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1191,25 +1275,29 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed or had no checker; unsupported languages rely on
+    the LLM judge.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
-        result: Optional[str] = None
+        results: List[str] = []
         if suffix == ".py":
-            result = _check_python_syntax_one(repo, relative_path)
+            r = _check_python_syntax_one(repo, relative_path)
+            if r:
+                results.append(r)
         elif suffix in {".js", ".mjs", ".cjs"}:
-            result = _check_node_syntax_one(repo, relative_path)
+            r = _check_node_syntax_one(repo, relative_path)
+            if r:
+                results.append(r)
         elif suffix in {".json"}:
-            result = _check_json_syntax_one(repo, relative_path)
+            r = _check_json_syntax_one(repo, relative_path)
+            if r:
+                results.append(r)
         bb = _check_brace_balance_one(repo, relative_path)
         if bb:
-            errors.append(bb)
-        # Other suffixes: trust the model; syntax errors will surface at runtime.
-        if result:
-            errors.append(result)
+            results.append(bb)
+        errors.extend(results)
     return errors
 
 
@@ -1531,6 +1619,7 @@ def build_budget_pressure_prompt(step: int) -> str:
 
 
 def build_coverage_nudge_prompt(missing_paths: List[str]) -> str:
+    """Tell the agent which explicitly mentioned paths are absent from the diff."""
     lines = ", ".join(f"`{p}`" for p in missing_paths[:14])
     if len(missing_paths) > 14:
         lines += f", … (+{len(missing_paths) - 14} more)"
@@ -1544,14 +1633,75 @@ def build_coverage_nudge_prompt(missing_paths: List[str]) -> str:
     )
 
 
+def _unaddressed_criteria(issue_text: str, patch: str) -> List[str]:
+    """Approximate which explicit issue bullets/lines have no textual signal in patch."""
+    patch_l = patch.lower()
+    candidates: List[str] = []
+    for raw in issue_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("-", "*", "+")) or re.match(r"^\d+[.)]\s+", line):
+            candidates.append(line)
+            continue
+        if any(token in line.lower() for token in ("must", "should", "need", "require")):
+            candidates.append(line)
+
+    missing: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = re.sub(r"^[-*+]\s*|^\d+[.)]\s*", "", item).strip()
+        if not text:
+            continue
+        tokens = [
+            t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", text.lower())
+            if t not in {"the", "and", "for", "with", "from", "that", "this", "into", "when", "then"}
+        ][:8]
+        if tokens and not any(tok in patch_l for tok in tokens):
+            key = text.lower()
+            if key not in seen:
+                seen.add(key)
+                missing.append(text)
+    return missing[:10]
+
+
+def build_criteria_nudge_prompt(missing_criteria: List[str]) -> str:
+    bullets = "\n".join(f"- {c}" for c in missing_criteria[:8])
+    return (
+        "Criteria nudge — the issue appears to include acceptance criteria not yet "
+        "evidenced in your draft patch:\n"
+        f"{bullets}\n\n"
+        "Address each missing criterion with the smallest targeted edit(s), then "
+        "run one cheap relevant verification and continue."
+    )
+
+
+def build_hail_mary_prompt(issue_text: str) -> str:
+    return (
+        "Hail-mary turn: no patch exists yet and budget is nearly exhausted.\n\n"
+        "You must produce a minimal best-effort code change NOW in the single most "
+        "likely file/function based on the issue text. Do not spend this turn on "
+        "more exploration. After editing, run one cheap syntax/test check if possible, "
+        "then end with <final>summary</final>.\n\n"
+        f"Issue reminder:\n{issue_text[:1200]}"
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final."""
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
         f"  {junk_summary}\n\n"
-        "Revert ONLY those hunks (sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder "
-        "imports, do not touch unrelated lines. After cleanup, end with "
+        "Low-signal categories to remove first:\n"
+        "  - blank-line-only hunks\n"
+        "  - whitespace-only hunks\n"
+        "  - comment-only hunks\n\n"
+        "Revert ONLY those hunks (sed/cat/python to restore the original lines).\n"
+        "Do NOT add new edits, do NOT refactor, do NOT reorder imports, and do "
+        "NOT touch unrelated lines.\n\n"
+        "If a flagged hunk is actually required for correctness, keep it and "
+        "briefly state why in <final>.\n\n"
+        "After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
         "patch as-is."
@@ -1647,11 +1797,14 @@ def solve(
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
-    consecutive_model_errors = 0
     polish_turns_used = 0
     coverage_nudges_used = 0
+    criteria_nudge_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    hail_mary_turns_used = 0
+    consecutive_model_errors = 0
+    out_of_time = False
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1674,7 +1827,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, coverage_nudges_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, coverage_nudges_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1698,6 +1851,17 @@ def solve(
                     assistant_text,
                     build_coverage_nudge_prompt(missing_files),
                     "COVERAGE_NUDGE_QUEUED:\n  " + "\n  ".join(missing_files),
+                )
+                return True
+
+        if criteria_nudge_turns_used < MAX_CRITERIA_NUDGES:
+            missing_criteria = _unaddressed_criteria(issue, patch)
+            if missing_criteria:
+                criteria_nudge_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(missing_criteria),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + "\n  ".join(missing_criteria),
                 )
                 return True
 
@@ -1742,10 +1906,14 @@ def solve(
 
             elapsed = time.monotonic() - _wall_start
             if elapsed > max(1, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS):
-                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+                out_of_time = True
+                logs.append(
+                    "\nWALL_STOP:\nout_of_time — entering reserve window; "
+                    "returning the best patch produced so far."
+                )
                 break
 
-            response_text = None
+            response_text: Optional[str] = None
             for _attempt in range(2):
                 try:
                     response_text, cost, _raw = chat_completion(
@@ -1772,7 +1940,7 @@ def solve(
                     )
                     success = True
                     break
-                if consecutive_model_errors < 3:
+                if consecutive_model_errors < 3 and not out_of_time:
                     logs.append(
                         "\nMODEL_ERROR_RETRY:\nNo patch yet; continuing to next step after model failure."
                     )
@@ -1883,10 +2051,21 @@ def solve(
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+            if (
+                not get_patch(repo).strip()
+                and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+                and (step >= max_steps - 1 or (time.monotonic() - _wall_start) > WALL_CLOCK_BUDGET_SECONDS * 0.85)
+            ):
+                hail_mary_turns_used += 1
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                logs.append("\nHAIL_MARY_QUEUED:\nForced minimal patch attempt due to low remaining budget.")
 
         patch = get_patch(repo)
         if patch.strip() and not success:
-            logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
+            patch_msg = "Returning the best patch produced within the step budget."
+            if out_of_time:
+                patch_msg += " (out_of_time: wall-clock cap)"
+            logs.append("\nPATCH_RETURN:\n" + patch_msg)
             success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
