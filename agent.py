@@ -6,7 +6,7 @@ Contract:
     The validator imports this file and calls:
 
         solve(
-            repo_path="/tmp/task_repo",
+            repo_path=/tmp/task_repo,
             issue="Fix the bug...",
             model="validator-managed-model",
             api_base="http://validator-proxy/v1",
@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -88,8 +89,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_CONVERSATION_CHARS = 55000
+MAX_PRELOADED_CONTEXT_CHARS = 22000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
@@ -117,19 +118,19 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
-    r"\brm\s+-rf\s+/",
-    r"\bsudo\b",
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\bmkfs\b",
-    r"\bdd\s+if=",
+    r\brm\s+-rf\s+/,
+    r\bsudo\b,
+    r\bshutdown\b,
+    r\breboot\b,
+    r\bmkfs\b,
+    r\bdd\s+if=,
     r":\(\)\s*\{\s*:\|:\s*&\s*\};:",
-    r"\bmount\b",
-    r"\bumount\b",
-    r"\biptables\b",
-    r"\bnft\b",
-    r"\bchown\s+-R\s+/",
-    r"\bchmod\s+-R\s+777\s+/",
+    r\bmount\b,
+    r\bumount\b,
+    r\biptables\b,
+    r\bnft\b,
+    r\bchown\s+-R\s+/,
+    r\bchmod\s+-R\s+777\s+/,
 ]
 
 
@@ -176,7 +177,7 @@ def _truncate(text: str, max_chars: int) -> str:
     half = max_chars // 2
     return (
         text[:half]
-        + "\n\n...[truncated "
+        + \n\n...[truncated 
         + str(len(text) - max_chars)
         + " chars]...\n\n"
         + text[-half:]
@@ -184,7 +185,7 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _safe_join_logs(logs: List[str]) -> str:
-    joined = "\n".join(logs)
+    joined = \n.join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
 
 
@@ -224,11 +225,11 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
 
 def _normalize_api_base(api_base: str) -> str:
     base = api_base.rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base[: -len("/chat/completions")]
-    if base.endswith("/v1"):
+    if base.endswith(/chat/completions):
+        return base[: -len(/chat/completions)]
+    if base.endswith(/v1):
         return base
-    return base + "/v1"
+    return base + /v1
 
 
 def _resolve_inference_config(
@@ -275,6 +276,53 @@ def _repo_path(path: str | Path) -> Path:
 # behavior, response parsing, or model-message strategy here. Keep all requests
 # pointed at the api_base/api_key supplied by solve(); the validator proxy
 # rewrites the model and sampling parameters server-side.
+
+def _collect_stream(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
+    """POST with stream=true, accumulate SSE delta content.
+
+    Stops reading as soon as </final> appears in the accumulated text — anything
+    the model emits after the closing tag is explanation prose that the harness
+    never parses, so there is no reason to wait for it.  Falls back to the
+    caller re-trying non-streaming on any exception.
+    """
+    stream_payload = {**json.loads(body), "stream": True}
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(stream_payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    chunks: List[str] = []
+    buf = b""
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        while True:
+            piece = resp.read(4096)
+            if not piece:
+                break
+            buf += piece
+            while b\n in buf:
+                raw_line, buf = buf.split(b\n, 1)
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line == "data: [DONE]":
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    obj = json.loads(line[6:])
+                    delta_text = (
+                        (obj.get("choices") or [{}])[0]
+                        .get("delta", {})
+                        .get("content") or ""
+                    )
+                    if delta_text:
+                        chunks.append(delta_text)
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
+            if chunks and re.search(r"</final>", "".join(chunks), re.IGNORECASE):
+                break
+    return "".join(chunks)
+
+
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -284,15 +332,16 @@ def chat_completion(
     timeout: int = 120,
     max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """OpenAI-compatible /v1/chat/completions client.
+    """OpenAI-compatible /v1/chat/completions client with SSE streaming.
 
-    Retries with exponential backoff on transient transport failures (timeout,
-    connection reset, HTTP 5xx, HTTP 429). Client-side 4xx (other than 429) bail
-    out immediately because retrying won't change the outcome.
+    Tries streaming first (lower TTFT, early exit after </final>:wink:.  On any
+    streaming failure disables streaming for the rest of this call and falls
+    through to a plain POST.  Retries with exponential backoff on 5xx / 429 /
+    transport errors; bails immediately on other 4xx.
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-    url = base + "/chat/completions"
+    url = base + /chat/completions
 
     payload = {
         "model": model_name,
@@ -306,15 +355,27 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    data: Optional[Dict[str, Any]] = None
+    use_stream = True
     last_error: Optional[Exception] = None
+
     for attempt in range(max_retries + 1):
+        # ---- streaming path (lower TTFT, early exit after </final>:wink: ----
+        if use_stream:
+            try:
+                content = _collect_stream(url, body, headers, timeout)
+                return content, None, {}
+            except Exception:
+                use_stream = False  # endpoint doesn't support SSE; skip for future attempts
+
+        # ---- non-streaming fallback ----
         req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 data = json.loads(raw)
-            break
+            content = data["choices"][0]["message"]["content"] or ""
+            usage = data.get("usage") or {}
+            return content, 0.0 if usage else None, data
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
             retryable = (500 <= e.code < 600) or e.code == 429
@@ -338,17 +399,7 @@ def chat_completion(
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
 
-    if data is None:
-        raise RuntimeError(f"Model request failed after retries: {last_error}")
-
-    try:
-        content = data["choices"][0]["message"]["content"] or ""
-    except Exception as e:
-        raise RuntimeError(f"Unexpected model response shape: {data}") from e
-
-    usage = data.get("usage") or {}
-    cost = 0.0 if usage else None
-    return content, cost, data
+    raise RuntimeError(f"Model request failed after retries: {last_error}")
 
 
 # -----------------------------
@@ -393,7 +444,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
-            executable="/bin/bash",
+            executable=/bin/bash,
             env=_command_env(),
         )
 
@@ -417,7 +468,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             command=command,
             exit_code=124,
             stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stderr=_truncate(stderr + f\nCommand timed out after {timeout}s., MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -435,8 +486,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 def _command_env() -> Dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
-        "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
+        "HOME": os.environ.get("HOME", /tmp) or /tmp,
+        "TMPDIR": os.environ.get("TMPDIR", /tmp) or /tmp,
         "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
@@ -462,7 +513,7 @@ def format_observation(result: CommandResult) -> str:
     ]
     if result.stderr.strip():
         parts.extend(["", "STDERR:", result.stderr])
-    return "\n".join(parts) + "\n"
+    return \n.join(parts) + \n
 
 
 # -----------------------------
@@ -502,7 +553,7 @@ def ensure_git_repo(repo: Path) -> None:
         "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
         cwd=str(repo),
         shell=True,
-        executable="/bin/bash",
+        executable=/bin/bash,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -539,11 +590,11 @@ def get_patch(repo: Path) -> str:
     if untracked.returncode != 0:
         return diff_output
 
-    for relative_path in [item for item in untracked.stdout.split("\0") if item]:
+    for relative_path in [item for item in untracked.stdout.split(\0) if item]:
         if _should_skip_patch_path(relative_path):
             continue
         file_diff = subprocess.run(
-            ["git", "diff", "--binary", "--no-index", "--", "/dev/null", relative_path],
+            ["git", "diff", "--binary", "--no-index", "--", /dev/null, relative_path],
             cwd=str(repo),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -568,21 +619,21 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
             continue
         mode_only = (
             block.startswith("diff --git ")
-            and "\nold mode " in block
-            and "\nnew mode " in block
-            and "\n@@ " not in block
-            and "\nGIT binary patch" not in block
-            and "\nBinary files " not in block
-            and "\nnew file mode " not in block
-            and "\ndeleted file mode " not in block
+            and \nold mode  in block
+            and \nnew mode  in block
+            and \n@@  not in block
+            and \nGIT binary patch not in block
+            and \nBinary files  not in block
+            and \nnew file mode  not in block
+            and \ndeleted file mode  not in block
         )
         if mode_only:
             continue
         kept.append(block)
 
     result = "".join(kept)
-    if diff_output.endswith("\n") and result and not result.endswith("\n"):
-        result += "\n"
+    if diff_output.endswith(\n) and result and not result.endswith(\n):
+        result += \n
     return result
 
 
@@ -605,7 +656,7 @@ def get_repo_summary(repo: Path) -> str:
         res = run_command(cmd, repo, timeout=10)
         parts.append(format_observation(res))
 
-    return "\n\n".join(parts)
+    return \n\n.join(parts)
 
 
 TEXT_FILE_EXTENSIONS = {
@@ -705,7 +756,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    return "\n\n".join(parts)
+    return \n\n.join(parts)
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -741,7 +792,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
         score += sum(3 for term in terms if term in path_lower)
-        if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
+        if /test in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
@@ -845,7 +896,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         data = path.read_bytes()
     except Exception:
         return ""
-    if b"\0" in data[:4096]:
+    if b\0 in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
@@ -922,7 +973,7 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     for block in blocks:
         if not block:
             continue
-        if not block.startswith("diff --git ") or "\n@@ " not in block:
+        if not block.startswith("diff --git ") or \n@@  not in block:
             out.append(block)
             continue
         parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
@@ -948,8 +999,8 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
             out.append(header + "".join(substantive))
         # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
-    if diff_output.endswith("\n") and result and not result.endswith("\n"):
-        result += "\n"
+    if diff_output.endswith(\n) and result and not result.endswith(\n):
+        result += \n
     return result
 
 
@@ -1142,7 +1193,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < n else ""
         if in_line_comment:
-            if ch == "\n":
+            if ch == \n:
                 in_line_comment = False
             i += 1
             continue
@@ -1235,6 +1286,32 @@ def _has_executable(name: str) -> bool:
 def _shell_quote(value: str) -> str:
     """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+# Matches commands that are very unlikely to write files — safe to run in
+# parallel with each other.  Conservative on purpose: a false negative (running
+# a write command sequentially) is harmless; a false positive (parallelising a
+# write command) could corrupt repo state.
+_READONLY_CMD_RE = re.compile(
+    r"^\s*(?:grep|find|cat|head|tail|wc|ls|echo|rg|ag|"
+    r"git\s+(?:log|diff|show|status|ls-files|grep)|"
+    r"python(?:\d+(?:\.\d+)?)?\s+-m\s+py_compile|node\s+--check)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_readonly_command_safe(cmd: str) -> bool:
+    """True when cmd is very likely read-only and safe to parallelise."""
+    return bool(_READONLY_CMD_RE.match(cmd.strip())) and ">" not in cmd
+
+
+def _run_commands_parallel(
+    commands: List[str], repo: Path, timeout: int
+) -> List[CommandResult]:
+    """Run a batch of read-only commands concurrently, preserving order."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(commands)) as ex:
+        futures = [ex.submit(run_command, cmd, repo, timeout) for cmd in commands]
+        return [f.result() for f in futures]
 
 
 # -----------------------------
@@ -1471,6 +1548,16 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
 
+## Output brevity (latency)
+
+Output tokens are the dominant latency cost — a 500-token response is ~5× slower
+than a 100-token response. Rules:
+- No prose outside `<plan>`, `<command>`, and `<final>` blocks.
+- No "Let me…", "I'll…", "Now I'll…" preamble before commands.
+- `<plan>`: one line per requirement, nothing more.
+- `<final>`: one sentence. Nothing after `</final>`.
+- Act on obvious command results directly; do not narrate what you observed.
+
 ## Safety
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
@@ -1570,7 +1657,7 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     issue names specific files and the draft skips them, surface that gap
     directly — much cheaper than hoping the self-check catches it.
     """
-    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    bullets = \n  .join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
@@ -1590,7 +1677,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     truncated = (
         patch
         if len(patch) <= 4000
-        else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
+        else patch[:2000] + \n...[truncated]...\n + patch[-1500:]
     )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
@@ -1613,7 +1700,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
+        "If the patch passes ALL criteria, respond exactlOK/n/n")'>y:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
@@ -1622,7 +1709,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
-    bullets = "\n  ".join(errors[:10]) or "(none)"
+    bullets = \n  .join(errors[:10]) or "(none)"
     return (
         f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
         "Issue the smallest possible fix command(s) to restore parseable code. "
@@ -1693,7 +1780,7 @@ def solve(
         marker: str,
     ) -> None:
         """Append assistant + corrective user message and journal it."""
-        logs.append(f"\n{marker}\n")
+        logs.append(f\n{marker}\n)
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
@@ -1731,7 +1818,7 @@ def solve(
                 queue_refinement_turn(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + \n  .join(syntax_errors),
                 )
                 return True
 
@@ -1772,7 +1859,7 @@ def solve(
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
-            logs.append(f"\n\n===== STEP {step} =====\n")
+            logs.append(f\n\n===== STEP {step} =====\n)
 
             if out_of_time():
                 logs.append(
@@ -1860,35 +1947,45 @@ def solve(
             observations: List[str] = []
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
-            for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
-                observation = format_observation(result)
-                observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
-                logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+            # Parallelize independent read-only commands (grep, find, cat, git
+            # diff, etc.) — they don't touch the repo so there's no ordering
+            # dependency and no patch-check logic needed between them.
+            if len(command_batch) > 1 and all(_is_readonly_command_safe(c) for c in command_batch):
+                batch_results = _run_commands_parallel(command_batch, repo, command_timeout)
+                for command_index, (command, result) in enumerate(zip(command_batch, batch_results), 1):
+                    observation = format_observation(result)
+                    observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
+                    logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+            else:
+                for command_index, command in enumerate(command_batch, 1):
+                    result = run_command(command, repo, timeout=command_timeout)
+                    observation = format_observation(result)
+                    observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
+                    logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
-                    if patch.strip() and _looks_like_successful_test_output(observation, command):
-                        if maybe_queue_refinement(response_text):
-                            break  # refinement queued — re-enter outer loop next iteration
-                        logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
-                        success = True
-                        break
-                    if patch.strip() and result.timed_out:
-                        if maybe_queue_refinement(response_text):
+                    if step >= 4 or command_index > 1:
+                        patch = get_patch(repo)
+                        if patch.strip() and _looks_like_successful_test_output(observation, command):
+                            if maybe_queue_refinement(response_text):
+                                break  # refinement queued — re-enter outer loop next iteration
+                            logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
+                            success = True
                             break
-                        logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
-                        success = True
-                        break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
-                        if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched — keep working instead of accepting.
-                            continue
-                        if maybe_queue_refinement(response_text):
+                        if patch.strip() and result.timed_out:
+                            if maybe_queue_refinement(response_text):
+                                break
+                            logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
+                            success = True
                             break
-                        logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
-                        success = True
-                        break
+                        if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
+                            if not _patch_covers_required_paths(patch, issue):
+                                # Required path not yet touched — keep working instead of accepting.
+                                continue
+                            if maybe_queue_refinement(response_text):
+                                break
+                            logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
+                            success = True
+                            break
 
             if len(commands) > len(command_batch):
                 observations.append(
@@ -1908,7 +2005,7 @@ def solve(
                 success = True
 
             if observations:
-                observation_text = "\n\n".join(observations)
+                observation_text = \n\n.join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -1920,7 +2017,7 @@ def solve(
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
+                        \n\nIf you have enough context to implement the fix, send the COMPLETE set of 
                         "edit commands in your next response — all files at once, covering EVERY requirement "
                         "in the issue. Use sed or python -c for surgical edits."
                     )
@@ -1936,7 +2033,7 @@ def solve(
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
-        step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
+        step_count = len([x for x in logs if x.startswith(\n\n===== STEP)])
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
@@ -2004,20 +2101,20 @@ def _looks_like_verification_command(command: str) -> bool:
     lowered = command.lower()
     patterns = [
         r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
-        r"\bpytest\b",
+        r\bpytest\b,
         r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r"\bnpx\s+tsc\b",
-        r"\btsc\b",
-        r"\bgo\s+test\b",
+        r\bnpx\s+tsc\b,
+        r\btsc\b,
+        r\bgo\s+test\b,
         r"\bcargo\s+(test|check|clippy|build)\b",
-        r"\bmvn\s+test\b",
+        r\bmvn\s+test\b,
         r"\bgradle(w)?\s+test\b",
         r"\bmake\s+(test|check|lint)\b",
-        r"\bruff\b",
-        r"\beslint\b",
+        r\bruff\b,
+        r\beslint\b,
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -2028,7 +2125,7 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
     lowered = command.lower().strip()
     return bool(
         re.search(r"\bgit\s+(diff|status)\b", lowered)
-        or re.search(r"\bgit\s+show\s+--stat\b", lowered)
+        or re.search(r\bgit\s+show\s+--stat\b, lowered)
     )
 
 
