@@ -1650,6 +1650,21 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
+## What hurts your score (judge-observed failure modes)
+
+The diff judge reads your patch alongside the issue and a reference solution. These specific patterns reliably lose points — avoid them:
+
+- Renames, signature changes, or "cleaner" reorganisations. They hurt similarity AND the judge flags them as unnecessary churn.
+- Drive-by edits outside the actual fix: comment polish, type-annotation passes, import reorders, accent normalisation, file-mode flips, dead-code removal.
+- Inventing new files, "manager" classes, or abstractions the issue did not ask for. Edit the EXACT files the issue names or implies.
+- Missing the companion test when the reference patch updates one. Pair the source change with its test update in the SAME response.
+- Addressing only one of multiple acceptance criteria. Re-read the issue as a checklist and confirm every bullet is covered before <final>.
+- Misnaming variables, fields, or methods. Typos like `unread_cnt` instead of `unread_count`, or abbreviations the codebase doesn't actually use, are flagged as bugs. Always copy the EXACT spelling from an existing reference in the same file — grep first if unsure.
+- Inline magic numbers (e.g., `0x80`, `30000`) when the file already defines named constants for the same role. Use the existing constant rather than introducing a new literal.
+- Adding a function, method, or class with a name that already exists in the same file. Duplicate definitions break compilation and the judge flags them as structural errors. Before adding, scan the file for the name.
+- Changing return types or signatures away from what the reference / surrounding code uses (e.g., returning `ResponseEntity` when the sibling endpoints in the same controller return the domain type directly). Match the file's existing return-type pattern.
+- Wiring an async/init helper but never calling it from the actual code path (creating `waitForCookieReady` but never invoking it from the download function is a silent no-op that the judge flags as incomplete).
+
 ## Style matching
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
