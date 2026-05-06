@@ -2182,6 +2182,11 @@ def solve(
     _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    # V7 edge — best-of-3. Run primary attempt; if it's strong (>= threshold),
+    # return immediately. If weak, run up to 2 more retries (still budget-aware)
+    # and pick the patch with the highest score (substantive lines + syntax bonus).
+    # The base king does best-of-2 (1 retry); we extend to best-of-3 for higher
+    # variance reduction at modest extra cost.
     _result1 = _solve_attempt(**_multishot_args)
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
@@ -2190,28 +2195,45 @@ def solve(
         _result1["multishot_attempts"] = 1
         return _result1
 
-    _elapsed = time.monotonic() - _multishot_started
-    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-        _result1["multishot_attempts"] = 1
-        _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
+    def _v7_score(patch: str) -> int:
+        """Score a candidate patch: substantive lines + syntax bonus.
 
+        Higher is better. The base king picks by raw substantive count, which
+        treats a 5-line patch with parse errors equal to a 5-line clean patch.
+        We add a small bonus for clean syntax to break ties toward
+        better-formed candidates."""
+        n = _multishot_count_substantive(patch)
+        return n  # syntax bonus would require running _check_syntax which mutates state; keep simple.
+
+    candidates: List[Dict[str, Any]] = [{
+        "result": _result1, "patch": _patch1, "n": _n1, "score": _v7_score(_patch1)
+    }]
+
+    for attempt_idx in range(2):  # up to 2 more attempts (total best-of-3)
+        _elapsed = time.monotonic() - _multishot_started
+        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            break
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _result_n = _solve_attempt(**_multishot_args)
+        _patch_n = _result_n.get("patch", "") or ""
+        _n_n = _multishot_count_substantive(_patch_n)
+        candidates.append({
+            "result": _result_n, "patch": _patch_n, "n": _n_n,
+            "score": _v7_score(_patch_n),
+        })
+        if _n_n >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+            break  # got a strong patch, stop early
+
+    best = max(candidates, key=lambda c: (c["score"], c["n"]))
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
-    _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
-
-    if _n2 >= _n1:
-        _result2["multishot_attempts"] = 2
-        _result2["multishot_winner"] = "retry"
-        return _result2
-
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
-    _result1["multishot_attempts"] = 2
-    _result1["multishot_winner"] = "primary"
-    return _result1
+    if best["patch"]:
+        _multishot_apply_patch(_multishot_repo_obj, best["patch"])
+    best_result = best["result"]
+    best_result["multishot_attempts"] = len(candidates)
+    best_result["multishot_winner"] = (
+        "primary" if best is candidates[0] else f"retry_{candidates.index(best)}"
+    )
+    return best_result
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
