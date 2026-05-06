@@ -472,9 +472,9 @@ def _diff_line_counts(repo: Path, ref_sha: str) -> Dict[str, int]:
 
 
 
-def _task_file_mentions(issue: str) -> List[str]:
-    mentions = _extract_issue_path_mentions(issue)
-    backticks = re.findall(r"`([^`]+)`", issue)
+def _task_file_mentions(iss: str) -> List[str]:
+    mentions = _extract_iss_path_mentions(iss)
+    backticks = re.findall(r"`([^`]+)`", iss)
     for value in backticks:
         cleaned = value.strip().strip("./")
         if re.search(r"\.[A-Za-z0-9]{1,8}$", cleaned) and cleaned not in mentions:
@@ -494,7 +494,7 @@ def _adaptive_target_cap(total_entries: int) -> int:
 
 def _score_reference_entry(
     entry: RawDiffEntry,
-    issue: str,
+    iss: str,
     issue_terms: List[str],
     path_mentions: List[str],
     line_counts: Dict[str, int],
@@ -522,7 +522,7 @@ def _score_reference_entry(
             score += 0.7
 
 
-    if basename in issue.lower():
+    if basename in iss.lower():
         score += 2.0
 
 
@@ -541,7 +541,7 @@ def _score_reference_entry(
 
 def _rank_reference_targets(
     entries: List[RawDiffEntry],
-    issue: str,
+    iss: str,
     line_counts: Dict[str, int],
 ) -> Tuple[List[RawDiffEntry], List[RawDiffEntry], str]:
     non_noise = [entry for entry in entries if not _is_noise_path(entry.path)]
@@ -550,11 +550,11 @@ def _rank_reference_targets(
         return [], dropped, "all entries looked like generated/noise paths"
 
 
-    mentions = _task_file_mentions(issue)
-    terms = _issue_terms(issue)
+    mentions = _task_file_mentions(iss)
+    terms = _iss_terms(iss)
     scored: List[Tuple[float, RawDiffEntry]] = []
     for entry in non_noise:
-        score = _score_reference_entry(entry, issue, terms, mentions, line_counts)
+        score = _score_reference_entry(entry, iss, terms, mentions, line_counts)
         scored.append((score, entry))
     scored.sort(key=lambda item: (-item[0], -line_counts.get(item[1].path, 0), item[1].path))
 
@@ -694,7 +694,7 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 
-def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
+def run_reference_prepass(repo: Path, iss: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
         return None
@@ -1434,7 +1434,7 @@ Rules:
 
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(iss: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1452,7 +1452,7 @@ budget; patch them directly unless a needed detail is missing.
     return f"""We need fix this issue:
 
 
-{issue}
+{iss}
 
 
 Repository summary:
@@ -1530,10 +1530,10 @@ def solve(
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
-        reference_result = run_reference_prepass(repo, issue, logs)
+        reference_result = run_reference_prepass(repo, iss, logs)
         preferred_context_files = reference_result.pending_paths if reference_result else []
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue, preferred_files=preferred_context_files)
+        preloaded_context = build_preloaded_context(repo, iss, preferred_files=preferred_context_files)
         prompt_addendum = _build_reference_prompt_addendum(reference_result)
         if prompt_addendum:
             prompt_addendum = "\n" + prompt_addendum.strip()
@@ -1560,7 +1560,7 @@ def solve(
             {
                 "role": "user",
                 "content": build_initial_user_prompt(
-                    issue,
+                    iss,
                     repo_summary,
                     preloaded_context,
                 )
@@ -1665,7 +1665,7 @@ def solve(
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf the observed snippets are enough to implement the issue, "
+                        "\n\nIf the observed snippets are enough to implement the iss, "
                         "send the complete set of edit commands in your next response."
                     )
                 messages.append({"role": "user", "content": observation_text})
@@ -1825,8 +1825,8 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
 
     parser = argparse.ArgumentParser(description="Run portable single-file coding agent.")
     parser.add_argument("--repo", required=True, help="Path to repo/task directory.")
-    parser.add_argument("--issue", required=False, help="Issue text.")
-    parser.add_argument("--issue-file", required=False, help="File containing issue text.")
+    parser.add_argument("--issue", required=False, help="iss text.")
+    parser.add_argument("--issue-file", required=False, help="File containing iss text.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name.")
     parser.add_argument("--api-base", default=DEFAULT_API_BASE, help="OpenAI-compatible API base.")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key.")
@@ -1842,19 +1842,19 @@ def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
 
-    issue = args.get("issue") or ""
+    iss = args.get("issue") or ""
     if args.get("issue_file"):
-        issue = Path(args["issue_file"]).read_text(encoding="utf-8")
+        iss = Path(args["issue_file"]).read_text(encoding="utf-8")
 
 
-    if not issue.strip():
+    if not iss.strip():
         print("ERROR: provide --issue or --issue-file", file=sys.stderr)
         return 2
 
 
     result = solve(
         repo_path=args["repo"],
-        issue=issue,
+        issue=iss,
         model=args["model"],
         api_base=args["api_base"],
         api_key=args["api_key"],
