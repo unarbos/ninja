@@ -695,7 +695,7 @@ def _adaptive_target_cap(total_entries: int) -> int:
 
 def _score_reference_entry(
     entry: RawDiffEntry,
-    issue: str,
+    task_text: str,
     issue_terms: List[str],
     path_mentions: List[str],
     line_counts: Dict[str, int],
@@ -735,7 +735,7 @@ def _score_reference_entry(
 
 def _rank_reference_targets(
     entries: List[RawDiffEntry],
-    issue: str,
+    task_text: str,
     line_counts: Dict[str, int],
 ) -> Tuple[List[RawDiffEntry], List[RawDiffEntry], str]:
     non_noise = [entry for entry in entries if not _is_noise_path(entry.path)]
@@ -874,7 +874,7 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
     return ("\n" + "\n".join(lines).strip() + "\n") if lines else ""
 
 
-def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
+def run_reference_prepass(repo: Path, task_text: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
     if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
         return None
     ref_sha = _find_reference_sha(repo)
@@ -1093,7 +1093,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str, preferred_files: Optional[List[str]] = None) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
