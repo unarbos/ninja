@@ -711,7 +711,8 @@ def _safe_json_from_text(text: str) -> Any:
         return None
 
 
-def _fallback_keywords(issue: str, max_keywords: int = MAX_KEYWORDS_FOR_CONTEXT) -> List[str]:
+def _fallback_keywords(problem: str, max_keywords: int = MAX_KEYWORDS_FOR_CONTEXT) -> List[str]:
+    issue = problem
     candidates: List[str] = []
     for p in _extract_issue_path_mentions(issue):
         candidates.append(p)
