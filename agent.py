@@ -118,19 +118,19 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
-    r\brm\s+-rf\s+/,
-    r\bsudo\b,
-    r\bshutdown\b,
-    r\breboot\b,
-    r\bmkfs\b,
-    r\bdd\s+if=,
+    r"\brm\s+-rf\s+/",
+    r"\bsudo\b",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bmkfs\b",
+    r"\bdd\s+if=",
     r":\(\)\s*\{\s*:\|:\s*&\s*\};:",
-    r\bmount\b,
-    r\bumount\b,
-    r\biptables\b,
-    r\bnft\b,
-    r\bchown\s+-R\s+/,
-    r\bchmod\s+-R\s+777\s+/,
+    r"\bmount\b",
+    r"\bumount\b",
+    r"\biptables\b",
+    r"\bnft\b",
+    r"\bchown\s+-R\s+/",
+    r"\bchmod\s+-R\s+777\s+/",
 ]
 
 
@@ -484,10 +484,14 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
 
 def _command_env() -> Dict[str, str]:
+    # HOME and TMPDIR are intentionally hardcoded (not read from os.environ).
+    # The PR Scope Guard's env-var allowlist does not permit reading those
+    # names; subprocesses get a stable /tmp for both, which is sufficient
+    # for the agent's bash/python/git/pytest usage inside the task repo.
     return {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", /tmp) or /tmp,
-        "TMPDIR": os.environ.get("TMPDIR", /tmp) or /tmp,
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
         "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
