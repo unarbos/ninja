@@ -1711,8 +1711,6 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 ## Safety
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
-
-ANTI-WHIFF RULE: Before your final response, verify `git diff HEAD` shows at least one changed file. If the diff is empty: make the single most confident change you identified during exploration — add it now. An empty patch is an automatic loss on both scoring axes. Any real code change beats no change.
 """
 
 
