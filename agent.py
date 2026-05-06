@@ -97,6 +97,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 
 # Wall-clock cap so one slow inference step cannot blow past validator deadlines.
 WALL_CLOCK_BUDGET_SECONDS = 540
+WALL_CLOCK_RESERVE_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_RESERVE_SECONDS", "30"))
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -125,12 +126,12 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"\bcurl\b",
-    r"\bwget\b",
-    r"\bnc\b",
-    r"\bnetcat\b",
-    r"\bssh\b",
-    r"/dev/tcp/",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
+    r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
 
 
@@ -1075,14 +1076,16 @@ _BRACE_LANG_SUFFIXES = frozenset(
 )
 
 
-def _brace_balance_delta(source: str) -> Tuple[int, int]:
-    """Return (brace_depth, last_line_checked). Depth 0 means balanced."""
+def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
+    """Return first unmatched delimiter as (line, message), or None."""
 
-    depth = 0
+    stack: List[Tuple[str, int]] = []
     line = 1
     i = 0
     n = len(source)
     state = "code"
+    opener_to_closer = {"{": "}", "[": "]", "(": ")"}
+    closer_to_opener = {"}": "{", "]": "[", ")": "("}
 
     while i < n:
         c = source[i]
@@ -1112,12 +1115,20 @@ def _brace_balance_delta(source: str) -> Tuple[int, int]:
                 state = "str_raw"
                 i += 1
                 continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth < 0:
-                    return depth, line
+            if c in opener_to_closer:
+                stack.append((c, line))
+            elif c in closer_to_opener:
+                if not stack:
+                    return line, f"unexpected closing '{c}'"
+                expected_open = closer_to_opener[c]
+                last_open, open_line = stack[-1]
+                if last_open != expected_open:
+                    expected_close = opener_to_closer[last_open]
+                    return line, (
+                        f"mismatched closing '{c}' for opening '{last_open}' "
+                        f"from line {open_line}; expected '{expected_close}'"
+                    )
+                stack.pop()
             i += 1
             continue
 
@@ -1159,7 +1170,11 @@ def _brace_balance_delta(source: str) -> Tuple[int, int]:
             i += 1
             continue
 
-    return depth, line
+    if stack:
+        last_open, open_line = stack[-1]
+        expected_close = opener_to_closer[last_open]
+        return open_line, f"unclosed '{last_open}' (expected '{expected_close}')"
+    return None
 
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1177,9 +1192,10 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         text = full.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
-    delta, err_line = _brace_balance_delta(text)
-    if delta != 0:
-        return f"{relative_path}:{err_line}: brace imbalance (net curly-brace depth {delta:+d})"
+    err = _delimiter_balance_error(text)
+    if err is not None:
+        err_line, detail = err
+        return f"{relative_path}:{err_line}: delimiter imbalance: {detail}"
     return None
 
 
@@ -1676,9 +1692,16 @@ def build_polish_prompt(junk_summary: str) -> str:
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
         f"  {junk_summary}\n\n"
-        "Revert ONLY those hunks (sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder "
-        "imports, do not touch unrelated lines. After cleanup, end with "
+        "Low-signal categories to remove first:\n"
+        "  - blank-line-only hunks\n"
+        "  - whitespace-only hunks\n"
+        "  - comment-only hunks\n\n"
+        "Revert ONLY those hunks (sed/cat/python to restore the original lines).\n"
+        "Do NOT add new edits, do NOT refactor, do NOT reorder imports, and do "
+        "NOT touch unrelated lines.\n\n"
+        "If a flagged hunk is actually required for correctness, keep it and "
+        "briefly state why in <final>.\n\n"
+        "After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
         "patch as-is."
@@ -1775,11 +1798,12 @@ def solve(
     success = False
     consecutive_no_command = 0
     polish_turns_used = 0
-    coverage_nudge_turns_used = 0
+    coverage_nudges_used = 0
     criteria_nudge_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     hail_mary_turns_used = 0
+    consecutive_model_errors = 0
     out_of_time = False
 
     def queue_refinement_turn(
@@ -1803,7 +1827,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, coverage_nudge_turns_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, coverage_nudges_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1819,10 +1843,10 @@ def solve(
                 )
                 return True
 
-        if coverage_nudge_turns_used < MAX_COVERAGE_NUDGES:
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing_files = _uncovered_required_paths(patch, issue)
             if missing_files:
-                coverage_nudge_turns_used += 1
+                coverage_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing_files),
@@ -1880,10 +1904,11 @@ def solve(
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > WALL_CLOCK_BUDGET_SECONDS:
+            elapsed = time.monotonic() - _wall_start
+            if elapsed > max(1, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS):
                 out_of_time = True
                 logs.append(
-                    "\nWALL_STOP:\nout_of_time — wall-clock budget exhausted; "
+                    "\nWALL_STOP:\nout_of_time — entering reserve window; "
                     "returning the best patch produced so far."
                 )
                 break
@@ -1907,15 +1932,23 @@ def solve(
                         time.sleep(3)
 
             if response_text is None:
+                consecutive_model_errors += 1
                 partial_patch = get_patch(repo)
                 if partial_patch.strip():
                     logs.append(
                         "\nMODEL_ERROR_RECOVER:\nPersistent model error; returning best partial patch."
                     )
                     success = True
+                    break
+                if consecutive_model_errors < 3 and not out_of_time:
+                    logs.append(
+                        "\nMODEL_ERROR_RETRY:\nNo patch yet; continuing to next step after model failure."
+                    )
+                    continue
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
+            consecutive_model_errors = 0
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
