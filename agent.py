@@ -74,28 +74,20 @@ DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
 # and api_key into solve(). Keep this code compatible with that path.
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
-DEFAULT_API_BASE = (
-    os.environ.get("AGENT_API_BASE")
-    or os.environ.get("NINJA_INFERENCE_BASE_URL")
-    or os.environ.get("OPENAI_BASE_URL", "")
-)
-DEFAULT_API_KEY = (
-    os.environ.get("AGENT_API_KEY")
-    or os.environ.get("NINJA_INFERENCE_API_KEY")
-    or os.environ.get("OPENAI_API_KEY", "")
-)
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "")
+DEFAULT_API_BASE = os.environ.get("OPENAI_BASE_URL", "")
+DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
-MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
-MAX_PRELOADED_CONTEXT_CHARS = int(os.environ.get("AGENT_MAX_PRELOADED_CONTEXT_CHARS", "12000"))
-MAX_PRELOADED_FILES = int(os.environ.get("AGENT_MAX_PRELOADED_FILES", "4"))
-MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
-MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
+MAX_OBSERVATION_CHARS = 9000
+MAX_TOTAL_LOG_CHARS = 180000
+MAX_CONVERSATION_CHARS = 60000
+MAX_PRELOADED_CONTEXT_CHARS = 12000
+MAX_PRELOADED_FILES = 4
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
-WALL_CLOCK_BUDGET_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_BUDGET_SECONDS", "480"))
+WALL_CLOCK_BUDGET_SECONDS = 480
 
 MAX_POLISH_TURNS = 1
 MAX_COVERAGE_NUDGES = 1
@@ -632,8 +624,6 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
-        return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
         return None
@@ -847,10 +837,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
 def _command_env() -> Dict[str, str]:
     return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
-        "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
-        "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "GIT_PAGER": "cat",
@@ -1475,7 +1465,6 @@ SECRETISH_PARTS = {
     ".env",
     ".npmrc",
     ".pypirc",
-    ".netrc",
     "credentials",
     "secret",
     "secrets",
@@ -1862,7 +1851,6 @@ def solve(
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
