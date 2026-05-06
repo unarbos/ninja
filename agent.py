@@ -1749,17 +1749,17 @@ def _keyword_concentration_primary(
     if not counts:
         return None
     sorted_counts = sorted(counts.items(), key=lambda x: (-x[1], len(x[0]), x[0]))
-    top_path, top_count = sorted_counts[0]
+    lead_path, top_count = sorted_counts[0]
     if top_count < 4:
         return None
     if len(sorted_counts) == 1:
-        return top_path
+        return lead_path
     runner_count = sorted_counts[1][1]
     top_n_total = sum(n for _, n in sorted_counts[:5])
     # Require both: 2x the runner-up AND >=50% of the top-5 mass. Either alone
     # is too easy to satisfy in a small repo where every file has 1-2 hits.
     if top_count >= 2 * max(1, runner_count) and top_count * 2 >= top_n_total:
-        return top_path
+        return lead_path
     return None
 
 
