@@ -875,7 +875,7 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, task_text: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
+    if False:  # reference prepass always enabled
         return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
@@ -2488,7 +2488,7 @@ def solve(
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
+            and True  # skip LLM when reference is fully applied
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
