@@ -115,9 +115,17 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_FOOTPRINT_TURNS = 1    # V3 edge: ask model to shrink an over-broad patch
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # bumped 2->3 to allow footprint shrink after coverage/criteria
+                                # placed the right edits — trim spurious volume.
+
+# V3 footprint thresholds. Cursor F1 = matched / max(model_changed, ref_changed),
+# so spurious lines inflate the denominator without adding numerator.
+FOOTPRINT_MAX_FILES_FACTOR = 3
+FOOTPRINT_MAX_TOTAL_FILES = 8
+FOOTPRINT_MAX_HUNK_LINES = 80
+FOOTPRINT_MAX_TOTAL_LINES = 600
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1056,6 +1064,114 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+# -----------------------------
+# V3 edge — patch footprint guard
+# -----------------------------
+
+
+def _patch_footprint_summary(patch: str) -> Dict[str, int]:
+    """Quantify the patch shape for the oversize check. Counts changed files,
+    +/- lines, the largest hunk seen, and the number of fat hunks above
+    FOOTPRINT_MAX_HUNK_LINES."""
+    files = set()
+    plus_lines = 0
+    minus_lines = 0
+    largest_hunk = 0
+    fat_hunks = 0
+    cur_hunk = 0
+
+    def _flush_hunk():
+        nonlocal cur_hunk, largest_hunk, fat_hunks
+        if cur_hunk > largest_hunk:
+            largest_hunk = cur_hunk
+        if cur_hunk > FOOTPRINT_MAX_HUNK_LINES:
+            fat_hunks += 1
+        cur_hunk = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            _flush_hunk()
+            m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+            if m:
+                files.add(m.group(1))
+        elif line.startswith("@@"):
+            _flush_hunk()
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus_lines += 1
+            cur_hunk += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus_lines += 1
+            cur_hunk += 1
+    _flush_hunk()
+
+    return {
+        "files": len(files),
+        "plus": plus_lines,
+        "minus": minus_lines,
+        "total_changed": plus_lines + minus_lines,
+        "largest_hunk": largest_hunk,
+        "fat_hunks": fat_hunks,
+    }
+
+
+def _patch_oversized(patch: str, issue_text: str) -> Optional[Dict[str, int]]:
+    """Return the footprint summary iff the patch is substantively over-broad
+    vs the issue scope. Otherwise None so the refinement step is skipped.
+
+    Two regimes:
+      1. Issue names paths: enforce relative scope (>3x mentioned files) AND
+         absolute caps. The relative check is the strongest signal.
+      2. Issue names NO paths: ONLY enforce absolute caps. We refuse to fire
+         on the relative check (target_count=1 by fallback) because correct
+         multi-file fixes for path-less issues would look "oversized" and the
+         shrink prompt would push the model to revert necessary edits."""
+    if not patch.strip():
+        return None
+    fp = _patch_footprint_summary(patch)
+    mentioned = _extract_issue_path_mentions(issue_text)
+
+    line_overshoot = fp["total_changed"] > FOOTPRINT_MAX_TOTAL_LINES
+    hunk_overshoot = fp["fat_hunks"] >= 2 or fp["largest_hunk"] > FOOTPRINT_MAX_HUNK_LINES * 2
+    abs_file_overshoot = fp["files"] > FOOTPRINT_MAX_TOTAL_FILES
+
+    if not mentioned:
+        # No mentioned-paths regime — absolute caps only.
+        if line_overshoot or hunk_overshoot or abs_file_overshoot:
+            fp["target_files"] = 0
+            return fp
+        return None
+
+    target_count = len(mentioned)
+    relative_file_overshoot = fp["files"] > target_count * FOOTPRINT_MAX_FILES_FACTOR
+    if relative_file_overshoot or abs_file_overshoot or line_overshoot or hunk_overshoot:
+        fp["target_files"] = target_count
+        return fp
+    return None
+
+
+def build_footprint_shrink_prompt(footprint: Dict[str, int], issue_text: str) -> str:
+    """Show concrete oversize numbers and ask for a minimum-sufficient diff."""
+    head = issue_text[:1200]
+    return (
+        "Footprint guard — your draft looks substantively over-broad for this task:\n"
+        f"  - files touched: {footprint['files']}"
+        f"  (issue names ~{footprint.get('target_files', 1)})\n"
+        f"  - total changed lines: {footprint['total_changed']} (cap {FOOTPRINT_MAX_TOTAL_LINES})\n"
+        f"  - largest hunk: {footprint['largest_hunk']} lines\n"
+        f"  - fat hunks (>{FOOTPRINT_MAX_HUNK_LINES} lines): {footprint['fat_hunks']}\n\n"
+        "Cursor F1 = matched_lines / max(model_changed, ref_changed). Every\n"
+        "spurious line in the patch inflates the denominator without adding\n"
+        "matched numerator.\n\n"
+        "Issue (head):\n"
+        f"{head}\n\n"
+        "Revert any unrelated drive-by edits, narrow each hunk to the minimum\n"
+        "lines that actually implement the requirement, and KEEP every change\n"
+        "the issue truly demands. Use sed/python -c/cat to revert non-required\n"
+        "lines back to original. Then end with <final>summary</final>. If the\n"
+        "patch is genuinely already minimal, respond exactly <final>OK</final>."
+    )
 
 
 # -----------------------------
@@ -2237,6 +2353,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    footprint_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2275,7 +2392,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, footprint_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2371,6 +2488,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # V3 edge — footprint guard fires after coverage/criteria placed the
+        # right edits, but BEFORE self_check, so the model still has budget to
+        # actually shrink. Cursor F1 denominator optimization.
+        if footprint_turns_used < MAX_FOOTPRINT_TURNS:
+            oversized = _patch_oversized(patch, issue)
+            if oversized is not None:
+                footprint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_footprint_shrink_prompt(oversized, issue),
+                    f"FOOTPRINT_SHRINK_QUEUED:\n  files={oversized['files']} "
+                    f"changed={oversized['total_changed']} "
+                    f"largest_hunk={oversized['largest_hunk']}",
                 )
                 return True
 
