@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -123,9 +123,9 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 # codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
-_RECENT_COMMIT_MAX_INSERTIONS = 30
+_RECENT_COMMIT_MAX_INSERTIONS = 50
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
-_RECENT_COMMIT_BLOCK_BUDGET = 4500
+_RECENT_COMMIT_BLOCK_BUDGET = 8000
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1607,6 +1607,14 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
 
 ## Workflow
 
