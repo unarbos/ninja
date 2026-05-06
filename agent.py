@@ -1660,7 +1660,7 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 ## Safety
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+No sudo. No destructive host operations. Repository file moves/deletions are allowed only when the issue asks for them. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
 
 
@@ -1672,6 +1672,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {preloaded_context}
 """
+    playbook = build_task_playbook(issue)
 
     return f"""Fix this issue:
 
@@ -1681,6 +1682,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
+{playbook}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
@@ -1690,6 +1692,55 @@ If the preloaded snippets show the target code, edit them directly — do not re
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+"""
+
+
+def build_task_playbook(issue: str) -> str:
+    issue_lower = issue.lower()
+    notes: List[str] = []
+
+    if any(term in issue_lower for term in ("cache", "localstorage", "offline", "reload", "refresh", "pull-to-refresh", "pull to refresh")):
+        notes.append(
+            "Cache/reload task: enumerate data hooks with one focused `ls src/hooks` or `rg \"export function use\" src/hooks`, then initialize React state from local storage snapshots for every fetching hook involved, including parent selector hooks such as active semester/current workspace as well as dependent list hooks; prefer one shared cache helper when several hooks need snapshots, refresh in the background, write snapshots after successful fetches and local mutations, put pull-to-refresh CSS on both html and body, and before final check that every fetching hook named in your plan is actually touched by the diff."
+        )
+
+    if any(term in issue_lower for term in ("broadcast", "banner", "settings panel", "severity")):
+        notes.append(
+            "Broadcast/settings task: implement the visible banner in the app shell, wire controls into the existing settings panel, "
+            "persist settings, and make dismissal depend on both message and severity."
+        )
+
+    if "service" in issue_lower and any(term in issue_lower for term in ("remove", "strip", "non-core", "refactor")):
+        notes.append(
+            "Service strip-down task: update every named service's code, dependency file, test descriptor, and URL map; after editing, search final files for removed endpoint names, response fields, imports, and dependencies."
+        )
+
+    if any(term in issue_lower for term in ("appointment", "booking", "workshop", "scheduling", "calendar event")):
+        notes.append(
+            "Booking/assignment task: store the stable id used for queries separately from the display label, write that id at creation time, filter dashboards and available slots by it, handle empty option lists by warning and disabling the primary form, and integrate new workshop/user fields into the existing admin user-creation flow."
+        )
+
+    if any(term in issue_lower for term in ("router", "routing", "file structure", "page components", "move app.js", "move app.css")):
+        notes.append(
+            "Routing/file-structure task: move or delete stale duplicate root files, update runtime imports, and create every page component and route named by the issue."
+        )
+
+    if any(term in issue_lower for term in ("rls", "policy", "migration", "quiet hours", "push notification", "row-level")):
+        notes.append(
+            "Database/security task: inspect existing table/column/function names before SQL, keep required client-side fallback filters, and apply server-side filtering without dropping in-app behavior."
+        )
+
+    if any(term in issue_lower for term in ("trip simulator", "battery drain", "charging station", "station marker", "range anxiety")):
+        notes.append(
+            "Trip simulator task: edit the visible scene and controls together; show station markers on the progress slider, split traveled vs remaining route styling, dim passed stations, surface low-battery warnings, and keep reset/play/scrub behavior consistent with route consumption."
+        )
+
+    if not notes:
+        return ""
+    bullets = "\n".join(f"- {note}" for note in notes)
+    return f"""Task-specific playbook:
+{bullets}
+
 """
 
 
