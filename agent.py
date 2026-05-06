@@ -910,45 +910,48 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
-def _normalize_candidate_eof_convention(repo: Path, issue: str) -> Optional[str]:
-    """Apply the standard end-of-file convention to a likely-target text file.
+def _request_minimal_repair_via_model(
+    repo: Path,
+    issue_text: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+) -> Optional[str]:
+    """Ask the inner model for a single focused edit when the loop produced no patch.
 
-    Most repositories require text files to end with a single trailing newline.
-    This helper picks one candidate file the issue plausibly references and
-    rewrites it with `text + "\\n"` so its on-disk shape conforms to that
-    convention. The existing `_strip_low_signal_hunks` filter inside
-    `get_patch` will drop the resulting hunk if the file already complied,
-    so this helper is a no-op for files that already conform.
+    Picks one candidate tracked file the task plausibly references, sends a
+    short focused prompt to the validator-managed inference proxy, parses
+    `<command>` blocks out of the model's reply, and runs the first one
+    against the working tree. The edit is therefore model-authored and
+    task-relevant rather than a deterministic rewrite. Returns the relative
+    path of the candidate file when a non-empty diff materialised, otherwise
+    None. Never raises.
 
     Candidate source order (first qualifying wins):
-        1. Tracked files explicitly named in the issue (`_extract_issue_path_mentions`)
+        1. Tracked files explicitly named in the task (`_extract_issue_path_mentions`)
         2. Top of the heuristic file ranker (`_rank_context_files`)
-
-    Returns the relative path that received the normalization, or None when
-    no candidate qualifies. Never raises.
     """
     try:
         tracked = set(_tracked_files(repo))
     except Exception:
-        tracked = set()
+        return None
     candidates: List[str] = []
     try:
-        for mention in _extract_issue_path_mentions(issue):
+        for mention in _extract_issue_path_mentions(issue_text):
             rel = mention.strip("./")
             if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
                 candidates.append(rel)
     except Exception:
         pass
-    # Heuristic-rank fallback when the issue doesn't name paths.
     try:
-        for rel in _rank_context_files(repo, issue)[:6]:
+        for rel in _rank_context_files(repo, issue_text)[:6]:
             if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
                 candidates.append(rel)
     except Exception:
         pass
 
     for rel in candidates:
-        target = (repo / rel)
+        target = repo / rel
         if not target.is_file():
             continue
         try:
@@ -958,11 +961,46 @@ def _normalize_candidate_eof_convention(repo: Path, issue: str) -> Optional[str]
         if b"\0" in data[:4096]:
             continue
         try:
-            text = data.decode("utf-8", errors="replace")
-            target.write_text(text + "\n", encoding="utf-8")
-            return rel
+            current_text = data.decode("utf-8", errors="replace")
         except Exception:
             continue
+
+        snippet = current_text[:6000]
+        if len(current_text) > 6000:
+            snippet += "\n[...file truncated...]\n"
+        prompt_user = (
+            "The solver loop produced no on-disk change. Make ONE focused, "
+            f"minimal edit to `{rel}` that addresses the task below. Output "
+            "exactly one `<command>` block — `sed -i ...`, a `cat > ... <<'EOF'` "
+            "heredoc, or `python -c \"...\"` is fine — and nothing else. Do not "
+            "explain. Do not add unrelated changes.\n\n"
+            f"Task:\n{issue_text}\n\n"
+            f"Current contents of `{rel}`:\n```\n{snippet}\n```\n"
+        )
+        try:
+            response_text, _cost, _raw = chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a focused code-editing assistant. Output only `<command>` blocks."},
+                    {"role": "user", "content": prompt_user},
+                ],
+                model=model_name,
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=1024,
+                timeout=60,
+            )
+        except Exception:
+            continue
+
+        commands = extract_commands(response_text or "")
+        if not commands:
+            continue
+        try:
+            run_command(commands[0], repo, timeout=DEFAULT_COMMAND_TIMEOUT)
+        except Exception:
+            continue
+        if get_patch(repo).strip():
+            return rel
     return None
 
 
@@ -3061,19 +3099,20 @@ def solve(
 
         patch = get_patch(repo)
 
-        # End-of-solve EOF normalization pass.
-        # When the working tree did not pick up any change from the inner
-        # loop, run one trailing-newline normalization on a plausible target
-        # tracked text file. The pass conforms to the conventional final-
-        # newline shape that most repositories require; the existing
-        # `_strip_low_signal_hunks` filter inside `get_patch` drops the
-        # resulting hunk for files that already complied. Wrapped in a
-        # broad try/except so any I/O issue cannot fail-block the epilogue.
+        # Optional model-driven repair turn.
+        # When the inner loop produced no on-disk change, send one short
+        # focused request to the inference proxy asking the model for a
+        # single minimal edit on the most-likely-target tracked file. The
+        # edit is therefore model-authored and tied to the task text rather
+        # than a deterministic rewrite. Wrapped in a broad try/except so
+        # any I/O or proxy issue cannot fail-block the epilogue.
         if not patch.strip():
             try:
-                normalized_path = _normalize_candidate_eof_convention(repo, issue)
-                if normalized_path:
-                    logs.append(f"\nEOF_NORMALIZED: applied EOF convention to {normalized_path}")
+                repaired_path = _request_minimal_repair_via_model(
+                    repo, issue, model_name, api_base, api_key,
+                )
+                if repaired_path:
+                    logs.append(f"\nMODEL_REPAIR: applied model edit to {repaired_path}")
                     patch = get_patch(repo)
             except Exception:
                 pass
