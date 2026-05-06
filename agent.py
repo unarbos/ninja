@@ -703,6 +703,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_sibling_style_anchors(files, tracked_set)
 
     parts: List[str] = []
     used = 0
@@ -1396,6 +1397,69 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
         if partner and partner not in seen:
             augmented.append(partner)
             seen.add(partner)
+    return augmented
+
+
+# Same-extension siblings from the same directory are concrete style anchors.
+# A FeaturedCategories.tsx that needs editing in a Next.js app is much more
+# likely to look like its sibling RelatedProducts.tsx than to look like an
+# abstract "match the file's style" instruction. The LLM judge's most common
+# loss mode in the live duel was "right problem, wrong shape" (default vs
+# named export, icon placement, missing design tokens) — those choices live
+# in the surrounding files of the same directory, not in any abstract rule.
+_SIBLING_STYLE_EXTS = {
+    ".cs", ".go", ".java", ".js", ".jsx", ".kt", ".py", ".rb", ".rs",
+    ".scss", ".svelte", ".ts", ".tsx", ".vue",
+}
+_SIBLING_STYLE_MAX_PER_FILE = 2
+_SIBLING_STYLE_TEST_HINTS = ("test", "spec", "mock", "stub", "fixture")
+
+
+def _find_sibling_style_anchors(relative_path: str, tracked: set) -> List[str]:
+    """Return up to N tracked files that share the directory and extension of
+    ``relative_path`` and look like real source files (not tests, mocks, or
+    fixtures). Conservative on count and lexicographic on order so the
+    selection is deterministic and the prompt stays compact.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in _SIBLING_STYLE_EXTS:
+        return []
+    parent = Path(relative_path).parent.as_posix()
+    candidates: List[str] = []
+    for tracked_path in tracked:
+        if tracked_path == relative_path:
+            continue
+        if Path(tracked_path).suffix.lower() != suffix:
+            continue
+        if Path(tracked_path).parent.as_posix() != parent:
+            continue
+        name_lower = Path(tracked_path).name.lower()
+        if any(hint in name_lower for hint in _SIBLING_STYLE_TEST_HINTS):
+            continue
+        if not _context_file_allowed(tracked_path):
+            continue
+        candidates.append(tracked_path)
+    candidates.sort(key=lambda p: (len(p), p))
+    return candidates[:_SIBLING_STYLE_MAX_PER_FILE]
+
+
+def _augment_with_sibling_style_anchors(files: List[str], tracked: set) -> List[str]:
+    """For ONLY the rank-0 file, append 1-2 same-dir same-ext siblings as
+    concrete style anchors. We restrict to the primary target so the
+    augmentation never crowds the preloaded-context budget; lower-ranked
+    files already have their own siblings as candidates if the main ranking
+    promotes them.
+    """
+    if not files or not tracked:
+        return files
+    augmented: List[str] = list(files)
+    seen: set = set(files)
+    primary = files[0]
+    for sibling in _find_sibling_style_anchors(primary, tracked):
+        if sibling in seen:
+            continue
+        seen.add(sibling)
+        augmented.append(sibling)
     return augmented
 
 
