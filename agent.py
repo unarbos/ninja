@@ -94,6 +94,12 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
+# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
+# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
+MAX_STEP_RETRIES = 2
+WALL_CLOCK_BUDGET_SECONDS = 540.0
+WALL_CLOCK_RESERVE_SECONDS = 20.0
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -101,6 +107,7 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -284,6 +291,7 @@ def _repo_path(path: str | Path) -> Path:
 
 _RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 _MAX_API_RETRIES = 3
+HTTP_RETRY_BASE_BACKOFF = 1.0
 
 # MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
 # behavior, response parsing, or model-message strategy here. Keep all requests
@@ -335,11 +343,15 @@ def chat_completion(
             last_error = RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}")
             if e.code not in _RETRYABLE_HTTP_CODES:
                 raise last_error from e
-            delay = min(2 ** attempt * 2, 15)
+            delay = min(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt), 15)
             time.sleep(delay)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             last_error = RuntimeError(f"Model request failed: {e}")
-            delay = min(2 ** attempt * 2, 15)
+            delay = min(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt), 15)
+            time.sleep(delay)
+        except json.JSONDecodeError as e:
+            last_error = RuntimeError(f"Model returned non-JSON: {e}")
+            delay = min(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt), 15)
             time.sleep(delay)
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
@@ -1126,15 +1138,17 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
-    required = _extract_issue_path_mentions(issue_text)
-    if not required:
-        return True
-    changed = set(_patch_changed_files(patch))
-    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
+    return not _uncovered_required_paths(patch, issue_text)
 
 
-def _find_missing_paths(patch: str, issue_text: str) -> List[str]:
-    """Return issue-mentioned paths that are not yet in the patch."""
+def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
+    """Required paths from the issue that the patch doesn't touch yet.
+
+    Used by the coverage-nudge refinement turn to tell the model concretely
+    which files the task says to edit but that haven't been touched. The
+    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
+    the gap to the model directly is the cheapest way to close it.
+    """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
         return []
@@ -1217,6 +1231,87 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
+_BRACE_BALANCE_SUFFIXES = {
+    ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
+    ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
+}
+
+
+def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Cheap brace/paren/bracket balance check for languages without a parser.
+
+    The LLM judge frequently dings patches for "extra closing braces" or
+    "duplicate brace" — issues a real compiler would catch. This naive
+    counter ignores braces inside string and comment context (best-effort)
+    and reports an imbalance with file + count delta.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1232,9 +1327,13 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_python_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
+            if result is None and suffix == ".js":
+                result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        # Other suffixes: trust the model; syntax errors will surface at runtime.
+        elif suffix in _BRACE_BALANCE_SUFFIXES:
+            result = _check_brace_balance_one(repo, relative_path)
+        # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
     return errors
@@ -1633,6 +1732,28 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
+    """Tell the model which issue-mentioned paths are still untouched.
+
+    The LLM diff judge most often docks king for incomplete coverage. When the
+    issue names specific files and the draft skips them, surface that gap
+    directly — much cheaper than hoping the self-check catches it.
+    """
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    return (
+        "Coverage gap — the task explicitly mentions these path(s) but your "
+        "current patch does NOT touch them:\n"
+        f"  {bullets}\n\n"
+        "Open each of those paths now (cat -n) and then issue the edit "
+        "commands needed to satisfy the task for them. Do not start "
+        "unrelated work and do not stop early until you have either edited "
+        "each path or confirmed via inspection that no edit is required.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1685,9 +1806,18 @@ def solve(
     consecutive_no_command = 0
     recent_commands: List[str] = []
     consecutive_read_only = 0
+    consecutive_model_errors = 0
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    coverage_nudges_used = 0
+    solve_started_at = time.monotonic()
+
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1706,10 +1836,11 @@ def solve(
         means the caller can declare success. The order is:
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
+            3. coverage-nudge — name issue-mentioned paths still untouched
+            4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1736,6 +1867,17 @@ def solve(
                 )
                 return True
 
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
@@ -1759,17 +1901,19 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > 480:
-                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+            if out_of_time():
+                logs.append(
+                    f"\nWALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "returning current state."
+                )
                 break
 
             response_text = None
-            for _attempt in range(2):
+            for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -1782,12 +1926,32 @@ def solve(
                         total_cost += cost
                     break
                 except Exception:
-                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
-                    if _attempt == 0:
-                        time.sleep(3)
+                    exc = traceback.format_exc()
+                    logs.append(
+                        f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
+                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
+                    )
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
+                        time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
+                        continue
+                    break
 
             if response_text is None:
-                break
+                consecutive_model_errors += 1
+                if get_patch(repo).strip():
+                    logs.append(
+                        "MODEL_ERROR_RECOVER:\nReturning best partial patch "
+                        "after persistent model errors."
+                    )
+                    success = True
+                    break
+                if consecutive_model_errors >= 3 or out_of_time():
+                    logs.append(
+                        "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
+                        "errors -- ending loop."
+                    )
+                    break
+                continue
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
@@ -1903,7 +2067,7 @@ def solve(
             if observations:
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
-                    missing = _find_missing_paths(get_patch(repo), issue)
+                    missing = _uncovered_required_paths(get_patch(repo), issue)
                     if missing:
                         observation_text += (
                             f"\n\nPatch exists but does NOT touch: {', '.join(missing)}. "
@@ -2121,4 +2285,4 @@ def main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:])) 
+    raise SystemExit(main(sys.argv[1:]))
