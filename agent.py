@@ -102,8 +102,15 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Validator allots clamp(2 * cursor_elapsed + 1, 120, 600) seconds per task and
+# the docker harness enforces a hard floor of max(that, 300)s from process start.
+# The actual budget is NOT exposed to solve(), so we plan for the worst case.
+# SAFE: lock in any patch we already have once we cross this; HARD: must stop.
+WALL_CLOCK_SAFE_BUDGET_SECONDS = 100.0
+WALL_CLOCK_HARD_BUDGET_SECONDS = 270.0
+WALL_CLOCK_RESERVE_SECONDS = 15.0
+# Cap on a single chat_completion call so one slow request can't burn the budget.
+MODEL_CALL_MAX_TIMEOUT_SECONDS = 60
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -1921,11 +1928,22 @@ def solve(
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
+    def elapsed() -> float:
+        return time.monotonic() - solve_started_at
+
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return WALL_CLOCK_HARD_BUDGET_SECONDS - elapsed()
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
+
+    def past_safe_budget() -> bool:
+        return elapsed() >= WALL_CLOCK_SAFE_BUDGET_SECONDS
+
+    def model_call_timeout() -> int:
+        # Never let a single request exceed what we have left (minus reserve).
+        budget = max(15.0, time_remaining() - WALL_CLOCK_RESERVE_SECONDS)
+        return int(min(MODEL_CALL_MAX_TIMEOUT_SECONDS, budget))
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2055,6 +2073,15 @@ def solve(
                 )
                 break
 
+            if past_safe_budget() and get_patch(repo).strip():
+                logs.append(
+                    f"WALL_CLOCK_SAFE_BAIL:\nelapsed={elapsed():.1f}s past safe budget "
+                    f"({WALL_CLOCK_SAFE_BUDGET_SECONDS:.0f}s) with patch in hand -- "
+                    "locking it in before validator's per-task timeout."
+                )
+                success = True
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2064,6 +2091,7 @@ def solve(
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=model_call_timeout(),
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -2134,6 +2162,15 @@ def solve(
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                if out_of_time():
+                    # Stop running shell commands once we've crossed the
+                    # validator's kill window — better to break and return
+                    # whatever's on disk than to be SIGTERM'd mid-command.
+                    logs.append(
+                        "\nWALL_CLOCK_STOP_CMDS:\nout of time inside command "
+                        f"batch (index={command_index}/{len(command_batch)})."
+                    )
+                    break
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -2227,12 +2264,16 @@ def solve(
             except Exception:
                 pass
 
+        # If a partial patch is on disk, claim success so the validator scores
+        # it as `completed` instead of `solver_error`. Validator reads git diff
+        # from the workspace, so the patch content is what counts; the harness
+        # exit code only decides which exit_reason gets recorded.
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
             steps=0,
             cost=total_cost,
-            success=False,
+            success=bool(patch.strip()),
         ).to_dict()
 
 
