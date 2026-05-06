@@ -1434,7 +1434,7 @@ Rules:
 
 
 
-def build_initial_user_prompt(iss: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1452,7 +1452,7 @@ budget; patch them directly unless a needed detail is missing.
     return f"""We need fix this issue:
 
 
-{iss}
+{issue}
 
 
 Repository summary:
@@ -1530,10 +1530,10 @@ def solve(
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
-        reference_result = run_reference_prepass(repo, iss, logs)
+        reference_result = run_reference_prepass(repo, issue, logs)
         preferred_context_files = reference_result.pending_paths if reference_result else []
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, iss, preferred_files=preferred_context_files)
+        preloaded_context = build_preloaded_context(repo, issue, preferred_files=preferred_context_files)
         prompt_addendum = _build_reference_prompt_addendum(reference_result)
         if prompt_addendum:
             prompt_addendum = "\n" + prompt_addendum.strip()
@@ -1560,7 +1560,7 @@ def solve(
             {
                 "role": "user",
                 "content": build_initial_user_prompt(
-                    iss,
+                    issue,
                     repo_summary,
                     preloaded_context,
                 )
