@@ -1610,19 +1610,20 @@ brief summary of what changed
 
 ## Language-specific completeness rules
 
-**Java:** Complete method bodies — no `// similar logic` stubs. Cascade to all
- call sites on signature changes. Include all required imports.
+**Java:** Write complete method bodies - never use '// similar logic' stubs.
+ Cascade all call-site changes when modifying signatures. Include all imports.
 
-**C/C++:** Edit both `.h` header AND `.cpp` implementation. Full signatures.
- All `#include` changes required.
+**C/C++:** Edit both .h header AND .cpp implementation for each changed function.
+ Include full signatures and all required #include changes.
 
-**TypeScript/C#:** Cascade interface/type changes to ALL implementing classes,
- components, and function parameters.
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing
+ classes, components, and function parameters. Missing one = lower score.
 
-**Go/Rust:** Update all struct field usages. Complete Rust lifetime annotations.
+**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
+ annotations on modified functions.
 
-**Anti-catastrophic-failure:** Include MORE files when uncertain — never produce
- a patch smaller than 20% of the expected fix size. Complete ALL affected files.
+**Multi-file tasks:** Complete ALL affected files in the same diff - never
+ leave a related file partially edited. When in doubt, include more files.
 
 
 
@@ -2052,23 +2053,7 @@ def solve(
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
-        # v24: Call validator-provided reference prepass if available.
-        # We look up via globals() — never define our own _reference_prepass (validator-owned).
-        _prepass_fn = globals().get("_reference_prepass")
-        if callable(_prepass_fn):
-            try:
-                _prepass_ok = _prepass_fn(repo, issue, logs)
-            except Exception as _exc:
-                logs.append(f"PREPASS_ERROR: {_exc}")
-                _prepass_ok = False
-            if _prepass_ok:
-                _pp = get_patch(repo)
-                if _pp.strip():
-                    logs.append("\nPREPASS_COMPLETE: Returning reference patch.")
-                    return AgentResult(patch=_pp, logs=_safe_join_logs(logs), steps=0, cost=0.0, success=True).to_dict()
-                logs.append("\nPREPASS_EMPTY: Patch empty after prepass; falling back to LLM.")
-
-                repo_summary = get_repo_summary(repo)
+        repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
@@ -2087,13 +2072,14 @@ def solve(
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
-                # v24: Emergency fallback — capture git diff HEAD if patch empty.
+                # Emergency: if patch is empty, try git diff HEAD.
                 if not get_patch(repo).strip():
-                    import subprocess as _sp
                     try:
-                        _ep = _sp.run(["git","diff","HEAD"], cwd=str(repo), capture_output=True, text=True, timeout=10)
-                        if _ep.stdout.strip():
-                            logs.append("WALL_CLOCK_EMERGENCY: captured partial patch via git diff HEAD.")
+                        import subprocess as _subp
+                        _r = _subp.run(["git","diff","HEAD"],
+                            cwd=str(repo), capture_output=True, text=True, timeout=10)
+                        if _r.stdout.strip():
+                            logs.append("WALL_EMERGENCY: partial patch captured.")
                     except Exception:
                         pass
                 break
