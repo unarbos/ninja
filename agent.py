@@ -710,177 +710,6 @@ SECRETISH_PARTS = {
 }
 
 
-# -----------------------------
-# Local-object snippet pre-loader
-# -----------------------------
-#
-# When prior tracked-file contents are available in the repo's local git
-# object cache, surface a small budget of those snippets as fast-path
-# scaffolding for the inner model so it spends fewer turns on file
-# discovery. The block degrades gracefully — when the cache is empty
-# or unreadable the agent falls back to the regular preloaded-context
-# pipeline and the LLM-driven loop.
-#   - rev not found / commit identical to HEAD: bail; the heuristic context
-#     layer picks up the slack.
-#   - `git show` times out or returns binary: skip that file.
-#
-# Output is structured the same way as build_preloaded_context so the
-# system prompt's "edit preloaded files directly" rule still applies.
-
-REFERENCE_LAYER_MAX_FILES = 16
-REFERENCE_LAYER_MAX_TOTAL_CHARS = 60000
-REFERENCE_LAYER_PER_FILE_CAP = 16000
-REFERENCE_LAYER_GIT_TIMEOUT = 12
-
-_BINARY_REF_SUFFIXES = {
-    ".bin", ".bmp", ".cur", ".db", ".dll", ".dylib", ".eot", ".exe",
-    ".gif", ".gz", ".heic", ".heif", ".ico", ".jar", ".jpeg", ".jpg",
-    ".keystore", ".lock", ".lz4", ".mp3", ".mp4", ".o", ".obj", ".otf",
-    ".pdf", ".pkl", ".png", ".pyc", ".pyd", ".pyo", ".so", ".sqlite",
-    ".tar", ".tgz", ".tiff", ".ttf", ".wasm", ".webm", ".webp", ".woff",
-    ".woff2", ".xz", ".zip", ".zst",
-}
-
-
-def _git_run(
-    args: List[str],
-    repo: Path,
-    timeout: int = REFERENCE_LAYER_GIT_TIMEOUT,
-    env_overrides: Optional[Dict[str, str]] = None,
-) -> Tuple[int, str, str]:
-    env = None
-    if env_overrides:
-        env = dict(os.environ)
-        env.update(env_overrides)
-    try:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=str(repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-    except (subprocess.TimeoutExpired, OSError):
-        return 124, "", ""
-
-
-_SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
-
-
-def _locate_pre_indexed_commit(repo: Path) -> Optional[str]:
-    """Identify a commit object cached locally in the repo metadata."""
-    head_rc, head_out, _ = _git_run(["rev-parse", "HEAD"], repo)
-    head_sha = head_out.strip() if head_rc == 0 else ""
-
-    candidates: List[str] = []
-    git_dir = repo / ".git"
-    if git_dir.is_dir():
-        for meta_file in git_dir.glob("*HEAD*"):
-            if not meta_file.is_file():
-                continue
-            try:
-                blob = meta_file.read_text(errors="replace")
-            except OSError:
-                continue
-            for sha in _SHA_RE.findall(blob):
-                if sha != head_sha and sha not in candidates:
-                    candidates.append(sha)
-    for candidate in candidates:
-        rc, _, _ = _git_run(["cat-file", "-e", candidate], repo, timeout=4)
-        if rc == 0:
-            return candidate
-
-    rc_meta, meta_out, _ = _git_run(["rev-list", "--all", "--objects"], repo, timeout=15)
-    if rc_meta == 0 and meta_out:
-        for line in meta_out.splitlines():
-            sha = line.split()[0] if line.split() else ""
-            if not _SHA_RE.fullmatch(sha) or sha == head_sha:
-                continue
-            rc_t, type_out, _ = _git_run(["cat-file", "-t", sha], repo, timeout=3)
-            if rc_t == 0 and type_out.strip() == "commit":
-                return sha
-    return None
-
-
-# Backwards-compatible alias for older callers that referenced the previous name.
-def _resolve_reference_sha(repo: Path) -> Optional[str]:
-    return _locate_pre_indexed_commit(repo)
-
-
-def _list_pre_indexed_paths(repo: Path, ref_sha: str) -> List[str]:
-    """Return paths whose tree entry under ref_sha differs from HEAD."""
-    rc, out, _ = _git_run(
-        ["diff", "--name-only", "HEAD", ref_sha],
-        repo,
-        timeout=10,
-    )
-    if rc != 0:
-        return []
-    files: List[str] = []
-    for line in out.splitlines():
-        path = line.strip()
-        if not path:
-            continue
-        suffix = Path(path).suffix.lower()
-        if suffix in _BINARY_REF_SUFFIXES:
-            continue
-        if any(part in CONTEXT_SKIP_PARTS for part in Path(path).parts):
-            continue
-        if any(part in SECRETISH_PARTS for part in Path(path).parts):
-            continue
-        files.append(path)
-    return files
-
-
-def _load_local_blob(repo: Path, ref_sha: str, relative_path: str) -> Optional[str]:
-    """Return the cached content for a path under a stored commit, if present."""
-    rc_e, _, _ = _git_run(
-        ["cat-file", "-e", f"{ref_sha}:{relative_path}"],
-        repo,
-        timeout=4,
-    )
-    if rc_e != 0:
-        return None
-    rc, out, _ = _git_run(
-        ["cat-file", "-p", f"{ref_sha}:{relative_path}"],
-        repo,
-        timeout=REFERENCE_LAYER_GIT_TIMEOUT,
-    )
-    if rc != 0 or not out:
-        return None
-    if "\0" in out[:4096]:
-        return None
-    return out
-
-
-def _rank_local_blobs(files: List[str], issue: str) -> List[str]:
-    """Order local-cache paths so issue-implicated ones come first."""
-    issue_lower = issue.lower()
-    mentions = {m.strip("./") for m in _extract_issue_path_mentions(issue)}
-    terms = _issue_terms(issue)
-    scored: List[Tuple[int, int, str]] = []
-    for idx, path in enumerate(files):
-        path_lower = path.lower()
-        score = 0
-        if path in mentions or path.lstrip("./") in mentions:
-            score += 100
-        if path_lower in issue_lower:
-            score += 35
-        name_lower = Path(path).name.lower()
-        if name_lower and name_lower in issue_lower:
-            score += 24
-        score += sum(2 for term in terms if term in path_lower)
-        scored.append((-score, idx, path))
-    scored.sort()
-    return [path for _s, _i, path in scored]
-
-
-
-
-
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -2229,11 +2058,6 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
 
-When the user prompt opens with a "Pre-indexed file snippets" block,
-those snippets are loaded from the local repo cache to save you discovery
-turns. Read them, write your edits to fit the surrounding style, and emit
-`<final>` once you are done.
-
 ## Empty patches and mode-only diffs are rejected
 
 A solution.diff that is either empty OR contains only file-mode/permission
@@ -2559,8 +2383,6 @@ def solve(
     patch_shrink_turns_used = 0
     consecutive_model_errors = 0
     force_edit_used = False
-    local_block: str = ""
-    local_paths: List[str] = []
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -2698,30 +2520,7 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        local_block, local_paths = _collect_local_object_snippets(repo, issue)
         preloaded_context = build_preloaded_context(repo, issue)
-        if local_block:
-            # Reference content takes precedence — keep it at the top so the
-            # model sees the target state before the heuristic snippets.
-            preloaded_context = (
-                local_block
-                + (("\n\n" + preloaded_context) if preloaded_context.strip() else "")
-            )
-            # Distinguish full-content (blobs were local) vs path-list
-            # fallback (blobs were remote, only filenames embedded). The
-            # mode is encoded in the prompt header text we just produced.
-            ref_mode = (
-                "full-content"
-                if local_block.startswith("Pre-indexed file snippets")
-                else "path-list"
-                if local_block.startswith("Pre-identified target paths")
-                else "unknown"
-            )
-            logs.append(
-                f"PRELOAD_LAYER_HIT mode={ref_mode}: "
-                f"{len(local_paths)} file(s); "
-                "first: " + ", ".join(local_paths[:6])
-            )
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
