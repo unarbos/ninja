@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -102,10 +102,10 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
-FINALIZE_STAGE_SECONDS = 60        # v28: last stretch — force <final> if any patch exists
-HARD_BAIL_SECONDS = 20             # v28: last resort — break loop and return current patch
+WALL_CLOCK_BUDGET_SECONDS = 290.0  # v29: aligned with validator's _DOCKER_SOLVER_HARD_TIMEOUT_SECONDS = 300, leave 10s buffer
+WALL_CLOCK_RESERVE_SECONDS = 15.0  # v29: proportionally tightened
+FINALIZE_STAGE_SECONDS = 45        # v29: last stretch — force <final> if any patch exists (~16% of budget)
+HARD_BAIL_SECONDS = 15             # v29: last resort — break loop and return current patch
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
