@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -108,13 +109,26 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_POLISH_TURNS = 1            # strip whitespace/comment/blank-only hunks
+MAX_SELF_CHECK_TURNS = 1        # ensure issue-mentioned paths are covered, no scope creep
+MAX_SYNTAX_FIX_TURNS = 1        # repair Python/TypeScript/JavaScript SyntaxError
+MAX_TEST_FIX_TURNS = 1          # repair the companion test we ran ourselves
+MAX_COVERAGE_NUDGES = 1         # tell model which issue-mentioned paths are still untouched
+MAX_CRITERIA_NUDGES = 1         # tell model which issue acceptance-criteria look unaddressed
+MAX_IDENTIFIER_VERIFY_TURNS = 1 # Edge A: rename invented identifiers to existing repo names
+MAX_HAIL_MARY_TURNS = 1         # last-resort: force a real edit when patch is empty after everything
+
+# Edge E — wall-clock-aware salvage triggers. The hail-mary refinement only
+# fires once the model voluntarily emits <final> with an empty patch, so two
+# failure modes still slip through: (1) the model keeps issuing <command>
+# blocks past step 5 with no patch staged ("loop-stuck"), and (2) the wall
+# clock runs out while the model is still slowly progressing. Both are 0%
+# rounds. The triggers below close those holes by forcing a hail-mary user
+# message in either situation. Each fires at most once per task.
+STEP_SALVAGE_THRESHOLD = 6      # fire if no patch after this many steps
+TIME_SALVAGE_THRESHOLD_SEC = 60 # fire if remaining wall-clock <= this and no patch
+MAX_STEP_SALVAGE_TURNS = 1
+MAX_TIME_SALVAGE_TURNS = 1
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -684,7 +698,7 @@ SECRETISH_PARTS = {
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Two improvements over a vanilla rank-and-read loop:
+    Layered context:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -696,6 +710,16 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+      3. Edge B — a short DETECTED STYLE anchor for the top-ranked file
+         (indent / quote-pref / semicolon / trailing-comma habits) so the
+         model's additions tokenize the same way the codebase does. The
+         validator's added_token_f1 component weighs heavily; matching
+         quote and indent style is essentially free score.
+
+      4. Edge C — a PRIMARY SURFACE hint when one tracked file dominates
+         the keyword-density distribution for issue terms. Saves 1-2
+         wrong-file inspection turns when the answer is concentrated.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -706,6 +730,22 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
+
+    # Edge C: primary-surface hint goes first when present, so it primes the
+    # model before it sees the file snippets themselves.
+    primary_hint = _primary_surface_hint(repo, tracked_set, issue)
+    if primary_hint:
+        parts.append(primary_hint)
+        used += len(primary_hint)
+
+    # Edge B: detected style anchor for the top file.
+    style_anchor = ""
+    if files:
+        style_anchor = _detect_file_style(repo, files[0])
+    if style_anchor:
+        parts.append(style_anchor)
+        used += len(style_anchor)
+
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
@@ -726,6 +766,122 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+# Edge B + C — context anchors.
+
+_STYLE_TRAILING_COMMA_RE = re.compile(r",\s*[\)\]\}]")
+_STYLE_SEMI_LINE_RE = re.compile(r";\s*(?://|/\*|$)")
+
+
+def _detect_file_style(repo: Path, top_file: str) -> str:
+    """Return a short DETECTED STYLE block summarizing the codebase's habits.
+
+    Empty string if the file can't be read or styles are too mixed to call.
+    Looks at indentation (tabs vs 2/4-space), quote preference (single vs
+    double), semicolon usage, and trailing-comma habit. The model imitates
+    concrete examples better than abstract rules; quoting these conventions
+    explicitly bumps `added_token_f1` because tokens like `'foo'` and `"foo"`
+    are different tokens to the validator.
+    """
+    try:
+        data = (repo / top_file).read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()[:80]
+    if not lines:
+        return ""
+
+    tab_lines = sum(1 for ln in lines if ln.startswith("\t"))
+    space4 = sum(1 for ln in lines if ln.startswith("    ") and not ln.startswith("\t"))
+    space2 = sum(1 for ln in lines if ln.startswith("  ") and not ln.startswith("    ") and not ln.startswith("\t"))
+    if tab_lines >= max(space4, space2) and tab_lines >= 3:
+        indent = "tabs"
+    elif space4 >= space2 and space4 >= 3:
+        indent = "4-space"
+    elif space2 >= 3:
+        indent = "2-space"
+    else:
+        indent = "mixed/unknown"
+
+    sq = sum(ln.count("'") for ln in lines)
+    dq = sum(ln.count('"') for ln in lines)
+    if dq >= sq * 1.5 and dq >= 4:
+        quote_pref = "double-quote"
+    elif sq >= dq * 1.5 and sq >= 4:
+        quote_pref = "single-quote"
+    else:
+        quote_pref = "mixed"
+
+    semi_lines = sum(1 for ln in lines if _STYLE_SEMI_LINE_RE.search(ln))
+    has_semis = "yes" if semi_lines >= 3 else "no"
+
+    trailing = sum(1 for ln in lines if _STYLE_TRAILING_COMMA_RE.search(ln))
+    trailing_label = "yes" if trailing >= 2 else "no"
+
+    return (
+        f"DETECTED CODE STYLE for {top_file} — match this exactly in your additions:\n"
+        f"- indent: {indent}\n"
+        f"- quote preference: {quote_pref}\n"
+        f"- semicolons at line end: {has_semis}\n"
+        f"- trailing commas in multi-line lists: {trailing_label}\n"
+    )
+
+
+def _primary_surface_hint(repo: Path, tracked_set: set, issue: str) -> str:
+    """Return a PRIMARY SURFACE hint when one tracked file dominates the
+    keyword-density distribution for issue terms.
+
+    Threshold: top file owns >= 2x runner-up AND >= 50% of top-5 mass.
+    Returns empty string when no file is dominant — the regular ranking
+    already handles that case fine.
+    """
+    terms = _issue_terms(issue)[:12]
+    if not terms or not tracked_set:
+        return ""
+    file_scores: Dict[str, int] = {}
+    for term in terms:
+        if len(term) < 3:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-c", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            if ":" not in line:
+                continue
+            relative_path, count_str = line.rsplit(":", 1)
+            relative_path = relative_path.strip()
+            if relative_path not in tracked_set or not _context_file_allowed(relative_path):
+                continue
+            try:
+                file_scores[relative_path] = file_scores.get(relative_path, 0) + int(count_str)
+            except ValueError:
+                continue
+    if not file_scores:
+        return ""
+    ranked = sorted(file_scores.items(), key=lambda item: -item[1])
+    top, top_score = ranked[0]
+    runner = ranked[1][1] if len(ranked) > 1 else 0
+    top5_sum = sum(score for _, score in ranked[:5])
+    if top_score >= max(2 * runner, 4) and top_score * 2 >= top5_sum:
+        return (
+            f"PRIMARY SURFACE: `{top}` (issue keywords concentrate here — "
+            "make this your first edit target unless inspection contradicts it)\n"
+        )
+    return ""
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1132,27 +1288,19 @@ _BRACE_BALANCE_SUFFIXES = {
 }
 
 
-def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
-    """Cheap brace/paren/bracket balance check for languages without a parser.
+def _count_bracket_chars(source: str) -> Dict[str, int]:
+    """Walk source counting brackets/parens/braces, skipping string and
+    comment context (best-effort).
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
+    Extracted from _check_brace_balance_one so the state-machine walk can
+    be reused or reasoned about apart from the file I/O and reporting
+    concerns. Recognised string delimiters: double-quote, single-quote,
+    and backtick (template literals). Recognised comment forms: ``//``
+    line comments and ``/* */`` block comments. Backslash inside a
+    string skips the next character so escape sequences don't terminate
+    the literal early.
     """
-    full = (repo / relative_path).resolve()
-    try:
-        full.relative_to(repo.resolve())
-    except (ValueError, RuntimeError):
-        return None
-    if not full.exists():
-        return None
-    try:
-        source = full.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-
-    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    counts: Dict[str, int] = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
     i = 0
     n = len(source)
     in_str: Optional[str] = None
@@ -1181,7 +1329,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
                 in_str = None
             i += 1
             continue
-        # Not in string/comment.
+        # Outside string / comment context.
         if ch == "/" and nxt == "/":
             in_line_comment = True
             i += 2
@@ -1197,6 +1345,30 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         if ch in counts:
             counts[ch] += 1
         i += 1
+    return counts
+
+
+def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Cheap brace/paren/bracket balance check for languages without a parser.
+
+    The LLM judge frequently dings patches for "extra closing braces" or
+    "duplicate brace" — issues a real compiler would catch. This naive
+    counter ignores braces inside string and comment context (best-effort)
+    and reports an imbalance with file + count delta.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    counts = _count_bracket_chars(source)
 
     diffs: List[str] = []
     for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
@@ -1237,17 +1409,16 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
+    """Portable executable presence check.
+
+    `command -v` is a shell builtin and is not actually present as a runnable
+    program inside the validator's `python:3.11-slim` solver image, so the old
+    `subprocess.run(["command", "-v", ...])` always returned False there and
+    silently disabled the JS / pytest / brace-balance gates. `shutil.which`
+    walks $PATH the same way the shell does and works in any container.
+    """
     try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
+        return bool(shutil.which(name))
     except Exception:
         return False
 
@@ -1496,6 +1667,156 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Edge A — identifier verification gate
+# -----------------------------
+#
+# When the model invents a name like `getUserData` in a codebase that uses
+# `get_user_data`, the patch typically scores poorly on token-similarity
+# AND draws judge complaints about not matching the codebase. This gate
+# extracts identifiers introduced in + lines, verifies they exist somewhere
+# in the un-touched repo, and queues a single refinement turn naming the
+# unknown ones so the model can rename them to the codebase's actual API.
+
+_ADDED_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])("
+    r"[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+)+"  # UpperCamelCase (MyClass)
+    r"|[a-z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+"     # lowerCamelCase (getProfileData)
+    r"|[a-z][a-z0-9]*(?:_[a-z0-9]+)+"            # snake_case (new_user_id)
+    r")(?![A-Za-z0-9_])"
+)
+_IDENTIFIER_STOP = frozenset({
+    "True", "False", "None", "self", "cls", "args", "kwargs",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "RuntimeError", "FileNotFoundError", "NotImplementedError",
+    "Optional", "List", "Dict", "Tuple", "Any", "Union", "Set", "Iterable",
+    "Iterator", "Callable", "Mapping", "Sequence",
+    "TODO", "FIXME", "XXX", "NOTE", "HACK",
+    "isinstance", "hasattr", "getattr", "setattr", "delattr",
+    "__init__", "__main__", "__name__", "__file__", "__doc__", "__class__",
+})
+
+
+def _patch_added_text_raw(patch: str) -> str:
+    """Concat + lines of the patch preserving original case."""
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append(line[1:])
+    return "\n".join(out)
+
+
+def _extract_added_identifiers(patch: str, max_identifiers: int = 12) -> List[str]:
+    """Identifiers introduced by + lines of the patch.
+
+    Restricted to CamelCase compounds and snake_case compounds (>=1 underscore
+    or >=1 internal capital). Single-word lowercase tokens are too noisy to
+    verify usefully (locals, parameters, etc.).
+    """
+    raw = _patch_added_text_raw(patch)
+    if not raw:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for match in _ADDED_IDENTIFIER_RE.finditer(raw):
+        token = match.group(1)
+        if token in _IDENTIFIER_STOP or token in seen:
+            continue
+        if len(token) < 4:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= max_identifiers:
+            break
+    return out
+
+
+def _identifier_is_defined_in_patch(patch: str, identifier: str) -> bool:
+    """Heuristic: does the patch's + lines contain a *definition* of `identifier`?
+
+    Catches the common definition shapes across languages so we can distinguish
+    "added but properly defined" from "used but never defined". The latter is
+    a real correctness bug (UnboundLocalError / NameError / undefined-variable
+    / TS2304) that consistently tanks the LLM judge score.
+    """
+    if not identifier:
+        return False
+    quoted = re.escape(identifier)
+    # ^+ lines (avoid +++ file headers); each pattern targets one definition shape.
+    patterns = (
+        # Python / JS / TS / Rust: def | class | fn | function | struct | enum | trait | impl
+        rf"^\+(?!\+\+)\s*(?:async\s+)?(?:def|class|fn|function|struct|enum|trait|impl|interface|type)\s+{quoted}\b",
+        # JS / TS / Java / C-family: let / const / var / final declarations
+        rf"^\+(?!\+\+)\s*(?:let|const|var|final|public|private|protected|static|export(?:\s+default)?)\s+(?:[A-Za-z_][\w<>,\s\[\]]*\s+)?{quoted}\b\s*[=:(]",
+        # Plain assignment: name = ...   or   name: type = ...   (Python-ish)
+        rf"^\+(?!\+\+)\s*{quoted}\s*(?::\s*[^=]+)?\s*=(?!=)",
+        # Tuple unpacking: ..., name, ... = ...   (best-effort; checks for `name,` or `, name` in LHS context)
+        rf"^\+(?!\+\+)[^=#\n]*\b{quoted}\b[^=#\n]*=(?!=)[^=]",
+        # Function parameter: def foo(name, ...) | function foo(name, ...) | (name) =>
+        rf"^\+(?!\+\+)[^=]*\b(?:def|fn|function)\s+\w+\s*\([^)]*\b{quoted}\b",
+        # Go: name := ... | func name(...) | name :=
+        rf"^\+(?!\+\+)\s*{quoted}\s*:=",
+        rf"^\+(?!\+\+)\s*func\s+(?:\([^)]*\)\s+)?{quoted}\b",
+    )
+    for pat in patterns:
+        if re.search(pat, patch, re.MULTILINE):
+            return True
+    return False
+
+
+def _unknown_added_identifiers(repo: Path, patch: str) -> List[Dict[str, str]]:
+    """Identifiers the patch adds that aren't in the un-touched repo.
+
+    Returns a list of dicts with `name` and `kind`:
+      - kind="undefined": added by patch, USED but never defined anywhere
+        (in the patch's + lines OR in the un-touched repo). This is the
+        strong-signal bug case (smoke2's `is_b2b` was this).
+      - kind="unknown": added by patch, defined somewhere in the patch's
+        + lines, but not in the un-touched repo. Could be a deliberate new
+        name OR a typo of an existing name.
+
+    `git grep -w -F` searches for whole-word literal matches. We exclude the
+    files the patch already touches so newly-defined names in the patched
+    file don't fool the gate.
+    """
+    if not patch.strip():
+        return []
+    candidates = _extract_added_identifiers(patch)
+    if not candidates:
+        return []
+    changed = set(_patch_changed_files(patch))
+    flagged: List[Dict[str, str]] = []
+    for ident in candidates:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-w", "-F", "--", ident],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        found = (
+            {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+            if proc.returncode == 0
+            else set()
+        )
+        outside_changed = found - changed
+        if outside_changed:
+            # Identifier exists in the un-touched repo — not an unknown.
+            continue
+        defined_in_patch = _identifier_is_defined_in_patch(patch, ident)
+        kind = "unknown" if defined_in_patch else "undefined"
+        flagged.append({"name": ident, "kind": kind})
+        if len(flagged) >= 8:
+            break
+    return flagged
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -1664,6 +1985,27 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+# Edge D — volume-task detection. Tasks whose issue text uses verbs like
+# `rewrite/replace/refactor/migrate/delete/drop/remove/deprecate/extract/
+# consolidate` typically have a reference patch that DELETES large blocks
+# rather than making a one-function surgical fix. The default "minimal fix"
+# strategy actively hurts on these, because the validator weights the
+# deleted_line_f1 + deleted_token_f1 portions of similarity at a non-trivial
+# fraction. Branching the strategy block by detected task type keeps the
+# bug-fix prompt sharp and gives volume tasks a strategy that matches what
+# Cursor actually produces.
+_VOLUME_TASK_RE = re.compile(
+    r"\b(rewrite|replace|refactor|migrate|delete|drop|remove|deprecate|extract|consolidate)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_volume_task(issue: str) -> bool:
+    if not issue:
+        return False
+    return bool(_VOLUME_TASK_RE.search(issue))
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -1672,6 +2014,25 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {preloaded_context}
 """
+
+    if _is_volume_task(issue):
+        strategy_block = (
+            "Strategy: this issue uses volume-task wording (rewrite/replace/refactor/migrate/"
+            "delete/drop/remove/deprecate/extract/consolidate). Reference patches for these "
+            "tasks typically DELETE significant blocks of code AND ADD any new files, helpers, "
+            "or tests the task requires — they are NOT one-line surgical fixes. "
+            "Identify the block(s) to remove and delete them cleanly. Then add EVERYTHING the "
+            "task asks for: every new file, every new helper, every new test, every new "
+            "interface. Do not skimp on additions — the LLM judge consistently rewards "
+            "comprehensive solutions on refactor/replace tasks, and the validator weights "
+            "matched additions and deletions roughly equally. Do NOT preserve the deleted code "
+            "in renamed wrappers or compatibility shims unless the issue asks for a shim."
+        )
+    else:
+        strategy_block = (
+            "Strategy: the fix is typically in ONE specific function or block. Identify it "
+            "precisely, then make the minimal edit that fixes the ROOT CAUSE."
+        )
 
     return f"""Fix this issue:
 
@@ -1683,7 +2044,7 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+{strategy_block}
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -1747,6 +2108,68 @@ def build_polish_prompt(junk_summary: str) -> str:
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
         "patch as-is."
+    )
+
+
+def build_identifier_verify_prompt(flagged: List[Dict[str, str]], issue_text: str) -> str:
+    """Tell the model which added identifiers are unknown or undefined.
+
+    Edge A v2 — three failure modes this catches:
+      1. UNDEFINED: identifier is USED in the patch's + lines but never
+         defined (no `name = ...`, no `def name`, no `let name`, etc.) and
+         doesn't exist in the un-touched repo. This is a real correctness
+         bug — the patch will raise NameError/UnboundLocalError/TS2304 at
+         runtime and the LLM judge will dock the patch heavily.
+      2. UNKNOWN: identifier is added AND defined in the patch but doesn't
+         appear in the rest of the repo. May be a deliberate new name OR a
+         typo / wrong-case version of an existing API. Cursor's reference
+         patches consistently reuse the codebase's exact names, so renaming
+         to a matching existing name lifts the validator's added_token_f1.
+    """
+    if not flagged:
+        return ""
+    undefined = [item["name"] for item in flagged if item.get("kind") == "undefined"]
+    unknown = [item["name"] for item in flagged if item.get("kind") == "unknown"]
+
+    sections: List[str] = []
+    if undefined:
+        sections.append(
+            "UNDEFINED variables — used in your patch but NEVER defined "
+            "(neither in your patch's added lines nor anywhere else in the "
+            "repository):\n  "
+            + "\n  ".join(f"- `{name}`" for name in undefined[:6])
+            + "\n\nThese will raise NameError / UnboundLocalError / TS2304 at "
+            "runtime and the LLM judge will tank your score for dead code. "
+            "For each one, decide:\n"
+            "  (a) the variable is meant to be assigned somewhere -> ADD the "
+            "missing definition (e.g. `is_b2b = (business_model.startswith('b2b') "
+            "or business_model in {'financial', 'saas'})`).\n"
+            "  (b) the variable is a typo of a real local / parameter -> rename "
+            "to the real name.\n"
+            "  (c) the usage was a mistake -> remove the usage."
+        )
+    if unknown:
+        sections.append(
+            "UNKNOWN identifiers — defined in your patch but absent elsewhere "
+            "in the repository:\n  "
+            + "\n  ".join(f"- `{name}`" for name in unknown[:6])
+            + "\n\nFor each one, decide:\n"
+            "  (a) intentional new name required by the task -> leave it.\n"
+            "  (b) typo or wrong-style version of an existing name "
+            "(e.g. `getUserData` when the codebase uses `get_user_data`, or "
+            "`ProjectKey` when the codebase uses `project_key`) -> grep for "
+            "the real name and rename via sed -i."
+        )
+
+    return (
+        "Identifier check — your patch contains the following issue(s):\n\n"
+        + "\n\n".join(sections)
+        + "\n\nIf unsure about a name, run `git grep -nE '<close_match>' -- :^.git` "
+        "to find what the codebase actually calls this concept. Make any "
+        "fix(es) now in the SAME response — add missing definitions, rename, "
+        "or remove the offending usage — then end with <final>summary</final>.\n\n"
+        "Issue (for reference):\n"
+        f"{issue_text[:1500]}\n"
     )
 
 
@@ -1917,7 +2340,10 @@ def solve(
     syntax_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    identifier_verify_turns_used = 0  # Edge A
     hail_mary_turns_used = 0
+    step_salvage_turns_used = 0       # Edge E (step-based)
+    time_salvage_turns_used = 0       # Edge E (time-based)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1946,10 +2372,13 @@ def solve(
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
             3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
+            4. criteria-nudge — name unaddressed acceptance-criterion bullets
+            5. identifier-verify (Edge A) — name added identifiers that don't
+               exist anywhere else in the repo so the model can rename them
+            6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, identifier_verify_turns_used, hail_mary_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2019,6 +2448,34 @@ def solve(
                 )
                 return True
 
+        # Edge A — identifier verification. Two sub-checks:
+        #   - "undefined": identifier USED in patch but never defined here
+        #     or in the un-touched repo (real correctness bug — NameError /
+        #     UnboundLocalError / TS2304). Tanks the LLM judge.
+        #   - "unknown": defined in the patch but absent from the rest of the
+        #     repo. Could be a deliberate new name or a typo that misses the
+        #     codebase's actual API. Lifts added_token_f1 when renamed.
+        # Skip the gate when wall-clock is tight — the underlying git-grep
+        # over many candidates can take tens of seconds on large repos, and
+        # blowing the wall-clock with no patch returned is worse than skipping
+        # the rename pass.
+        if (
+            identifier_verify_turns_used < MAX_IDENTIFIER_VERIFY_TURNS
+            and time_remaining() > 90.0
+        ):
+            flagged = _unknown_added_identifiers(repo, patch)
+            if flagged:
+                identifier_verify_turns_used += 1
+                summary = ", ".join(
+                    f"{item['kind']}:{item['name']}" for item in flagged[:6]
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_identifier_verify_prompt(flagged, issue),
+                    "IDENTIFIER_VERIFY_QUEUED:\n  " + summary,
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
@@ -2054,6 +2511,31 @@ def solve(
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            # Edge E — wall-clock-aware salvage. Before the next model call,
+            # check whether we are loop-stuck (no patch after STEP_SALVAGE_THRESHOLD
+            # steps) or time-stuck (less than TIME_SALVAGE_THRESHOLD_SEC remaining
+            # and patch empty). In either case, swap the model's pending input
+            # for the hail-mary prompt so the next response is forced to make a
+            # real edit. Each trigger fires at most once per task. The existing
+            # refinement-gate hail-mary still fires when the model voluntarily
+            # emits <final> with empty patch; these two triggers cover the cases
+            # where the model never voluntarily stops in time.
+            if not get_patch(repo).strip():
+                if time_remaining() <= TIME_SALVAGE_THRESHOLD_SEC and time_salvage_turns_used < MAX_TIME_SALVAGE_TURNS:
+                    time_salvage_turns_used += 1
+                    messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                    logs.append(
+                        f"\nTIME_SALVAGE_QUEUED: remaining={time_remaining():.1f}s "
+                        "and patch still empty — forcing single emergency edit."
+                    )
+                elif step >= STEP_SALVAGE_THRESHOLD and step_salvage_turns_used < MAX_STEP_SALVAGE_TURNS:
+                    step_salvage_turns_used += 1
+                    messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                    logs.append(
+                        f"\nSTEP_SALVAGE_QUEUED: step={step} and patch still empty — "
+                        "forcing single emergency edit."
+                    )
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
