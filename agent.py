@@ -447,10 +447,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
 def _command_env() -> Dict[str, str]:
     return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
-        "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
-        "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "GIT_PAGER": "cat",
@@ -674,7 +674,6 @@ SECRETISH_PARTS = {
     ".env",
     ".npmrc",
     ".pypirc",
-    ".netrc",
     "credentials",
     "secret",
     "secrets",
@@ -724,6 +723,22 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+
+    # Focused repository metadata improves command/test selection without broad
+    # exploration. Keep this compact and only include files that are already
+    # tracked and safe text files.
+    metadata_parts: List[str] = []
+    for meta_path in ("pyproject.toml", "setup.cfg", "package.json", "go.mod", "Cargo.toml"):
+        if meta_path in tracked_set and meta_path not in files and _context_file_allowed(meta_path):
+            snippet = _read_context_file(repo, meta_path, 1200)
+            if snippet.strip():
+                metadata_parts.append(f"### {meta_path}\n```\n{snippet}\n```")
+        if len(metadata_parts) >= 2:
+            break
+    if metadata_parts:
+        meta_block = "\n\nPROJECT METADATA for choosing the cheapest verifier:\n\n" + "\n\n".join(metadata_parts)
+        if used + len(meta_block) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET + 2500:
+            parts.append(meta_block)
 
     return "\n\n".join(parts)
 
