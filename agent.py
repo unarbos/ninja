@@ -177,7 +177,7 @@ def _truncate(text: str, max_chars: int) -> str:
     half = max_chars // 2
     return (
         text[:half]
-        + \n\n...[truncated 
+        + "\n\n...[truncated "
         + str(len(text) - max_chars)
         + " chars]...\n\n"
         + text[-half:]
@@ -185,7 +185,7 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _safe_join_logs(logs: List[str]) -> str:
-    joined = \n.join(logs)
+    joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
 
 
@@ -225,11 +225,11 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
 
 def _normalize_api_base(api_base: str) -> str:
     base = api_base.rstrip("/")
-    if base.endswith(/chat/completions):
-        return base[: -len(/chat/completions)]
-    if base.endswith(/v1):
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")]
+    if base.endswith("/v1"):
         return base
-    return base + /v1
+    return base + "/v1"
 
 
 def _resolve_inference_config(
@@ -300,8 +300,8 @@ def _collect_stream(url: str, body: bytes, headers: Dict[str, str], timeout: int
             if not piece:
                 break
             buf += piece
-            while b\n in buf:
-                raw_line, buf = buf.split(b\n, 1)
+            while b"\n" in buf:
+                raw_line, buf = buf.split(b"\n", 1)
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or line == "data: [DONE]":
                     continue
@@ -341,7 +341,7 @@ def chat_completion(
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-    url = base + /chat/completions
+    url = base + "/chat/completions"
 
     payload = {
         "model": model_name,
@@ -468,7 +468,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             command=command,
             exit_code=124,
             stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f\nCommand timed out after {timeout}s., MAX_OBSERVATION_CHARS),
+            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -517,7 +517,7 @@ def format_observation(result: CommandResult) -> str:
     ]
     if result.stderr.strip():
         parts.extend(["", "STDERR:", result.stderr])
-    return \n.join(parts) + \n
+    return "\n".join(parts) + "\n"
 
 
 # -----------------------------
@@ -623,21 +623,21 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
             continue
         mode_only = (
             block.startswith("diff --git ")
-            and \nold mode  in block
-            and \nnew mode  in block
-            and \n@@  not in block
-            and \nGIT binary patch not in block
-            and \nBinary files  not in block
-            and \nnew file mode  not in block
-            and \ndeleted file mode  not in block
+            and "\nold mode " in block
+            and "\nnew mode " in block
+            and "\n@@ " not in block
+            and "\nGIT binary patch" not in block
+            and "\nBinary files " not in block
+            and "\nnew file mode " not in block
+            and "\ndeleted file mode " not in block
         )
         if mode_only:
             continue
         kept.append(block)
 
     result = "".join(kept)
-    if diff_output.endswith(\n) and result and not result.endswith(\n):
-        result += \n
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
     return result
 
 
@@ -660,7 +660,7 @@ def get_repo_summary(repo: Path) -> str:
         res = run_command(cmd, repo, timeout=10)
         parts.append(format_observation(res))
 
-    return \n\n.join(parts)
+    return "\n\n".join(parts)
 
 
 TEXT_FILE_EXTENSIONS = {
@@ -760,7 +760,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    return \n\n.join(parts)
+    return "\n\n".join(parts)
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -977,7 +977,7 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     for block in blocks:
         if not block:
             continue
-        if not block.startswith("diff --git ") or \n@@  not in block:
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
             out.append(block)
             continue
         parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
@@ -1003,8 +1003,8 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
             out.append(header + "".join(substantive))
         # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
-    if diff_output.endswith(\n) and result and not result.endswith(\n):
-        result += \n
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
     return result
 
 
@@ -1197,7 +1197,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < n else ""
         if in_line_comment:
-            if ch == \n:
+            if ch == "\n":
                 in_line_comment = False
             i += 1
             continue
@@ -1661,7 +1661,7 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     issue names specific files and the draft skips them, surface that gap
     directly — much cheaper than hoping the self-check catches it.
     """
-    bullets = \n  .join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
@@ -1681,7 +1681,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     truncated = (
         patch
         if len(patch) <= 4000
-        else patch[:2000] + \n...[truncated]...\n + patch[-1500:]
+        else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
@@ -1713,7 +1713,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
-    bullets = \n  .join(errors[:10]) or "(none)"
+    bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
         f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
         "Issue the smallest possible fix command(s) to restore parseable code. "
@@ -1784,7 +1784,7 @@ def solve(
         marker: str,
     ) -> None:
         """Append assistant + corrective user message and journal it."""
-        logs.append(f\n{marker}\n)
+        logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
@@ -1822,7 +1822,7 @@ def solve(
                 queue_refinement_turn(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + \n  .join(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -1863,7 +1863,7 @@ def solve(
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
-            logs.append(f\n\n===== STEP {step} =====\n)
+            logs.append(f"\n\n===== STEP {step} =====\n")
 
             if out_of_time():
                 logs.append(
@@ -2009,7 +2009,7 @@ def solve(
                 success = True
 
             if observations:
-                observation_text = \n\n.join(observations)
+                observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -2021,7 +2021,7 @@ def solve(
                     )
                 elif not success:
                     observation_text += (
-                        \n\nIf you have enough context to implement the fix, send the COMPLETE set of 
+                        "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
                         "edit commands in your next response — all files at once, covering EVERY requirement "
                         "in the issue. Use sed or python -c for surgical edits."
                     )
@@ -2037,7 +2037,7 @@ def solve(
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
-        step_count = len([x for x in logs if x.startswith(\n\n===== STEP)])
+        step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
@@ -2105,20 +2105,20 @@ def _looks_like_verification_command(command: str) -> bool:
     lowered = command.lower()
     patterns = [
         r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
-        r\bpytest\b,
+        r"\bpytest\b",
         r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r\bnpx\s+tsc\b,
-        r\btsc\b,
-        r\bgo\s+test\b,
+        r"\bnpx\s+tsc\b",
+        r"\btsc\b",
+        r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
-        r\bmvn\s+test\b,
+        r"\bmvn\s+test\b",
         r"\bgradle(w)?\s+test\b",
         r"\bmake\s+(test|check|lint)\b",
-        r\bruff\b,
-        r\beslint\b,
+        r"\bruff\b",
+        r"\beslint\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -2129,7 +2129,7 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
     lowered = command.lower().strip()
     return bool(
         re.search(r"\bgit\s+(diff|status)\b", lowered)
-        or re.search(r\bgit\s+show\s+--stat\b, lowered)
+        or re.search(r"\bgit\s+show\s+--stat\b", lowered)
     )
 
 
