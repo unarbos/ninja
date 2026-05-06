@@ -115,6 +115,11 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_TOTAL_REFINEMENT_TURNS = 2  # hard cap on total refinement turns across all gates;
+                                # each turn is one extra LLM round-trip (10-30s) and
+                                # the validator's per-round timeout can be as low as
+                                # 120s, so chains of 5-7 refinements push us into
+                                # timeout-whiff territory (a guaranteed loss).
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -531,6 +536,11 @@ def get_patch(repo: Path) -> str:
         ":(exclude,glob)**/node_modules/**",
         ":(exclude).git",
     ]
+    # Pre-pass: undo pure mode-only chmod flips (executable-bit toggles
+    # that the agent didn't actually intend) so they never reach the diff
+    # text the judge sees. Best-effort; failures are silent.
+    _revert_mode_only_index_changes(repo)
+
     proc = subprocess.run(
         ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
@@ -550,6 +560,11 @@ def get_patch(repo: Path) -> str:
         timeout=30,
     )
     if untracked.returncode != 0:
+        diff_output = _strip_mode_only_file_diffs(diff_output)
+        diff_output = _strip_low_signal_hunks(diff_output)
+        diff_output = _strip_mode_metadata_lines(diff_output)
+        diff_output = _strip_trailing_newline_hunks(diff_output)
+        diff_output = _strip_import_reorder_hunks(diff_output)
         return diff_output
 
     for relative_path in [item for item in untracked.stdout.split("\0") if item]:
@@ -567,7 +582,184 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
-    return _strip_low_signal_hunks(cleaned)
+    cleaned = _strip_low_signal_hunks(cleaned)
+    # Static-strip pass — pure-Python diff sanitisation that doesn't cost an
+    # LLM call. Targets the judge's recurring "unrelated churn" complaint:
+    # mode-only metadata, trailing-newline-only flips, and pure import
+    # reorders (added and removed lines are a permutation of imports).
+    cleaned = _strip_mode_metadata_lines(cleaned)
+    cleaned = _strip_trailing_newline_hunks(cleaned)
+    cleaned = _strip_import_reorder_hunks(cleaned)
+    return cleaned
+
+
+def _looks_like_import_line(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    return bool(
+        re.match(r"^(?:from\s+\S+\s+)?import\s+", stripped)
+        or re.match(r"^import\s+\{[^}]*\}\s+from\s+['\"][^'\"]+['\"];?\s*$", stripped)
+        or re.match(r"^import\s+\S+\s+from\s+['\"][^'\"]+['\"];?\s*$", stripped)
+        or re.match(r"^const\s+\{[^}]*\}\s*=\s*require\(['\"][^'\"]+['\"]\);?\s*$", stripped)
+    )
+
+
+def _revert_mode_only_index_changes(repo: Path) -> None:
+    """Best-effort: undo plain executable-bit flips that the agent didn't
+    intend. Iterates `git diff --raw` and for any file whose ONLY change is
+    `100755->100644` (or vice versa), restores the original mode via
+    `git update-index --chmod`.
+
+    Has no effect when there are real content changes for the same path;
+    in that case the mode flip stays but `_strip_mode_metadata_lines` will
+    keep it out of the patch text shown to the judge.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--raw", "-z"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    if proc.returncode != 0:
+        return
+    raw = proc.stdout or ""
+    tokens = raw.split("\0")
+    i = 0
+    while i < len(tokens):
+        meta = tokens[i]
+        i += 1
+        if not meta or not meta.startswith(":"):
+            continue
+        path = tokens[i] if i < len(tokens) else ""
+        i += 1
+        if not path:
+            continue
+        # ":<old_mode> <new_mode> <old_sha> <new_sha> <status>"
+        fields = meta[1:].split(" ")
+        if len(fields) < 5:
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = fields[0], fields[1], fields[2], fields[3], fields[4]
+        if status != "M":
+            continue
+        if old_sha == new_sha and old_mode != new_mode:
+            try:
+                target_mode = "+x" if old_mode == "100755" else "-x"
+                subprocess.run(
+                    ["git", "update-index", "--chmod", target_mode, "--", path],
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+            except (subprocess.SubprocessError, OSError):
+                continue
+
+
+def _strip_mode_metadata_lines(block: str) -> str:
+    """Drop ``old mode``/``new mode`` lines from diff blocks. The trailing
+    ``index <a>..<b> <mode>`` line is otherwise harmless once these are
+    gone — the @@ hunks (if any) are real content."""
+    if "old mode " not in block and "new mode " not in block:
+        return block
+    out_lines: List[str] = []
+    for line in block.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out_lines.append(line)
+    return "".join(out_lines)
+
+
+def _strip_trailing_newline_hunks(diff_output: str) -> str:
+    """Drop hunks whose only delta is a trailing-newline flip — added and
+    removed lines are byte-identical after rstrip plus ``\\ No newline at
+    end of file`` marker on either side."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
+            out.append(block)
+            continue
+        parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = parts[0]
+        kept_hunks: List[str] = []
+        for hunk_text in parts[1:]:
+            if not hunk_text:
+                continue
+            added: List[str] = []
+            removed: List[str] = []
+            saw_no_newline = False
+            for line in hunk_text.splitlines():
+                if line.startswith("\\ No newline at end of file"):
+                    saw_no_newline = True
+                elif line.startswith("+") and not line.startswith("+++"):
+                    added.append(line[1:])
+                elif line.startswith("-") and not line.startswith("---"):
+                    removed.append(line[1:])
+            stripped_added = [s.rstrip() for s in added]
+            stripped_removed = [s.rstrip() for s in removed]
+            if saw_no_newline and stripped_added == stripped_removed and stripped_added:
+                continue
+            kept_hunks.append(hunk_text)
+        if kept_hunks:
+            out.append(header + "".join(kept_hunks))
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _strip_import_reorder_hunks(diff_output: str) -> str:
+    """Drop hunks whose added and removed lines are a permutation of each
+    other and consist only of import statements. Pure import reorders are
+    cited by the judge as ``unrelated churn``."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
+            out.append(block)
+            continue
+        parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = parts[0]
+        kept_hunks: List[str] = []
+        for hunk_text in parts[1:]:
+            if not hunk_text:
+                continue
+            added: List[str] = []
+            removed: List[str] = []
+            for line in hunk_text.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    added.append(line[1:].strip())
+                elif line.startswith("-") and not line.startswith("---"):
+                    removed.append(line[1:].strip())
+            if (
+                added
+                and removed
+                and sorted(added) == sorted(removed)
+                and all(_looks_like_import_line(s) for s in added + removed)
+            ):
+                continue
+            kept_hunks.append(hunk_text)
+        if kept_hunks:
+            out.append(header + "".join(kept_hunks))
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1552,6 +1744,11 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
+    Plain mentions get +1 per symbol; files that contain a *call-site*
+    form of the symbol (the symbol followed immediately by ``(``) get an
+    extra +2 boost so consumer files float to the top of the preload —
+    the call-shape mirrors what the patch will need to produce.
+
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
@@ -1559,10 +1756,11 @@ def _symbol_grep_hits(
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_files(pattern: str) -> List[str]:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
+                ["git", "grep", "-l", "-F", "--", pattern],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1570,16 +1768,26 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    for symbol in symbols:
+        for relative_path in _grep_files(symbol):
+            if relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+        if len(symbol) < 3 or (not symbol[0].isalpha() and symbol[0] != "_"):
+            continue
+        for relative_path in _grep_files(symbol + "("):
+            if relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 2
     return hits
 
 
@@ -1918,6 +2126,7 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    total_refinement_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1949,7 +2158,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -1958,6 +2167,8 @@ def solve(
         # this king. An empty patch has Jaccard = 0 against any non-empty
         # reference; a guess has Jaccard > 0 with non-zero probability.
         # Force one final real-edit attempt before the duel scores zero.
+        # Hail-mary is exempt from MAX_TOTAL_REFINEMENT_TURNS because it's
+        # the only thing standing between us and a guaranteed-zero result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -1969,10 +2180,17 @@ def solve(
                 return True
             return False
 
+        # Hard cap on total optional refinement turns. Each turn is one
+        # extra LLM round-trip (10-30s); validator's per-round timeout can
+        # be 120-200s. Chains of 5-7 refinements push us into timeout-whiff.
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_polish_prompt(junk),
@@ -1984,6 +2202,7 @@ def solve(
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
                 syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
@@ -1995,6 +2214,7 @@ def solve(
             missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
@@ -2012,6 +2232,7 @@ def solve(
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
@@ -2021,6 +2242,7 @@ def solve(
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
+            total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(patch, issue),
@@ -2204,6 +2426,47 @@ def solve(
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # Post-loop empty-patch fallback. The main loop can exit with no
+        # patch when the model issued only inspection commands (cat/grep/
+        # ls/find/sed-no-match) and never reached `<final>` or a budget
+        # cutoff that triggered `maybe_queue_refinement`. In that case
+        # `hail_mary_turns_used` is still 0 — fire it now manually so the
+        # round doesn't return empty (= guaranteed 0 on both Cursor
+        # similarity and the LLM judge). This was the dominant failure
+        # mode in duel #4085 (h83/sol8): rounds 38-47 had c_exit=completed
+        # but c_lines=0, costing the late-round collapse.
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and not out_of_time()
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={time_remaining():.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if out_of_time():
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
