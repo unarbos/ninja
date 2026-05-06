@@ -752,12 +752,13 @@ def _fallback_keywords(problem: str, max_keywords: int = MAX_KEYWORDS_FOR_CONTEX
 
 
 def _extract_priority_keywords(
-    issue: str,
+    problem: str,
     model: str,
     api_base: str,
     api_key: str,
     max_keywords: int = MAX_KEYWORDS_FOR_CONTEXT,
 ) -> List[str]:
+    issue = problem
     if not issue.strip() or not model or not api_base or not api_key:
         return _fallback_keywords(issue, max_keywords=max_keywords)
 
