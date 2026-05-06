@@ -681,7 +681,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def gather_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -1590,7 +1590,7 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a precise, minimal-diff coding agent. Your patch is scored two ways, each worth 50%:
+POLICY_PROMPT = """You are a precise, minimal-diff coding agent. Your patch is scored two ways, each worth 50%:
 1. Cursor similarity — how closely your diff matches the reference (files touched, line regions changed, and tokens added/removed).
 2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A correct, complete patch can score well even if similarity is modest.
 
@@ -1664,7 +1664,7 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def make_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1693,7 +1693,7 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
-def build_no_command_repair_prompt() -> str:
+def make_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
 If the patch is complete, respond with <final>summary</final>. Otherwise continue
@@ -1705,7 +1705,7 @@ your command here
 """
 
 
-def build_budget_pressure_prompt(step: int) -> str:
+def make_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
@@ -1720,7 +1720,7 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
-def build_polish_prompt(junk_summary: str) -> str:
+def make_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
     The LLM judge frequently penalises patches for "unrelated changes",
@@ -1750,7 +1750,7 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
-def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
+def make_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
     The LLM diff judge most often docks king for incomplete coverage. When the
@@ -1772,7 +1772,7 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
+def make_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
@@ -1807,7 +1807,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     )
 
 
-def build_syntax_fix_prompt(errors: List[str]) -> str:
+def make_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
@@ -1818,7 +1818,7 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
-def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
+def make_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
     The LLM judge frequently dings the king for "missing N of M criteria" on
@@ -1842,7 +1842,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
-def build_hail_mary_prompt(issue_text: str) -> str:
+def make_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
     early-exit ('if not patch.strip(): return False'), which silently accepted
@@ -1869,7 +1869,7 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
-def build_test_fix_prompt(test_path: str, output: str) -> str:
+def make_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
     return (
@@ -1963,7 +1963,7 @@ def solve(
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_hail_mary_prompt(issue),
+                    make_hail_mary_prompt(issue),
                     "HAIL_MARY_QUEUED: patch empty at refinement gate",
                 )
                 return True
@@ -1975,7 +1975,7 @@ def solve(
                 polish_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
+                    make_polish_prompt(junk),
                     f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
@@ -1986,7 +1986,7 @@ def solve(
                 syntax_fix_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
+                    make_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
@@ -1997,7 +1997,7 @@ def solve(
                 coverage_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
+                    make_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
@@ -2014,7 +2014,7 @@ def solve(
                 criteria_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
+                    make_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
@@ -2023,7 +2023,7 @@ def solve(
             self_check_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
+                make_self_check_prompt(patch, issue),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -2035,11 +2035,11 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context = gather_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "system", "content": POLICY_PROMPT},
+            {"role": "user", "content": make_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
@@ -2125,7 +2125,7 @@ def solve(
                     logs.append("\nSTOPPED:\nModel repeatedly failed to produce a command or final answer.")
                     break
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": build_no_command_repair_prompt()})
+                messages.append({"role": "user", "content": make_no_command_repair_prompt()})
                 continue
 
             consecutive_no_command = 0
@@ -2203,7 +2203,7 @@ def solve(
                 break
 
             if not get_patch(repo).strip() and step in {2, 4}:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+                messages.append({"role": "user", "content": make_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
