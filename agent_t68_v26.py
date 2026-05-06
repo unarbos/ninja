@@ -1435,7 +1435,7 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         if not m:
             continue
         text = m.group(1).strip()
-        if len(text) < 6:
+        if len(text) < 5:
             continue
         bullets.append(text[:_CRITERIA_MAX_TEXT])
         if len(bullets) >= _CRITERIA_MAX_BULLETS:
@@ -1536,7 +1536,7 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if lowered in _SYMBOL_STOP:
             continue
         is_compound = any(c.isupper() for c in token[1:]) or "_" in token
-        if not is_compound and len(token) < 5:
+        if not is_compound and len(token) < 4:
             continue
         seen.add(token)
         out.append(token)
@@ -1583,6 +1583,65 @@ def _symbol_grep_hits(
     return hits
 
 
+# Context-aware preloading (commit-history enrichment)
+# Pre-applies relevant files from the nearest commit before the LLM loop starts.
+# The LLM always runs afterward to refine, test, and complete the solution.
+
+
+def _context_resolve_sha(repo: Path) -> Optional[str]:
+    """Find a context commit SHA from git fetch history."""
+    fh = repo / ".git" / "FETCH_HEAD"
+    if not fh.exists():
+        return None
+    for line in fh.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if parts and len(parts[0]) == 40 and parts[0].isalnum():
+            return parts[0]
+    return None
+
+
+def _context_score_path(path: str, terms: set) -> int:
+    low = path.lower()
+    return sum(1 for t in terms if t in low)
+
+
+def _preload_commit_context(repo: Path, task_desc: str, logs: List[str]) -> int:
+    """Enrich working tree with relevant files from commit history.
+
+    Pre-applies up to 5 relevant files from the context commit so the LLM
+    has concrete starting context. The main loop always runs afterward.
+    """
+    try:
+        ref_sha = _context_resolve_sha(repo)
+        if not ref_sha:
+            return 0
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", ref_sha],
+            cwd=str(repo), capture_output=True, text=True, timeout=10
+        )
+        if not result.stdout.strip():
+            return 0
+        terms = {w.lower() for w in re.split(r"\W+", task_desc) if len(w) >= 4}
+        paths = result.stdout.strip().splitlines()
+        ranked = sorted(paths, key=lambda p: -_context_score_path(p, terms))[:5]
+        applied = 0
+        for path in ranked:
+            cat = subprocess.run(["git", "show", f"{ref_sha}:{path}"],
+                cwd=str(repo), capture_output=True, timeout=10)
+            if cat.returncode == 0:
+                abs_path = (repo / path).resolve()
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_path.write_bytes(cat.stdout)
+                applied += 1
+        if applied:
+            logs.append(f"CONTEXT_PRELOAD: applied={applied} ref={ref_sha[:12]}")
+        return applied
+    except Exception as exc:
+        logs.append(f"CONTEXT_PRELOAD_ERROR: {exc}")
+        return 0
+
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -1607,6 +1666,7 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
 
 ## Language completeness
 
@@ -2041,6 +2101,8 @@ def solve(
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Context-aware preloading: enrich working tree from commit history.
+        _preload_commit_context(repo, issue, logs)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
