@@ -446,11 +446,15 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
 
 def _command_env() -> Dict[str, str]:
+    # Guard-safe sandbox defaults: do not inherit PATH/HOME/TMPDIR/LANG from
+    # miner-controlled environment variables. The validator static guard
+    # disallows those reads, and these stable values preserve the intended
+    # command surface inside the slim Python container.
     return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
-        "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
-        "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "GIT_PAGER": "cat",
