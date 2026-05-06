@@ -97,7 +97,7 @@ MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
 # Wall-clock cap so one slow inference step cannot blow past validator deadlines.
-WALL_CLOCK_BUDGET_SECONDS = int(os.environ.get("AGENT_WALL_CLOCK_BUDGET_SECONDS", "480"))
+WALL_CLOCK_BUDGET_SECONDS = "480"
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
