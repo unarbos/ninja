@@ -704,6 +704,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    primary_surface = _keyword_concentration_primary(repo, tracked_set, issue)
+    if primary_surface and primary_surface not in files:
+        files.insert(0, primary_surface)
 
     parts: List[str] = []
     used = 0
@@ -744,6 +747,21 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             )
             if len(block) <= _STYLE_HINT_BUDGET:
                 parts.append(block)
+
+    # Primary-surface anchor. When one file owns the bulk of the issue's
+    # keyword density, naming it as the starting point saves discovery turns.
+    # Prepended so the model reads "start here" before the snippets that
+    # justify it.
+    if primary_surface:
+        block = (
+            f"PRIMARY SURFACE: {primary_surface}\n"
+            "Issue identifiers concentrate in this file far more than in any "
+            "other tracked file. Begin edits here unless a preloaded snippet "
+            "shows the fix clearly belongs elsewhere — do not spend turns "
+            "greping to rediscover it."
+        )
+        if len(block) <= _STYLE_HINT_BUDGET:
+            parts.insert(0, block)
 
     return "\n\n".join(parts)
 
@@ -1677,6 +1695,72 @@ def _symbol_grep_hits(
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
+
+
+def _keyword_concentration_primary(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Optional[str]:
+    """Pick a single 'primary surface' file when one dominates keyword density.
+
+    Distinct from `_symbol_grep_hits`, which gives one hit per (file, symbol)
+    pair. Here we use `git grep -c` so a file mentioning the symbol 30 times
+    outranks one mentioning it once. The model's biggest information cost is
+    picking the wrong starting file — when one file owns the bulk of the
+    issue's keyword surface, naming it up-front saves 1-2 discovery turns.
+
+    Returns None when hits are spread out across files: a confidently-wrong
+    primary surface is worse than no hint, since it can pull the model away
+    from the real fix site.
+    """
+    keywords = _extract_issue_symbols(issue_text, max_symbols=16)
+    if not keywords:
+        return None
+    counts: Dict[str, int] = {}
+    for kw in keywords:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-c", "-F", "--", kw],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            sep = line.rfind(":")
+            if sep < 0:
+                continue
+            relative_path = line[:sep].strip()
+            try:
+                n = int(line[sep + 1:])
+            except ValueError:
+                continue
+            if n <= 0 or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            counts[relative_path] = counts.get(relative_path, 0) + n
+    if not counts:
+        return None
+    sorted_counts = sorted(counts.items(), key=lambda x: (-x[1], len(x[0]), x[0]))
+    top_path, top_count = sorted_counts[0]
+    if top_count < 4:
+        return None
+    if len(sorted_counts) == 1:
+        return top_path
+    runner_count = sorted_counts[1][1]
+    top_n_total = sum(n for _, n in sorted_counts[:5])
+    # Require both: 2x the runner-up AND >=50% of the top-5 mass. Either alone
+    # is too easy to satisfy in a small repo where every file has 1-2 hits.
+    if top_count >= 2 * max(1, runner_count) and top_count * 2 >= top_n_total:
+        return top_path
+    return None
 
 
 # -----------------------------
