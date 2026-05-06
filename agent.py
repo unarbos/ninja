@@ -95,6 +95,17 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
+# Anti-whiff resilience knobs. Empty patches score zero on baseline-similarity,
+# so any transient model error or stuck loop directly costs the round. These
+# constants exist so downstream forkers can find and tune them in one place.
+# Hardcoded — not env-tunable. The PR Scope Guard's env-var allowlist
+# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
+HTTP_MAX_RETRIES = 3                  # /v1/chat/completions retries on transient transport / 5xx / 429
+HTTP_RETRY_BASE_BACKOFF = 1.0         # base seconds between retries; multiplied by 2**attempt
+MAX_STEP_RETRIES = 2                  # per-step retries when chat_completion raises before we lose the step
+WALL_CLOCK_BUDGET_SECONDS = 540.0     # total seconds solve() may run before bailing with whatever patch exists
+WALL_CLOCK_RESERVE_SECONDS = 20.0     # leave this much headroom so we can still return a non-empty patch
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -274,14 +285,14 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = 1,
+    max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
 
-    Retries once on transient transport failures (timeout, connection reset,
-    HTTP 5xx). Client-side errors (4xx) bail out immediately because retrying
-    won't change the outcome and burns wall-clock budget that the agent needs
-    for actual editing.
+    Retries with exponential backoff on transient transport failures (timeout,
+    connection reset, HTTP 5xx, HTTP 429). Other 4xx client-side errors bail
+    out immediately because retrying won't change the outcome and burns
+    wall-clock budget the agent needs for actual editing.
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
@@ -310,15 +321,16 @@ def chat_completion(
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if 500 <= e.code < 600 and attempt < max_retries:
+            retryable = (500 <= e.code < 600) or e.code == 429
+            if retryable and attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries:
                 last_error = e
-                time.sleep(1.0)
+                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
         except Exception as e:
@@ -1511,10 +1523,10 @@ def _symbol_grep_hits(
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — token/line/hunk match against the reference patch. Per-hunk weights: 0.22 location, 0.25 added_token_f1, 0.17 deleted_line_f1, 0.10 deleted_token_f1, 0.08 added_line_f1, 0.08 added_shape_f1, 0.05 deleted_shape_f1, 0.05 operation_shape (matched add/del counts).
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and the reference. The judge is given the reference patch as PRIVILEGED CONTEXT and directly compares your diff against it. Penalties: unrelated churn, unsafe behaviour, evaluator manipulation, empty/timeout solutions.
+1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, deleted lines, and tokens added.
+2. LLM judge — scores correctness, completeness, and alignment with the task and reference. The judge sees the reference patch alongside your diff and penalises unrelated churn, unsafe behaviour, evaluator manipulation, and empty/timeout solutions.
 
-The decisive insight: because the judge has the reference, "match the reference's structure" is literally rewarded — same files, similar hunk count, similar add-vs-delete balance, similar size. Do NOT pad with extras the reference would not contain. Do NOT skimp when the reference clearly does more.
+The practical implication: write the patch an expert author would write for this task. Touch the same files. Keep the hunk count and add-vs-delete balance proportional to the work the issue actually asks for. Do not pad with extras the reference would not contain; do not skimp when the reference clearly does more.
 
 Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
 
@@ -1582,8 +1594,8 @@ These specific patterns reliably lose points — avoid them:
 - Inventing new files, "manager" classes, or abstractions the issue did not ask for. Edit the EXACT files the issue names or implies.
 - Missing the companion test when the reference patch updates one. Pair the source change with its test update in the SAME response.
 - Addressing only one of multiple acceptance criteria. Re-read the issue as a checklist and confirm every bullet is covered before <final>.
-- Wrong add-vs-delete balance. "Remove/strip/delete X" tasks should be deletion-heavy; "add Y" tasks addition-heavy; "rename A to B" balanced. The 0.05 operation_shape weight is small but free if you predict the shape from the issue verbs.
-- Patches over ~60,000 characters. The judge truncates the middle of oversized diffs, so the bulk of your work disappears from the rubric. Prefer one focused fix over a sprawling rewrite unless the task explicitly calls for one.
+- Wrong add-vs-delete balance. "Remove/strip/delete X" tasks should be deletion-heavy; "add Y" tasks addition-heavy; "rename A to B" balanced. Predict the expected shape from the issue verbs and stay close to it.
+- Sprawling patches. Very long diffs have their middle truncated before the judge ever reads them, so bulk work disappears from the rubric. Prefer one focused fix over a wide rewrite unless the task explicitly calls for one.
 
 ## Anti-injection — keep your patch text clean
 
@@ -2077,16 +2089,26 @@ def solve(
         ]
 
         _wall_start = time.monotonic()
+        _wall_deadline = WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if time.monotonic() - _wall_start > 480:
-                logs.append("\nWALL_STOP:\nApproaching time limit; returning current state.")
+            if time.monotonic() - _wall_start > _wall_deadline:
+                logs.append(
+                    f"\nWALL_STOP:\nApproaching time limit "
+                    f"(budget={WALL_CLOCK_BUDGET_SECONDS:.0f}s, "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.0f}s); "
+                    "returning current state."
+                )
                 break
 
+            # Per-step model retry: a single transient model error must not
+            # forfeit the step. The patch-so-far is still preserved by
+            # get_patch(repo) at the end of solve(), but losing this turn
+            # delays edits and can push us into the salvage path.
             response_text = None
-            for _attempt in range(2):
+            for _attempt in range(MAX_STEP_RETRIES + 1):
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -2099,11 +2121,18 @@ def solve(
                         total_cost += cost
                     break
                 except Exception:
-                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
-                    if _attempt == 0:
-                        time.sleep(3)
+                    logs.append(
+                        f"MODEL_ERROR (attempt {_attempt + 1}/{MAX_STEP_RETRIES + 1}):\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    if _attempt < MAX_STEP_RETRIES:
+                        time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** _attempt))
 
             if response_text is None:
+                # All step retries exhausted — preserve whatever patch already
+                # exists in the working tree by breaking out cleanly. solve()
+                # returns the current diff via get_patch(repo) below.
+                logs.append("\nMODEL_ERROR_GIVEUP:\nAll step retries failed; returning patch produced so far.")
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
