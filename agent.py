@@ -102,8 +102,22 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 280.0
+WALL_CLOCK_RESERVE_SECONDS = 45.0
+PATCH_RETURN_MIN_TIME_SECONDS = 95.0
+REFINEMENT_MIN_TIME_SECONDS = 95.0
+MAX_COMMAND_FAILURE_FIX_TURNS = 1
+# Empty-patch pressure: when no edit has landed and either time or
+# step budget runs short, fire a one-shot nudge that tells the model
+# to stop searching and write at least one concrete edit now. Big-file
+# refactors (PHP/JS 1000+ line files) otherwise burn the whole budget
+# on grep/sed-n discovery and submit an empty patch (=zero match score).
+# Step trigger fires earlier than time trigger because deepseek-v4-flash
+# can run 30 steps in ~200s on a fast model, so time-only would never
+# fire before max_steps exhaustion.
+EMPTY_PATCH_PRESSURE_THRESHOLD_SECONDS = 180.0
+EMPTY_PATCH_PRESSURE_STEP_THRESHOLD = 14
+MAX_EMPTY_PATCH_PRESSURE_NUDGES = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -479,6 +493,11 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
+def summarize_failed_command(result: CommandResult) -> str:
+    """Compact failed command context for one repair turn."""
+    return _truncate(format_observation(result), 2500)
+
+
 # -----------------------------
 # Action parsing
 # -----------------------------
@@ -525,6 +544,7 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -569,6 +589,58 @@ def get_patch(repo: Path) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """Undo chmod-only drift in the worktree so validators don't score it."""
+    try:
+        summary = subprocess.run(
+            ["git", "diff", "--summary", "--"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return
+    if summary.returncode != 0 or "mode change" not in (summary.stdout or ""):
+        return
+
+    for line in (summary.stdout or "").splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        try:
+            full = (repo / relative_path).resolve()
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            block = subprocess.run(
+                ["git", "diff", "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        diff_text = block.stdout or ""
+        if "\n@@ " in diff_text or "\nGIT binary patch" in diff_text or "\nBinary files " in diff_text:
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1129,6 +1201,275 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
+def _check_js_obvious_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch cheap JS syntax holes when node is unavailable in the sandbox."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    empty_first_arg = re.compile(r"\b[A-Za-z_$][\w$]*\s*\(\s*,")
+    empty_arg_after_comma = re.compile(r",\s*,")
+    for index, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if empty_first_arg.search(stripped):
+            return f"{relative_path}:{index}: suspicious empty first function-call argument"
+        if empty_arg_after_comma.search(stripped):
+            return f"{relative_path}:{index}: suspicious empty function-call argument"
+    return None
+
+
+def _check_duplicate_html_ids_one(repo: Path, relative_path: str, patch: str) -> List[str]:
+    """Report duplicate HTML ids introduced in a touched markup file."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    ids = re.findall(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", text)
+    if not ids:
+        return []
+    added_ids = _patch_added_ids_for_file(patch, relative_path)
+    if not added_ids:
+        return []
+    counts: Dict[str, int] = {}
+    for value in ids:
+        counts[value] = counts.get(value, 0) + 1
+    errors: List[str] = []
+    for value in sorted(added_ids):
+        count = counts.get(value, 0)
+        if count > 1:
+            errors.append(f"{relative_path}: duplicate id '{value}' appears {count} times")
+    return errors
+
+
+def _check_unwired_added_buttons_one(repo: Path, relative_path: str, patch: str) -> List[str]:
+    """Report newly added button ids with no obvious JS click handler."""
+    button_ids = _patch_added_button_ids_for_file(patch, relative_path)
+    if not button_ids:
+        return []
+
+    changed_code_files = [
+        path for path in _patch_changed_files(patch)
+        if Path(path).suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
+    ]
+    if not changed_code_files:
+        return []
+
+    code_chunks: List[str] = []
+    for code_path in changed_code_files:
+        full = (repo / code_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or full.stat().st_size > 2_000_000:
+            continue
+        try:
+            code_chunks.append(full.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+    if not code_chunks:
+        return []
+
+    code = "\n".join(code_chunks)
+    errors: List[str] = []
+    for button_id in sorted(button_ids):
+        if _added_button_has_inline_handler(patch, relative_path, button_id):
+            continue
+        escaped = re.escape(button_id)
+        wired_patterns = [
+            rf"\belements\.{escaped}\s*\.\s*(?:addEventListener|onclick)\b",
+            rf"\b{escaped}\s*\.\s*(?:addEventListener|onclick)\b",
+            rf"getElementById\(\s*['\"]{escaped}['\"]\s*\)\s*\.\s*(?:addEventListener|onclick)\b",
+            rf"querySelector\(\s*['\"]#{escaped}['\"]\s*\)\s*\.\s*(?:addEventListener|onclick)\b",
+        ]
+        if not any(re.search(pattern, code) for pattern in wired_patterns):
+            errors.append(f"{relative_path}: added button id '{button_id}' has no obvious click handler")
+    return errors
+
+
+def _added_button_has_inline_handler(patch: str, relative_path: str, button_id: str) -> bool:
+    current: Optional[str] = None
+    escaped = re.escape(button_id)
+    pattern = re.compile(
+        rf"<button\b[^>]*\bid\s*=\s*['\"]{escaped}['\"][^>]*\bonclick\s*=",
+        re.IGNORECASE,
+    )
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.*?) b/(.*)$", line)
+            current = match.group(2) if match else None
+            continue
+        if current == relative_path and line.startswith("+") and not line.startswith("+++"):
+            if pattern.search(line[1:]):
+                return True
+    return False
+
+
+def _patch_added_ids_for_file(patch: str, relative_path: str) -> set[str]:
+    current: Optional[str] = None
+    ids: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.*?) b/(.*)$", line)
+            current = match.group(2) if match else None
+            continue
+        if current != relative_path:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            ids.update(re.findall(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", line[1:]))
+    return ids
+
+
+def _patch_added_button_ids_for_file(patch: str, relative_path: str) -> set[str]:
+    current: Optional[str] = None
+    ids: set[str] = set()
+    button_id_re = re.compile(r"<button\b[^>]*\bid\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.*?) b/(.*)$", line)
+            current = match.group(2) if match else None
+            continue
+        if current != relative_path:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            ids.update(button_id_re.findall(line[1:]))
+    return ids
+
+
+_HELPER_DECL_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?:public|private|protected|internal|static|async|sealed|virtual|override|readonly)\s+
+    )*
+    (?:
+        function\s+ |
+        def\s+ |
+        [A-Za-z_][\w<>,\[\]\.?]*\s+
+    )
+    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(
+    """,
+    re.VERBOSE,
+)
+
+_HELPER_TOKEN_STOP = {
+    "try", "get", "set", "build", "create", "make", "handle", "process",
+    "parse", "resolve", "convert", "update", "add", "remove", "read", "write",
+    "load", "save", "find", "fetch", "run", "do", "is", "has", "should",
+}
+
+
+def _check_suspicious_duplicate_helpers_one(repo: Path, relative_path: str, patch: str) -> List[str]:
+    if _path_looks_like_test_file(relative_path):
+        return []
+    added_names = _patch_added_helper_names_for_file(patch, relative_path)
+    if not added_names:
+        return []
+
+    original_text = _git_show_file(repo, relative_path)
+    if not original_text:
+        return []
+
+    existing_names = _helper_names_from_text(original_text)
+    if not existing_names:
+        return []
+
+    errors: List[str] = []
+    for added in sorted(added_names):
+        if added in existing_names:
+            continue
+        added_tokens = _helper_name_tokens(added)
+        if len(added_tokens) < 3:
+            continue
+        for existing in sorted(existing_names):
+            existing_tokens = _helper_name_tokens(existing)
+            overlap = added_tokens & existing_tokens
+            if len(overlap) >= 3 and any(len(token) >= 5 for token in overlap):
+                errors.append(
+                    f"{relative_path}: added helper '{added}' closely overlaps existing helper "
+                    f"'{existing}'; reuse or modify the existing helper instead"
+                )
+                break
+    return errors
+
+
+def _path_looks_like_test_file(relative_path: str) -> bool:
+    lowered = relative_path.lower()
+    name = Path(lowered).name
+    return (
+        "/test/" in lowered
+        or "/tests/" in lowered
+        or lowered.startswith("test/")
+        or lowered.startswith("tests/")
+        or "test" in name
+        or "spec" in name
+    )
+
+
+def _patch_added_helper_names_for_file(patch: str, relative_path: str) -> set[str]:
+    current: Optional[str] = None
+    names: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.*?) b/(.*)$", line)
+            current = match.group(2) if match else None
+            continue
+        if current != relative_path:
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        match = _HELPER_DECL_RE.match(line[1:])
+        if match:
+            names.add(match.group("name"))
+    return names
+
+
+def _helper_names_from_text(text: str) -> set[str]:
+    names: set[str] = set()
+    for line in text.splitlines():
+        match = _HELPER_DECL_RE.match(line)
+        if match:
+            names.add(match.group("name"))
+    return names
+
+
+def _helper_name_tokens(name: str) -> set[str]:
+    raw = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", name.replace("_", " "))
+    return {token.lower() for token in raw if len(token) >= 3 and token.lower() not in _HELPER_TOKEN_STOP}
+
+
+def _git_show_file(repo: Path, relative_path: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"HEAD:{relative_path}"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""
+
+
+
 _BRACE_BALANCE_SUFFIXES = {
     ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
     ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
@@ -1237,6 +1578,23 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
+
+
+def _check_obvious_static_errors(repo: Path, patch: str) -> List[str]:
+    """Fast checks for high-confidence broken patches not caught by parsers."""
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            js_error = _check_js_obvious_syntax_one(repo, relative_path)
+            if js_error:
+                errors.append(js_error)
+        if suffix in {".cs", ".java", ".js", ".jsx", ".py", ".ts", ".tsx"}:
+            errors.extend(_check_suspicious_duplicate_helpers_one(repo, relative_path, patch))
+        if suffix in {".html", ".htm", ".vue", ".svelte", ".tsx", ".jsx"}:
+            errors.extend(_check_duplicate_html_ids_one(repo, relative_path, patch))
+            errors.extend(_check_unwired_added_buttons_one(repo, relative_path, patch))
+    return errors[:10]
 
 
 def _has_executable(name: str) -> bool:
@@ -1788,7 +2146,7 @@ brief summary of what changed
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Pre-edit intent**: immediately before any edit command, write `EDIT INTENT: file:line-line function/block -> exact change`. If line numbers are not available yet, name the exact function/block and old text you will change. After editing, use `git diff` or the test failure output to verify the hunk landed in that intended region; if it drifted, fix or revert it before final.
+**Pre-edit intent**: immediately before edit commands, write ONE short line: `EDIT INTENT: file:line/function -> exact change`. No long prose. After editing, verify the diff landed in that intended region.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -1798,7 +2156,7 @@ brief summary of what changed
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+**Companion tests**: update tests only when the issue explicitly asks for tests, or when a changed public contract makes an existing targeted test obviously stale. Do not add partial test churn just to demonstrate behavior.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
@@ -1986,10 +2344,39 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
-        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
-        "Issue the smallest possible fix command(s) to restore parseable code. "
-        "Do NOT introduce new edits, do NOT refactor. Then end with "
+        f"Static/syntax check failed on touched file(s):\n  {bullets}\n\n"
+        "Issue the smallest possible fix command(s) to make the current patch complete and parseable. "
+        "If a new UI control is reported as unwired, add the missing existing-style handler for that control. "
+        "Do NOT introduce unrelated edits, do NOT refactor. Then end with "
         "<final>summary</final>."
+    )
+
+
+def build_command_failure_fix_prompt(failure_summary: str) -> str:
+    return (
+        "The previous command failed after a patch already existed, so the patch is not ready yet.\n\n"
+        f"{failure_summary}\n\n"
+        "Fix the root cause of that failure with the smallest possible edit, or revert the partial hunk that caused it. "
+        "Then run one targeted check if time allows and end with <final>summary</final>."
+    )
+
+
+def build_empty_patch_pressure_prompt(remaining_seconds: float) -> str:
+    """Force the model off discovery and into a concrete edit before the budget runs out.
+
+    Big-file refactors (single 1000+ line files, multi-file JS/PHP backends)
+    otherwise spend the entire budget grepping and reading. Without a patch
+    at exit time the round scores 0. This prompt tells the model to commit
+    to its best current understanding and edit at least one concrete location
+    NOW; refinement turns can fix mistakes if any time is left.
+    """
+    return (
+        f"TIME PRESSURE: only {remaining_seconds:.0f}s left and you have not edited any file yet. "
+        "Stop searching. Pick the highest-value concrete edit you can justify from what you have already seen "
+        "and apply it RIGHT NOW with `cat > <path> << 'EOF' ... EOF` (full-file rewrite) or `sed -i` (small substitution).\n\n"
+        "If the issue lists multiple files, batch ALL the edits in this single response — do not split across turns. "
+        "It is far better to ship a partially-correct patch covering most of the requested files than a perfect plan with zero edits. "
+        "After editing, end with <final>summary</final>; refinement gates will polish anything that needs polishing."
     )
 
 
@@ -2146,6 +2533,9 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    command_failure_fix_turns_used = 0
+    empty_patch_pressure_nudges_used = 0
+    last_failed_command_summary: Optional[str] = None
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2182,6 +2572,17 @@ def solve(
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, consistency_check_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
         patch = get_patch(repo)
 
+        # Local validator solves are often hard-killed around 300s. If we
+        # already have a substantive patch and the remaining wall-clock budget
+        # is thin, returning it beats queuing another model self-review that may
+        # be killed before the harness can serialize the patch.
+        if patch.strip() and time_remaining() < REFINEMENT_MIN_TIME_SECONDS:
+            logs.append(
+                f"\nREFINEMENT_SKIPPED_TIME_LOW:\nremaining={time_remaining():.1f}s "
+                f"threshold={REFINEMENT_MIN_TIME_SECONDS:.1f}s"
+            )
+            return False
+
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. The original `return False` here silently accepted empty
         # patches and cost ~10% of rounds in the live duel that promoted
@@ -2211,6 +2612,16 @@ def solve(
                 return True
 
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            static_errors = _check_obvious_static_errors(repo, patch)
+            if static_errors:
+                syntax_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(static_errors),
+                    "STATIC_FIX_QUEUED:\n  " + "\n  ".join(static_errors),
+                )
+                return True
+
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
                 syntax_fix_turns_used += 1
@@ -2294,15 +2705,81 @@ def solve(
                 )
                 break
 
+            patch_before_turn = get_patch(repo)
+            if (
+                not patch_before_turn.strip()
+                and empty_patch_pressure_nudges_used < MAX_EMPTY_PATCH_PRESSURE_NUDGES
+                and time_remaining() > WALL_CLOCK_RESERVE_SECONDS
+                and (
+                    step >= EMPTY_PATCH_PRESSURE_STEP_THRESHOLD
+                    or time_remaining() < EMPTY_PATCH_PRESSURE_THRESHOLD_SECONDS
+                )
+            ):
+                empty_patch_pressure_nudges_used += 1
+                logs.append(
+                    f"EMPTY_PATCH_PRESSURE_QUEUED:\nstep={step} "
+                    f"remaining={time_remaining():.1f}s "
+                    "-- no edit yet; forcing concrete-edit pressure."
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": build_empty_patch_pressure_prompt(time_remaining()),
+                    }
+                )
+
+            if patch_before_turn.strip() and time_remaining() < PATCH_RETURN_MIN_TIME_SECONDS:
+                if (
+                    last_failed_command_summary
+                    and command_failure_fix_turns_used < MAX_COMMAND_FAILURE_FIX_TURNS
+                    and time_remaining() > WALL_CLOCK_RESERVE_SECONDS
+                ):
+                    command_failure_fix_turns_used += 1
+                    logs.append(
+                        "PATCH_RETURN_DELAYED_COMMAND_FAILURE:\n"
+                        + last_failed_command_summary
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": build_command_failure_fix_prompt(last_failed_command_summary),
+                        }
+                    )
+                else:
+                    static_errors = _check_obvious_static_errors(repo, patch_before_turn)
+                    if static_errors and time_remaining() > WALL_CLOCK_RESERVE_SECONDS:
+                        logs.append(
+                            "PATCH_RETURN_DELAYED_STATIC_ERRORS:\n  "
+                            + "\n  ".join(static_errors)
+                        )
+                        messages.append({"role": "user", "content": build_syntax_fix_prompt(static_errors)})
+                    else:
+                        logs.append(
+                            f"PATCH_RETURN_TIME_LOW:\nremaining={time_remaining():.1f}s "
+                            f"threshold={PATCH_RETURN_MIN_TIME_SECONDS:.1f}s -- "
+                            "returning current patch instead of spending another model turn."
+                        )
+                        success = True
+                        break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
+                    has_patch_before_request = bool(get_patch(repo).strip())
+                    request_timeout = max(
+                        20,
+                        min(
+                            45 if has_patch_before_request else 90,
+                            int(time_remaining() - WALL_CLOCK_RESERVE_SECONDS),
+                        ),
+                    )
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=request_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -2312,6 +2789,9 @@ def solve(
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
+                    if get_patch(repo).strip() and time_remaining() < PATCH_RETURN_MIN_TIME_SECONDS:
+                        response_text = None
+                        break
                     if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
@@ -2373,13 +2853,24 @@ def solve(
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                patch_before_command = get_patch(repo)
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                patch_after_command = get_patch(repo)
+                if patch_after_command.strip():
+                    if result.exit_code != 0:
+                        last_failed_command_summary = summarize_failed_command(result)
+                    elif last_failed_command_summary and (
+                        patch_after_command != patch_before_command
+                        or _looks_like_successful_test_output(observation, command)
+                        or _looks_like_patch_review_command(command, result)
+                    ):
+                        last_failed_command_summary = None
 
                 if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
+                    patch = patch_after_command
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
