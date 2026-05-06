@@ -879,98 +879,6 @@ def _rank_local_blobs(files: List[str], issue: str) -> List[str]:
 
 
 
-def _apply_cached_scaffolding(
-    repo: Path,
-    sha: str,
-    paths: List[str],
-    logs: List[str],
-) -> None:
-    """Write each pre-indexed snippet's content into the working tree."""
-    wrote = 0
-    for rel in paths:
-        try:
-            content = _load_local_blob(repo, sha, rel)
-            if content is None:
-                continue
-            target = repo / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            wrote += 1
-        except Exception:
-            continue
-    if wrote:
-        logs.append(f"\nSCAFFOLDING_APPLIED: wrote {wrote} cached snippet(s)")
-
-
-def _collect_local_object_snippets(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Embed pre-indexed file snippets in the initial prompt, when available.
-
-    Returns (block, files). `block` is the formatted prompt section; "" on
-    any failure or when no cached commit is available. `files` is the
-    list of paths the layer reports as touched-by-reference so the loop
-    can promote them as fallback edit targets.
-
-    Two modes:
-
-    * **Full-content mode** — when blobs ARE local (rare on standard tau
-      sandboxes; common when the agent runs outside docker), embed each
-      file's intended END state and instruct the model to overwrite.
-    * **Path-list mode** — when blobs are remote-only (the normal sandbox
-      case: `--filter=blob:none` partial clone with no network access),
-      emit just the list of paths the reference patch touches. This is a
-      strong file-selection signal that supplements the heuristic preload
-      without requiring the contents.
-
-    The path-list itself is always derivable: `git diff-tree -r --name-only`
-    compares tree OIDs and never needs blob content.
-    """
-    try:
-        ref_sha = _resolve_reference_sha(repo)
-        if not ref_sha:
-            return "", []
-        files = _list_pre_indexed_paths(repo, ref_sha)
-        if not files:
-            return "", []
-
-        ranked = _rank_local_blobs(files, issue)
-        capped = ranked[:REFERENCE_LAYER_MAX_FILES]
-
-        # Try full-content mode first.
-        used = 0
-        included: List[str] = []
-        parts: List[str] = []
-        for rel in capped:
-            content = _load_local_blob(repo, ref_sha, rel)
-            if content is None:
-                continue
-            content = _truncate(content, REFERENCE_LAYER_PER_FILE_CAP)
-            block = f"### {rel}\n```\n{content}\n```"
-            if parts and used + len(block) > REFERENCE_LAYER_MAX_TOTAL_CHARS:
-                break
-            parts.append(block)
-            included.append(rel)
-            used += len(block)
-
-        if parts:
-            header = (
-                f"Pre-indexed file snippets ({len(parts)} from local cache):\n\n"
-                "Use these as a strong structural and stylistic guide while "
-                "making your changes — match indentation, identifier names, "
-                "quote style, trailing commas, and blank-line patterns to fit "
-                "the surrounding code."
-            )
-            return header + "\n\n" + "\n\n".join(parts), included
-
-        # Path-list fallback (sandboxed partial-clone case).
-        bullets = "\n".join(f"- `{p}`" for p in capped)
-        header = (
-            f"Pre-identified target paths — the issue most likely needs edits in "
-            f"these {len(capped)} file(s). Read the current working-tree "
-            "contents of these files first before making changes."
-        )
-        return header + "\n\n" + bullets + "\n", capped
-    except Exception:
-        return "", []
 
 
 def build_preloaded_context(repo: Path, issue: str) -> str:
@@ -3024,15 +2932,6 @@ def solve(
 
         patch = get_patch(repo)
 
-        # If the inner-loop produced nothing usable, apply the cached scaffolding
-        # snippets directly so the run does not return an empty patch when the
-        # model errored or timed out.
-        if not patch.strip() and local_paths and local_block:
-            sha = _locate_pre_indexed_commit(repo)
-            if sha:
-                _apply_cached_scaffolding(repo, sha, local_paths, logs)
-                patch = get_patch(repo)
-
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3059,7 +2958,7 @@ def solve(
             logs=_safe_join_logs(logs),
             steps=0,
             cost=total_cost,
-            success=bool(patch.strip()),
+            success=False,
         ).to_dict()
 
 
