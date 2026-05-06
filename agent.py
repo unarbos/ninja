@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Contract:
     The validator imports this file and calls:
@@ -91,22 +90,24 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 28000
-MAX_PRELOADED_FILES = 8
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
 # Wall-clock cap so one slow inference step cannot blow past validator deadlines.
-WALL_CLOCK_BUDGET_SECONDS = 480
+WALL_CLOCK_BUDGET_SECONDS = 540
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_COVERAGE_NUDGES = 1    # explicitly list issue paths still absent from diff
+MAX_CRITERIA_NUDGES = 1    # remind model about issue criteria not evidenced in diff
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_SELF_CHECK_TURNS = 1   # holistic self-review vs task
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves (reserved / prompts)
+MAX_HAIL_MARY_TURNS = 1    # last-resort forced minimal patch to avoid empty-patch forfeits
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -1616,6 +1617,60 @@ def build_coverage_nudge_prompt(missing_paths: List[str]) -> str:
     )
 
 
+def _unaddressed_criteria(issue_text: str, patch: str) -> List[str]:
+    """Approximate which explicit issue bullets/lines have no textual signal in patch."""
+    patch_l = patch.lower()
+    candidates: List[str] = []
+    for raw in issue_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("-", "*", "+")) or re.match(r"^\d+[.)]\s+", line):
+            candidates.append(line)
+            continue
+        if any(token in line.lower() for token in ("must", "should", "need", "require")):
+            candidates.append(line)
+
+    missing: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = re.sub(r"^[-*+]\s*|^\d+[.)]\s*", "", item).strip()
+        if not text:
+            continue
+        tokens = [
+            t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", text.lower())
+            if t not in {"the", "and", "for", "with", "from", "that", "this", "into", "when", "then"}
+        ][:8]
+        if tokens and not any(tok in patch_l for tok in tokens):
+            key = text.lower()
+            if key not in seen:
+                seen.add(key)
+                missing.append(text)
+    return missing[:10]
+
+
+def build_criteria_nudge_prompt(missing_criteria: List[str]) -> str:
+    bullets = "\n".join(f"- {c}" for c in missing_criteria[:8])
+    return (
+        "Criteria nudge — the issue appears to include acceptance criteria not yet "
+        "evidenced in your draft patch:\n"
+        f"{bullets}\n\n"
+        "Address each missing criterion with the smallest targeted edit(s), then "
+        "run one cheap relevant verification and continue."
+    )
+
+
+def build_hail_mary_prompt(issue_text: str) -> str:
+    return (
+        "Hail-mary turn: no patch exists yet and budget is nearly exhausted.\n\n"
+        "You must produce a minimal best-effort code change NOW in the single most "
+        "likely file/function based on the issue text. Do not spend this turn on "
+        "more exploration. After editing, run one cheap syntax/test check if possible, "
+        "then end with <final>summary</final>.\n\n"
+        f"Issue reminder:\n{issue_text[:1200]}"
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final."""
     return (
@@ -1721,8 +1776,10 @@ def solve(
     consecutive_no_command = 0
     polish_turns_used = 0
     coverage_nudge_turns_used = 0
+    criteria_nudge_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    hail_mary_turns_used = 0
     out_of_time = False
 
     def queue_refinement_turn(
@@ -1746,7 +1803,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, coverage_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, coverage_nudge_turns_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1770,6 +1827,17 @@ def solve(
                     assistant_text,
                     build_coverage_nudge_prompt(missing_files),
                     "COVERAGE_NUDGE_QUEUED:\n  " + "\n  ".join(missing_files),
+                )
+                return True
+
+        if criteria_nudge_turns_used < MAX_CRITERIA_NUDGES:
+            missing_criteria = _unaddressed_criteria(issue, patch)
+            if missing_criteria:
+                criteria_nudge_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(missing_criteria),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + "\n  ".join(missing_criteria),
                 )
                 return True
 
@@ -1839,6 +1907,12 @@ def solve(
                         time.sleep(3)
 
             if response_text is None:
+                partial_patch = get_patch(repo)
+                if partial_patch.strip():
+                    logs.append(
+                        "\nMODEL_ERROR_RECOVER:\nPersistent model error; returning best partial patch."
+                    )
+                    success = True
                 break
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
@@ -1944,6 +2018,14 @@ def solve(
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+            if (
+                not get_patch(repo).strip()
+                and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+                and (step >= max_steps - 1 or (time.monotonic() - _wall_start) > WALL_CLOCK_BUDGET_SECONDS * 0.85)
+            ):
+                hail_mary_turns_used += 1
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                logs.append("\nHAIL_MARY_QUEUED:\nForced minimal patch attempt due to low remaining budget.")
 
         patch = get_patch(repo)
         if patch.strip() and not success:
