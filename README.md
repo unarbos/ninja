@@ -4,16 +4,21 @@
 `agent.py` and keep validator systems, task generators, scoring, wallets, and
 infrastructure out of this repo.
 
-Miner submissions happen through pull requests to this repo. The validator only
-runs PRs that are also committed on-chain by a registered miner hotkey.
+Miner submissions happen only through pull requests to this repo. The validator
+does not queue raw `owner/repo@sha` commitments or arbitrary external repos; it
+only runs PR heads from `unarbos/ninja` that are also committed on-chain by a
+registered miner hotkey.
 
 ## What You Are Allowed To Edit
 
-- `agent.py`
-- README/docs to clarify agent behavior for miners
+- `agent.py` for miner submissions
+
+Miner PRs must not modify anything else. Docs in this repo may be updated by
+maintainers to clarify policy, but production miner submissions are judged only
+when the PR diff is limited to `agent.py`.
 
 Nothing else should be added here for production mining, including
-( but not limited to ):
+(but not limited to):
 
 - validator service code
 - PM2 configs or service orchestration
@@ -97,6 +102,7 @@ Keep these boundaries intact:
 PRs are blocked (or fail CI) if they:
 
 - modify files outside `agent.py`
+- try to submit or point the validator at another repo instead of this PR head
 - change the `solve(...)` entry-point contract
 - add forbidden provider/secret references
 - attempt to hardcode or route around the managed model/proxy (`api_base`,
@@ -142,10 +148,12 @@ It defaults to subnet 66:
 `--hotkey` is checked against the loaded wallet hotkey so the PR title, wallet,
 and on-chain commitment all refer to the same miner.
 
-Only one commitment per miner hotkey is eligible in each 24h window. The
-validator enforces the window as 7,200 chain blocks since the last accepted
-commitment for that hotkey. A newer commitment made before that window expires
-is skipped.
+Only one accepted submission is eligible per miner hotkey registration. The
+validator uses block `8,104,340` as the hotkey-spent cutoff: commitments before
+that block do not spend a hotkey for the current submission window, while any
+accepted commitment at or after that block does. A hotkey cannot resubmit after
+24h; after an accepted submission, that hotkey is spent for future submissions
+unless it is registered again as a new miner hotkey.
 
 The validator binds the PR to the committing hotkey by checking that the PR title
 starts with the same hotkey that made the on-chain commitment. It also checks that
