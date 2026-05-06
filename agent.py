@@ -1545,7 +1545,6 @@ def solve(
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
