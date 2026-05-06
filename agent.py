@@ -1435,7 +1435,7 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         if not m:
             continue
         text = m.group(1).strip()
-        if len(text) < 6:
+        if len(text) < 5:
             continue
         bullets.append(text[:_CRITERIA_MAX_TEXT])
         if len(bullets) >= _CRITERIA_MAX_BULLETS:
@@ -1607,6 +1607,14 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes and components.
+**Multi-file** - complete ALL affected files in one diff; include more files when uncertain.
 
 ## Workflow
 
@@ -2053,6 +2061,12 @@ def solve(
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
+                if not get_patch(repo).strip():
+                    try:
+                        import subprocess as _s
+                        r = _s.run(["git","diff","HEAD"],cwd=str(repo),capture_output=True,text=True,timeout=10)
+                        if r.stdout.strip(): logs.append("WALL_EMERGENCY: partial patch.")
+                    except Exception: pass
                 break
 
             response_text: Optional[str] = None
