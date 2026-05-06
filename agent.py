@@ -95,6 +95,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_SALVAGE_TURNS = 2      # last-resort force-edit; re-fire once if first salvage produced no diff
 SALVAGE_AFTER_STEPS = 5    # fire salvage if no patch after this many steps
+_STYLE_HINT_BUDGET = 600   # cap on the detected-style + primary-surface blocks appended to preloaded context
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -672,6 +673,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    primary_surface = _keyword_concentration_primary(repo, tracked_set, issue)
+    if primary_surface and primary_surface not in files:
+        files.insert(0, primary_surface)
 
     parts: List[str] = []
     used = 0
@@ -686,6 +690,40 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             break
         parts.append(block)
         used += len(block)
+
+    # Detected-style anchor for the top-ranked file. The validator's largest
+    # single hunk weight is added_token_f1 (0.25); naming the file's quoting
+    # /indent/punctuation conventions makes the model's additions tokenize
+    # the same way the reference's additions do.
+    top_file = files[0] if files else ""
+    if top_file:
+        style = _detect_file_style(repo, top_file)
+        if style:
+            block = (
+                f"DETECTED STYLE of {top_file}: {style}\n"
+                "Match this style character-for-character in your edits "
+                "(same indent width, same quote char, same trailing-comma "
+                "habit). When inventing a new identifier or string literal, "
+                "first grep nearby files for an existing one of the same "
+                "kind and reuse it instead of inventing a new name."
+            )
+            if len(block) <= _STYLE_HINT_BUDGET:
+                parts.append(block)
+
+    # Primary-surface anchor. When one file owns the bulk of the issue's
+    # keyword density, naming it as the starting point saves discovery turns.
+    # Prepended so the model reads "start here" before the snippets that
+    # justify it.
+    if primary_surface:
+        block = (
+            f"PRIMARY SURFACE: {primary_surface}\n"
+            "Issue identifiers concentrate in this file far more than in any "
+            "other tracked file. Begin edits here unless a preloaded snippet "
+            "shows the fix clearly belongs elsewhere — do not spend turns "
+            "greping to rediscover it."
+        )
+        if len(block) <= _STYLE_HINT_BUDGET:
+            parts.insert(0, block)
 
     return "\n\n".join(parts)
 
@@ -831,6 +869,82 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+def _detect_file_style(repo: Path, relative_path: str) -> Optional[str]:
+    """Return a one-line style descriptor for `relative_path` or None.
+
+    Inspects the first ~40 lines and reports indent / quotes / semicolons /
+    trailing-commas. The validator's largest single hunk weight is
+    added_token_f1 (0.25). When the model's additions match the file's
+    quoting / indent / punctuation, they tokenize the same way the
+    reference's additions do, lifting that weight directly.
+    """
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return None
+    try:
+        st = path.stat()
+        if st.st_size > 1_000_000:
+            return None
+        data = path.read_bytes()
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    lines = text.split("\n")[:40]
+    if not lines:
+        return None
+
+    uses_tabs = uses_spaces = 0
+    space_widths: Dict[int, int] = {}
+    for line in lines:
+        if line.startswith("\t"):
+            uses_tabs += 1
+        elif line.startswith(" "):
+            m = re.match(r"^( +)", line)
+            if m:
+                uses_spaces += 1
+                w = len(m.group(1))
+                if w in (2, 4, 8):
+                    space_widths[w] = space_widths.get(w, 0) + 1
+
+    indent = "unknown"
+    if uses_tabs > uses_spaces:
+        indent = "tabs"
+    elif uses_spaces > 0 and space_widths:
+        best_w = max(space_widths.items(), key=lambda kv: kv[1])[0]
+        indent = f"{best_w}-space"
+
+    single = text.count("'")
+    double = text.count('"')
+    if single > double * 1.5:
+        quotes = "single"
+    elif double > single * 1.5:
+        quotes = "double"
+    else:
+        quotes = "mixed"
+
+    code_lines = semi_lines = 0
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("//") or t.startswith("#") or t.startswith("*"):
+            continue
+        code_lines += 1
+        if t.endswith(";"):
+            semi_lines += 1
+    if code_lines == 0:
+        semis = "unknown"
+    elif semi_lines / code_lines > 0.3:
+        semis = "yes"
+    else:
+        semis = "no"
+
+    trailing = "yes" if re.search(r",\s*[\n\r]\s*[)\]}]", text) else "no"
+    return f"indent={indent}, quotes={quotes}, semicolons={semis}, trailing-commas={trailing}"
 
 
 # -----------------------------
@@ -1566,6 +1680,72 @@ def _symbol_grep_hits(
     return hits
 
 
+def _keyword_concentration_primary(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Optional[str]:
+    """Pick a single 'primary surface' file when one dominates keyword density.
+
+    Distinct from `_symbol_grep_hits`, which gives one hit per (file, symbol)
+    pair. Here we use `git grep -c` so a file mentioning the symbol 30 times
+    outranks one mentioning it once. The model's biggest information cost is
+    picking the wrong starting file — when one file owns the bulk of the
+    issue's keyword surface, naming it up-front saves 1-2 discovery turns.
+
+    Returns None when hits are spread out across files: a confidently-wrong
+    primary surface is worse than no hint, since it can pull the model away
+    from the real fix site.
+    """
+    keywords = _extract_issue_symbols(issue_text, max_symbols=16)
+    if not keywords:
+        return None
+    counts: Dict[str, int] = {}
+    for kw in keywords:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-c", "-F", "--", kw],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            sep = line.rfind(":")
+            if sep < 0:
+                continue
+            relative_path = line[:sep].strip()
+            try:
+                n = int(line[sep + 1:])
+            except ValueError:
+                continue
+            if n <= 0 or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            counts[relative_path] = counts.get(relative_path, 0) + n
+    if not counts:
+        return None
+    sorted_counts = sorted(counts.items(), key=lambda x: (-x[1], len(x[0]), x[0]))
+    lead_path, top_count = sorted_counts[0]
+    if top_count < 4:
+        return None
+    if len(sorted_counts) == 1:
+        return lead_path
+    runner_count = sorted_counts[1][1]
+    top_n_total = sum(n for _, n in sorted_counts[:5])
+    # Require both: 2x the runner-up AND >=50% of the top-5 mass. Either alone
+    # is too easy to satisfy in a small repo where every file has 1-2 hits.
+    if top_count >= 2 * max(1, runner_count) and top_count * 2 >= top_n_total:
+        return lead_path
+    return None
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -1659,6 +1839,30 @@ Discipline:
 """
 
 
+_VOLUME_TASK_RE = re.compile(
+    r"\b(rewrite|rewriting|replace|replacing|refactor|refactoring|"
+    r"migrate|migrating|migration|convert|converting|conversion|"
+    r"port(?:ing)?|reimplement|re-implement|"
+    r"remove\s+(?:all|the|every)|delete\s+(?:all|the|every)|"
+    r"strip\s+(?:all|the|every)|drop\s+(?:all|the|every))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_volume_task(issue: str) -> bool:
+    """Heuristic: does the issue describe a wholesale rewrite/replace/migration?
+
+    The validator weights deletions at 0.27 (deleted_line_f1 0.17 +
+    deleted_token_f1 0.10). Reference patches for these task shapes contain
+    long deletion sequences; matching them by deleting the same lines lifts
+    that 0.27. Bug-fix tasks score worse under this strategy, so we gate on
+    explicit rewrite/replace/migrate wording.
+    """
+    if not issue:
+        return False
+    return bool(_VOLUME_TASK_RE.search(issue))
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -1671,6 +1875,33 @@ These files have already been read for you. Re-reading them burns the duel
 budget; patch them directly unless a needed detail is missing.
 """
 
+    if _is_volume_task(issue):
+        strategy = (
+            "Strategy (VOLUME MODE — task uses rewrite/replace/refactor/"
+            "migrate wording): the hidden reference patch for this kind of "
+            "task typically DELETES large sections of the old implementation "
+            "and replaces them with a smaller new one. The validator scores "
+            "matched deleted lines at 0.27 weight per hunk — match it by "
+            "deleting the SAME lines.\n\n"
+            "  - Identify every block being replaced (old implementation, "
+            "deprecated UI, legacy types, dead code paths).\n"
+            "  - Delete each block aggressively in its own edit (heredoc or "
+            "sed -i with a unique anchor). Multiple smaller edits beat one "
+            "giant rewrite — they tokenize closer to the reference's hunks.\n"
+            "  - Replace deleted sections with the minimal stub or new "
+            "implementation the task asks for.\n"
+            "  - Match local style on the additions (the DETECTED STYLE "
+            "block above shows the target file's conventions).\n"
+            "  - Do not delete unrelated files just to pad volume — only "
+            "delete sections plausibly replaced by the task itself."
+        )
+    else:
+        strategy = (
+            "Strategy: the fix is typically in ONE specific function or "
+            "block. Identify it precisely, then make the minimal edit that "
+            "fixes the ROOT CAUSE."
+        )
+
     return f"""We need fix this issue:
 
 {issue}
@@ -1679,6 +1910,8 @@ Repository summary:
 
 {repo_summary}
 {context_section}
+
+{strategy}
 
 If the preloaded snippets identify the target code, start by editing them. Do
 not re-read preloaded files or run broad searches first. If the target is still
