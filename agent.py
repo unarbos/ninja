@@ -104,6 +104,8 @@ HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 540.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+FINALIZE_STAGE_SECONDS = 60        # v28: last stretch — force <final> if any patch exists
+HARD_BAIL_SECONDS = 20             # v28: last resort — break loop and return current patch
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -523,7 +525,67 @@ def ensure_git_repo(repo: Path) -> None:
     )
 
 
+def _revert_mode_only_index_changes(repo: Path) -> None:
+    """v28 edge: best-effort undo of plain executable-bit flips that the agent
+    didn't intend. Iterates `git diff --raw` and for any file whose ONLY change
+    is `100755->100644` (or vice versa), restores the original mode via
+    `git update-index --chmod`.
+
+    Has no effect when there are real content changes for the same path; the
+    mode flip stays but `_strip_low_signal_hunks` keeps it out of the patch.
+    Ported from jupiter385191-boop's PR #266 (a working competitor's edge)."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--raw", "-z"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    if proc.returncode != 0:
+        return
+
+    raw = proc.stdout or ""
+    entries = raw.split("\0")
+    i = 0
+    while i + 1 < len(entries):
+        meta = entries[i]
+        path = entries[i + 1]
+        i += 2
+        if not meta.startswith(":") or not path:
+            continue
+        bits = meta[1:].split()
+        if len(bits) < 5:
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = bits[:5]
+        if status not in {"M", "T"}:
+            continue
+        if old_mode == new_mode:
+            continue
+        if old_sha != new_sha:
+            continue  # content changed — leave mode alone
+        target_mode = "+x" if old_mode.endswith("755") else "-x"
+        try:
+            subprocess.run(
+                ["git", "update-index", f"--chmod={target_mode}", "--", path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+
+
 def get_patch(repo: Path) -> str:
+    # v28 edge: undo accidental chmod-only changes BEFORE diffing, so they
+    # never leak into the patch text shown to the judge.
+    _revert_mode_only_index_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -1735,6 +1797,32 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+def build_emergency_finalize_prompt(remaining_seconds: float) -> str:
+    """v28 edge: forced when wall-clock has entered the finalize stage with NO
+    patch. Converts "10 zero-score timeouts of 50 rounds" into "non-zero
+    partial-credit rounds". Ported from jupiter385191-boop PR #266."""
+    return (
+        f"FINAL STAGE — only ~{int(remaining_seconds)}s left and the repo is "
+        "still unchanged. Stop reading files. In your next response, issue "
+        "exactly one minimal edit command for the single most likely target "
+        "file, then immediately end with <final>incomplete - time pressure</final>. "
+        "Do not run any tests, do not search more files. A small targeted "
+        "edit beats an empty patch."
+    )
+
+
+def build_finalize_force_prompt(remaining_seconds: float) -> str:
+    """v28 edge: forced when wall-clock has entered the finalize stage with a
+    patch already present. Stop tinkering, finalize what we have."""
+    return (
+        f"FINAL STAGE — only ~{int(remaining_seconds)}s left and a patch "
+        "already exists. Do not issue more commands. Respond with exactly:\n"
+        "<final>summary of changes</final>\n"
+        "Any further edits in this remaining budget are likely to make the "
+        "patch worse rather than better."
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -1935,6 +2023,8 @@ def solve(
     hail_mary_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+    finalize_force_sent = False  # v28: track if we've nudged for finalize already
+    emergency_force_sent = False  # v28: track if we've nudged emergency-empty already
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2060,6 +2150,39 @@ def solve(
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
+            # v28 edge: wall-clock-aware emergency / force-finalize prompts.
+            # Fire BEFORE step header so the prompt arrives in the model's next
+            # call. Ported from jupiter385191-boop PR #266.
+            remaining = time_remaining()
+            if remaining <= HARD_BAIL_SECONDS:
+                logs.append(
+                    f"\nHARD_BAIL:\nremaining={remaining:.0f}s <= {HARD_BAIL_SECONDS}s; "
+                    "exiting loop with current patch."
+                )
+                break
+            if remaining <= FINALIZE_STAGE_SECONDS:
+                _patch_now = get_patch(repo)
+                if _patch_now.strip():
+                    if not finalize_force_sent:
+                        finalize_force_sent = True
+                        messages.append({
+                            "role": "user",
+                            "content": build_finalize_force_prompt(remaining),
+                        })
+                        logs.append(
+                            f"\nFINALIZE_FORCE_QUEUED:\n  remaining ~{int(remaining)}s, patch present."
+                        )
+                else:
+                    if not emergency_force_sent:
+                        emergency_force_sent = True
+                        messages.append({
+                            "role": "user",
+                            "content": build_emergency_finalize_prompt(remaining),
+                        })
+                        logs.append(
+                            f"\nEMERGENCY_FINALIZE_QUEUED:\n  remaining ~{int(remaining)}s, no patch yet."
+                        )
+
             logs.append(f"\n\n===== STEP {step} =====\n")
 
             if out_of_time():
