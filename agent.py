@@ -270,14 +270,12 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = 1,
+    max_retries: int = 2,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
 
-    Retries once on transient transport failures (timeout, connection reset,
-    HTTP 5xx). Client-side errors (4xx) bail out immediately because retrying
-    won't change the outcome and burns wall-clock budget that the agent needs
-    for actual editing.
+    Retries on transient transport/proxy failures (timeout, connection reset,
+    HTTP retryable statuses like 429/5xx, and occasional JSON decode errors).
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
@@ -306,12 +304,12 @@ def chat_completion(
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if 500 <= e.code < 600 and attempt < max_retries:
+            if e.code in {408, 409, 425, 429, 500, 502, 503, 504} and attempt < max_retries:
                 last_error = e
                 time.sleep(1.0)
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 last_error = e
                 time.sleep(1.0)
