@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Portable single-file SWE-style coding agent harness.
-
 Contract:
     The validator imports this file and calls:
 
@@ -1777,7 +1775,7 @@ def solve(
     success = False
     consecutive_no_command = 0
     polish_turns_used = 0
-    coverage_nudges_used = 0
+    coverage_nudge_turns_used = 0
     criteria_nudge_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
@@ -1805,7 +1803,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, coverage_nudges_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal polish_turns_used, coverage_nudge_turns_used, criteria_nudge_turns_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1821,10 +1819,10 @@ def solve(
                 )
                 return True
 
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+        if coverage_nudge_turns_used < MAX_COVERAGE_NUDGES:
             missing_files = _uncovered_required_paths(patch, issue)
             if missing_files:
-                coverage_nudges_used += 1
+                coverage_nudge_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing_files),
