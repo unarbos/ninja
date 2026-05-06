@@ -115,6 +115,14 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_FOOTPRINT_TURNS = 1    # ask model to shrink an over-broad patch to minimum sufficient diff
+# Cursor F1 ratio = matched_lines / max(model_changed, ref_changed). An oversized
+# patch inflates the denominator without adding numerator, so footprint control is
+# a direct optimization. These thresholds bound "looks too big".
+FOOTPRINT_MAX_FILES_FACTOR = 3      # patch should not touch >3x the count named in the issue
+FOOTPRINT_MAX_TOTAL_FILES = 8       # cap regardless of issue (most real fixes are <=8 files)
+FOOTPRINT_MAX_HUNK_LINES = 80       # any single hunk over this is suspicious
+FOOTPRINT_MAX_TOTAL_LINES = 600     # whole-patch line cap
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1055,6 +1063,106 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# V3 edge — footprint guard
+# -----------------------------
+
+
+def _patch_footprint_summary(patch: str) -> Dict[str, int]:
+    """Quantify the patch shape for the oversize check.
+
+    Counts changed files, total +/- lines, the largest hunk we see, and the
+    number of "fat" hunks that exceed FOOTPRINT_MAX_HUNK_LINES. Compare.py's
+    F1 ratio is matched / max(changed_a, changed_b), so an over-broad patch
+    inflates the denominator without adding numerator. Footprint control is a
+    direct optimization of the cursor side of the score.
+    """
+    files = set()
+    plus_lines = 0
+    minus_lines = 0
+    largest_hunk = 0
+    fat_hunks = 0
+    cur_hunk = 0
+
+    def _flush_hunk():
+        nonlocal cur_hunk, largest_hunk, fat_hunks
+        if cur_hunk > largest_hunk:
+            largest_hunk = cur_hunk
+        if cur_hunk > FOOTPRINT_MAX_HUNK_LINES:
+            fat_hunks += 1
+        cur_hunk = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            _flush_hunk()
+            m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+            if m:
+                files.add(m.group(1))
+        elif line.startswith("@@"):
+            _flush_hunk()
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus_lines += 1
+            cur_hunk += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus_lines += 1
+            cur_hunk += 1
+    _flush_hunk()
+
+    return {
+        "files": len(files),
+        "plus": plus_lines,
+        "minus": minus_lines,
+        "total_changed": plus_lines + minus_lines,
+        "largest_hunk": largest_hunk,
+        "fat_hunks": fat_hunks,
+    }
+
+
+def _patch_oversized(patch: str, issue_text: str) -> Optional[Dict[str, int]]:
+    """If the patch looks substantively over-broad for the task, return its
+    footprint summary so the prompt can reference concrete numbers. Otherwise
+    None, so the refinement step is skipped."""
+    if not patch.strip():
+        return None
+    fp = _patch_footprint_summary(patch)
+    mentioned = _extract_issue_path_mentions(issue_text)
+    target_count = max(1, len(mentioned))
+
+    file_overshoot = (
+        fp["files"] > target_count * FOOTPRINT_MAX_FILES_FACTOR
+        or fp["files"] > FOOTPRINT_MAX_TOTAL_FILES
+    )
+    line_overshoot = fp["total_changed"] > FOOTPRINT_MAX_TOTAL_LINES
+    hunk_overshoot = fp["fat_hunks"] >= 2 or fp["largest_hunk"] > FOOTPRINT_MAX_HUNK_LINES * 2
+
+    if file_overshoot or line_overshoot or hunk_overshoot:
+        fp["target_files"] = target_count
+        return fp
+    return None
+
+
+def build_footprint_shrink_prompt(footprint: Dict[str, int], issue_text: str) -> str:
+    """Show concrete oversize numbers and ask for a minimum-sufficient diff."""
+    head = issue_text[:1200]
+    return (
+        "Footprint guard — your draft looks substantively over-broad for this task:\n"
+        f"  - files touched: {footprint['files']}"
+        f"  (issue names ~{footprint.get('target_files', 1)})\n"
+        f"  - total changed lines: {footprint['total_changed']} (cap {FOOTPRINT_MAX_TOTAL_LINES})\n"
+        f"  - largest hunk: {footprint['largest_hunk']} lines\n"
+        f"  - fat hunks (>{FOOTPRINT_MAX_HUNK_LINES} lines): {footprint['fat_hunks']}\n\n"
+        "The scoring is matched_lines / max(model_changed, ref_changed): every\n"
+        "oversize hunk inflates the denominator without adding matched numerator.\n\n"
+        "Issue (head):\n"
+        f"{head}\n\n"
+        "Revert any unrelated drive-by edits, narrow each hunk to the minimum\n"
+        "lines that actually implement the requirement, and KEEP every change\n"
+        "the issue truly demands. Use sed/python -c/cat to revert non-required\n"
+        "lines back to original. Then end with <final>summary</final>. If the\n"
+        "patch is genuinely already minimal, respond exactly <final>OK</final>."
+    )
+
+
+# -----------------------------
 # Multi-language syntax gate
 # -----------------------------
 #
@@ -1918,6 +2026,7 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    footprint_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1949,7 +2058,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, footprint_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2016,6 +2125,24 @@ def solve(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # V3 edge: footprint guard runs after coverage+criteria (so we know we
+        # have the *right* files) but before self_check (so the model still
+        # has budget to actually shrink). The scoring objective is matched /
+        # max(model_changed, ref_changed) — every spurious line in the patch
+        # inflates the denominator without adding the numerator.
+        if footprint_turns_used < MAX_FOOTPRINT_TURNS:
+            oversized = _patch_oversized(patch, issue)
+            if oversized is not None:
+                footprint_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_footprint_shrink_prompt(oversized, issue),
+                    f"FOOTPRINT_SHRINK_QUEUED:\n  files={oversized['files']} "
+                    f"changed={oversized['total_changed']} "
+                    f"largest_hunk={oversized['largest_hunk']}",
                 )
                 return True
 
