@@ -21,6 +21,7 @@ from typing import Any
 
 DEFAULT_NETUID = 66
 MAX_RAW_COMMITMENT_BYTES = 128
+HOTKEY_SPENT_SINCE_BLOCK = 8_104_340
 NINJA_PR_COMMITMENT_RE = re.compile(
     r"^github-pr:unarbos/ninja#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
@@ -92,11 +93,6 @@ def parse_args() -> argparse.Namespace:
         help="Submit through Bittensor MEV protection.",
     )
     parser.add_argument(
-        "--skip-format-check",
-        action="store_true",
-        help="Allow non-ninja commitment strings.",
-    )
-    parser.add_argument(
         "--skip-registration-check",
         action="store_true",
         help="Skip checking that the hotkey is registered on the subnet before submit.",
@@ -118,7 +114,7 @@ def resolve_commitment(args: argparse.Namespace) -> str:
     return commitment.strip()
 
 
-def validate_commitment(commitment: str, *, skip_format_check: bool) -> None:
+def validate_commitment(commitment: str) -> None:
     if not commitment:
         raise ValueError("commitment string is empty")
 
@@ -133,10 +129,10 @@ def validate_commitment(commitment: str, *, skip_format_check: bool) -> None:
             f"{MAX_RAW_COMMITMENT_BYTES} bytes"
         )
 
-    if not skip_format_check and not NINJA_PR_COMMITMENT_RE.fullmatch(commitment):
+    if not NINJA_PR_COMMITMENT_RE.fullmatch(commitment):
         raise ValueError(
             "commitment must match github-pr:unarbos/ninja#<pr-number>@<head-sha>; "
-            "pass --skip-format-check to submit a different string"
+            "raw owner/repo@sha commitments are not accepted by the validator"
         )
 
 
@@ -179,7 +175,7 @@ def main() -> int:
 
     try:
         commitment = resolve_commitment(args)
-        validate_commitment(commitment, skip_format_check=args.skip_format_check)
+        validate_commitment(commitment)
         bt = load_bittensor()
         wallet = load_wallet(bt, args)
     except Exception as exc:
@@ -199,6 +195,7 @@ def main() -> int:
     print(f"wallet_hotkey: {wallet_hotkey}")
     print(f"netuid: {args.netuid}")
     print(f"commitment: {commitment}")
+    print(f"hotkey_spent_since_block: {HOTKEY_SPENT_SINCE_BLOCK}")
 
     if args.dry_run:
         print("dry_run: true")
