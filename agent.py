@@ -1615,6 +1615,7 @@ brief summary of what changed
 **TypeScript/C#** - cascade interface changes to all implementing classes.
 **Multi-file** - complete ALL affected files; include more when uncertain.
 
+
 ## Workflow
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
