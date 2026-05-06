@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+Portable single-file SWE-style coding agent harness.
+
 Contract:
     The validator imports this file and calls:
 
@@ -66,7 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; the
+# observation size, and max_tokens. Do not set sampling parameters; validator
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
