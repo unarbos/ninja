@@ -1268,30 +1268,62 @@ def _shell_quote(value: str) -> str:
 # the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python — the most common shapes.
+    # Python — covers pytest/unittest layouts including nested test dirs.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    # TypeScript / JavaScript — Jest / Vitest conventions.
+    ("{stem}.py", "tests/unit/test_{stem}.py"),
+    ("{stem}.py", "tests/integration/test_{stem}.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    # TypeScript / JavaScript — Jest / Vitest .test and .spec conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/{stem}.spec.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/__tests__/{stem}.spec.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/{stem}.spec.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/__tests__/{stem}.spec.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
+    ("{stem}.js", "{dir}/{stem}.spec.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "{dir}/__tests__/{stem}.spec.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
+    ("{stem}.jsx", "{dir}/{stem}.spec.jsx"),
+    # C# — xUnit/NUnit/MSTest layouts. .NET tasks usually keep tests in a
+    # parallel project (e.g. `Foo.Infrastructure/Sub/X.cs` ->
+    # `Foo.Tests/Sub/XTests.cs`); the basename-suffix fallback in
+    # _find_test_partner catches that. Templates here cover same-tree.
+    ("{stem}.cs", "{dir}/{stem}Tests.cs"),
+    ("{stem}.cs", "{stem}Tests.cs"),
+    ("{stem}.cs", "Tests/{stem}Tests.cs"),
+    ("{stem}.cs", "tests/{stem}Tests.cs"),
+    ("{stem}.cs", "{dir}/Tests/{stem}Tests.cs"),
+    ("{stem}.cs", "{stem}.Tests/{stem}Tests.cs"),
+    # Other languages — common canonical conventions.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
+    ("{stem}.rs", "tests/{stem}.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    ("{stem}.rb", "{dir}/{stem}_spec.rb"),
 )
 
 
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
+    """Return the most plausible test file for a source path, or None.
+
+    First tries `_TEST_PARTNER_TEMPLATES` (cheap, deterministic). When no
+    template matches we fall back to a basename-suffix scan over the tracked
+    file set so we catch cross-project layouts like .NET parallel projects
+    (`Foo.Infrastructure/Sub/X.cs` -> `Foo.Tests/Sub/XTests.cs`) that simple
+    `{stem}/{dir}` substitution cannot express. The fallback is conservative:
+    it requires unambiguous candidates so we never push the model toward an
+    unrelated test partner.
+    """
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
@@ -1308,6 +1340,45 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
         candidate = str(Path(candidate))
         if candidate in tracked and _context_file_allowed(candidate):
             return candidate
+
+    # Basename-suffix fallback for cross-project layouts (.NET parallel,
+    # Java / Kotlin / Ruby / Python / TS / JS / Go / Rust where the test
+    # lives in a parallel directory tree).
+    suffix_lower = suffix.lower()
+    fallback_basenames: List[str] = []
+    if suffix_lower == ".cs":
+        fallback_basenames = [f"{stem}Tests.cs", f"{stem}Test.cs"]
+    elif suffix_lower == ".py":
+        fallback_basenames = [f"test_{stem}.py", f"{stem}_test.py"]
+    elif suffix_lower in (".ts", ".tsx", ".js", ".jsx"):
+        fallback_basenames = [
+            f"{stem}.test{suffix_lower}",
+            f"{stem}.spec{suffix_lower}",
+        ]
+    elif suffix_lower == ".go":
+        fallback_basenames = [f"{stem}_test.go"]
+    elif suffix_lower == ".rs":
+        fallback_basenames = [f"{stem}_test.rs"]
+    elif suffix_lower == ".rb":
+        fallback_basenames = [f"{stem}_spec.rb"]
+    elif suffix_lower == ".java":
+        fallback_basenames = [f"{stem}Test.java", f"{stem}Tests.java"]
+    elif suffix_lower == ".kt":
+        fallback_basenames = [f"{stem}Test.kt", f"{stem}Tests.kt"]
+    if not fallback_basenames:
+        return None
+    matches: List[str] = []
+    for basename in fallback_basenames:
+        for tracked_path in tracked:
+            if tracked_path.endswith("/" + basename) or tracked_path == basename:
+                if _context_file_allowed(tracked_path):
+                    matches.append(tracked_path)
+        if matches:
+            break
+    # Only return when exactly one tracked file matches the test-name shape;
+    # ambiguous matches risk pushing the model at an unrelated test partner.
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -2236,41 +2307,103 @@ def solve(
         ).to_dict()
 
 
+_TEST_SUMMARY_PATTERNS: Tuple[Tuple["re.Pattern[str]", "re.Pattern[str]"], ...] = (
+    # pytest summary line: "===== 12 passed in 0.34s ====="
+    (
+        re.compile(r"=+\s*\d+\s+passed(?:[^\n=]*?)\s+in\s+\d", re.IGNORECASE),
+        re.compile(r"\b\d+\s+(failed|errors?)\b", re.IGNORECASE),
+    ),
+    # jest / vitest: "Tests:       4 passed, 4 total"
+    (
+        re.compile(r"^\s*tests?:\s+\d+\s+passed", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*tests?:[^\n]*\b\d+\s+(failed|todo)", re.IGNORECASE | re.MULTILINE),
+    ),
+    # mocha: "12 passing"
+    (
+        re.compile(r"^\s*\d+\s+passing\b", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*\d+\s+failing\b", re.IGNORECASE | re.MULTILINE),
+    ),
+    # go test: "ok  \tpkg\t0.123s" or final "PASS"
+    (
+        re.compile(r"(?m)^(?:ok\s+\S+|PASS)\s*$"),
+        re.compile(r"(?m)^(?:--- FAIL|FAIL\b)"),
+    ),
+    # cargo test: "test result: ok. N passed; 0 failed"
+    (
+        re.compile(r"test\s+result:\s+ok\.\s+\d+\s+passed", re.IGNORECASE),
+        re.compile(r"test\s+result:\s+failed", re.IGNORECASE),
+    ),
+    # rspec: "5 examples, 0 failures"
+    (
+        re.compile(r"^\s*\d+\s+examples?,\s+0\s+failures?\b", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*\d+\s+examples?,\s+\d+\s+failures?\b", re.IGNORECASE | re.MULTILINE),
+    ),
+)
+
+
+def _parse_test_summary(observation: str, command: str) -> Optional[bool]:
+    """Return True when an explicit pass summary is present and no fail
+    summary, False when an explicit fail summary appears, or None when no
+    runner summary line is detected so the caller can fall back to the loose
+    marker heuristic.
+    """
+    if not _looks_like_verification_command(command):
+        return None
+    for pass_re, fail_re in _TEST_SUMMARY_PATTERNS:
+        fail_match = fail_re.search(observation)
+        pass_match = pass_re.search(observation)
+        if fail_match:
+            return False
+        if pass_match:
+            return True
+    return None
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
+    """Return True only when we have HIGH confidence the latest command was a
+    real verification step that passed.
+
+    The legacy fallback accepted any exit-0 command whose observation merely
+    contained the substring "ok" or "success" anywhere — which falsely fires
+    on `cat > file.py` whenever the file content has identifiers like
+    `lookup`, `book`, `token`, `mock`, and on `grep` when matched lines
+    contain those substrings. Combined with the system prompt asking the
+    model to batch independent edits in one response, the substring trap
+    triggered AUTO_STOP mid-batch and dropped half the planned files. We
+    now only auto-stop when:
+        - a known runner summary line confirms a pass, or
+        - the last command was an actual verification command (pytest, jest,
+          tsc, go test, etc.) and exited 0 with no clear failure marker.
+    Anything else (cat, grep, sed, echo, ls, mkdir, edits) no longer
+    triggers early termination; we let the model decide via <final>.
+    """
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-    ]
-
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
+    summary = _parse_test_summary(observation, command)
+    if summary is True and (exit_code is None or exit_code == 0):
+        return True
+    if summary is False:
+        return False
 
     if exit_code is not None and exit_code != 0:
         return False
+    if not _looks_like_verification_command(command):
+        return False
 
-    has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
+    bad_markers = (
+        " failed",
+        " failures",
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+    )
+    if any(marker in lower for marker in bad_markers):
+        return False
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
-        has_bad = True
-
-    if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
-        return True
-
-    return (exit_code == 0 or has_good) and has_good and not has_bad
+        return False
+    return True
 
 
 def _looks_like_verification_command(command: str) -> bool:
@@ -2279,11 +2412,18 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
         r"\bpytest\b",
         r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
+        r"\bpython\d*(\.\d+)?\s+-m\s+unittest\b",
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r"\bnpx\s+tsc\b",
+        r"\bnpx\s+(tsc|jest|vitest|mocha)\b",
         r"\btsc\b",
+        r"\bjest\b",
+        r"\bvitest\b",
+        r"\bmocha\b",
+        r"\bphpunit\b",
+        r"\b(?:bundle\s+exec\s+)?rspec\b",
+        r"\bdotnet\s+test\b",
         r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
         r"\bmvn\s+test\b",
