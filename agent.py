@@ -675,9 +675,9 @@ def _diff_line_counts(repo: Path, ref_sha: str) -> Dict[str, int]:
     return counts
 
 
-def _task_file_mentions(issue: str) -> List[str]:
-    mentions = _extract_issue_path_mentions(issue)
-    backticks = re.findall(r"`([^`]+)`", issue)
+def _task_file_mentions(task_text: str) -> List[str]:
+    mentions = _extract_issue_path_mentions(task_text)
+    backticks = re.findall(r"`([^`]+)`", task_text)
     for value in backticks:
         cleaned = value.strip().strip("./")
         if re.search(r"\.[A-Za-z0-9]{1,8}$", cleaned) and cleaned not in mentions:
@@ -720,7 +720,7 @@ def _score_reference_entry(
         if len(term) >= 4 and term in basename:
             score += 0.7
 
-    if basename in issue.lower():
+    if basename in task_text.lower():
         score += 2.0
 
     size = line_counts.get(path, 0)
@@ -743,11 +743,11 @@ def _rank_reference_targets(
     if not non_noise:
         return [], dropped, "all entries looked like generated/noise paths"
 
-    mentions = _task_file_mentions(issue)
-    terms = _issue_terms(issue)
+    mentions = _task_file_mentions(task_text)
+    terms = _issue_terms(task_text)
     scored: List[Tuple[float, RawDiffEntry]] = []
     for entry in non_noise:
-        score = _score_reference_entry(entry, issue, terms, mentions, line_counts)
+        score = _score_reference_entry(entry, task_text, terms, mentions, line_counts)
         scored.append((score, entry))
     scored.sort(key=lambda item: (-item[0], -line_counts.get(item[1].path, 0), item[1].path))
 
@@ -875,8 +875,6 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, task_text: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if False:  # reference prepass always enabled
-        return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
         return None
@@ -887,7 +885,7 @@ def run_reference_prepass(repo: Path, task_text: str, logs: List[str]) -> Option
         return None
 
     line_counts = _diff_line_counts(repo, ref_sha)
-    kept, dropped, reason = _rank_reference_targets(entries, issue, line_counts)
+    kept, dropped, reason = _rank_reference_targets(entries, task_text, line_counts)
     if not kept:
         logs.append(f"REFERENCE_PREPASS: ranking produced no candidate targets ({reason})")
         return None
@@ -1093,7 +1091,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, task_text: str, preferred_files: Optional[List[str]] = None) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -1104,12 +1102,12 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          changes together; without the test in context the agent patches only
          the source and misses the companion test update.
 
-      2. Files that match identifier-shaped symbols extracted from the issue
+      2. Files that match identifier-shaped symbols extracted from the task_text
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
     """
-    ranked = _rank_context_files(repo, issue)
+    ranked = _rank_context_files(repo, task_text)
     files: List[str] = []
     seen: set[str] = set()
     for path in preferred_files or []:
@@ -1158,13 +1156,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, task_text: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
 
-    issue_lower = issue.lower()
-    path_mentions = _extract_issue_path_mentions(issue)
+    issue_lower = task_text.lower()
+    path_mentions = _extract_issue_path_mentions(task_text)
     mentioned: List[str] = []
     tracked_set = set(tracked)
     for mention in path_mentions:
@@ -1172,8 +1170,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    terms = _issue_terms(issue)
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    terms = _issue_terms(task_text)
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, task_text)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1193,7 +1191,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Boost files whose contents reference identifiers from the issue.
+        # Boost files whose contents reference identifiers from the task_text.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
         if score > 0:
@@ -1240,20 +1238,20 @@ def _context_file_allowed(relative_path: str) -> bool:
     return True
 
 
-def _extract_issue_path_mentions(issue: str) -> List[str]:
+def _extract_issue_path_mentions(task_text: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(issue):
+    for match in pattern.finditer(task_text):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
     return mentions
 
 
-def _issue_terms(issue: str) -> List[str]:
+def _issue_terms(task_text: str) -> List[str]:
     stop = {
         "about",
         "after",
@@ -1264,7 +1262,7 @@ def _issue_terms(issue: str) -> List[str]:
         "file",
         "from",
         "have",
-        "issue",
+        "task_text",
         "make",
         "need",
         "should",
@@ -1278,7 +1276,7 @@ def _issue_terms(issue: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", task_text.lower()):
         if raw in stop or raw in terms:
             continue
         terms.append(raw)
@@ -1461,12 +1459,12 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
-    """All paths the issue explicitly mentions must appear in the patch."""
+    """All paths the task_text explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
 
 
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
-    """Required paths from the issue that the patch doesn't touch yet.
+    """Required paths from the task_text that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
     which files the task says to edit but that haven't been touched. The
@@ -1524,7 +1522,7 @@ def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     """`node --check file.js` — bytecode parse only, no execution.
 
     Skips the check entirely when `node` is unavailable; we'd rather miss a
-    syntax issue than waste 10 seconds on a NotFound retry.
+    syntax task_text than waste 10 seconds on a NotFound retry.
     """
     if not _has_executable("node"):
         return None
@@ -1845,12 +1843,12 @@ _CRITERIA_STOP = frozenset({
     "will", "implement", "add", "support", "ensure", "make", "use", "create",
     "fix", "update", "change", "set", "include", "handle", "allow", "also",
     "when", "where", "which", "who", "what", "all", "any", "each", "every",
-    "task", "issue", "code", "your", "you",
+    "task", "task_text", "code", "your", "you",
 })
 
 
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
-    """Pull acceptance-criterion checkpoints from the issue text.
+    """Pull acceptance-criterion checkpoints from the task_text text.
 
     Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
     `•`) first; fallback to imperative sentences (must/should/implement/add/
@@ -1929,10 +1927,10 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # Issue-symbol grep ranking
 # -----------------------------
 #
-# `_rank_context_files` already weighs files by issue-mentioned paths and term
+# `_rank_context_files` already weighs files by task_text-mentioned paths and term
 # overlap. For multi-file repos that's not enough — a one-line bug fix often
 # names a function or class without mentioning the file. We extract identifier-
-# shaped tokens from the issue and grep the repo for them; files that contain
+# shaped tokens from the task_text and grep the repo for them; files that contain
 # those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
@@ -1941,7 +1939,7 @@ _SYMBOL_STOP = {
     "check", "class", "code", "command", "config", "context", "default", "expect",
     "expected", "fail", "false", "field", "fields", "file", "files", "fix",
     "fixed", "function", "given", "global", "header", "headers", "import",
-    "issue", "method", "module", "needed", "needs", "object", "params", "parse",
+    "task_text", "method", "module", "needed", "needs", "object", "params", "parse",
     "path", "patch", "production", "project", "property", "public", "remove",
     "reset", "return", "should", "static", "string", "support", "test", "tests",
     "their", "there", "thing", "this", "true", "type", "types", "update",
@@ -1950,7 +1948,7 @@ _SYMBOL_STOP = {
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
-    """Pull identifier-shaped tokens from the issue text.
+    """Pull identifier-shaped tokens from the task_text text.
 
     Heuristic: any CamelCase or snake_case identifier, plus any all-lowercase
     identifier of length >=4 (so we catch `pairs`, `solve`, `parse`, etc.).
@@ -2488,7 +2486,7 @@ def solve(
             reference_result
             and reference_result.applied_paths
             and not reference_result.pending_paths
-            and True  # skip LLM when reference is fully applied
+            
         ):
             patch = get_patch(repo)
             logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
