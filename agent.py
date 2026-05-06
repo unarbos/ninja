@@ -52,6 +52,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -93,25 +95,27 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+MAX_MODEL_ERROR_RECOVERY_TURNS = 1
+MAX_BARE_CAT_LINES = 240
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
+# Anti-whiff knobs. Empty patches score zero, but duel timeouts are worse than
+# a single missed completion. Keep retries shallow and recover through the main
+# loop instead of nesting long waits.
 # Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
-HTTP_MAX_RETRIES = 3
+HTTP_MAX_RETRIES = 0
 HTTP_RETRY_BASE_BACKOFF = 1.0
-MAX_STEP_RETRIES = 2
+MAX_STEP_RETRIES = 1
+MODEL_REQUEST_TIMEOUT_SECONDS = 90
 WALL_CLOCK_BUDGET_SECONDS = 540.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_POLISH_TURNS = 1       # strip whitespace/blank-only hunks
+MAX_SELF_CHECK_TURNS = 1   # one targeted completion repair, not a generic review loop
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
@@ -119,15 +123,15 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\bmkfs\b",
+    r"(?:^|[;&|]\s*)shutdown\b",
+    r"(?:^|[;&|]\s*)reboot\b",
+    r"(?:^|[;&|]\s*)mkfs\b",
     r"\bdd\s+if=",
     r":\(\)\s*\{\s*:\|:\s*&\s*\};:",
-    r"\bmount\b",
-    r"\bumount\b",
-    r"\biptables\b",
-    r"\bnft\b",
+    r"(?:^|[;&|]\s*)mount\b",
+    r"(?:^|[;&|]\s*)umount\b",
+    r"(?:^|[;&|]\s*)iptables\b",
+    r"(?:^|[;&|]\s*)nft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
 ]
@@ -253,7 +257,7 @@ def _resolve_inference_config(
 def _is_dangerous_command(command: str) -> Optional[str]:
     lowered = command.strip()
     for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, lowered):
+        if re.search(pattern, lowered, flags=re.MULTILINE):
             return pattern
     return None
 
@@ -281,7 +285,7 @@ def chat_completion(
     api_base: Optional[str],
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = 120,
+    timeout: int = MODEL_REQUEST_TIMEOUT_SECONDS,
     max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
@@ -382,6 +386,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             blocked=True,
         )
 
+    command = _limit_bare_cat_command(command)
     start = time.time()
 
     try:
@@ -439,11 +444,26 @@ def _command_env() -> Dict[str, str]:
         "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
         "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "GIT_PAGER": "cat",
         "PAGER": "cat",
         "CI": "1",
     }
+
+
+def _limit_bare_cat_command(command: str) -> str:
+    if any(token in command for token in ("|", ";", "&", "<", ">")):
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if len(parts) == 2 and parts[0] == "cat":
+        return f"sed -n '1,{MAX_BARE_CAT_LINES}p' {shlex.quote(parts[1])}"
+    if len(parts) == 3 and parts[0] == "cat" and parts[1] in {"-n", "--number"}:
+        return f"nl -ba {shlex.quote(parts[2])} | sed -n '1,{MAX_BARE_CAT_LINES}p'"
+    return command
 
 
 def format_observation(result: CommandResult) -> str:
@@ -470,16 +490,44 @@ def format_observation(result: CommandResult) -> str:
 # -----------------------------
 
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
+FENCED_COMMAND_RE = re.compile(r"```(?:bash|sh|shell|zsh)?\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_commands(model_text: str) -> List[str]:
-    return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    commands = [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    if commands:
+        return commands
+    fallback: List[str] = []
+    for match in FENCED_COMMAND_RE.finditer(model_text):
+        command = _clean_command_block(match.group(1))
+        if command and _looks_like_shell_command_block(command):
+            fallback.append(command)
+    return fallback
 
 
-def extract_command(model_text: str) -> Optional[str]:
-    commands = extract_commands(model_text)
-    return commands[0] if commands else None
+def _clean_command_block(command: str) -> str:
+    lines = []
+    for line in command.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("$ "):
+            lines.append(stripped[2:])
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _looks_like_shell_command_block(command: str) -> bool:
+    first = command.strip().splitlines()[0].strip()
+    if not first or first.startswith(("diff --git", "@@", "+", "-")):
+        return False
+    return bool(
+        re.match(
+            r"^(python\d*(\.\d+)?|sed|perl|git|rg|grep|find|cat|printf|tee|"
+            r"pytest|node|npm|npx|pnpm|yarn|uv|go|cargo|make|mkdir|mv|cp|rm|touch|cd|set)\b",
+            first,
+        )
+    )
 
 
 def extract_final(model_text: str) -> Optional[str]:
@@ -495,29 +543,46 @@ def extract_final(model_text: str) -> Optional[str]:
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
-    if git_dir.exists():
-        return
-
+    if not git_dir.exists():
+        subprocess.run(
+            "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
+            cwd=str(repo),
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
     subprocess.run(
-        "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
+        ["git", "config", "core.filemode", "false"],
         cwd=str(repo),
-        shell=True,
-        executable="/bin/bash",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=30,
+        timeout=5,
     )
+
+
+PATCH_SKIP_SUFFIXES = {
+    ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+    ".zip", ".gz", ".tgz", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mov",
+}
+
+PATCH_SKIP_NAMES = {
+    ".ds_store", "bun.lockb", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+}
 
 
 def get_patch(repo: Path) -> str:
     exclude_pathspecs = [
-        ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
         ":(exclude,glob)**/.pytest_cache/**",
         ":(exclude,glob)**/node_modules/**",
         ":(exclude).git",
     ]
+    exclude_pathspecs.extend(f":(exclude,glob)**/*{suffix}" for suffix in sorted(PATCH_SKIP_SUFFIXES))
+    exclude_pathspecs.extend(f":(exclude,glob)**/{name}" for name in sorted(PATCH_SKIP_NAMES))
     proc = subprocess.run(
         ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
@@ -554,6 +619,7 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_skipped_file_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
 
 
@@ -586,9 +652,28 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+def _strip_skipped_file_diffs(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        path = _diff_block_path(block)
+        if path and _should_skip_patch_path(path):
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix == ".pyc":
+    if path.suffix.lower() in PATCH_SKIP_SUFFIXES or path.name.lower() in PATCH_SKIP_NAMES:
         return True
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
 
@@ -695,8 +780,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for index, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget = per_file_budget
+        if index == 0:
+            budget = max(budget, min(12000, MAX_PRELOADED_CONTEXT_CHARS // 2))
+        snippet = _read_context_file(repo, relative_path, budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -783,6 +871,8 @@ def _context_file_allowed(relative_path: str) -> bool:
     name_lower = path.name.lower()
     if parts_lower & CONTEXT_SKIP_PARTS:
         return False
+    if path.suffix.lower() in PATCH_SKIP_SUFFIXES or name_lower in PATCH_SKIP_NAMES:
+        return False
     if name_lower.startswith(".env") or name_lower in SECRETISH_PARTS or parts_lower & SECRETISH_PARTS:
         return False
     if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
@@ -856,31 +946,29 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # -----------------------------
 #
 # Two failure modes produce low-quality patches: drive-by whitespace /
-# comment / blank-line edits, and patches that cover the wrong files. The
-# helpers below detect both. They're applied at two stages:
+# blank-line edits, and patches that cover the wrong files. The helpers below
+# detect both. They're applied at two stages:
 #
-#   1. At patch-return time: low-signal hunks are silently dropped from the
+#   1. At patch-return time: objective junk hunks are silently dropped from the
 #      final diff (so the validator never sees them).
 #   2. Inside the loop: when the model's draft contains junk, we queue a
 #      "polish" turn that asks the model to revert those hunks itself, since
 #      doing so cleanly is safer than mechanical filtering for borderline cases
-#      (e.g., a comment edit that genuinely matters).
+#      (e.g., indentation-only churn in non-semantic files).
 
-_COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
-_BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
+SEMANTIC_WHITESPACE_SUFFIXES = {".py", ".yaml", ".yml"}
+SEMANTIC_WHITESPACE_NAMES = {"Makefile", "makefile"}
 
 
-def _line_is_comment(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if any(stripped.startswith(p) for p in _COMMENT_LINE_PREFIXES):
-        return True
-    if _BLOCK_COMMENT_RE.match(line):
-        return True
-    if stripped.startswith('"""') or stripped.startswith("'''"):
-        return True
-    return False
+def _diff_block_path(block: str) -> str:
+    first = block.splitlines()[0] if block else ""
+    match = re.match(r"diff --git a/.+? b/(.+)$", first)
+    return match.group(1) if match else ""
+
+
+def _preserve_whitespace_only_hunk(relative_path: str) -> bool:
+    path = Path(relative_path)
+    return path.suffix.lower() in SEMANTIC_WHITESPACE_SUFFIXES or path.name in SEMANTIC_WHITESPACE_NAMES
 
 
 def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
@@ -900,15 +988,8 @@ def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
     return a == r
 
 
-def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
-    body = [line for line in added + removed if line.strip()]
-    if not body:
-        return False
-    return all(_line_is_comment(line) for line in body)
-
-
 def _strip_low_signal_hunks(diff_output: str) -> str:
-    """Drop blank-only / whitespace-only / comment-only hunks from each file.
+    """Drop blank-only / whitespace-only hunks from each file.
 
     Whole-file blocks with no @@ markers are kept verbatim because they are
     file-create / file-delete / binary patches that the hunk classifier
@@ -925,6 +1006,7 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
         if not block.startswith("diff --git ") or "\n@@ " not in block:
             out.append(block)
             continue
+        relative_path = _diff_block_path(block)
         parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
         header = parts[0]
         hunks = [chunk for chunk in parts[1:] if chunk]
@@ -939,8 +1021,10 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
                     removed.append(line[1:])
             if (
                 _hunk_is_blank_only(added, removed)
-                or _hunk_is_whitespace_only(added, removed)
-                or _hunk_is_comment_only(added, removed)
+                or (
+                    _hunk_is_whitespace_only(added, removed)
+                    and not _preserve_whitespace_only_hunk(relative_path)
+                )
             ):
                 continue
             substantive.append(hunk_text)
@@ -968,10 +1052,8 @@ def _diff_low_signal_summary(patch: str) -> str:
             return
         if _hunk_is_blank_only(current_added, current_removed):
             notes.append(f"{current_file}: blank-line-only hunk")
-        elif _hunk_is_whitespace_only(current_added, current_removed):
+        elif _hunk_is_whitespace_only(current_added, current_removed) and not _preserve_whitespace_only_hunk(current_file):
             notes.append(f"{current_file}: whitespace-only hunk")
-        elif _hunk_is_comment_only(current_added, current_removed):
-            notes.append(f"{current_file}: comment-only hunk")
 
     for line in patch.splitlines():
         if line.startswith("diff --git "):
@@ -1032,6 +1114,46 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+VISIBLE_TASK_TERMS = {
+    "ui", "screen", "page", "view", "component", "button", "form", "modal",
+    "layout", "render", "display", "visual", "chart", "dashboard", "style",
+    "3d", "scene", "hud", "overlay", "animation", "slider", "scrubber",
+    "play", "pause", "marker", "simulator", "visualization",
+}
+
+SUPPORT_PATH_PARTS = {
+    "api", "client", "context", "data", "hooks", "lib", "mock", "mocks",
+    "model", "models", "schema", "services", "store", "stores", "type",
+    "types", "util", "utils",
+}
+
+VISIBLE_SUFFIXES = {".tsx", ".jsx", ".vue", ".svelte", ".html", ".css", ".scss"}
+
+
+def _completion_warning(patch: str, issue_text: str) -> str:
+    files = _patch_changed_files(patch)
+    if not files:
+        return ""
+    issue_lower = issue_text.lower()
+    if not any(term in issue_lower for term in VISIBLE_TASK_TERMS):
+        return ""
+    visible_files = [path for path in files if Path(path).suffix.lower() in VISIBLE_SUFFIXES]
+    if visible_files:
+        return ""
+    def support_file(relative_path: str) -> bool:
+        path = Path(relative_path)
+        markers = {part.lower() for part in path.parts}
+        markers.add(path.stem.lower())
+        return bool(markers & SUPPORT_PATH_PARTS)
+
+    if all(support_file(path) for path in files):
+        return (
+            "draft currently touches only support/store/type/helper files, "
+            "but the task appears to require visible user-facing behavior"
+        )
+    return ""
 
 
 # -----------------------------
@@ -1217,19 +1339,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
-    try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
-    except Exception:
-        return False
+    return shutil.which(name, path=_command_env().get("PATH")) is not None
 
 
 def _shell_quote(value: str) -> str:
@@ -1363,36 +1473,39 @@ def _symbol_grep_hits(
     tracked_set: set,
     issue_text: str,
 ) -> Dict[str, int]:
-    """Count how many extracted symbols each tracked file references.
+    """Find tracked files that reference extracted issue symbols.
 
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
+    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a boost
     to ranking, never the only signal.
     """
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
+    grep_command = ["git", "grep", "-l", "-F"]
     for symbol in symbols:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=4,
-            )
-        except Exception:
+        grep_command.extend(["-e", symbol])
+    grep_command.append("--")
+    try:
+        proc = subprocess.run(
+            grep_command,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=6,
+        )
+    except Exception:
+        return {}
+    if proc.returncode not in (0, 1):
+        return {}
+    for line in proc.stdout.splitlines():
+        relative_path = line.strip()
+        if not relative_path or relative_path not in tracked_set:
             continue
-        if proc.returncode not in (0, 1):
+        if not _context_file_allowed(relative_path):
             continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+        hits[relative_path] = 3
     return hits
 
 
@@ -1427,15 +1540,18 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps / bounded `sed -n` ranges to find the exact function or block. Do not loop on inspection. Avoid bare `cat file` on source files; inspect the needed range.
 
-**Edit surgically**: change only the lines that implement the fix.
+**Edit surgically**: change the smallest coherent block that implements the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
 - Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+- For UI/layout tasks, it is acceptable to rewrite the local component/render block when that is simpler than scattered edits.
+- Never rewrite an entire function when only 1–3 lines need changing.
+- When replacing JavaScript/TypeScript function blocks, preserve the newline before the next declaration; never leave `}async`, `}function`, or `}const` joined together.
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+Every `<command>` block must be complete and closed. If an edit is large, split it into smaller complete command blocks.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
@@ -1452,14 +1568,28 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
+Implement the primary behavior first. If the task is about visible UI, edit the component/view/style that users see before widening stores, types, mocks, or helpers. Prefer local component state over global store changes unless multiple callers truly share the new state.
+
+Tiny helpers and new files are allowed when they clearly reduce repeated logic across multiple files or when the acceptance criteria imply a missing module/asset. Wire them into every caller in the same response.
+
+When the task names an existing helper/RPC/API, grep that exact name and inspect its real signature before wiring callers. Do not invent a similarly named replacement.
+
+For strip-down/removal tasks, remove obsolete endpoints, branches, imports, dependencies, and tests outright. Leaving compatibility routes or unused feature code counts as incomplete.
+
+Move/rename/delete requirements are real requirements: if the task says a file moved or should no longer exist, remove the obsolete repo file too.
+
+If duplicate root/src files exist, edit the one imported by the runtime entrypoint (`main`, router, or package config). Do not patch stale duplicate copies unless the task explicitly asks to move or delete them.
+
+If the issue names a project/subdirectory, keep edits inside that project unless a shared file is clearly imported by that project.
+
 ## Scope discipline — what NOT to change
 
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
+- Broad helper abstractions when a local edit is enough
+- New files that are not wired into the runtime path
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
@@ -1473,7 +1603,7 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 ## Safety
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+No sudo. No destructive host operations. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
 
 
@@ -1496,11 +1626,13 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is typically in one specific function, component, or block. Identify it precisely, then make the smallest complete edit that fixes the ROOT CAUSE.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately. Do not use bare `cat file` for large source files.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+
+If a visible feature is requested, touch the visible component/view/style, not only store/type/helper scaffolding. If repeated logic appears in several files, add a tiny shared helper and update all callers instead of copy-pasting.
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
@@ -1533,6 +1665,15 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+def build_truncated_command_prompt() -> str:
+    return (
+        "Your previous response started a <command> block but did not close it, "
+        "so no command was executed. Send a shorter executable command now. "
+        "If the edit is large, split it into one file per command block, but make "
+        "each block complete with </command>."
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -1551,7 +1692,6 @@ def build_polish_prompt(junk_summary: str) -> str:
         "your draft (the diff judge consistently penalises these as "
         "'unrelated' or 'unnecessary churn'):\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
-        "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
@@ -1575,48 +1715,13 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
+        "Edit those path(s) now. Read only an exact missing path if necessary; "
+        "do not run broad search. Do not stop early until you have either "
+        "edited each path or confirmed from already loaded context that no edit "
+        "is required.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
-    )
-
-
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
-    truncated = (
-        patch
-        if len(patch) <= 4000
-        else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
-    )
-    return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
-        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
-        "Your patch:\n```diff\n"
-        f"{truncated}\n```\n\n"
-        "Task:\n"
-        f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
     )
 
 
@@ -1631,20 +1736,41 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
-def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """When the companion-test gate fails, hand the model the exact failure tail."""
-    tail = output[-2400:] if len(output) > 2400 else output
+def build_completion_fix_prompt(warning: str, issue_text: str) -> str:
     return (
-        f"Companion test is failing after your patch: `{test_path}`.\n\n"
-        "Test output (tail):\n```\n"
-        f"{tail}\n```\n\n"
-        "Diagnose first: is the source patch incomplete (missing part of the fix), "
-        "or does the test itself need updating to match new correct behaviour?\n"
-        "- If the source fix is incomplete, extend it now.\n"
-        "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
-        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
-        "then end with <final>summary</final>."
+        f"Completeness warning: {warning}.\n\n"
+        "Before finalizing, edit the primary runtime file that actually implements "
+        "the requested behavior. Keep existing support edits only if they are still "
+        "needed. Then run the most targeted verification available and end with "
+        "<final>summary</final>.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}"
     )
+
+
+def build_model_error_recovery_prompt(patch: str, issue_text: str) -> str:
+    files = ", ".join(_patch_changed_files(patch)[:8]) or "(none)"
+    warning = _completion_warning(patch, issue_text)
+    warning_text = f"\n\nCompleteness warning: {warning}." if warning else ""
+    return (
+        "The previous model call failed, but a draft patch exists. Recover quickly.\n\n"
+        f"Changed files so far: {files}.{warning_text}\n\n"
+        "If the draft fully satisfies every requirement, respond with <final>summary</final>. "
+        "If not, issue only the missing edit command(s) now, then a targeted verification, "
+        "then <final>summary</final>. Do not restart exploration."
+    )
+
+
+def _turn_max_tokens(max_tokens: int, step: int, patch_exists: bool, seconds_left: float) -> int:
+    if seconds_left < 90:
+        return min(max_tokens, 3072)
+    if patch_exists and step >= 8:
+        return min(max_tokens, 4096)
+    if patch_exists and step >= 4:
+        return min(max_tokens, 6144)
+    if step >= 8:
+        return min(max_tokens, 6144)
+    return max_tokens
 
 
 # -----------------------------
@@ -1679,6 +1805,7 @@ def solve(
     syntax_fix_turns_used = 0
     coverage_nudges_used = 0
     consecutive_model_errors = 0
+    model_error_recovery_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -1702,10 +1829,11 @@ def solve(
 
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
-            1. polish — drop low-signal hunks the model still emitted
+            1. polish — drop blank/whitespace-only hunks the model still emitted
             2. syntax — quote any parser error back at the model
             3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
+            4. completion — only for patches that look like support/store-only
+               changes on visible UI tasks.
         Each refinement runs at most once per cycle.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used
@@ -1746,12 +1874,13 @@ def solve(
                 )
                 return True
 
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+        completion_warning = _completion_warning(patch, issue)
+        if completion_warning and self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
-                "SELF_CHECK_QUEUED",
+                build_completion_fix_prompt(completion_warning, issue),
+                "COMPLETION_FIX_QUEUED:\n  " + completion_warning,
             )
             return True
 
@@ -1783,6 +1912,17 @@ def solve(
                 break
 
             response_text: Optional[str] = None
+            patch_exists_before_call = bool(get_patch(repo).strip())
+            request_max_tokens = _turn_max_tokens(
+                max_tokens,
+                step,
+                patch_exists_before_call,
+                time_remaining(),
+            )
+            request_timeout = max(
+                30,
+                min(MODEL_REQUEST_TIMEOUT_SECONDS, int(time_remaining() - WALL_CLOCK_RESERVE_SECONDS)),
+            )
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
                     response_text, cost, _raw = chat_completion(
@@ -1790,7 +1930,8 @@ def solve(
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
-                        max_tokens=max_tokens,
+                        max_tokens=request_max_tokens,
+                        timeout=request_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -1807,14 +1948,23 @@ def solve(
 
             if response_text is None:
                 consecutive_model_errors += 1
-                # If we already have any patch staged in the repo, stop early
-                # and return that patch rather than wiping everything because
-                # the proxy hiccuped. Empty patches score 0; partial patches
-                # can still earn cursor-similarity credit.
-                if get_patch(repo).strip():
+                patch = get_patch(repo)
+                if (
+                    patch.strip()
+                    and model_error_recovery_used < MAX_MODEL_ERROR_RECOVERY_TURNS
+                    and not out_of_time()
+                    and time_remaining() > 60
+                ):
+                    model_error_recovery_used += 1
+                    messages.append({"role": "user", "content": build_model_error_recovery_prompt(patch, issue)})
+                    logs.append("MODEL_ERROR_RECOVERY_TURN_QUEUED:\nDraft patch exists; asking for fast completion check.")
+                    continue
+                # If recovery is exhausted, return the patch rather than wipe
+                # everything because the proxy hiccuped.
+                if patch.strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
-                        "after persistent model errors."
+                        "after persistent model errors and recovery attempt."
                     )
                     success = True
                     break
@@ -1841,6 +1991,11 @@ def solve(
                     success = True
                     break
                 consecutive_no_command += 1
+                if "<command" in response_text.lower():
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append({"role": "user", "content": build_truncated_command_prompt()})
+                    logs.append("\nTRUNCATED_COMMAND_REPAIR_QUEUED")
+                    continue
                 patch = get_patch(repo)
                 if patch.strip():
                     if maybe_queue_refinement(response_text):
@@ -1908,8 +2063,10 @@ def solve(
                 success = True
 
             if observations:
+                current_patch = get_patch(repo)
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                if not success and current_patch.strip():
+                    completion_warning = _completion_warning(current_patch, issue)
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
@@ -1918,6 +2075,16 @@ def solve(
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
+                    if step >= 12:
+                        observation_text += (
+                            "\n\nBudget cap: do not continue one-file-per-turn. "
+                            "Batch every remaining edit in the next response, then finalize."
+                        )
+                    if completion_warning:
+                        observation_text += (
+                            "\n\nCompleteness warning: "
+                            f"{completion_warning}. Edit the primary runtime file before finalizing."
+                        )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
@@ -1929,7 +2096,7 @@ def solve(
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step >= 2:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -1973,6 +2140,9 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " failures",
         " error",
         " errors",
+        "not found",
+        "command not found",
+        "cannot find",
         "traceback",
         "assertionerror",
         "syntaxerror",
@@ -1982,8 +2152,8 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     good_markers = [
         " passed",
         " all passed",
-        "ok",
-        "success",
+        "tests passed",
+        "build succeeded",
     ]
 
     if exit_code is not None and exit_code != 0:
@@ -1997,7 +2167,7 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
 
-    return (exit_code == 0 or has_good) and has_good and not has_bad
+    return exit_code == 0 and has_good and not has_bad
 
 
 def _looks_like_verification_command(command: str) -> bool:
