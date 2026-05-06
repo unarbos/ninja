@@ -115,6 +115,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_TOTAL_REFINEMENT_TURNS = 2  # hard cap on total refinement turns across all gates;
+                                # each turn is one extra LLM round-trip (~10-30s) and
+                                # the validator's per-round timeout can be as low as
+                                # 120s, so chains of 5-7 refinements cause timeout-whiff.
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1552,6 +1556,11 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
+    Plain mentions get +1 per symbol; files that contain a *call-site* form
+    of the symbol (the symbol followed immediately by ``(``) get an extra
+    +2 boost so consumer files float to the top of the preload — the
+    call-shape mirrors what the patch will need to produce.
+
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
@@ -1559,10 +1568,11 @@ def _symbol_grep_hits(
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_files(pattern: str) -> List[str]:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
+                ["git", "grep", "-l", "-F", "--", pattern],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1570,16 +1580,26 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    for symbol in symbols:
+        for relative_path in _grep_files(symbol):
+            if relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+        if len(symbol) < 3 or (not symbol[0].isalpha() and symbol[0] != "_"):
+            continue
+        for relative_path in _grep_files(symbol + "("):
+            if relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 2
     return hits
 
 
@@ -1918,6 +1938,7 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    total_refinement_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1949,7 +1970,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -1958,6 +1979,9 @@ def solve(
         # this king. An empty patch has Jaccard = 0 against any non-empty
         # reference; a guess has Jaccard > 0 with non-zero probability.
         # Force one final real-edit attempt before the duel scores zero.
+        # The hail-mary turn is NOT counted toward the total cap because
+        # it's the only thing standing between us and a guaranteed-zero
+        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -1969,10 +1993,20 @@ def solve(
                 return True
             return False
 
+        # Hard cap on total refinement turns across all optional gates. Each
+        # turn is one extra LLM round-trip (10-30s) and the validator's
+        # per-round timeout can be as low as 120s, so chains of 5-7
+        # refinements push us into timeout-whiff territory (a guaranteed
+        # loss). Two refinement turns is enough to fix typical patch
+        # issues; a third is rarely better and frequently fatal on speed.
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_polish_prompt(junk),
@@ -1984,6 +2018,7 @@ def solve(
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
                 syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
@@ -1995,6 +2030,7 @@ def solve(
             missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
@@ -2012,6 +2048,7 @@ def solve(
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
@@ -2021,6 +2058,7 @@ def solve(
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
+            total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(patch, issue),
