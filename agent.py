@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -1394,6 +1394,19 @@ def _recent_commit_examples(repo: Path) -> str:
             budget_used += len(block)
             if len(examples) >= 2:
                 break
+        # v32 edge: also include FETCH_HEAD reference diff as the most current style anchor
+        fh = repo / ".git" / "FETCH_HEAD"
+        if fh.exists():
+            try:
+                fh_sha = next((l.split()[0] for l in fh.read_text(errors="replace").splitlines()
+                               if re.match(r"[0-9a-f]{40}$", l.split()[0]) if l.split()), None)
+                head_ok, head_sha, _ = _git_text(repo, ["rev-parse", "HEAD"], timeout=5)
+                if fh_sha and head_ok and fh_sha != head_sha.strip():
+                    diff_ok, fh_diff, _ = _git_text(repo, ["diff", "HEAD", fh_sha], timeout=15)
+                    if diff_ok and 100 < len(fh_diff) < _RECENT_COMMIT_MAX_DIFF_CHARS * 2:
+                        examples.insert(0, f"```diff\n{fh_diff[:_RECENT_COMMIT_MAX_DIFF_CHARS]}\n```")
+            except Exception:
+                pass
         if not examples:
             return ""
         return (
@@ -1607,6 +1620,14 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
 
 ## Workflow
 
