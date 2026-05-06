@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -1536,7 +1536,7 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if lowered in _SYMBOL_STOP:
             continue
         is_compound = any(c.isupper() for c in token[1:]) or "_" in token
-        if not is_compound and len(token) < 4:
+        if not is_compound and len(token) < 5:
             continue
         seen.add(token)
         out.append(token)
@@ -1607,6 +1607,27 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
+## Pre-edit planning
+
+Before writing any code, first run:
+  find . -type f | head -60
+then grep -r "<key_symbol>" -l to find ALL files referencing the changed symbol.
+
+Build a list of ALL files needing changes:
+- Primary file from the issue
+- Any file importing or calling the changed function/class
+- Associated test files (test_*, *.test.ts, *.spec.ts)
+- Type definition files if changing an interface
+
+Edit EVERY file in your list. An incomplete multi-file patch scores lower.
 
 ## Workflow
 
