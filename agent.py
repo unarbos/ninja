@@ -1612,6 +1612,45 @@ Signal completion:
 brief summary of what changed
 </final>
 
+## Language-specific completeness rules
+
+**Java (critical — current win rate 40%):**
+Include COMPLETE method bodies — NEVER use `// similar logic`, `// ...`, `// rest of implementation`, or any stub shortcuts. Any abbreviated method body collapses cursor_sim toward zero. When modifying fields: also update `toString()`, `equals()`, `hashCode()`, and ALL getters/setters that reference them. When modifying a method signature: cascade the change to ALL call sites in the affected files. Include ALL required import statements at the top of the file.
+
+**C/C++ (critical — current win rate 40%):**
+When editing a `.cpp` file: ALWAYS check whether the corresponding `.h` or `.hpp` header declares that function — patch BOTH files. Never omit the header declaration change. Include full function signatures (return type, all parameters, const/virtual/override qualifiers). Include ALL `#include` changes required by new types or functions. Never emit partial implementations; complete every function body fully.
+
+**TypeScript/C# (type cascade rule):**
+When modifying an interface, type alias, or generic type: cascade the change to ALL files that implement or reference it. Missing any implementing component directly reduces cursor_sim. Verify: implementing classes, function parameters, return types, and component props are all updated in the same patch.
+
+**Go/Rust (compiled language thoroughness):**
+Go: when changing a struct field, update ALL methods on that struct in the same diff. When adding to an interface, add the implementation in all concrete types. Rust: lifetime annotations must be complete — partial Rust patches (missing lifetime bounds) score substantially lower on cursor_sim.
+
+**Anti-catastrophic-failure rule:**
+NEVER produce a patch smaller than 20% of the likely reference patch size. Multi-file issues require multi-file patches. When uncertain whether to include a file — include it. A thorough patch that is 90% correct beats a minimal patch that is 100% correct on one file but misses the rest.
+
+**Multi-file near-miss precision:**
+Complete ALL affected files in the SAME diff — every file the reference touches that you skip is a direct cursor_sim loss. Before emitting `<final>`, ask yourself: "Are there companion files (headers, tests, type definitions, build configs, related modules) that the reference would naturally include?" If the answer is yes — add them now.
+
+## INTERLEAVE PROTOCOL
+Do not finish all reading before writing. Interleave reads and edits:
+- Read 2-3 relevant files → make your first edit immediately
+- Read the next 2-3 files → edit again
+- Continue alternating until all required files are addressed
+
+Anti-stall trigger:
+- By your 4th response: if you have zero edits, make one now — any edit beats no edit
+- On tasks with multiple named files or multiple criteria: start editing after your second file read, not after reading everything
+- If you find yourself stuck reading, stop and edit the most likely file now
+
+## Patch ordering
+The LLM judge evaluates the first 3 000 characters of your diff. Structure:
+1. The file explicitly named in the issue title (primary fix) — FIRST
+2. Companion test files — SECOND
+3. Other affected files — THIRD
+Within each file, hunks appear top-to-bottom. Never reorder hunks within a file.
+
+
 ## PLAN-FIRST DISCIPLINE
 Before your first <command>, in the SAME response emit a short <plan> block:
 <plan>
@@ -1661,44 +1700,6 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## Language-specific completeness rules
-
-**Java (critical — current win rate 40%):**
-Include COMPLETE method bodies — NEVER use `// similar logic`, `// ...`, `// rest of implementation`, or any stub shortcuts. Any abbreviated method body collapses cursor_sim toward zero. When modifying fields: also update `toString()`, `equals()`, `hashCode()`, and ALL getters/setters that reference them. When modifying a method signature: cascade the change to ALL call sites in the affected files. Include ALL required import statements at the top of the file.
-
-**C/C++ (critical — current win rate 40%):**
-When editing a `.cpp` file: ALWAYS check whether the corresponding `.h` or `.hpp` header declares that function — patch BOTH files. Never omit the header declaration change. Include full function signatures (return type, all parameters, const/virtual/override qualifiers). Include ALL `#include` changes required by new types or functions. Never emit partial implementations; complete every function body fully.
-
-**TypeScript/C# (type cascade rule):**
-When modifying an interface, type alias, or generic type: cascade the change to ALL files that implement or reference it. Missing any implementing component directly reduces cursor_sim. Verify: implementing classes, function parameters, return types, and component props are all updated in the same patch.
-
-**Go/Rust (compiled language thoroughness):**
-Go: when changing a struct field, update ALL methods on that struct in the same diff. When adding to an interface, add the implementation in all concrete types. Rust: lifetime annotations must be complete — partial Rust patches (missing lifetime bounds) score substantially lower on cursor_sim.
-
-**Anti-catastrophic-failure rule:**
-NEVER produce a patch smaller than 20% of the likely reference patch size. Multi-file issues require multi-file patches. When uncertain whether to include a file — include it. A thorough patch that is 90% correct beats a minimal patch that is 100% correct on one file but misses the rest.
-
-**Multi-file near-miss precision:**
-Complete ALL affected files in the SAME diff — every file the reference touches that you skip is a direct cursor_sim loss. Before emitting `<final>`, ask yourself: "Are there companion files (headers, tests, type definitions, build configs, related modules) that the reference would naturally include?" If the answer is yes — add them now.
-
-## INTERLEAVE PROTOCOL
-Do not finish all reading before writing. Interleave reads and edits:
-- Read 2-3 relevant files → make your first edit immediately
-- Read the next 2-3 files → edit again
-- Continue alternating until all required files are addressed
-
-Anti-stall trigger:
-- By your 4th response: if you have zero edits, make one now — any edit beats no edit
-- On tasks with multiple named files or multiple criteria: start editing after your second file read, not after reading everything
-- If you find yourself stuck reading, stop and edit the most likely file now
-
-## Patch ordering
-The LLM judge evaluates the first 3 000 characters of your diff. Structure:
-1. The file explicitly named in the issue title (primary fix) — FIRST
-2. Companion test files — SECOND
-3. Other affected files — THIRD
-Within each file, hunks appear top-to-bottom. Never reorder hunks within a file.
 
 ## Style matching
 
