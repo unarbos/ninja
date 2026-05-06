@@ -1911,6 +1911,124 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+# -----------------------------
+# V9 edge — evidence-based pivot
+# -----------------------------
+#
+# Replaces wording-only fallbacks (V4 family). When the agent has not produced
+# any patch by step 2, the issue is rarely "the model doesn't know which file"
+# — it's "the model needs SPECIFIC code lines to anchor the edit". This module
+# extracts targeted excerpts from the next-best file cluster (ranks 3-8) and
+# appends them as actual code evidence, not a directive to "go look at file X".
+#
+# Empirical principle (per king crown chain): the LLM judge rewards precise
+# patches; precise patches require precise context. Augmenting the agent with
+# concrete matched-lines + context windows from fallback files is upstream of
+# every heuristic refinement gate the king already has.
+
+_V9_MAX_FILES = 4              # number of fallback files to scan
+_V9_MATCH_CONTEXT_LINES = 3    # lines of context above/below each matched line
+_V9_MAX_LINES_PER_FILE = 30    # cap per-file output (avoid spamming)
+_V9_MAX_TOTAL_CHARS = 5000     # total cap on the appended evidence message
+
+
+def _v9_focused_excerpts(repo: Path, file_path: str, issue_terms: List[str]) -> List[str]:
+    """Extract matched-line + context windows from one file. Returns list of
+    formatted excerpts. Empty list if file unreadable or no matches.
+
+    Matching is case-insensitive substring across all issue terms. We pick
+    ranges around hits and merge overlapping ones to avoid duplicate context.
+    """
+    full = repo / file_path
+    if not full.exists() or not full.is_file():
+        return []
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    if len(text) > 200_000:
+        # Don't scan generated/lockfile-class files — even if they slipped past
+        # _context_file_allowed.
+        return []
+
+    lines = text.splitlines()
+    if not lines:
+        return []
+
+    needles_lower = [t.lower() for t in issue_terms if len(t) >= 3]
+    if not needles_lower:
+        return []
+
+    hit_indices: List[int] = []
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+        if any(n in line_lower for n in needles_lower):
+            hit_indices.append(i)
+            if len(hit_indices) >= 6:
+                break
+
+    if not hit_indices:
+        return []
+
+    # Merge ranges around hits.
+    ranges: List[Tuple[int, int]] = []
+    for i in hit_indices:
+        start = max(0, i - _V9_MATCH_CONTEXT_LINES)
+        end = min(len(lines) - 1, i + _V9_MATCH_CONTEXT_LINES)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+
+    excerpts: List[str] = []
+    total_lines = 0
+    for start, end in ranges:
+        if total_lines >= _V9_MAX_LINES_PER_FILE:
+            break
+        chunk_lines: List[str] = []
+        for ln in range(start, end + 1):
+            chunk_lines.append(f"{ln + 1:5d}: {lines[ln]}")
+            total_lines += 1
+            if total_lines >= _V9_MAX_LINES_PER_FILE:
+                break
+        if chunk_lines:
+            excerpts.append("\n".join(chunk_lines))
+    return excerpts
+
+
+def build_v9_evidence_message(repo: Path, fallback_files: List[str], issue: str) -> Optional[str]:
+    """Build the message body with focused excerpts from fallback files.
+
+    Returns None when no usable evidence was found, so the caller can skip
+    appending an empty message.
+    """
+    terms = _issue_terms(issue)[:8]  # cap; reuse king's tokenizer
+    if not terms:
+        return None
+    sections: List[str] = []
+    total_chars = 0
+    for fp in fallback_files[:_V9_MAX_FILES]:
+        excerpts = _v9_focused_excerpts(repo, fp, terms)
+        if not excerpts:
+            continue
+        body = "\n  ...\n".join(excerpts)
+        block = f"### {fp}\n```\n{body}\n```"
+        if total_chars + len(block) > _V9_MAX_TOTAL_CHARS:
+            break
+        sections.append(block)
+        total_chars += len(block)
+    if not sections:
+        return None
+    return (
+        "Additional evidence — focused excerpts from candidate fallback files\n"
+        "(matches issue terms; line numbers prefixed). The primary file you've\n"
+        "been considering may not be the right target. Read these excerpts\n"
+        "and decide whether the fix actually lives here. If yes, edit; if no,\n"
+        "explain briefly which evidence rules them out and continue.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -2393,6 +2511,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
+        # V9 — precompute fallback file list (ranks 3-8). The top 2 are already
+        # preloaded by build_preloaded_context as full snippets; if the model
+        # hasn't produced a patch by step 2, the bottleneck is rarely "doesn't
+        # know which file" — it's "needs concrete code lines from the *next*
+        # cluster". Fire once at step 2 with focused excerpts.
+        try:
+            _v9_ranked = _rank_context_files(repo, issue)
+        except Exception:
+            _v9_ranked = []
+        v9_fallback_files = _v9_ranked[2:8]
+        v9_evidence_used = False
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
@@ -2560,6 +2690,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+            # V9 — fire focused-evidence pivot once at step 2 if patch is still
+            # empty. We add CONCRETE matched code excerpts (not just filenames)
+            # from the next-best cluster. Strictly upstream of any refinement
+            # gate, so this is "more context for the same loop" rather than
+            # "more refinement of an existing patch".
+            if (
+                not v9_evidence_used
+                and step == 2
+                and not get_patch(repo).strip()
+                and v9_fallback_files
+            ):
+                _ev = build_v9_evidence_message(repo, v9_fallback_files, issue)
+                if _ev is not None:
+                    v9_evidence_used = True
+                    logs.append("\nV9_EVIDENCE_QUEUED: focused excerpts from "
+                                + ", ".join(v9_fallback_files[:_V9_MAX_FILES]))
+                    messages.append({"role": "user", "content": _ev})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
