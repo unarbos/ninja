@@ -161,14 +161,29 @@ class AgentResult:
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    half = max_chars // 2
-    return (
-        text[:half]
-        + "\n\n...[truncated "
-        + str(len(text) - max_chars)
-        + " chars]...\n\n"
-        + text[-half:]
-    )
+    lines = text.splitlines(True)
+    head_lines = 20
+    tail_lines = 40
+    if len(lines) > head_lines + tail_lines + 2:
+        head_part = "".join(lines[:head_lines])
+        tail_part = "".join(lines[-tail_lines:])
+        omitted = len(lines) - head_lines - tail_lines
+        combined = (
+            head_part
+            + f"\n...[{omitted} lines / {len(text) - len(head_part) - len(tail_part)} chars truncated]...\n"
+            + tail_part
+        )
+        if len(combined) <= max_chars:
+            return combined
+    # Character fallback: output length must never exceed max_chars (marker included).
+    omitted = max(0, len(text) - max_chars)
+    marker = f"\n\n...[truncated {omitted} chars]...\n\n"
+    if len(marker) >= max_chars:
+        return text[:max_chars]
+    room = max_chars - len(marker)
+    head_len = room // 2
+    tail_len = room - head_len
+    return text[:head_len] + marker + text[-tail_len:]
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -184,11 +199,12 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
     if _message_chars(messages) <= MAX_CONVERSATION_CHARS:
         return messages
 
-    head = messages[:2]
+    pin_count = min(3, len(messages))
+    head = messages[:pin_count]
     tail: List[Dict[str, str]] = []
-    budget = max(8000, MAX_CONVERSATION_CHARS - _message_chars(head) - 400)
+    budget = max(8000, MAX_CONVERSATION_CHARS - _message_chars(head) - 500)
     used = 0
-    for message in reversed(messages[2:]):
+    for message in reversed(messages[pin_count:]):
         size = len(message.get("content") or "") + 32
         if tail and used + size > budget:
             break
@@ -199,14 +215,21 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
     omitted = max(0, len(messages) - len(head) - len(tail))
     if omitted == 0:
         return messages
-    note = {
-        "role": "user",
-        "content": (
-            f"[{omitted} older interaction messages omitted to stay within the "
-            "time/token budget. Continue from the recent observations and make "
-            "the smallest useful patch.]"
-        ),
-    }
+
+    dropped_files: List[str] = []
+    for msg in messages[pin_count : pin_count + omitted]:
+        content = msg.get("content") or ""
+        for m in re.finditer(r"[\w./+-]+\.(?:py|ts|tsx|js|jsx|go|rs|rb|java|c|cpp|h)", content):
+            f = m.group(0)
+            if f not in dropped_files and len(dropped_files) < 8:
+                dropped_files.append(f)
+
+    summary = f"[{omitted} older messages omitted."
+    if dropped_files:
+        summary += " Files referenced: " + ", ".join(dropped_files) + "."
+    summary += " Continue from the recent context.]"
+
+    note = {"role": "user", "content": summary}
     return [*head, note, *tail]
 
 
@@ -341,6 +364,27 @@ def chat_completion(
 # repo. You may improve command validation, environment handling, timeouts, and
 # output shaping. Keep commands scoped to the repo and avoid secrets or network
 # access outside the validator inference proxy.
+_BASH_PREAMBLE = r'''
+apply_edit() {
+  local file="$1" old="$2" new="$3"
+  python3 -c "
+import sys, pathlib
+f = pathlib.Path(sys.argv[1])
+text = f.read_text(encoding='utf-8')
+if sys.argv[2] not in text:
+    print('ERROR: old_string not found in ' + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+count = text.count(sys.argv[2])
+if count > 1:
+    print('WARNING: old_string found ' + str(count) + ' times, replacing first occurrence only', file=sys.stderr)
+text = text.replace(sys.argv[2], sys.argv[3], 1)
+f.write_text(text, encoding='utf-8')
+print('Applied edit to ' + sys.argv[1])
+" "$file" "$old" "$new"
+}
+'''
+
+
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -364,11 +408,12 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             blocked=True,
         )
 
+    full_command = _BASH_PREAMBLE + command
     start = time.time()
 
     try:
         proc = subprocess.run(
-            command,
+            full_command,
             cwd=str(cwd),
             shell=True,
             text=True,
@@ -576,16 +621,44 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 
 
 def get_repo_summary(repo: Path) -> str:
-    commands = [
-        "pwd",
-        "git ls-files | awk 'NR<=220 {print} END {if (NR>220) print \"... \" NR-220 \" more tracked files\"}'",
-        "git status --short || true",
-    ]
+    parts: List[str] = []
 
-    parts = []
-    for cmd in commands:
-        res = run_command(cmd, repo, timeout=10)
-        parts.append(format_observation(res))
+    res = run_command("pwd", repo, timeout=10)
+    parts.append(format_observation(res))
+
+    tree_cmd = (
+        "git ls-files | awk -F/ '"
+        "{d=\"\"; for(i=1;i<NF;i++){d=d$i\"/\"; if(!seen[d]++){for(j=1;j<i;j++)printf \"  \"; print $i\"/\"}}"
+        " for(j=1;j<NF;j++)printf \"  \"; print $NF"
+        "}' | head -300"
+    )
+    res = run_command(tree_cmd, repo, timeout=10)
+    parts.append("DIRECTORY TREE:\n" + (res.stdout or "(empty)"))
+
+    res = run_command("git status --short || true", repo, timeout=10)
+    if res.stdout.strip():
+        parts.append("GIT STATUS:\n" + res.stdout)
+
+    res = run_command("git log --oneline -10 2>/dev/null || true", repo, timeout=10)
+    if res.stdout.strip():
+        parts.append("RECENT COMMITS:\n" + res.stdout)
+
+    config_files = [
+        "package.json", "pyproject.toml", "setup.py", "setup.cfg",
+        "Cargo.toml", "go.mod", "Makefile", "Gemfile", "pom.xml",
+        "build.gradle", "CMakeLists.txt",
+    ]
+    for cfg in config_files:
+        cfg_path = repo / cfg
+        if cfg_path.is_file():
+            try:
+                content = cfg_path.read_text(encoding="utf-8", errors="replace")
+                snippet = "\n".join(content.splitlines()[:40])
+                if len(content.splitlines()) > 40:
+                    snippet += f"\n... ({len(content.splitlines()) - 40} more lines)"
+                parts.append(f"CONFIG ({cfg}):\n{snippet}")
+            except Exception:
+                pass
 
     return "\n\n".join(parts)
 
@@ -830,7 +903,10 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    return _truncate(text, max_chars)
+    lines = text.splitlines(True)
+    width = len(str(len(lines)))
+    numbered = "".join(f"{i:{width}d}|{line}" for i, line in enumerate(lines, 1))
+    return _truncate(numbered, max_chars)
 
 
 # -----------------------------
@@ -1188,6 +1264,20 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _build_test_command(test_path: str) -> Optional[str]:
+    """Return a shell command to run a single test file, or None if unknown."""
+    suffix = Path(test_path).suffix.lower()
+    if suffix == ".py":
+        return f"python -m pytest {_shell_quote(test_path)} -x -q 2>&1 | head -60"
+    if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+        return f"npx jest --no-coverage {_shell_quote(test_path)} 2>&1 | head -60"
+    if suffix == ".go":
+        parent = str(Path(test_path).parent)
+        pkg = "./" + parent if parent and parent != "." else "./..."
+        return f"go test {pkg} -run . -count=1 -v 2>&1 | head -60"
+    return None
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -1284,10 +1374,10 @@ def _symbol_grep_hits(
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
+1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed. The reference is typically the minimal correct fix. Fewer extraneous changes = higher similarity.
 2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else. When in doubt, make the SMALLEST correct change.
 
 ## Command format
 
@@ -1295,6 +1385,8 @@ Run a bash command:
 <command>
 bash command here
 </command>
+
+You may include MULTIPLE <command> blocks in one response to batch independent edits.
 
 Signal completion:
 <final>
@@ -1307,13 +1399,14 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets (they include line numbers) or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+**Edit surgically**: change only the lines that implement the fix. Prefer `apply_edit` for safe, exact string replacement:
+- `apply_edit FILE 'OLD_TEXT' 'NEW_TEXT'` — finds OLD_TEXT in FILE and replaces the first occurrence with NEW_TEXT. Fails loudly if OLD_TEXT is not found. Use this for most edits.
+- Copy OLD_TEXT exactly from the file content (the line-number prefixes in preloaded snippets like `  42|` are NOT part of the file — strip them).
+- For one-line substitutions `sed -i 's/old/new/' file` also works.
+- Larger edits: a heredoc `cat << 'EOF' > file` or a minimal Python script.
+- Never rewrite an entire function when only 1–3 lines need changing.
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
@@ -1321,7 +1414,7 @@ brief summary of what changed
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files or run extra commands after the fix is verified.
 
 ## Scope discipline — what to change
 
@@ -1346,10 +1439,14 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 ## Style matching
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
+- Python: preserve existing indent width, string quote style, trailing commas
+- JavaScript/TypeScript: preserve semicolons vs no-semicolons, const/let/var style, arrow vs function
+- Go: keep `gofmt`-compatible formatting
+- JSON: preserve existing indent width
 
 ## Preloaded snippets
 
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+Preloaded files include line numbers (e.g. `  42|code here`). These are the most likely edit targets. Edit them directly — do not re-read them. Use the line numbers to orient yourself but remember they are not part of the file content.
 
 ## Safety
 
@@ -1374,15 +1471,13 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
-
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
-
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
-
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+Instructions:
+1. Read the ENTIRE issue above. List every requirement — the LLM judge penalizes incomplete solutions.
+2. The fix is typically in ONE specific function or block. The preloaded snippets (with line numbers) are the most likely targets.
+3. If the preloaded snippets show the target code, emit your `<plan>` and ALL edit commands in your FIRST response. Do not re-read files you already have. Use `apply_edit FILE 'OLD' 'NEW'` for precise edits.
+4. If the target is unclear, run ONE focused grep to locate it, then edit immediately in the same response.
+5. After patching, run the most targeted test (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.).
+6. Finish with <final>...</final>.
 """
 
 
@@ -1402,14 +1497,15 @@ def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "You already have preloaded snippets with line numbers for the most likely targets. "
+            "Your next response MUST contain apply_edit or sed commands that make the fix. "
+            "Stop exploring — edit NOW."
         )
     return (
-        "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        "HARD budget check: still no patch after multiple steps. "
+        "Your next response MUST make code changes — use `apply_edit FILE 'OLD' 'NEW'` targeting "
+        "the most obvious location from the issue. Even a best-effort fix is better than "
+        "more exploration. Do NOT read files or grep — edit immediately."
     )
 
 
@@ -1519,6 +1615,7 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1537,10 +1634,12 @@ def solve(
         means the caller can declare success. The order is:
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. self-check — show the diff and ask "did you cover everything?"
+            3. companion test — run the test partner and feed failures back
+            4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal test_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1566,6 +1665,28 @@ def solve(
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            tracked_set = set(_tracked_files(repo))
+            changed = _patch_changed_files(patch)
+            for changed_file in changed:
+                partner = _find_test_partner(changed_file, tracked_set)
+                if not partner:
+                    continue
+                test_cmd = _build_test_command(partner)
+                if not test_cmd:
+                    continue
+                test_result = run_command(test_cmd, repo, timeout=command_timeout)
+                if test_result.exit_code != 0:
+                    test_fix_turns_used += 1
+                    output = (test_result.stdout or "") + "\n" + (test_result.stderr or "")
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_test_fix_prompt(partner, output),
+                        f"TEST_FIX_QUEUED:\n  {partner} failed (exit {test_result.exit_code})",
+                    )
+                    return True
+                break
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -1688,6 +1809,21 @@ def solve(
                     "Continue with one command at a time if more work remains."
                 )
 
+            if not success:
+                current_diff = get_patch(repo)
+                if current_diff.strip():
+                    diff_stat = subprocess.run(
+                        ["git", "diff", "--stat"],
+                        cwd=str(repo), stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, timeout=5,
+                    )
+                    stat_text = (diff_stat.stdout or "").strip()
+                    diff_preview = _truncate(current_diff, 3000)
+                    observations.append(
+                        f"CURRENT PATCH (diff --stat):\n{stat_text}\n\n"
+                        f"CURRENT PATCH (preview):\n{diff_preview}"
+                    )
+
             if final is not None and get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
@@ -1714,7 +1850,7 @@ def solve(
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
                         "edit commands in your next response — all files at once, covering EVERY requirement "
-                        "in the issue. Use sed or python -c for surgical edits."
+                        "in the issue. Use `apply_edit FILE 'OLD' 'NEW'` for precise edits."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
