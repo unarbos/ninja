@@ -129,6 +129,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_CONSISTENCY_CHECK_TURNS = 1  # verify multi-file import/export/call consistency
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_TEST_PARTNER_NUDGES = 1  # nudge missing companion-test edit when source was changed but partner test exists in repo
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1760,6 +1761,60 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _missing_test_partners(repo: Path, patch: str) -> List[Tuple[str, str]]:
+    """Source files in the patch whose companion test exists in the repo but
+    was not edited.
+
+    The Harpagon failure mode (v7 mean 28% vs v6 73%): the model edits
+    `Service.cs` thoroughly but skips `ServiceTests.cs` even when the
+    reference patch updates both. Issue-path coverage and criteria nudges
+    don't catch it because the test file usually isn't named in the issue.
+    `_find_test_partner` already locates the partner deterministically;
+    surfacing it back to the model right before <final> is the cheapest
+    way to close the gap.
+    """
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+    try:
+        tracked_list = _tracked_files(repo)
+    except Exception:
+        return []
+    tracked = set(tracked_list)
+    if not tracked:
+        return []
+    changed_set = set(changed)
+    missing: List[Tuple[str, str]] = []
+    for relative_path in changed:
+        if _path_looks_like_test_file(relative_path):
+            continue
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        if partner in changed_set:
+            continue
+        # Avoid duplicates when several edited sources share a partner.
+        if any(p == partner for _, p in missing):
+            continue
+        missing.append((relative_path, partner))
+        if len(missing) >= 4:
+            break
+    return missing
+
+
+def build_test_partner_nudge_prompt(missing: List[Tuple[str, str]]) -> str:
+    """Tell the model to update each existing test partner it forgot."""
+    bullets = "\n  ".join(f"- {src} -> {partner}" for src, partner in missing[:4])
+    return (
+        "Test-partner gap — these source files in your patch have a companion "
+        "test file ALREADY in the repo, but you did NOT update them:\n"
+        f"  {bullets}\n\n"
+        "Update each existing test counterpart so it matches the new source behavior. "
+        "Edit only the test files listed (do NOT create brand-new test files unless the "
+        "issue explicitly asks for them). Then end with <final>summary</final>."
+    )
+
+
 # Same-extension siblings from the same directory are concrete style anchors.
 # A FeaturedCategories.tsx that needs editing in a Next.js app is much more
 # likely to look like its sibling RelatedProducts.tsx than to look like an
@@ -2532,6 +2587,7 @@ def solve(
     consistency_check_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    test_partner_nudges_used = 0
     hail_mary_turns_used = 0
     command_failure_fix_turns_used = 0
     empty_patch_pressure_nudges_used = 0
@@ -2569,7 +2625,7 @@ def solve(
             6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, consistency_check_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, consistency_check_turns_used, coverage_nudges_used, criteria_nudges_used, test_partner_nudges_used, hail_mary_turns_used
         patch = get_patch(repo)
 
         # Local validator solves are often hard-killed around 300s. If we
@@ -2629,6 +2685,18 @@ def solve(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if test_partner_nudges_used < MAX_TEST_PARTNER_NUDGES:
+            missing_partners = _missing_test_partners(repo, patch)
+            if missing_partners:
+                test_partner_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_partner_nudge_prompt(missing_partners),
+                    "TEST_PARTNER_NUDGE_QUEUED:\n  "
+                    + " | ".join(f"{s} -> {p}" for s, p in missing_partners),
                 )
                 return True
 
