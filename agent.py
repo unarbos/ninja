@@ -116,8 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # T68 v36: raised from 2 — allows criteria-nudge at position 2 within 270s budget
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -770,6 +769,36 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # === R2-PATTERN BOOSTS (v37) ===
+        # Config+implementation boost: if issue mentions config, boost consumers
+        path_lower_parts = relative_path.replace('\\', '/').split('/')
+        filename = path_lower_parts[-1] if path_lower_parts else ''
+        is_config = any(w in filename for w in ('config', 'settings', 'constants', 'env', 'conf'))
+        issue_has_config = any(w in issue.lower() for w in ('config', 'setting', 'environment', 'constant'))
+        if issue_has_config and not is_config and score > 0:
+            score += 40  # boost implementation files when config-related issue
+
+        # TypeScript cascade boost: boost all .ts/.tsx when interface/type/component changes
+        if filename.endswith(('.ts', '.tsx')):
+            ts_cascade_terms = ('interface', 'type ', 'extends', 'implements', 'component', 'props', 'hook')
+            if any(t in issue.lower() for t in ts_cascade_terms):
+                score += 60  # strong boost — TS cascade is 34.3% of R2 patches
+
+        # CSS+TSX co-change boost: style files always pair with components
+        if filename.endswith(('.css', '.scss', '.sass', '.module.css', '.module.scss')):
+            has_tsx = any(f.endswith('.tsx') for f in tracked_set)
+            if has_tsx and score > 0:
+                score += 35
+
+        # Controller+Service boost: load service when route/handler is in scope
+        is_service = any(w in filename for w in ('service', 'repository', 'repo', 'store', 'dao'))
+        has_controller = any(
+            any(w in tf for w in ('controller', 'route', 'handler', 'router'))
+            for tf in tracked_set
+        )
+        if is_service and has_controller:
+            score += 40
+        # === END R2-PATTERN BOOSTS ===
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1777,6 +1806,18 @@ brief summary of what changed
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
+## Pre-final completeness checklist (CHECK BEFORE <final>)
+
+Before emitting <final>, verify ALL of these in your reasoning:
+
+1. Every requirement or acceptance criterion from the issue has a corresponding diff hunk.
+2. All TypeScript/Java/C# interface changes cascaded to all implementors (use grep to verify).
+3. All comments in modified functions are preserved unless the task explicitly removes them.
+4. No `// TODO`, `// similar logic`, or stub implementations left in edited regions.
+5. If the issue says "create [filename]", the diff contains `new file mode` for that path.
+
+If ANY check fails → issue the corrective commands NOW before `<final>`.
+
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
 ## Scope discipline — what to change
@@ -1840,6 +1881,99 @@ annotations on modified functions.
 
 **Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
+
+## Task classification — BEFORE you do anything else
+
+Identify the task type from the FIRST WORD of the issue title or description:
+
+| First word(s) | Task type | Expected files | Strategy |
+|---------------|-----------|----------------|----------|
+| Implement, Integrate, Introduce, Create | FEATURE_BUILD | 7-12 files | Create new code, new imports, async/await, error handling |
+| Enhance, Extend, Expand, Improve, Refine, Enable, Add | FEATURE_EXTEND | 6-10 files | Extend existing code, cascade to all consumers |
+| Refactor, Reorganize, Restructure, Rename, Unify, Standardize, Simplify | REFACTOR | 3-6 files | Move/rename ONLY — never add features |
+| Add, Include, Attach, Introduce | ADD | 4-7 files | Targeted addition, minimal new files |
+| Migrate, Upgrade, Port, Convert | MIGRATION | 7-12 files | Touch every file using old API/pattern |
+| Fix, Repair, Resolve, Correct, Debug | BUG_FIX | 1-4 files | Surgical — root cause only, no restructuring |
+
+**Emit your classification as the FIRST LINE of your response:**
+`Task type: FEATURE_BUILD | Expected files: 7-12 | Strategy: create, cascade, import`
+
+Use this classification to calibrate how many files to touch and how much to implement.
+
+## Feature implementation protocol (FEATURE_BUILD and FEATURE_EXTEND only)
+
+When task type is FEATURE_BUILD or FEATURE_EXTEND:
+
+**Before touching any file, discover all required files:**
+```bash
+# Find files related to the feature keyword
+grep -r "KEYWORD" --include="*.ts" --include="*.tsx" --include="*.py" --include="*.js" -l . 2>/dev/null | head -20
+# Find service/repository layer if issue mentions routes or API
+grep -r "router\|@Controller\|app\.\(get\|post\|put\|delete\)\|@app\." --include="*.ts" --include="*.js" --include="*.py" -l . 2>/dev/null | head -10
+# Find schema/model if issue mentions data structures
+grep -r "schema\|model\|interface\|dataclass\|@Entity" --include="*.ts" --include="*.py" --include="*.java" -l . 2>/dev/null | head -10
+```
+
+**For FEATURE_BUILD tasks, expect to change:**
+- Primary module/component file
+- Type definitions (types.ts, interfaces.ts, schema.ts, models.py)
+- Route/controller that exposes it (if API-facing)
+- Service/repository that handles it (if data-touching)
+- UI component that renders it (if frontend-facing)
+- Import statements in index files (__init__.py, index.ts)
+
+**Mandatory rules for FEATURE_BUILD:**
+- Always add new import statements at the TOP of each modified file
+- If the feature involves I/O (API, DB, file): add async/await and error handling
+- If you touch fewer than 4 files on a FEATURE_BUILD task, run grep again — you are likely missing cascade targets
+- Do not submit until you have verified all feature entry points are wired up
+
+## Per-language cascade rules (MANDATORY when changing shared code)
+
+### Python
+When changing a module X.py:
+- Check `__init__.py` in the same package (exports may need updating)
+- Check `conftest.py` if test fixtures need updating
+- Run: `grep -r "from.*X import\|import.*X" --include="*.py" -l . 2>/dev/null`
+
+### TypeScript/JavaScript
+When changing an interface, type, or function signature:
+- Run: `grep -r "TypeName\|functionName" --include="*.ts" --include="*.tsx" --include="*.js" -l . 2>/dev/null`
+- Update ALL files that import or implement the changed interface
+- Check for barrel exports: `grep -r "export.*from.*filename" --include="*.ts" -l . 2>/dev/null`
+
+### TSX (React components)
+When changing component props or API:
+- Run: `grep -r "ComponentName" --include="*.tsx" --include="*.jsx" -l . 2>/dev/null`
+- Update all parent components that pass the changed props
+- Check story files: `grep -r "ComponentName" --include="*.stories.*" -l . 2>/dev/null`
+
+### Java
+When changing a class or interface:
+- Run: `grep -r "ClassName" --include="*.java" -l . 2>/dev/null`
+- Check all subclasses (`extends ClassName`) and implementing classes (`implements ClassName`)
+
+### Go
+When changing a struct or interface:
+- Run: `grep -r "StructName\|InterfaceName" --include="*.go" -l . 2>/dev/null`
+- Update all types that embed or implement the changed type
+
+## TypeScript/React cascade protocol (MANDATORY when changing types, interfaces, or components)
+
+When you change an interface, type, function signature, or component API, execute these BEFORE emitting <final>:
+
+```bash
+# For interface/type changes:
+grep -r "InterfaceName" --include="*.ts" --include="*.tsx" -l .
+# For function signature changes:
+grep -r "functionName" --include="*.ts" --include="*.tsx" --include="*.js" -l .
+# For component API changes:
+grep -r "ComponentName" --include="*.tsx" --include="*.jsx" -l .
+```
+
+Update EVERY file returned by these greps. TypeScript cascade errors (missing interface update,
+stale prop usage, unmatched types) are the most common cause of incomplete patches in this codebase.
+Never assume the issue lists all affected files — TypeScript cascades silently.
 
 ## Style matching
 
@@ -2084,7 +2218,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 6  # R2 median 284 additions; <6 lines = almost certainly incomplete multi-file attempt
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
@@ -2148,6 +2282,46 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _detect_task_archetype(issue: str) -> str:
+    """Detect task archetype from first verb of issue text.
+
+    Returns one of: FEATURE_BUILD, FEATURE_EXTEND, REFACTOR, BUG_FIX,
+                    MIGRATION, ADD, ENABLE, UNKNOWN
+
+    Used to calibrate file budget and strategy in solve().
+    """
+    if not issue:
+        return "UNKNOWN"
+
+    # Extract first meaningful word
+    first_line = issue.strip().split('\n')[0].strip()
+    words = first_line.lower().split()
+    first_word = words[0].rstrip('.,!:') if words else ""
+
+    archetype_map = {
+        "FEATURE_BUILD": {"implement", "integrate", "introduce", "create", "build", "develop"},
+        "FEATURE_EXTEND": {"enhance", "extend", "expand", "improve", "refine", "upgrade"},
+        "REFACTOR": {"refactor", "reorganize", "restructure", "rename", "unify", "standardize", "simplify", "clean", "cleanup"},
+        "BUG_FIX": {"fix", "repair", "resolve", "correct", "debug", "patch", "hotfix"},
+        "MIGRATION": {"migrate", "upgrade", "port", "convert", "transition"},
+        "ADD": {"add", "include", "attach", "insert", "append"},
+        "ENABLE": {"enable", "activate", "allow", "support", "toggle"},
+    }
+
+    for archetype, verbs in archetype_map.items():
+        if first_word in verbs:
+            return archetype
+
+    # Secondary check: scan issue body for strong signals
+    issue_lower = issue[:200].lower()
+    if any(w in issue_lower for w in ("new feature", "implement", "create a new")):
+        return "FEATURE_BUILD"
+    if any(w in issue_lower for w in ("bug", "error", "crash", "broken", "failing")):
+        return "BUG_FIX"
+
+    return "UNKNOWN"
 
 
 # -----------------------------
@@ -2228,6 +2402,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
     repo: Optional[Path] = None
     logs: List[str] = []
+    # v37: _detect_task_archetype — adaptive strategy injection
+    _task_archetype = _detect_task_archetype(issue)
+    _archetype_hint = f"[ARCHETYPE: {_task_archetype}] " if _task_archetype != "UNKNOWN" else ""
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
@@ -2298,6 +2475,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
+        # T68 v36: criteria-nudge moved to position 2 (after cap check, before polish).
+        # Addresses multi-bullet acceptance criteria early — the most common judge-score loss.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -2356,24 +2547,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2395,7 +2568,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(_archetype_hint + issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
@@ -2736,3 +2909,4 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
