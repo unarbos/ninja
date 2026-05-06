@@ -113,7 +113,9 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_PLAN_COVERAGE_NUDGES = 1  # tell model which planned target files are still untouched
+MAX_STALE_LITERAL_NUDGES = 1  # catch old quoted values left in adjacent prompts/examples
+MAX_REMOVAL_SURFACE_NUDGES = 1  # catch removed endpoints/fields/imports still present
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -524,6 +526,7 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -568,6 +571,45 @@ def get_patch(repo: Path) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """Undo accidental chmod-only churn while preserving content edits."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    for line in proc.stdout.splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        if not relative_path or _should_skip_patch_path(relative_path):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -982,9 +1024,12 @@ def _diff_low_signal_summary(patch: str) -> str:
     current_file = "?"
     current_added: List[str] = []
     current_removed: List[str] = []
+    current_mode_only = False
 
     def flush() -> None:
         if not current_added and not current_removed:
+            if current_mode_only:
+                notes.append(f"{current_file}: file-mode-only hunk")
             return
         if _hunk_is_blank_only(current_added, current_removed):
             notes.append(f"{current_file}: blank-line-only hunk")
@@ -997,12 +1042,16 @@ def _diff_low_signal_summary(patch: str) -> str:
         if line.startswith("diff --git "):
             flush()
             current_added, current_removed = [], []
+            current_mode_only = False
             tokens = line.split()
             if len(tokens) >= 4 and tokens[3].startswith("b/"):
                 current_file = tokens[3][2:]
         elif line.startswith("@@"):
+            current_mode_only = False
             flush()
             current_added, current_removed = [], []
+        elif line.startswith(("old mode ", "new mode ")):
+            current_mode_only = True
         elif line.startswith("+") and not line.startswith("+++"):
             current_added.append(line[1:])
         elif line.startswith("-") and not line.startswith("---"):
@@ -1052,6 +1101,67 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+def _extract_planned_target_paths(repo: Path, assistant_text: str) -> List[str]:
+    """Resolve concrete files named in the model's <plan> to tracked paths.
+
+    This is intentionally task-agnostic: if the model says a repo file/function
+    is a planned target, the final diff should usually touch that file. It
+    catches incomplete multi-file edits without keyword playbooks.
+    """
+    plan_match = re.search(r"<plan>(.*?)</plan>", assistant_text, flags=re.IGNORECASE | re.DOTALL)
+    if not plan_match:
+        return []
+    plan = plan_match.group(1)
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    tracked = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    tracked_set = set(tracked)
+    stem_to_paths: Dict[str, List[str]] = {}
+    for path in tracked:
+        if not _context_file_allowed(path):
+            continue
+        stem_to_paths.setdefault(Path(path).stem, []).append(path)
+
+    out: List[str] = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        if path not in seen and path in tracked_set and _context_file_allowed(path):
+            seen.add(path)
+            out.append(path)
+
+    for token in re.findall(r"[A-Za-z0-9_./@+-]+\.[A-Za-z0-9_+-]+", plan):
+        normalized = token.strip("`'\"(),;:[]{}")
+        if normalized in tracked_set:
+            add(normalized)
+
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", plan):
+        paths = stem_to_paths.get(token)
+        if paths and len(paths) == 1:
+            add(paths[0])
+
+    return out[:8]
+
+
+def _uncovered_planned_paths(repo: Path, assistant_text: str, patch: str) -> List[str]:
+    planned = _extract_planned_target_paths(repo, assistant_text)
+    if not planned:
+        return []
+    changed = set(_patch_changed_files(patch))
+    return [path for path in planned if path not in changed]
 
 
 # -----------------------------
@@ -1405,94 +1515,144 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# v21 edge: criteria-nudge support
-_CRITERIA_MAX_BULLETS = 8
-_CRITERIA_MAX_TEXT = 220
-_CRITERIA_STOP = frozenset({
-    "a", "an", "and", "as", "at", "be", "but", "by", "do", "for", "from",
-    "if", "in", "is", "it", "of", "on", "or", "so", "that", "the", "this",
-    "to", "we", "with", "our", "must", "should", "shall", "can", "may",
-    "will", "implement", "add", "support", "ensure", "make", "use", "create",
-    "fix", "update", "change", "set", "include", "handle", "allow", "also",
-    "when", "where", "which", "who", "what", "all", "any", "each", "every",
-    "task", "issue", "code", "your", "you",
-})
+_NEGATED_LITERAL_WORDS = re.compile(
+    r"\b(no longer|remove|removed|reject|invalid|disallow|forbid|mandatory|required|must|required to|should not|cannot|can't|re-?prompt)\b",
+    re.IGNORECASE,
+)
 
 
-def _extract_acceptance_criteria(issue_text: str) -> List[str]:
-    """Pull acceptance-criterion checkpoints from the issue text.
+def _patch_changed_files(patch: str) -> set[str]:
+    files: set[str] = set()
+    for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", patch, flags=re.MULTILINE):
+        old_path, new_path = match.groups()
+        if new_path != "/dev/null":
+            files.add(new_path)
+        elif old_path != "/dev/null":
+            files.add(old_path)
+    return files
 
-    Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `•`) first; fallback to imperative sentences (must/should/implement/add/
-    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
-    so the nudge prompt stays compact."""
-    if not issue_text:
+
+def _negated_issue_literals(issue_text: str) -> List[str]:
+    """Quoted task literals in sentences that make old behavior invalid.
+
+    This is intentionally narrow: it catches stale user-facing prompts/examples
+    after behavior changes ("skip" is no longer allowed) without turning every
+    acceptance bullet into a noisy keyword checklist.
+    """
+    literals: List[str] = []
+    for sentence in re.split(r"(?<=[.!?\n])\s+", issue_text):
+        if not _NEGATED_LITERAL_WORDS.search(sentence):
+            continue
+        for match in re.finditer(r"['\"`]([^'\"`]{2,80})['\"`]", sentence):
+            literal = match.group(1).strip()
+            before = sentence[max(0, match.start() - 32):match.start()].lower()
+            if not literal or literal.lower() in {item.lower() for item in literals}:
+                continue
+            if literal.lower() in {"scheduled", "pending", "active", "enabled", "disabled", "true", "false"}:
+                continue
+            if "status" in before or "check" in before:
+                continue
+            if re.search(r"[A-Za-z0-9]", literal):
+                literals.append(literal)
+    return literals[:8]
+
+
+def _stale_negated_literal_hits(repo: Path, issue_text: str, patch: str) -> List[Tuple[str, str]]:
+    literals = _negated_issue_literals(issue_text)
+    if not literals:
         return []
-    bullets: List[str] = []
-    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
-    for line in issue_text.splitlines():
-        m = bullet_re.match(line)
-        if not m:
+    changed = _patch_changed_files(patch)
+    hits: List[Tuple[str, str]] = []
+    for relative_path in _tracked_files(repo):
+        if relative_path in changed or not _context_file_allowed(relative_path):
             continue
-        text = m.group(1).strip()
-        if len(text) < 6:
+        content = _read_context_file(repo, relative_path, 20000).lower()
+        if not content:
             continue
-        bullets.append(text[:_CRITERIA_MAX_TEXT])
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
+        for literal in literals:
+            if literal.lower() in content:
+                hits.append((relative_path, literal))
+                break
+        if len(hits) >= 8:
             break
-    if bullets:
-        return bullets
-    fallback_re = re.compile(
-        r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
-        re.IGNORECASE,
+    return hits
+
+
+_REMOVAL_SURFACE_WORDS = re.compile(
+    r"\b(remove|removed|strip|no longer|no |omit|omits|without|disable|delete|deprecated|non-core)\b",
+    re.IGNORECASE,
+)
+
+_REMOVAL_TOKEN_STOP = {
+    "acceptance", "action", "actions", "all", "also", "and", "api", "app",
+    "basic", "bool", "code", "core", "count", "directly", "endpoint",
+    "endpoints", "essential", "example", "features", "field", "fields",
+    "file", "files", "from", "function", "handles", "import", "imports",
+    "includes", "locally", "more", "must", "only", "other", "panel",
+    "profile", "remaining", "remove", "removed", "response", "returns",
+    "root", "directory", "contains", "current", "currently", "system", "sync", "have",
+    "schema", "schemas", "service", "services", "should", "status",
+    "table", "tables", "test", "tests", "the", "unchanged", "update",
+    "user", "users", "when", "with",
+}
+
+
+def _is_surface_removal_task(issue_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(strip down|non-core|all other features|remove unused imports|"
+            r"no longer reference|remove .* endpoints?|remove .* actions?|"
+            r"omit .* fields?|response .* omit)\b",
+            issue_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
     )
-    for raw in re.split(r"(?<=[.!?])\s+", issue_text):
-        text = raw.strip()
-        if not text or len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
+
+
+def _removed_surface_tokens(issue_text: str) -> List[str]:
+    tokens: List[str] = []
+    for line in issue_text.splitlines():
+        if not _REMOVAL_SURFACE_WORDS.search(line):
             continue
-        if not fallback_re.search(text):
-            continue
-        bullets.append(text)
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
+        for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", line):
+            token = raw.strip("_")
+            lower = token.lower()
+            if lower in _REMOVAL_TOKEN_STOP or lower in {item.lower() for item in tokens}:
+                continue
+            # Prefer externally visible names: snake_case fields/actions,
+            # dependencies, or compact feature labels from removal lists.
+            if "_" in token or len(token) >= 4:
+                tokens.append(token)
+        if len(tokens) >= 24:
             break
-    return bullets
+    return tokens[:24]
 
 
-def _criterion_keywords(criterion: str) -> List[str]:
-    """Significant tokens from a criterion (drop stopwords + short words)."""
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", criterion.lower())
-    return [t for t in tokens if t not in _CRITERIA_STOP]
-
-
-def _patch_added_text(patch: str) -> str:
-    """Concat all + lines of the patch (lower-cased) for keyword search."""
-    out: List[str] = []
-    for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            out.append(line[1:])
-    return "\n".join(out).lower()
-
-
-def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
-    """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
-    criteria = _extract_acceptance_criteria(issue_text)
-    if not criteria:
+def _remaining_removed_surface_hits(repo: Path, issue_text: str, patch: str) -> List[Tuple[str, str]]:
+    if not _is_surface_removal_task(issue_text):
         return []
-    added_lower = _patch_added_text(patch)
-    if not added_lower:
-        return criteria
-    missing: List[str] = []
-    for crit in criteria:
-        keywords = _criterion_keywords(crit)
-        if not keywords:
+    tokens = _removed_surface_tokens(issue_text)
+    if not tokens:
+        return []
+    changed_files = _patch_changed_files(patch)
+    hits: List[Tuple[str, str]] = []
+    for relative_path in _tracked_files(repo):
+        if not _context_file_allowed(relative_path):
             continue
-        # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
-        if hits * 2 < len(keywords):
-            missing.append(crit)
-    return missing
+        content = _read_context_file(repo, relative_path, 40000).lower()
+        if not content:
+            continue
+        for token in tokens:
+            lower = token.lower()
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(lower)}(?![A-Za-z0-9_])", content):
+                # Changed files are more suspicious after a removal refactor;
+                # untouched files still matter for URL maps/tests/docs.
+                tag = relative_path if relative_path not in changed_files else f"{relative_path} (changed)"
+                hits.append((tag, token))
+                break
+        if len(hits) >= 10:
+            break
+    return hits
 
 
 # -----------------------------
@@ -1626,6 +1786,18 @@ brief summary of what changed
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
+**Literal constraints**: words like "only", "exactly", "nearest", "most recent", and named statuses are binding. Do not broaden a status set, add arbitrary thresholds, or change the ordering basis unless the issue asks for it.
+
+**Adjacent contract text**: when changing what input is valid, what an API returns, or what timing/config means, update nearby prompts, classifier examples, tests, fixtures, and docs that still advertise the old behavior.
+
+**Preserve existing contracts**: for database, auth, security, routing, and config changes, prefer additive migrations/config entries that preserve existing behavior. Do not replace or drop existing access rules, endpoints, routes, or settings unless the issue explicitly asks for removal.
+
+**Large UI/component edits**: when adding a section to a large JSX/TSX/component file, inspect the enclosing component boundary and use one unique anchor. Never insert React hooks inside loops, maps, callbacks, or conditionals. After editing, check for duplicate section labels and obvious hook misuse before finalizing.
+
+**Frontend shared state**: if two components must read/write the same local UI setting, create or reuse one hook/store/helper and make controls state-driven. Do not parse localStorage directly during render, duplicate storage keys, or poll for same-tab updates when a shared React state source fits.
+
+**React completeness**: every new user-selectable value needs visible JSX controls, save/submit usage, disabled states if required, and `useEffect` dependency arrays containing every state/prop used by the query/effect. Adding state without rendering the control is incomplete.
+
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
@@ -1638,6 +1810,8 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+
+For removal or simplification tasks, remove every externally visible surface that belongs to the removed behavior: handler branches, response fields, imports/dependencies, URL/config maps, and tests/fixtures. Then run one focused grep for the removed names before final.
 
 ## Scope discipline — what NOT to change
 
@@ -1672,7 +1846,6 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {preloaded_context}
 """
-    playbook = build_task_playbook(issue)
 
     return f"""Fix this issue:
 
@@ -1682,65 +1855,19 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-{playbook}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
+Your `<plan>` must name the exact repo-relative file path for every file you intend to edit. Keep the plan short, but make it checkable.
+
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
+Before finalizing behavior changes, check for adjacent prompts/examples/tests/config that still describe the old behavior, especially quoted values the issue says are invalid or removed.
+
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
-"""
-
-
-def build_task_playbook(issue: str) -> str:
-    issue_lower = issue.lower()
-    notes: List[str] = []
-
-    if any(term in issue_lower for term in ("cache", "localstorage", "offline", "reload", "refresh", "pull-to-refresh", "pull to refresh")):
-        notes.append(
-            "Cache/reload task: enumerate data hooks with one focused `ls src/hooks` or `rg \"export function use\" src/hooks`, then initialize React state from local storage snapshots for every fetching hook involved, including parent selector hooks such as active semester/current workspace as well as dependent list hooks; prefer one shared cache helper when several hooks need snapshots, refresh in the background, write snapshots after successful fetches and local mutations, put pull-to-refresh CSS on both html and body, and before final check that every fetching hook named in your plan is actually touched by the diff."
-        )
-
-    if any(term in issue_lower for term in ("broadcast", "banner", "settings panel", "severity")):
-        notes.append(
-            "Broadcast/settings task: implement the visible banner in the app shell, wire controls into the existing settings panel, "
-            "persist settings, and make dismissal depend on both message and severity."
-        )
-
-    if "service" in issue_lower and any(term in issue_lower for term in ("remove", "strip", "non-core", "refactor")):
-        notes.append(
-            "Service strip-down task: update every named service's code, dependency file, test descriptor, and URL map; after editing, search final files for removed endpoint names, response fields, imports, and dependencies."
-        )
-
-    if any(term in issue_lower for term in ("appointment", "booking", "workshop", "scheduling", "calendar event")):
-        notes.append(
-            "Booking/assignment task: store the stable id used for queries separately from the display label, write that id at creation time, filter dashboards and available slots by it, handle empty option lists by warning and disabling the primary form, and integrate new workshop/user fields into the existing admin user-creation flow."
-        )
-
-    if any(term in issue_lower for term in ("router", "routing", "file structure", "page components", "move app.js", "move app.css")):
-        notes.append(
-            "Routing/file-structure task: move or delete stale duplicate root files, update runtime imports, and create every page component and route named by the issue."
-        )
-
-    if any(term in issue_lower for term in ("rls", "policy", "migration", "quiet hours", "push notification", "row-level")):
-        notes.append(
-            "Database/security task: inspect existing table/column/function names before SQL, keep required client-side fallback filters, and apply server-side filtering without dropping in-app behavior."
-        )
-
-    if any(term in issue_lower for term in ("trip simulator", "battery drain", "charging station", "station marker", "range anxiety")):
-        notes.append(
-            "Trip simulator task: edit the visible scene and controls together; show station markers on the progress slider, split traveled vs remaining route styling, dim passed stations, surface low-battery warnings, and keep reset/play/scrub behavior consistent with route consumption."
-        )
-
-    if not notes:
-        return ""
-    bullets = "\n".join(f"- {note}" for note in notes)
-    return f"""Task-specific playbook:
-{bullets}
-
 """
 
 
@@ -1823,6 +1950,19 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
+def build_plan_coverage_nudge_prompt(missing_paths: List[str]) -> str:
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    return (
+        "Plan-coverage gap — your own <plan> named these repo files as edit "
+        "targets, but the current patch does NOT touch them:\n"
+        f"  {bullets}\n\n"
+        "If a listed file truly needs no edit, say why in <final>. Otherwise "
+        "edit the missing planned file(s) now with the smallest change needed "
+        "to complete the issue. Do not add unrelated files or broaden scope. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -1869,25 +2009,37 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
-def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
-    """Tell the model which acceptance-criteria checkpoints look unaddressed.
-
-    The LLM judge frequently dings the king for "missing N of M criteria" on
-    multi-bullet issues. The path-coverage gate sees files; this gate sees the
-    criterion checkpoints themselves and surfaces them with the original text.
-    """
-    bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
+def build_stale_literal_prompt(hits: List[Tuple[str, str]], issue_text: str) -> str:
+    details = "\n  ".join(f"- `{path}` still contains `{literal}`" for path, literal in hits[:8])
     return (
-        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
-        "the task are NOT clearly reflected in your patch's added lines:\n"
-        f"  {bullets}\n\n"
-        "For each one, decide:\n"
-        "  (a) you already addressed it but the keywords differ -> respond "
-        "with <final>summary</final> and explain why in the summary; OR\n"
-        "  (b) it really IS missing -> issue the additional <command> blocks "
-        "needed to satisfy it, then end with <final>summary</final>.\n\n"
-        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
-        "code. Add only what is required to cover the listed criteria.\n\n"
+        "Stale-literal check: the task makes these quoted values or phrases "
+        "invalid/removed/mandatory, but they still appear in untouched files:\n"
+        f"  {details}\n\n"
+        "Inspect only the listed files if needed. If a hit is user-facing text, "
+        "LLM/classifier examples, validation tests, fixtures, docs, or config "
+        "that still advertises or accepts the old behavior, update it with the "
+        "smallest matching edit. If every hit is unrelated or intentionally "
+        "used as a rejected/invalid example, respond with <final>summary</final>.\n\n"
+        "Do not broaden scope or rewrite working code.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_removal_surface_prompt(hits: List[Tuple[str, str]], issue_text: str) -> str:
+    details = "\n  ".join(f"- `{path}` still contains `{token}`" for path, token in hits[:10])
+    return (
+        "Removal-surface check: this task asks to strip, omit, or keep only a "
+        "smaller public surface, but these removed-looking names still appear "
+        "in the current repo:\n"
+        f"  {details}\n\n"
+        "Run one focused grep or inspect the listed files only. Remove leftover "
+        "endpoint/action branches, response fields, imports/dependencies, URL "
+        "maps, and tests/fixtures that still expose removed behavior. Keep "
+        "database schema references only when the task explicitly says the "
+        "schema remains unchanged and the reference is not externally visible.\n\n"
+        "If every hit is intentionally retained, finish with <final>summary</final>. "
+        "Do not rewrite the architecture.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -1967,7 +2119,9 @@ def solve(
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     coverage_nudges_used = 0
-    criteria_nudges_used = 0
+    plan_coverage_nudges_used = 0
+    stale_literal_nudges_used = 0
+    removal_surface_nudges_used = 0
     hail_mary_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2000,7 +2154,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, plan_coverage_nudges_used, stale_literal_nudges_used, removal_surface_nudges_used, hail_mary_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2053,20 +2207,38 @@ def solve(
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
+        if plan_coverage_nudges_used < MAX_PLAN_COVERAGE_NUDGES:
+            missing = _uncovered_planned_paths(repo, assistant_text, patch)
+            if missing:
+                plan_coverage_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    build_plan_coverage_nudge_prompt(missing),
+                    "PLAN_COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if stale_literal_nudges_used < MAX_STALE_LITERAL_NUDGES:
+            stale_hits = _stale_negated_literal_hits(repo, issue, patch)
+            if stale_hits:
+                stale_literal_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_stale_literal_prompt(stale_hits, issue),
+                    "STALE_LITERAL_NUDGE_QUEUED:\n  "
+                    + " | ".join(f"{path}:{literal}" for path, literal in stale_hits[:4]),
+                )
+                return True
+
+        if removal_surface_nudges_used < MAX_REMOVAL_SURFACE_NUDGES:
+            remaining = _remaining_removed_surface_hits(repo, issue, patch)
+            if remaining:
+                removal_surface_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_removal_surface_prompt(remaining, issue),
+                    "REMOVAL_SURFACE_NUDGE_QUEUED:\n  "
+                    + " | ".join(f"{path}:{token}" for path, token in remaining[:4]),
                 )
                 return True
 
@@ -2185,7 +2357,25 @@ def solve(
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                if (
+                    not get_patch(repo).strip()
+                    and step >= 10
+                    and _looks_like_read_only_command(command)
+                ):
+                    result = CommandResult(
+                        command=command,
+                        exit_code=1,
+                        stdout="",
+                        stderr=(
+                            "Budget guard blocked late read-only exploration. "
+                            "Use the context already gathered and issue the "
+                            "smallest plausible edit command next."
+                        ),
+                        duration_sec=0.0,
+                        blocked=True,
+                    )
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
@@ -2297,23 +2487,26 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " failures",
         " error",
         " errors",
+        "command not found",
+        "not found",
+        "no such file",
         "traceback",
         "assertionerror",
         "syntaxerror",
         "exception",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
+    good_patterns = [
+        r"\bpassed\b",
+        r"\ball passed\b",
+        r"(?m)^ok\b",
+        r"\bsuccess\b",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(re.search(pattern, lower) for pattern in good_patterns)
     has_bad = any(marker in lower for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
@@ -2353,6 +2546,21 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
     return bool(
         re.search(r"\bgit\s+(diff|status)\b", lowered)
         or re.search(r"\bgit\s+show\s+--stat\b", lowered)
+    )
+
+
+def _looks_like_read_only_command(command: str) -> bool:
+    lowered = command.lower().strip()
+    write_markers = [
+        "sed -i", "perl -pi", "python", "node -e", "cat >", "tee ",
+        "apply_patch", "mv ", "cp ", "rm ", "mkdir", "touch ",
+        "npm install", "pnpm install", "yarn add",
+    ]
+    if any(marker in lowered for marker in write_markers):
+        return False
+    return bool(
+        re.match(r"^(cat|grep|rg|sed -n|head|tail|wc|ls|find)\b", lowered)
+        or re.match(r"^git\s+(grep|diff|status|show|log|ls-files)\b", lowered)
     )
 
 
