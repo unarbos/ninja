@@ -6,7 +6,7 @@ Contract:
     The validator imports this file and calls:
 
         solve(
-            repo_path=/tmp/task_repo,
+            repo_path="/tmp/task_repo",
             issue="Fix the bug...",
             model="validator-managed-model",
             api_base="http://validator-proxy/v1",
@@ -444,7 +444,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
-            executable=/bin/bash,
+            executable="/bin/bash",
             env=_command_env(),
         )
 
@@ -557,7 +557,7 @@ def ensure_git_repo(repo: Path) -> None:
         "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
         cwd=str(repo),
         shell=True,
-        executable=/bin/bash,
+        executable="/bin/bash",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -594,11 +594,11 @@ def get_patch(repo: Path) -> str:
     if untracked.returncode != 0:
         return diff_output
 
-    for relative_path in [item for item in untracked.stdout.split(\0) if item]:
+    for relative_path in [item for item in untracked.stdout.split("\0") if item]:
         if _should_skip_patch_path(relative_path):
             continue
         file_diff = subprocess.run(
-            ["git", "diff", "--binary", "--no-index", "--", /dev/null, relative_path],
+            ["git", "diff", "--binary", "--no-index", "--", "/dev/null", relative_path],
             cwd=str(repo),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -796,7 +796,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
         score += sum(3 for term in terms if term in path_lower)
-        if /test in path_lower or "spec." in path_lower or ".test." in path_lower:
+        if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
@@ -900,7 +900,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         data = path.read_bytes()
     except Exception:
         return ""
-    if b\0 in data[:4096]:
+    if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
@@ -1704,7 +1704,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactlOK/n/n")'>y:\n<final>OK</final>\n\n"
+        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
