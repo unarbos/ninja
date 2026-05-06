@@ -707,6 +707,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    # V5 edge — neighbour expansion of the top file (imports + sibling types).
+    files = _v5_augment_with_neighbors(repo, files, tracked_set)
 
     parts: List[str] = []
     used = 0
@@ -1339,6 +1341,137 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+# V5 edge — multi-file dependency neighbor expansion. The judge frequently
+# dings patches that miss a sibling type/interface or an imported helper
+# module. Companion tests are already preloaded; siblings and imports are not.
+
+_V5_NEIGHBOR_BUDGET = 4
+_V5_IMPORT_RE_PY = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.M)
+_V5_IMPORT_RE_JS = re.compile(r"""(?:from|require\()\s*['"]([./][^'"]+)['"]""", re.M)
+_V5_IMPORT_RE_GO = re.compile(r'^\s*import\s+(?:"([^"]+)"|\(\s*\n([\s\S]*?)\n\s*\))', re.M)
+
+
+def _v5_extract_local_imports(repo: Path, relative_path: str, tracked: set) -> List[str]:
+    """Read the file and return relative paths of LOCAL imports it references."""
+    full = repo / relative_path
+    try:
+        head = full.read_text(encoding="utf-8", errors="replace")[:8000]
+    except Exception:
+        return []
+    src_dir = str(Path(relative_path).parent).strip(".") or ""
+    suffix = Path(relative_path).suffix
+    candidates: List[str] = []
+
+    if suffix == ".py":
+        for m in _V5_IMPORT_RE_PY.finditer(head):
+            mod = m.group(1) or m.group(2) or ""
+            if not mod or mod.startswith(("os", "sys", "re", "json", "typing", "pathlib",
+                                          "subprocess", "time", "urllib", "collections",
+                                          "dataclasses", "abc", "functools", "itertools")):
+                continue
+            rel = mod.replace(".", "/") + ".py"
+            if rel in tracked:
+                candidates.append(rel)
+            elif (rel + "/__init__.py") in tracked:
+                candidates.append(rel + "/__init__.py")
+    elif suffix in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+        repo_resolved = Path(repo).resolve(strict=False)
+        for m in _V5_IMPORT_RE_JS.finditer(head):
+            spec = m.group(1)
+            if not spec.startswith("."):
+                continue
+            # Resolve relative spec against (repo / src_dir), NOT against
+            # process CWD. Without `Path(repo) /` prefix Python anchors the
+            # resolution at os.getcwd() because src_dir is a relative path,
+            # so the relative_to() call would always raise ValueError and
+            # silently drop every JS/TS import.
+            base = (repo_resolved / src_dir / spec).resolve(strict=False)
+            try:
+                rel_base = str(base.relative_to(repo_resolved))
+            except ValueError:
+                continue
+            for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs"):
+                cand = rel_base + ext
+                if cand in tracked:
+                    candidates.append(cand)
+                    break
+                idx = rel_base + "/index" + ext
+                if idx in tracked:
+                    candidates.append(idx)
+                    break
+    elif suffix == ".go":
+        for m in _V5_IMPORT_RE_GO.finditer(head):
+            block = (m.group(1) or m.group(2) or "")
+            for line in block.splitlines():
+                line = line.strip().strip('"')
+                if not line or "/" not in line:
+                    continue
+                pkg = line.rsplit("/", 1)[-1]
+                for tracked_path in tracked:
+                    if tracked_path.endswith("/" + pkg + ".go") and tracked_path not in candidates:
+                        candidates.append(tracked_path)
+
+    out: List[str] = []
+    for c in candidates:
+        if c == relative_path or c in out:
+            continue
+        out.append(c)
+        if len(out) >= _V5_NEIGHBOR_BUDGET:
+            break
+    return out
+
+
+def _v5_extract_sibling_types(repo: Path, relative_path: str, tracked: set) -> List[str]:
+    """Type/interface companion in the same directory."""
+    src_dir = Path(relative_path).parent
+    stem = Path(relative_path).stem
+    suffix = Path(relative_path).suffix
+    out: List[str] = []
+    siblings = [tp for tp in tracked
+                if Path(tp).parent == src_dir and tp != relative_path]
+    if suffix in (".ts", ".tsx"):
+        wanted = ["types.ts", "interfaces.ts", f"{stem}.types.ts", f"{stem}.d.ts"]
+    elif suffix == ".py":
+        wanted = ["types.py", "_types.py", "protocols.py", "schema.py"]
+    elif suffix == ".go":
+        wanted = ["types.go"]
+    else:
+        wanted = []
+    for w in wanted:
+        for tp in siblings:
+            if Path(tp).name == w:
+                out.append(tp)
+                break
+    return out[:2]
+
+
+def _v5_augment_with_neighbors(repo: Path, files: List[str], tracked: set) -> List[str]:
+    """Insert 2-4 neighbours of the TOP file into the preload list."""
+    if not files:
+        return files
+    top = files[0]
+    imports = _v5_extract_local_imports(repo, top, tracked)
+    types = _v5_extract_sibling_types(repo, top, tracked)
+    extras: List[str] = []
+    for cand in imports + types:
+        if cand not in files and cand not in extras:
+            extras.append(cand)
+        if len(extras) >= _V5_NEIGHBOR_BUDGET:
+            break
+    if not extras:
+        return files
+    out: List[str] = [files[0]]
+    insertion_point = 1
+    if len(files) > 1 and "test" in files[1].lower():
+        out.append(files[1])
+        insertion_point = 2
+    out.extend(extras)
+    for f in files[insertion_point:]:
+        if f not in out:
+            out.append(f)
+    return out
 
 
 def _run_companion_test(
