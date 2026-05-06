@@ -67,6 +67,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
+# validator controls temperature/top_p and related sampling policy.
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
@@ -288,7 +289,7 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = 2,
+    max_retries: int = 3,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client with robust transient retries."""
 
@@ -308,7 +309,7 @@ def chat_completion(
     }
 
     max_attempts = max_retries + 1
-    backoff_sec = 1.2
+    backoff_sec = 1.0
     last_error: Optional[Exception] = None
 
     for attempt in range(max_attempts):
@@ -328,13 +329,13 @@ def chat_completion(
             err_body = e.read().decode("utf-8", errors="replace")
             if attempt + 1 < max_attempts and _http_status_retryable(e.code):
                 last_error = e
-                time.sleep(backoff_sec * (attempt + 1))
+                time.sleep(backoff_sec * (2 ** attempt))
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as e:
             last_error = e
             if attempt + 1 < max_attempts:
-                time.sleep(backoff_sec * (attempt + 1))
+                time.sleep(backoff_sec * (2 ** attempt))
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
         except RuntimeError:
@@ -1914,7 +1915,7 @@ def solve(
                 break
 
             response_text: Optional[str] = None
-            for _attempt in range(2):
+            for _attempt in range(3):
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -1927,9 +1928,11 @@ def solve(
                         total_cost += cost
                     break
                 except Exception:
-                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/2):\n{traceback.format_exc()}")
-                    if _attempt == 0:
-                        time.sleep(3)
+                    logs.append(f"MODEL_ERROR (attempt {_attempt + 1}/3):\n{traceback.format_exc()}")
+                    if _attempt < 2:
+                        # Keep stronger transient-failure handling: exponential backoff
+                        # improves resilience to brief proxy/provider hiccups.
+                        time.sleep(2 ** _attempt)
 
             if response_text is None:
                 consecutive_model_errors += 1
