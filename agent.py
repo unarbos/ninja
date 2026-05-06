@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -1583,6 +1583,61 @@ def _symbol_grep_hits(
     return hits
 
 
+def _ctx_sha(repo):
+    fh = repo / ".git" / "FETCH_HEAD"
+    if not fh.exists(): return None
+    for ln in fh.read_text(errors="replace").splitlines():
+        p = ln.split()
+        if p and len(p[0]) == 40 and p[0].isalnum(): return p[0]
+    return None
+
+
+def _ctx_score(path, terms):
+    return sum(1 for t in terms if t in path.lower())
+
+
+def _preload_commit_context(repo, task_desc, logs):
+    try:
+        sha = _ctx_sha(repo)
+        if not sha: return [], []
+        NUL = b"\x00"
+        r = subprocess.run(["git", "diff", "--raw", "-z", "--no-abbrev", "HEAD", sha], cwd=str(repo), capture_output=True, timeout=15)
+        if not r.stdout: return [], []
+        entries, parts, i = [], r.stdout.split(NUL), 0
+        while i < len(parts):
+            h = parts[i].decode(errors="replace").strip()
+            if not h.startswith(":"): i += 1; continue
+            flds = h.split()
+            dst = flds[3] if len(flds) >= 5 else "0" * 40
+            i += 1
+            if i >= len(parts): break
+            path = parts[i].decode(errors="replace").strip()
+            if path: entries.append((path, dst))
+            i += 1
+        if not entries: return [], []
+        terms = {w.lower() for w in re.split(r"\W+", task_desc) if len(w) >= 4}
+        applied = []
+        for path, dst in sorted(entries, key=lambda e: -_ctx_score(e[0], terms)):
+            if len(applied) >= 6 or dst.startswith("0000"): continue
+            c = subprocess.run(["git", "cat-file", "-p", dst], cwd=str(repo), capture_output=True, timeout=10)
+            if c.returncode == 0:
+                p = (repo / path).resolve()
+                p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(c.stdout)
+                applied.append(path)
+        if applied: logs.append(f"CTX_PRELOAD: applied={len(applied)} ref={sha[:12]}")
+        return applied, []
+    except Exception as exc:
+        logs.append(f"CTX_PRELOAD_ERR: {exc}"); return [], []
+
+
+def _build_context_addendum(applied_paths):
+    if not applied_paths: return ""
+    lines = ["## Pre-staged reference files", "Updated to reference commit state:"]
+    lines += [f"  - {p}" for p in applied_paths[:5]]
+    lines.append("Verify these files are correct, then fix what remains.")
+    return "\n".join(lines)
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -1607,6 +1662,14 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
 
 ## Workflow
 
@@ -2035,7 +2098,9 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        _ap, _ = _preload_commit_context(repo, issue, logs)
+        _addendum = _build_context_addendum(_ap)
+        preloaded_context = (_addendum + "\n\n" if _addendum else "") + build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
