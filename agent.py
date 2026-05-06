@@ -67,6 +67,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
+# MINER-EDITABLE: You may tune local budgets like step count, command timeout,
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator proxy owns temperature/top-p/etc. and overwrites them server-side.
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
@@ -89,8 +92,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_CONTEXT_CHARS = 28000
+MAX_PRELOADED_FILES = 8
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -113,6 +116,8 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_CRITERIA_NUDGES = 1    # surface acceptance-criterion checkpoints whose substance is absent
+MAX_IDENT_VERIFY_TURNS = 1 # surface added identifiers that don't appear in the unpatched repo
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -677,7 +682,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          X_test.go for X.go, etc.) are slotted in right after their source
          partner. Real GitHub-derived tasks almost always need source+test
          changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
+         the source and bleeds Cursor-similarity score.
 
       2. Files that match identifier-shaped symbols extracted from the issue
          text get a substantial rank boost via `_symbol_grep_hits`. This
@@ -693,7 +698,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1200, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -855,7 +860,7 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # Hunk classifiers + diff hygiene
 # -----------------------------
 #
-# Two failure modes produce low-quality patches: drive-by whitespace /
+# Two failure modes hurt the 2/3 Cursor-similarity score: drive-by whitespace /
 # comment / blank-line edits, and patches that cover the wrong files. The
 # helpers below detect both. They're applied at two stages:
 #
@@ -1018,10 +1023,9 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
-    Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
+    Surfaced to the model in the coverage-nudge refinement turn so it can
+    edit the missing files before finalising. Tasks that name multiple
+    files often leave one untouched; this gate makes the gap concrete.
     """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
@@ -1032,6 +1036,271 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+# -----------------------------
+# Acceptance-criterion checklist
+# -----------------------------
+#
+# Multi-checkpoint issues benefit from a feature-level coverage check, on top
+# of the file-level path-coverage gate. Many issues list 3-7 acceptance
+# criteria; if the model addresses only one and finalises, the resulting
+# patch has plenty of file-coverage but missing substance.
+
+_MAX_CRITERIA = 8
+_MAX_CRITERION_CHARS = 220
+_CRITERION_STOP = frozenset({
+    "a", "an", "and", "as", "at", "be", "but", "by", "do", "for", "from",
+    "if", "in", "is", "it", "of", "on", "or", "so", "that", "the", "this",
+    "to", "we", "with", "our", "must", "should", "shall", "can", "may",
+    "will", "implement", "add", "support", "ensure", "make", "use", "create",
+    "fix", "update", "change", "set", "include", "handle", "allow", "also",
+    "when", "where", "which", "who", "what", "all", "any", "each", "every",
+    "task", "issue", "code",
+})
+
+
+def _extract_acceptance_criteria(issue_text: str) -> List[str]:
+    """Pull per-checkpoint acceptance criteria from the issue body.
+
+    Looks for numbered lines (``1.`` / ``1)``) and bullets (``-`` / ``*`` /
+    ``•``). When no list structure exists, falls back to imperative
+    sentences containing must / should / implement / add / support / ...
+    """
+    if not issue_text:
+        return []
+    lines = issue_text.splitlines()
+    bullets: List[str] = []
+    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
+    for line in lines:
+        m = bullet_re.match(line)
+        if not m:
+            continue
+        text = m.group(1).strip()
+        if len(text) < 6:
+            continue
+        bullets.append(text[:_MAX_CRITERION_CHARS])
+        if len(bullets) >= _MAX_CRITERIA:
+            break
+    if bullets:
+        return bullets
+
+    sentences = re.split(r"(?<=[.!?])\s+", issue_text)
+    imperative_re = re.compile(
+        r"\b(must|should|shall|implement|add|support|ensure|create|fix|update|"
+        r"return|expose|wire|require|render|emit|reject|accept|disable|enable|"
+        r"validate|persist|store|load|cache|rename|remove|delete|register)\b",
+        re.IGNORECASE,
+    )
+    for sentence in sentences:
+        s = sentence.strip()
+        if len(s) < 12 or len(s) > _MAX_CRITERION_CHARS:
+            continue
+        if imperative_re.search(s):
+            bullets.append(s[:_MAX_CRITERION_CHARS])
+            if len(bullets) >= _MAX_CRITERIA:
+                break
+    return bullets
+
+
+def _criterion_keywords(criterion: str) -> List[str]:
+    """Yank content tokens >=4 chars (or shorter if uppercase / dotted) out
+    of one criterion, dropping stopwords and connectives."""
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}", criterion)
+    keywords: List[str] = []
+    seen: set[str] = set()
+    for tok in raw_tokens:
+        norm = tok.strip("./-")
+        if not norm:
+            continue
+        if norm.lower() in _CRITERION_STOP:
+            continue
+        if len(norm) < 4 and not (norm[0].isupper() or "." in norm):
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        keywords.append(norm)
+    return keywords
+
+
+def _patch_added_text(patch: str) -> str:
+    """Concatenate ``+`` lines from a unified diff, excluding the
+    ``+++`` file headers."""
+    if not patch:
+        return ""
+    added: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    return "\n".join(added)
+
+
+def _keyword_in_text(keyword: str, lower_text: str) -> bool:
+    """True if ``keyword`` (or its dotted stem of >=4 chars) appears in
+    ``lower_text``. Handles path-style criteria like ``groups.tsx`` matching
+    a patch that mentions ``groups`` in surrounding code."""
+    k = keyword.lower()
+    if k in lower_text:
+        return True
+    if "." in k:
+        stem = k.split(".", 1)[0]
+        if len(stem) >= 4 and stem in lower_text:
+            return True
+    return False
+
+
+def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
+    """Acceptance criteria whose substance doesn't show up in the patch.
+
+    Path-shaped keywords (e.g. ``groups.tsx``) are required: a criterion
+    that names a specific file but whose path/stem is absent from the
+    patch's added lines is unaddressed regardless of how many incidental
+    content keywords overlap. For criteria with no path keywords, fall
+    back to a content-keyword threshold: 1 hit suffices for short
+    criteria, 2 hits for long ones.
+    """
+    criteria = _extract_acceptance_criteria(issue_text)
+    if not criteria:
+        return []
+    added = _patch_added_text(patch)
+    if not added:
+        return list(criteria)
+    added_lower = added.lower()
+    unaddressed: List[str] = []
+    for crit in criteria:
+        keywords = _criterion_keywords(crit)
+        if not keywords:
+            continue
+        path_kws = [k for k in keywords if "." in k]
+        content_kws = [k for k in keywords if "." not in k]
+        if path_kws and not any(_keyword_in_text(k, added_lower) for k in path_kws):
+            unaddressed.append(crit)
+            continue
+        if not content_kws:
+            continue
+        threshold = 2 if len(content_kws) >= 6 else 1
+        hits = sum(1 for k in content_kws if _keyword_in_text(k, added_lower))
+        if hits < threshold:
+            unaddressed.append(crit)
+    return unaddressed[:_MAX_CRITERIA]
+
+
+# -----------------------------
+# Identifier-verification gate
+# -----------------------------
+#
+# When a patch introduces an identifier (function name, class, constant,
+# attribute) that isn't present anywhere in the rest of the repository, that
+# identifier is most likely invented rather than referenced from existing
+# code. A common failure mode is using ``project`` when ``projectKey`` is
+# what the surrounding code expects, or using a placeholder constant like
+# ``PROJECT_ROOT`` when only ``project_root`` is defined. This pre-final
+# gate runs ``git grep -F`` against the un-patched repo for each candidate
+# identifier and surfaces the ones that don't exist anywhere.
+
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_IDENT_BUILTIN_SKIP = frozenset({
+    "self", "cls", "True", "False", "None", "Ellipsis", "NotImplemented",
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "classmethod", "compile", "complex", "delattr",
+    "dict", "dir", "divmod", "enumerate", "eval", "exec", "filter", "float",
+    "format", "frozenset", "getattr", "globals", "hasattr", "hash", "help",
+    "hex", "id", "input", "int", "isinstance", "issubclass", "iter", "len",
+    "list", "locals", "map", "max", "memoryview", "min", "next", "object",
+    "oct", "open", "ord", "pow", "print", "property", "range", "repr",
+    "reversed", "round", "set", "setattr", "slice", "sorted", "staticmethod",
+    "str", "sum", "super", "tuple", "type", "vars", "zip", "__init__",
+    "__name__", "__file__", "__doc__", "__main__", "__class__", "__dict__",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "RuntimeError", "OSError", "FileNotFoundError",
+    "StopIteration", "NotImplementedError", "ImportError", "Path", "Optional",
+    "Dict", "List", "Tuple", "Any", "Union", "Set", "Callable", "Iterator",
+    "Iterable", "Mapping", "TypeVar", "Generic", "Sequence",
+})
+_IDENT_KEYWORDS = frozenset({
+    "and", "or", "not", "if", "elif", "else", "for", "while", "break",
+    "continue", "return", "yield", "import", "from", "as", "def", "class",
+    "lambda", "try", "except", "finally", "raise", "with", "pass", "global",
+    "nonlocal", "assert", "async", "await", "in", "is", "del",
+    "function", "var", "let", "const", "interface", "extends", "implements",
+    "public", "private", "protected", "package", "static", "void", "new",
+    "this", "throws", "throw", "switch", "case", "default", "type", "enum",
+    "true", "false", "null", "undefined",
+})
+
+
+def _added_candidate_identifiers(patch: str) -> List[str]:
+    """Extract identifier tokens from the patch's added lines that look
+    like they reference real code (function/class/constant names).
+
+    Skips Python keywords, common builtins, language-keyword-shaped
+    tokens, pure-uppercase names <4 chars, and all-lowercase tokens
+    <6 chars. The lowercase-length filter is the noise control: short
+    identifiers like ``lib``, ``root``, ``self``, ``cls`` are usually
+    module-import paths or local variables, not code references that
+    would benefit from a verification grep.
+    """
+    added = _patch_added_text(patch)
+    if not added:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+    for tok in _IDENT_TOKEN_RE.findall(added):
+        if tok in seen:
+            continue
+        if tok in _IDENT_BUILTIN_SKIP or tok.lower() in _IDENT_KEYWORDS:
+            continue
+        if tok.isupper() and len(tok) < 4:
+            continue
+        # Drop short all-lowercase non-underscore tokens (locals/loop vars).
+        if tok.islower() and "_" not in tok and len(tok) < 6:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _grep_repo_for_identifier(repo: Path, identifier: str, exclude_paths: List[str]) -> bool:
+    """Return True if ``identifier`` appears anywhere in the un-patched
+    tracked repo, excluding files the patch itself touches.
+
+    Use ``git grep -F -w --`` so we match the literal word boundary.
+    """
+    try:
+        cmd = ["git", "grep", "-q", "-F", "-w", "--", identifier]
+        for ex in exclude_paths:
+            cmd.extend([":(exclude)" + ex])
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return True  # fail open — don't block on grep errors
+    return proc.returncode == 0
+
+
+def _likely_invented_identifiers(repo: Path, patch: str, max_to_check: int = 12) -> List[str]:
+    """Return identifiers added by the patch that don't appear anywhere
+    else in the un-patched repository.
+
+    Bounded by ``max_to_check`` so we never spend a huge wall-clock budget
+    here. Excluding the patch's own touched files prevents matching the
+    identifier against its own newly-added definition.
+    """
+    candidates = _added_candidate_identifiers(patch)
+    if not candidates:
+        return []
+    touched = _patch_changed_files(patch)
+    invented: List[str] = []
+    for ident in candidates[:max_to_check]:
+        if not _grep_repo_for_identifier(repo, ident, touched):
+            invented.append(ident)
+    return invented
 
 
 # -----------------------------
@@ -1365,6 +1634,12 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
+    Plain mentions get +1 per symbol. Files that contain a *call-site* form
+    of the symbol (the symbol followed immediately by ``(``) get an extra
+    +2 so consumer files float to the top of the preload — knowing how an
+    API is consumed before editing it tends to produce edits that match
+    the existing call shape.
+
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
@@ -1372,10 +1647,11 @@ def _symbol_grep_hits(
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_files(pattern: str) -> List[str]:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
+                ["git", "grep", "-l", "-F", "--", pattern],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1383,16 +1659,27 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    for symbol in symbols:
+        for relative_path in _grep_files(symbol):
+            if relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+        # Caller pass: ``<symbol>(`` — function/constructor invocations.
+        if len(symbol) < 3 or (not symbol[0].isalpha() and symbol[0] != "_"):
+            continue
+        for relative_path in _grep_files(symbol + "("):
+            if relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 2
     return hits
 
 
@@ -1403,77 +1690,59 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+You must fix the issue by editing files in the repo. You have a tight wall-clock
+budget, so make a useful patch quickly instead of exhaustively exploring.
 
-## Command format
+You interact only by issuing bash commands. The environment will run your command
+and return stdout/stderr. Use this exact format when you want to run a command:
 
-Run a bash command:
 <command>
-bash command here
+your bash command here
 </command>
 
-Signal completion:
+When you are finished, respond with:
+
 <final>
-brief summary of what changed
+short summary of what you changed
 </final>
 
-## Workflow
+Plan-first discipline: before your first <command>, in the SAME response output
+a short <plan> block listing the target files and which acceptance criterion
+maps to each. Then immediately issue the first <command>(s). Do not split plan
+and commands across turns; that wastes a step.
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
-
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
-
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
-
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
-
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
-
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
-
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
-
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
-
-## Scope discipline — what to change
-
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
-- "Fix X in function Y" → change only function Y
-- "Add feature Z to class C" → add only what Z requires inside C
-- "Bug when condition Q" → fix the condition that causes it, do not restructure
-
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
-
-## Scope discipline — what NOT to change
-
-- Whitespace-only, comment-only, or blank-line-only edits
-- Imports not needed by your fix
-- Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
-- Test files unless the issue requires it OR your source change broke an existing test
-- Error handling, logging, or defensive checks not directly required by the fix
-
-## Style matching
-
-Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
-
-## Preloaded snippets
-
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
-
-## Safety
-
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+Discipline:
+- Work directly in the repository. Prefer the smallest diff that satisfies every
+  acceptance criterion. Surplus lines hurt the similarity score.
+- If file snippets are preloaded in the user prompt, edit those files first.
+  Do not re-read preloaded files.
+- The preload includes companion test files alongside their source partners
+  whenever both exist. When you patch a source file, update the companion test
+  in the SAME response if it is affected — failing to keep tests in sync is
+  the most common reason a patch trails on the similarity score.
+- When several files need changes, emit every independent file-edit command in
+  the SAME response. Do not split one planned patch into one file per turn.
+- Match indentation, quote style, semicolons, trailing commas, blank-line
+  patterns, and brace placement EXACTLY from surrounding code.
+- Match identifier and string tokens to what the surrounding code already uses.
+- Avoid whitespace-only edits, comment-only edits, blank-line shuffling, import
+  reorders, type annotation drive-bys, dead-code removal not asked for by the
+  task, defensive checks not asked for by the task, and unrelated refactors.
+- If the target is unclear, run one or two focused grep/sed -n commands, then
+  edit. Do not loop on inspection.
+- Verification: prefer a single targeted check on a touched file
+  (`python -m py_compile X.py`, `node --check X.js`, `pytest -k name X`,
+  `tsc --noEmit X.ts`). Avoid full installs, full builds, broad test suites.
+- If dependencies are missing or a verification command is slow, keep the patch
+  and finalize instead of spending the whole budget.
+- Do not dump huge generated, minified, binary, lock, or vendored files.
+- Do not use sudo. Do not delete the repository. Do not access secrets.
+- Do not make network calls except through the validator-provided inference proxy.
+- Do not modify hidden tests or evaluator files.
+- Do not stop after only explaining; actually edit the code.
+- You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
 """
 
 
@@ -1481,12 +1750,15 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
+Preloaded likely relevant tracked-file snippets:
 
 {preloaded_context}
+
+These files have already been read for you. Re-reading them burns the duel
+budget; patch them directly unless a needed detail is missing.
 """
 
-    return f"""Fix this issue:
+    return f"""We need fix this issue:
 
 {issue}
 
@@ -1494,15 +1766,14 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
-
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
-
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+If the preloaded snippets identify the target code, start by editing them. Do
+not re-read preloaded files or run broad searches first. If the target is still
+unclear, run one or two focused search/snippet commands, then make the best
+focused patch you can. If multiple files need edits, include every independent
+file edit command in the same response. Do not run a broad test suite before
+editing. After a patch exists, run one cheap verification if possible, then finish with
+<final>...</final>.
 """
 
 
@@ -1520,17 +1791,8 @@ your command here
 
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
-        return (
-            "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
-        )
-    return (
-        "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
-    )
+        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
+    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
 def build_polish_prompt(junk_summary: str) -> str:
@@ -1585,6 +1847,61 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
+def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
+    """Surface acceptance-criterion checkpoints whose substance is absent
+    from the patch's added lines.
+
+    For each, the model must either confirm via inspection that the
+    criterion was already addressed (different keywords) or issue the
+    additional edits needed to satisfy it.
+    """
+    bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
+    return (
+        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
+        "the task are NOT clearly reflected in your patch's added lines:\n"
+        f"  {bullets}\n\n"
+        "For each one, decide:\n"
+        "  (a) you already addressed it but the keywords differ -> respond "
+        "with <final>summary</final> and explain why in the summary; OR\n"
+        "  (b) it really IS missing -> issue the additional <command> blocks "
+        "needed to satisfy it, then end with <final>summary</final>.\n\n"
+        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
+        "code. Add only what is required to cover the listed criteria.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_identifier_verify_prompt(invented: List[str]) -> str:
+    """Ask the model to verify identifiers added by its patch that don't
+    appear anywhere else in the un-patched repository.
+
+    These are the most common cause of patches that compile but reference
+    nothing real (e.g. ``project`` instead of ``projectKey``). The model
+    must either replace each with the correct existing identifier from
+    the codebase, or confirm by inspection that introducing a brand-new
+    name was intentional and well-scoped.
+    """
+    bullets = "\n  ".join(f"- {i}" for i in invented[:10]) or "(none)"
+    return (
+        "Identifier-verification pass — these identifiers were added by your "
+        "patch but do NOT appear anywhere else in the un-patched repository:\n"
+        f"  {bullets}\n\n"
+        "For each, run a focused `git grep` (case-sensitive, plain text "
+        "match against an obvious lowercase / camelCase / snake_case "
+        "variant) on the un-patched code to find the existing canonical "
+        "name. Two outcomes:\n"
+        "  (a) An existing variant exists (e.g. you used `projectKey` but "
+        "    the codebase uses `project_key`) -> replace the added "
+        "    occurrence(s) to match the existing name, then finalise.\n"
+        "  (b) The identifier really IS new and intended (e.g. a brand "
+        "    new function the task says to introduce) -> leave it and "
+        "    finalise.\n\n"
+        "Do NOT introduce additional new identifiers in this pass. After "
+        "any rename, end with <final>summary</final>."
+    )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -1593,30 +1910,19 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
-        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "Self-check pass. Review your draft patch for:\n"
+        "  - any acceptance criterion from the task NOT addressed\n"
+        "  - companion test files that the source change broke or that need updating\n"
+        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
+        "  - newly-introduced bugs or syntax errors\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
+        "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
+        "Otherwise emit corrective <command> blocks in the SAME response that "
+        "fix only the listed issues, then end with <final>summary</final>. "
+        "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
     )
 
 
@@ -1635,15 +1941,12 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
     return (
-        f"Companion test is failing after your patch: `{test_path}`.\n\n"
+        f"Companion test still failing after your patch: `{test_path}`.\n\n"
         "Test output (tail):\n```\n"
         f"{tail}\n```\n\n"
-        "Diagnose first: is the source patch incomplete (missing part of the fix), "
-        "or does the test itself need updating to match new correct behaviour?\n"
-        "- If the source fix is incomplete, extend it now.\n"
-        "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
-        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
-        "then end with <final>summary</final>."
+        "Fix the cause — usually either the source patch is incomplete or the "
+        "test needs to be updated to match the new behavior. Issue the minimal "
+        "<command> blocks needed, then end with <final>summary</final>."
     )
 
 
@@ -1678,6 +1981,8 @@ def solve(
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     coverage_nudges_used = 0
+    criteria_nudges_used = 0
+    ident_verify_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1708,7 +2013,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, ident_verify_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1746,6 +2051,30 @@ def solve(
                 )
                 return True
 
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            # Only fire when at least 2 criteria were extracted (single-
+            # checkpoint issues are already covered by path-coverage / self-check).
+            if unaddressed and len(_extract_acceptance_criteria(issue)) >= 2:
+                criteria_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:80] for c in unaddressed[:3]),
+                )
+                return True
+
+        if ident_verify_turns_used < MAX_IDENT_VERIFY_TURNS:
+            invented = _likely_invented_identifiers(repo, patch)
+            if invented:
+                ident_verify_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_identifier_verify_prompt(invented),
+                    "IDENT_VERIFY_QUEUED:\n  " + ", ".join(invented[:6]),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
@@ -1768,8 +2097,6 @@ def solve(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -1911,18 +2238,14 @@ def solve(
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
-                        "\n\nPatch now exists. Next steps (all in ONE response):\n"
-                        "1. Any remaining file edits or companion test updates.\n"
-                        "2. Run the most targeted functional test available "
-                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
-                        "3. Emit <final>summary</final>."
+                        "\n\nPatch now exists. If more edits are needed, send every "
+                        "remaining independent file-edit command in your next response. "
+                        "Do not spend separate turns editing one file at a time."
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
-                        "edit commands in your next response — all files at once, covering EVERY requirement "
-                        "in the issue. Use sed or python -c for surgical edits."
+                        "\n\nIf the observed snippets are enough to implement the issue, "
+                        "send the complete set of edit commands in your next response."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
