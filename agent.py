@@ -1868,13 +1868,13 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # The validator hides its per-task timeout, so we estimate task difficulty from
 # the issue + repo and pick a budget that fits. Bias LOW: over-predicting means
 # SIGTERM and zero score; under-predicting means an early bail with the patch.
-def estimate_task_scale(issue: str, repo_summary: str) -> int:
+def estimate_task_scale(issue_text: str, repo_summary: str) -> int:
     score = 0
-    score += min(40, len(issue) // 200)
-    score += 5 * len(_extract_issue_path_mentions(issue))
-    score += 8 * len(_extract_acceptance_criteria(issue))
-    score += 3 * (issue.count("```") // 2)
-    score += 2 * len(_extract_issue_symbols(issue))
+    score += min(40, len(issue_text) // 200)
+    score += 5 * len(_extract_issue_path_mentions(issue_text))
+    score += 8 * len(_extract_acceptance_criteria(issue_text))
+    score += 3 * (issue_text.count("```") // 2)
+    score += 2 * len(_extract_issue_symbols(issue_text))
     # Repo size adds a small kicker — bigger repos take cursor longer.
     summary_lines = repo_summary.count("\n") if repo_summary else 0
     score += min(10, summary_lines // 20)
