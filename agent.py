@@ -91,8 +91,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 28000
-MAX_PRELOADED_FILES = 8
+MAX_PRELOADED_CONTEXT_CHARS = 32000  # UPGRADED from goup_9 (was 28000)
+MAX_PRELOADED_FILES = 10  # UPGRADED from goup_9 (was 8)
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -160,6 +160,9 @@ class AgentResult:
 # Utility
 # -----------------------------
 
+_MAX_LINE_LENGTH = 500  # For output sanitization [FROM goup_9]
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -171,6 +174,27 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+def _sanitize_output(text: str) -> str:
+    """Strip null bytes, control chars, and cap overly long lines from command output.
+    [MERGED FROM goup_9]"""
+    if not text:
+        return text
+    cleaned = text.replace("\x00", "")
+    if any(ord(c) < 32 and c not in "\n\r\t" for c in cleaned[:2048]):
+        cleaned = "".join(
+            c if (c in "\n\r\t" or 32 <= ord(c) < 127 or ord(c) > 127) else "?"
+            for c in cleaned
+        )
+    lines = cleaned.split("\n")
+    truncated_lines = []
+    for line in lines:
+        if len(line) > _MAX_LINE_LENGTH:
+            truncated_lines.append(line[:_MAX_LINE_LENGTH] + "...[line truncated]")
+        else:
+            truncated_lines.append(line)
+    return "\n".join(truncated_lines)
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -261,6 +285,10 @@ def _repo_path(path: str | Path) -> Path:
 # OpenAI-compatible client
 # -----------------------------
 
+# Retry on 429 (rate-limit) in addition to 5xx; use exponential backoff. [FROM goup_9]
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_MAX_API_RETRIES = 3
+
 # MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
 # behavior, response parsing, or model-message strategy here. Keep all requests
 # pointed at the api_base/api_key supplied by solve(); the validator proxy
@@ -272,14 +300,14 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
 
-    Retries once on transient transport failures (timeout, connection reset,
-    HTTP 5xx). Client-side errors (4xx) bail out immediately because retrying
-    won't change the outcome and burns wall-clock budget that the agent needs
-    for actual editing.
+    Retries on transient transport failures (timeout, connection reset,
+    HTTP 429/5xx) with exponential backoff. Client-side errors (4xx except
+    429) bail out immediately because retrying won't change the outcome and
+    burns wall-clock budget that the agent needs for actual editing.
+    [MERGED FROM goup_9: Added 429 rate-limit handling with exponential backoff]
     """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
@@ -297,9 +325,8 @@ def chat_completion(
         "Authorization": f"Bearer {key}",
     }
 
-    data: Optional[Dict[str, Any]] = None
     last_error: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
+    for attempt in range(_MAX_API_RETRIES):
         req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -308,22 +335,19 @@ def chat_completion(
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if 500 <= e.code < 600 and attempt < max_retries:
-                last_error = e
-                time.sleep(1.0)
-                continue
-            raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
+            last_error = RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}")
+            if e.code not in _RETRYABLE_HTTP_CODES:
+                raise last_error from e
+            delay = min(2 ** attempt * 2, 15)  # Exponential backoff: 2, 4, 8, 15... [FROM goup_9]
+            time.sleep(delay)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            if attempt < max_retries:
-                last_error = e
-                time.sleep(1.0)
-                continue
-            raise RuntimeError(f"Model request failed: {e}") from e
+            last_error = RuntimeError(f"Model request failed: {e}")
+            delay = min(2 ** attempt * 2, 15)  # Exponential backoff [FROM goup_9]
+            time.sleep(delay)
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
-
-    if data is None:
-        raise RuntimeError(f"Model request failed after retries: {last_error}")
+    else:
+        raise last_error or RuntimeError("Model request failed after retries")
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
@@ -335,9 +359,17 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
 # Shell execution
 # -----------------------------
+
+# Detect and extend timeout for heavy install/build commands [FROM goup_9]
+_HEAVY_CMD_RE = re.compile(
+    r"\b(?:pip\s+install|npm\s+install|npm\s+ci|yarn\s+install|yarn\s+add|"
+    r"pnpm\s+install|pnpm\s+add|apt-get|brew\s+install|cargo\s+build|"
+    r"mvn\s+(?:install|package)|gradle\s+build|make\s+all)\b",
+    re.IGNORECASE,
+)
+_HEAVY_CMD_TIMEOUT = 30
 
 # MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
 # repo. You may improve command validation, environment handling, timeouts, and
@@ -354,6 +386,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stderr="Empty command ignored.",
             duration_sec=0.0,
         )
+
+    # Detect heavy commands and extend timeout [FROM goup_9]
+    if _HEAVY_CMD_RE.search(command):
+        timeout = max(timeout, _HEAVY_CMD_TIMEOUT)
 
     blocked_pattern = _is_dangerous_command(command)
     if blocked_pattern:
@@ -384,8 +420,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate(_sanitize_output(proc.stdout or ""), MAX_OBSERVATION_CHARS),
+            stderr=_truncate(_sanitize_output(proc.stderr or ""), MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -400,8 +436,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate(_sanitize_output(stdout), MAX_OBSERVATION_CHARS),
+            stderr=_truncate(_sanitize_output(stderr + f"\nCommand timed out after {timeout}s."), MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -467,7 +503,13 @@ def extract_command(model_text: str) -> Optional[str]:
 
 
 def extract_final(model_text: str) -> Optional[str]:
-    match = FINAL_RE.search(model_text)
+    # Strip think blocks before searching [FROM goup_9]
+    try:
+        _THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+        cleaned = _THINK_RE.sub("", model_text)
+    except:
+        cleaned = model_text
+    match = FINAL_RE.search(cleaned)
     if not match:
         return None
     return match.group(1).strip()
