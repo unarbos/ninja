@@ -115,6 +115,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_IDENT_VERIFY_TURNS = 1 # surface added identifiers absent from the unpatched repo
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1236,6 +1237,126 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+# -----------------------------
+# Identifier-verification gate
+# -----------------------------
+#
+# Catches the case where the patch introduces an identifier (function name,
+# class, constant, attribute) that doesn't exist anywhere else in the
+# repository. A common failure mode is using a wrong-cased / wrong-snake
+# variant of a real identifier (e.g. ``project`` when the codebase defines
+# ``projectKey``). Pre-final, we ``git grep -F -w`` each added candidate
+# identifier against the un-patched repo (excluding files the patch touches)
+# and surface those that aren't found anywhere.
+
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_IDENT_BUILTIN_SKIP = frozenset({
+    "self", "cls", "True", "False", "None", "Ellipsis", "NotImplemented",
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "classmethod", "compile", "complex", "delattr",
+    "dict", "dir", "divmod", "enumerate", "eval", "exec", "filter", "float",
+    "format", "frozenset", "getattr", "globals", "hasattr", "hash", "help",
+    "hex", "id", "input", "int", "isinstance", "issubclass", "iter", "len",
+    "list", "locals", "map", "max", "memoryview", "min", "next", "object",
+    "oct", "open", "ord", "pow", "print", "property", "range", "repr",
+    "reversed", "round", "set", "setattr", "slice", "sorted", "staticmethod",
+    "str", "sum", "super", "tuple", "type", "vars", "zip", "__init__",
+    "__name__", "__file__", "__doc__", "__main__", "__class__", "__dict__",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "RuntimeError", "OSError", "FileNotFoundError",
+    "StopIteration", "NotImplementedError", "ImportError", "Path", "Optional",
+    "Dict", "List", "Tuple", "Any", "Union", "Set", "Callable", "Iterator",
+    "Iterable", "Mapping", "TypeVar", "Generic", "Sequence",
+})
+_IDENT_LANG_KEYWORDS = frozenset({
+    "and", "or", "not", "if", "elif", "else", "for", "while", "break",
+    "continue", "return", "yield", "import", "from", "as", "def", "class",
+    "lambda", "try", "except", "finally", "raise", "with", "pass", "global",
+    "nonlocal", "assert", "async", "await", "in", "is", "del",
+    "function", "var", "let", "const", "interface", "extends", "implements",
+    "public", "private", "protected", "package", "static", "void", "new",
+    "this", "throws", "throw", "switch", "case", "default", "type", "enum",
+    "true", "false", "null", "undefined",
+})
+
+
+def _added_text_preserve_case(patch: str) -> str:
+    """Local concat of patch ``+`` lines with original case preserved.
+
+    The shared ``_patch_added_text`` lower-cases for the criteria-checker;
+    identifier verification needs case-sensitive matching to distinguish
+    ``PROJECT_ROOT`` from ``project_root``.
+    """
+    if not patch:
+        return ""
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append(line[1:])
+    return "\n".join(out)
+
+
+def _added_candidate_identifiers(patch: str) -> List[str]:
+    """Identifier tokens from added lines worth verifying against the repo.
+
+    Skips Python keywords, common builtins / typing aliases, language-keyword
+    shaped tokens, pure-uppercase short tokens (often section markers), and
+    short all-lowercase non-underscore tokens (locals / iteration variables).
+    """
+    added = _added_text_preserve_case(patch)
+    if not added:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+    for tok in _IDENT_TOKEN_RE.findall(added):
+        if tok in seen:
+            continue
+        if tok in _IDENT_BUILTIN_SKIP or tok.lower() in _IDENT_LANG_KEYWORDS:
+            continue
+        if tok.isupper() and len(tok) < 4:
+            continue
+        if tok.islower() and "_" not in tok and len(tok) < 6:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _grep_repo_for_identifier(repo: Path, identifier: str, exclude_paths: List[str]) -> bool:
+    """True if ``identifier`` appears anywhere in the un-patched repo,
+    excluding files the patch already touches. Fail-open on grep errors so
+    we never block the loop on a transient failure."""
+    try:
+        cmd = ["git", "grep", "-q", "-F", "-w", "--", identifier]
+        for ex in exclude_paths:
+            cmd.append(":(exclude)" + ex)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return True
+    return proc.returncode == 0
+
+
+def _likely_invented_identifiers(repo: Path, patch: str, max_to_check: int = 12) -> List[str]:
+    """Identifiers added by the patch that don't appear elsewhere in the
+    un-patched repo. Bounded to avoid spending wall-clock on grep."""
+    candidates = _added_candidate_identifiers(patch)
+    if not candidates:
+        return []
+    touched = _patch_changed_files(patch)
+    invented: List[str] = []
+    for ident in candidates[:max_to_check]:
+        if not _grep_repo_for_identifier(repo, ident, touched):
+            invented.append(ident)
+    return invented
+
+
 def _has_executable(name: str) -> bool:
     """Quick shell `command -v` check; cheaper than starting a Python import."""
     try:
@@ -1552,6 +1673,12 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
+    Plain mentions get +1 per symbol. Files that contain a *call-site* form
+    of the symbol (the symbol followed immediately by ``(``) get an extra
+    +2 boost so consumer files float to the top of the preload — knowing
+    how an API is consumed before editing it tends to produce edits that
+    match the existing call shape.
+
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
@@ -1559,10 +1686,11 @@ def _symbol_grep_hits(
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_files(pattern: str) -> List[str]:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
+                ["git", "grep", "-l", "-F", "--", pattern],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1570,16 +1698,26 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    for symbol in symbols:
+        for relative_path in _grep_files(symbol):
+            if relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+        if len(symbol) < 3 or (not symbol[0].isalpha() and symbol[0] != "_"):
+            continue
+        for relative_path in _grep_files(symbol + "("):
+            if relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 2
     return hits
 
 
@@ -1869,6 +2007,35 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_identifier_verify_prompt(invented: List[str]) -> str:
+    """Ask the model to verify identifiers added by its patch that don't
+    appear anywhere else in the un-patched repository.
+
+    Common cause of patches that compile but reference nothing real (e.g.
+    using ``project`` when the codebase defines ``projectKey``, or using
+    a wrong-cased CSS class). The model must either replace each with an
+    existing canonical name or confirm it was an intentional new addition.
+    """
+    bullets = "\n  ".join(f"- {i}" for i in invented[:10]) or "(none)"
+    return (
+        "Identifier-verification pass — these identifiers were added by your "
+        "patch but do NOT appear anywhere else in the un-patched repository:\n"
+        f"  {bullets}\n\n"
+        "For each, run a focused `git grep` (case-sensitive, plain text "
+        "match against an obvious lowercase / camelCase / snake_case "
+        "variant) on the un-patched code to find the existing canonical "
+        "name. Two outcomes:\n"
+        "  (a) An existing variant exists (e.g. you used `projectKey` but "
+        "    the codebase uses `project_key`) -> replace the added "
+        "    occurrence(s) to match the existing name, then finalise.\n"
+        "  (b) The identifier really IS new and intended (e.g. a brand "
+        "    new function the task says to introduce) -> leave it and "
+        "    finalise.\n\n"
+        "Do NOT introduce additional new identifiers in this pass. After "
+        "any rename, end with <final>summary</final>."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -1918,6 +2085,7 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    ident_verify_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1949,7 +2117,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, ident_verify_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2016,6 +2184,17 @@ def solve(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if ident_verify_turns_used < MAX_IDENT_VERIFY_TURNS:
+            invented = _likely_invented_identifiers(repo, patch)
+            if invented:
+                ident_verify_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_identifier_verify_prompt(invented),
+                    "IDENT_VERIFY_QUEUED:\n  " + ", ".join(invented[:6]),
                 )
                 return True
 
