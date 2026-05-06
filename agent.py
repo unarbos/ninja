@@ -2086,6 +2086,14 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+# Coverage weights for the multi-shot picker. Each covered required path is
+# worth 50 substantive lines; each addressed criterion is worth 30. Tuned
+# so a small but well-targeted patch beats a sprawling 50-line miss: typical
+# king output is 30-300 lines, so the per-path/criterion bonus has to be
+# order-of-magnitude with line count for coverage to actually shift the
+# picker's choice on realistic candidates.
+_MULTISHOT_PATH_WEIGHT = 50
+_MULTISHOT_CRITERION_WEIGHT = 30
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2102,6 +2110,35 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_quality_score(patch: str, issue: str) -> int:
+    """Quality measure used to pick between two multi-shot attempts.
+
+    Substantive added lines alone are quantity, not quality: a 50-line
+    patch that touches 1 of 3 required paths is worse than a 30-line
+    patch that touches 3 of 3. This score combines:
+
+        substantive_lines + 5 * covered_required_paths + 3 * addressed_criteria
+
+    so a well-targeted small patch beats a sprawling but thin one. Both
+    attempts run the same scoring, so the comparison is meaningful even
+    when the absolute numbers are noisy.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    required_paths = _extract_issue_path_mentions(issue or "")
+    if required_paths:
+        uncovered = _uncovered_required_paths(patch, issue or "")
+        covered = max(0, len(required_paths) - len(uncovered))
+        base += _MULTISHOT_PATH_WEIGHT * covered
+    criteria = _extract_acceptance_criteria(issue or "")
+    if criteria:
+        unaddressed = _unaddressed_criteria(patch, issue or "")
+        addressed = max(0, len(criteria) - len(unaddressed))
+        base += _MULTISHOT_CRITERION_WEIGHT * addressed
+    return base
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2197,13 +2234,32 @@ def solve(
         return _result1
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
+    # Diversify the retry: prefix the issue with a short note that the prior
+    # attempt produced low-signal output, so the inner loop has a different
+    # prior and is less likely to repeat the same shape of failure.
+    _retry_args = dict(_multishot_args)
+    _retry_args["issue"] = (
+        "[retry-attempt] The previous solve pass on this same task produced "
+        "very few substantive changes. Be more thorough this time: edit "
+        "every file the issue names, address every numbered/bulleted "
+        "acceptance criterion with at least one corresponding code change, "
+        "and prefer a small targeted edit over more inspection turns. "
+        "Original task follows.\n\n"
+    ) + (issue or "")
+    _result2 = _solve_attempt(**_retry_args)
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    # Pick the winner by coverage-weighted quality, not raw line count.
+    # A 50-line patch covering 1 of 3 required paths is worse than a 30-line
+    # patch covering 3 of 3.
+    _q1 = _multishot_quality_score(_patch1, issue)
+    _q2 = _multishot_quality_score(_patch2, issue)
+
+    if _q2 >= _q1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_q_primary"] = _q1
+        _result2["multishot_q_retry"] = _q2
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -2211,6 +2267,8 @@ def solve(
         _multishot_apply_patch(_multishot_repo_obj, _patch1)
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
+    _result1["multishot_q_primary"] = _q1
+    _result1["multishot_q_retry"] = _q2
     return _result1
 
 
