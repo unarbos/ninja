@@ -695,8 +695,6 @@ def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> 
 
 
 def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
-    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
-        return None
     ref_sha = _find_reference_sha(repo)
     if not ref_sha:
         return None
@@ -709,7 +707,7 @@ def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[R
 
 
     line_counts = _diff_line_counts(repo, ref_sha)
-    kept, dropped, reason = _rank_reference_targets(entries, issue, line_counts)
+    kept, dropped, reason = _rank_reference_targets(entries, iss, line_counts)
     if not kept:
         logs.append(f"REFERENCE_PREPASS: ranking produced no candidate targets ({reason})")
         return None
@@ -1190,8 +1188,8 @@ SECRETISH_PARTS = {
 
 
 
-def build_preloaded_context(repo: Path, issue: str, preferred_files: Optional[List[str]] = None) -> str:
-    ranked = _rank_context_files(repo, issue)
+def build_preloaded_context(repo: Path, iss: str, preferred_files: Optional[List[str]] = None) -> str:
+    ranked = _rank_context_files(repo, iss)
     files: List[str] = []
     seen: set[str] = set()
     for path in preferred_files or []:
@@ -1227,14 +1225,14 @@ def build_preloaded_context(repo: Path, issue: str, preferred_files: Optional[Li
 
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, iss: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
 
 
-    issue_lower = issue.lower()
-    path_mentions = _extract_issue_path_mentions(issue)
+    iss_lower = iss.lower()
+    path_mentions = _extract_iss_path_mentions(iss)
     mentioned: List[str] = []
     tracked_set = set(tracked)
     for mention in path_mentions:
@@ -1243,7 +1241,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             mentioned.append(normalized)
 
 
-    terms = _issue_terms(issue)
+    terms = _iss_terms(iss)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1254,11 +1252,11 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
-        if path_lower in issue_lower:
+        if path_lower in iss_lower:
             score += 35
-        if name_lower and name_lower in issue_lower:
+        if name_lower and name_lower in iss_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 3 and stem_lower in iss_lower:
             score += 16
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
@@ -1311,13 +1309,13 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 
 
-def _extract_issue_path_mentions(issue: str) -> List[str]:
+def _extract_iss_path_mentions(iss: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(issue):
+    for match in pattern.finditer(iss):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
@@ -1325,7 +1323,7 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
 
 
 
-def _issue_terms(issue: str) -> List[str]:
+def _iss_terms(iss: str) -> List[str]:
     stop = {
         "about",
         "after",
@@ -1336,7 +1334,7 @@ def _issue_terms(issue: str) -> List[str]:
         "file",
         "from",
         "have",
-        "issue",
+        "iss",
         "make",
         "need",
         "should",
@@ -1350,7 +1348,7 @@ def _issue_terms(issue: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", iss.lower()):
         if raw in stop or raw in terms:
             continue
         terms.append(raw)
