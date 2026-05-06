@@ -128,6 +128,13 @@ _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
 
+# Per-solve() routing state. Set by solve()/build_preloaded_context, read by
+# the prompt builders. Threaded through module globals (rather than function
+# parameters) so the validator-owned signatures of build_initial_user_prompt
+# and build_budget_pressure_prompt stay byte-identical to the contract.
+_CURRENT_TASK_MODE: str = "B"
+_LAST_PRIMARY_SURFACE: Optional[str] = None
+
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
@@ -682,11 +689,12 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, Optional[str]]:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Returns ``(context_string, primary_surface)``. Callers also use
-    ``primary_surface`` to classify task mode (see ``_classify_task_mode``).
+    Side effect: sets the module-level ``_LAST_PRIMARY_SURFACE`` so callers
+    in the same solve() invocation can read it without changing this
+    function's contract-protected signature.
 
     Two improvements over a vanilla rank-and-read loop:
 
@@ -701,13 +709,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, Optional[str]]
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
     """
+    global _LAST_PRIMARY_SURFACE
+    _LAST_PRIMARY_SURFACE = None
     files = _rank_context_files(repo, issue)
     if not files:
-        return "", None
+        return ""
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
     primary_surface = _keyword_concentration_primary(repo, tracked_set, issue)
+    _LAST_PRIMARY_SURFACE = primary_surface
     if primary_surface and primary_surface not in files:
         files.insert(0, primary_surface)
 
@@ -766,7 +777,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, Optional[str]]
         if len(block) <= _STYLE_HINT_BUDGET:
             parts.insert(0, block)
 
-    return "\n\n".join(parts), primary_surface
+    return "\n\n".join(parts)
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1871,18 +1882,18 @@ def _is_volume_task(issue: str) -> bool:
     return bool(_VOLUME_TASK_RE.search(issue))
 
 
-def _classify_task_mode(issue: str, primary_surface: Optional[str]) -> str:
+def _classify_task_mode(task_text: str, primary_surface: Optional[str]) -> str:
     """Classify a task into one of three shapes for prompt + budget routing.
 
     A — single-surface narrow fix: one file is the keyword-concentration
-        winner and the issue mentions at most one path. Discovery is cheap
+        winner and the task mentions at most one path. Discovery is cheap
         because the target is already named; force editing fast.
 
-    B — multi-file: the issue names two or more paths, OR neither a primary
+    B — multi-file: the task names two or more paths, OR neither a primary
         surface nor explicit paths are detectable. Allow one extra discovery
         turn before the hard budget cutoff fires.
 
-    C — single-surface volume rewrite: the issue uses rewrite/replace/migrate
+    C — single-surface volume rewrite: the task uses rewrite/replace/migrate
         wording. Existing volume strategy applies (delete-and-replace blocks).
         Treated as tight-budget like A — once the surface is identified, the
         edit is mechanical and shouldn't need wide grepping.
@@ -1891,9 +1902,9 @@ def _classify_task_mode(issue: str, primary_surface: Optional[str]) -> str:
     (2) which steps `build_budget_pressure_prompt` fires on. See
     `_budget_pressure_steps`.
     """
-    if _is_volume_task(issue):
+    if _is_volume_task(task_text):
         return "C"
-    path_mentions = _extract_issue_path_mentions(issue)
+    path_mentions = _extract_issue_path_mentions(task_text)
     if len(path_mentions) >= 2:
         return "B"
     if primary_surface and len(path_mentions) <= 1:
@@ -1915,12 +1926,8 @@ def _budget_pressure_steps(mode: str) -> set:
     return {2, 4}
 
 
-def build_initial_user_prompt(
-    issue: str,
-    repo_summary: str,
-    preloaded_context: str = "",
-    mode: str = "B",
-) -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+    mode = _CURRENT_TASK_MODE
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -2001,13 +2008,15 @@ your command here
 """
 
 
-def build_budget_pressure_prompt(step: int, mode: str = "B") -> str:
+def build_budget_pressure_prompt(step: int) -> str:
     """Soft + hard "stop exploring, start editing" prompts.
 
     The schedule of which steps fire this prompt is owned by
-    `_budget_pressure_steps(mode)`. This function only chooses the wording
-    based on whether we're in the soft (first) or hard (second) firing.
+    `_budget_pressure_steps(_CURRENT_TASK_MODE)`. This function only chooses
+    the wording based on whether we're in the soft (first) or hard (second)
+    firing for the current task mode.
     """
+    mode = _CURRENT_TASK_MODE
     tight = mode in ("A", "C")
     hard = step >= 3 if tight else step >= 4
     if not hard:
@@ -2344,8 +2353,11 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, primary_surface = build_preloaded_context(repo, issue)
+        global _CURRENT_TASK_MODE
+        preloaded_context = build_preloaded_context(repo, issue)
+        primary_surface = _LAST_PRIMARY_SURFACE
         task_mode = _classify_task_mode(issue, primary_surface)
+        _CURRENT_TASK_MODE = task_mode
         budget_pressure_steps = _budget_pressure_steps(task_mode)
         logs.append(
             f"TASK_MODE: {task_mode} "
@@ -2355,12 +2367,7 @@ def solve(
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": build_initial_user_prompt(
-                    issue, repo_summary, preloaded_context, mode=task_mode
-                ),
-            },
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
@@ -2522,7 +2529,7 @@ def solve(
                 break
 
             if not get_patch(repo).strip() and step in budget_pressure_steps:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step, mode=task_mode)})
+                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
