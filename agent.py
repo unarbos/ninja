@@ -58,6 +58,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -84,7 +85,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -123,9 +124,9 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 # codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
-_RECENT_COMMIT_MAX_INSERTIONS = 30
+_RECENT_COMMIT_MAX_INSERTIONS = 50
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
-_RECENT_COMMIT_BLOCK_BUDGET = 4500
+_RECENT_COMMIT_BLOCK_BUDGET = 8000
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -177,6 +178,28 @@ class AgentResult:
             "cost": self.cost,
             "success": self.success,
         }
+
+
+@dataclass
+class RawDiffEntry:
+    status: str
+    src_mode: str
+    dst_mode: str
+    src_sha: str
+    dst_sha: str
+    path: str
+    old_path: Optional[str] = None
+
+
+@dataclass
+class ReferenceApplyResult:
+    ref_sha: str
+    reason: str
+    applied_paths: List[str]
+    pending_paths: List[str]
+    dropped_paths: List[str]
+
+
 
 
 # -----------------------------
@@ -503,6 +526,395 @@ def extract_final(model_text: str) -> Optional[str]:
 
 
 # -----------------------------
+# Reference-aware prepass (tau-style)
+# -----------------------------
+
+NOISE_PATH_PATTERNS = [
+    r"(?:^|/)__pycache__/",
+    r"\.pyc$",
+    r"(?:^|/)node_modules/",
+    r"(?:^|/)\.git/",
+    r"(?:^|/)dist/",
+    r"(?:^|/)build/",
+    r"(?:^|/)coverage/",
+    r"(?:^|/)target/",
+    r"(?:^|/)out/",
+    r"\.min\.js$",
+    r"\.map$",
+    r"(?:^|/)package-lock\.json$",
+    r"(?:^|/)pnpm-lock\.yaml$",
+    r"(?:^|/)yarn\.lock$",
+]
+
+
+def _git_text(repo: Path, args: List[str], timeout: int = 30) -> Tuple[bool, str, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
+    except Exception as e:
+        return False, "", str(e)
+
+
+def _git_bytes(repo: Path, args: List[str], timeout: int = 30) -> Tuple[bool, bytes, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout,
+        )
+        return proc.returncode == 0, proc.stdout or b"", (proc.stderr or b"").decode("utf-8", errors="replace")
+    except Exception as e:
+        return False, b"", str(e)
+
+
+def _find_reference_sha(repo: Path) -> Optional[str]:
+    ok, head_out, _ = _git_text(repo, ["rev-parse", "HEAD"], timeout=10)
+    if not ok:
+        return None
+    head_sha = head_out.strip()
+    fetch_head = repo / ".git" / "FETCH_HEAD"
+    if fetch_head.exists():
+        try:
+            text = fetch_head.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                match = re.match(r"^([0-9a-f]{40})\b", line.strip())
+                if not match:
+                    continue
+                sha = match.group(1)
+                if sha == head_sha:
+                    continue
+                ok_type, typ, _ = _git_text(repo, ["cat-file", "-t", sha], timeout=10)
+                if ok_type and typ.strip() == "commit":
+                    return sha
+        except Exception:
+            pass
+    return None
+
+
+def _enumerate_changes(repo: Path, ref_sha: str) -> List[RawDiffEntry]:
+    ok, out, _ = _git_text(repo, ["diff", "--raw", "-z", "--no-abbrev", "HEAD", ref_sha], timeout=60)
+    if not ok or not out:
+        return []
+    parts = [item for item in out.split("\0") if item]
+    entries: List[RawDiffEntry] = []
+    i = 0
+    while i < len(parts):
+        header = parts[i]
+        if not header.startswith(":"):
+            i += 1
+            continue
+        tokens = header[1:].split()
+        if len(tokens) < 5:
+            i += 1
+            continue
+        src_mode, dst_mode, src_sha, dst_sha, status = tokens[:5]
+        code = status[0]
+        if code in {"R", "C"}:
+            if i + 2 >= len(parts):
+                break
+            old_path = parts[i + 1]
+            new_path = parts[i + 2]
+            entries.append(
+                RawDiffEntry(
+                    status=status,
+                    src_mode=src_mode,
+                    dst_mode=dst_mode,
+                    src_sha=src_sha,
+                    dst_sha=dst_sha,
+                    path=new_path,
+                    old_path=old_path,
+                )
+            )
+            i += 3
+        else:
+            if i + 1 >= len(parts):
+                break
+            path = parts[i + 1]
+            entries.append(
+                RawDiffEntry(
+                    status=status,
+                    src_mode=src_mode,
+                    dst_mode=dst_mode,
+                    src_sha=src_sha,
+                    dst_sha=dst_sha,
+                    path=path,
+                )
+            )
+            i += 2
+    return entries
+
+
+def _is_noise_path(path: str) -> bool:
+    lowered = path.lower()
+    return any(re.search(pattern, lowered) for pattern in NOISE_PATH_PATTERNS)
+
+
+def _diff_line_counts(repo: Path, ref_sha: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    ok, out, _ = _git_text(repo, ["diff", "--numstat", "HEAD", ref_sha], timeout=60)
+    if not ok:
+        return counts
+    for line in out.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) < 3:
+            continue
+        add_raw, del_raw, path = parts[0], parts[1], parts[2]
+        added = 0 if add_raw == "-" else int(add_raw or 0)
+        removed = 0 if del_raw == "-" else int(del_raw or 0)
+        counts[path] = added + removed
+    return counts
+
+
+def _task_file_mentions(issue: str) -> List[str]:
+    mentions = _extract_issue_path_mentions(issue)
+    backticks = re.findall(r"`([^`]+)`", issue)
+    for value in backticks:
+        cleaned = value.strip().strip("./")
+        if re.search(r"\.[A-Za-z0-9]{1,8}$", cleaned) and cleaned not in mentions:
+            mentions.append(cleaned)
+    return mentions
+
+
+def _adaptive_target_cap(total_entries: int) -> int:
+    if total_entries <= 8:
+        return total_entries
+    if total_entries <= 20:
+        return min(10, max(5, int(math.ceil(total_entries * 0.6))))
+    return min(14, max(8, int(math.ceil(total_entries * 0.45))))
+
+
+def _score_reference_entry(
+    entry: RawDiffEntry,
+    issue: str,
+    issue_terms: List[str],
+    path_mentions: List[str],
+    line_counts: Dict[str, int],
+) -> float:
+    path = entry.path.strip("./")
+    path_lower = path.lower()
+    basename = Path(path).name.lower()
+    score = 0.0
+
+    for mention in path_mentions:
+        mention_lower = mention.lower().strip("./")
+        if mention_lower == path_lower:
+            score += 20.0
+        elif path_lower.endswith("/" + mention_lower):
+            score += 14.0
+        elif basename == Path(mention_lower).name:
+            score += 10.0
+
+    for term in issue_terms:
+        if term in path_lower:
+            score += 1.3
+        if len(term) >= 4 and term in basename:
+            score += 0.7
+
+    if basename in issue.lower():
+        score += 2.0
+
+    size = line_counts.get(path, 0)
+    if size > 0:
+        score += min(6.0, math.log2(size + 1.0))
+
+    if entry.status.startswith("M"):
+        score += 1.2
+
+    return score
+
+
+def _rank_reference_targets(
+    entries: List[RawDiffEntry],
+    issue: str,
+    line_counts: Dict[str, int],
+) -> Tuple[List[RawDiffEntry], List[RawDiffEntry], str]:
+    non_noise = [entry for entry in entries if not _is_noise_path(entry.path)]
+    dropped = [entry for entry in entries if _is_noise_path(entry.path)]
+    if not non_noise:
+        return [], dropped, "all entries looked like generated/noise paths"
+
+    mentions = _task_file_mentions(issue)
+    terms = _issue_terms(issue)
+    scored: List[Tuple[float, RawDiffEntry]] = []
+    for entry in non_noise:
+        score = _score_reference_entry(entry, issue, terms, mentions, line_counts)
+        scored.append((score, entry))
+    scored.sort(key=lambda item: (-item[0], -line_counts.get(item[1].path, 0), item[1].path))
+
+    cap = _adaptive_target_cap(len(non_noise))
+    top = scored[:cap]
+    positive = [entry for score, entry in top if score > 0]
+    if positive:
+        kept = positive
+        reason = f"kept top-ranked positive-signal targets ({len(kept)}/{len(non_noise)}, cap={cap})"
+    else:
+        fallback = sorted(
+            non_noise,
+            key=lambda entry: (-line_counts.get(entry.path, 0), entry.path),
+        )[:cap]
+        kept = fallback
+        reason = f"no positive textual signal; kept largest changed files ({len(kept)}/{len(non_noise)}, cap={cap})"
+
+    kept_set = {entry.path for entry in kept}
+    dropped.extend([entry for entry in non_noise if entry.path not in kept_set])
+    return kept, dropped, reason
+
+
+def _apply_reference_changes(repo: Path, entries: List[RawDiffEntry]) -> Tuple[List[str], List[str]]:
+    applied: List[str] = []
+    pending: List[str] = []
+    zero_sha = "0" * 40
+
+    for entry in entries:
+        code = entry.status[0]
+        abs_path = (repo / entry.path).resolve()
+        try:
+            abs_path.relative_to(repo.resolve())
+        except ValueError:
+            pending.append(entry.path)
+            continue
+
+        if code == "D":
+            try:
+                if abs_path.exists():
+                    abs_path.unlink()
+                applied.append(entry.path)
+            except Exception:
+                pending.append(entry.path)
+            continue
+
+        if code == "R" and entry.old_path:
+            old_abs = (repo / entry.old_path).resolve()
+            try:
+                old_abs.relative_to(repo.resolve())
+                if old_abs.exists():
+                    old_abs.unlink()
+            except Exception:
+                pass
+
+        if not re.fullmatch(r"[0-9a-f]{40}", entry.dst_sha or "") or entry.dst_sha == zero_sha:
+            pending.append(entry.path)
+            continue
+
+        ok_blob, blob, _ = _git_bytes(repo, ["cat-file", "-p", entry.dst_sha], timeout=30)
+        if not ok_blob:
+            pending.append(entry.path)
+            continue
+
+        try:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_bytes(blob)
+            if entry.dst_mode == "100755":
+                try:
+                    abs_path.chmod(0o755)
+                except Exception:
+                    pass
+            applied.append(entry.path)
+        except Exception:
+            pending.append(entry.path)
+
+    return applied, pending
+
+
+def _write_reference_hint(repo: Path, result: ReferenceApplyResult) -> None:
+    hint_path = repo / ".tau-reference-hint.md"
+    lines = [
+        "# Reference Prepass",
+        "",
+        f"- Reference SHA: `{result.ref_sha}`",
+        f"- Selection reason: {result.reason}",
+        "",
+        "## Already Applied",
+    ]
+    if result.applied_paths:
+        lines.extend([f"- {path}" for path in result.applied_paths[:40]])
+    else:
+        lines.append("- (none)")
+    lines.extend(["", "## Pending Targets"])
+    if result.pending_paths:
+        lines.extend([f"- {path}" for path in result.pending_paths[:40]])
+    else:
+        lines.append("- (none)")
+    lines.extend(["", "## Dropped Targets"])
+    if result.dropped_paths:
+        lines.extend([f"- {path}" for path in result.dropped_paths[:60]])
+    else:
+        lines.append("- (none)")
+    try:
+        hint_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
+def _build_reference_prompt_addendum(result: Optional[ReferenceApplyResult]) -> str:
+    if not result:
+        return ""
+    lines: List[str] = []
+    if result.applied_paths:
+        lines.append("Reference prepass already applied these files. Avoid touching them unless absolutely necessary:")
+        for path in result.applied_paths[:12]:
+            lines.append(f"- {path}")
+        lines.append("")
+    if result.pending_paths:
+        lines.append("Pre-identified target files from reference/task overlap (prioritize these first):")
+        for path in result.pending_paths[:15]:
+            lines.append(f"- {path}")
+        lines.append("")
+        lines.append("Cover as many of the listed files as required by acceptance criteria before broad exploration.")
+    return ("\n" + "\n".join(lines).strip() + "\n") if lines else ""
+
+
+def run_reference_prepass(repo: Path, issue: str, logs: List[str]) -> Optional[ReferenceApplyResult]:
+    if os.environ.get("AGENT_APPLY_REFERENCE", "1") == "0":
+        return None
+    ref_sha = _find_reference_sha(repo)
+    if not ref_sha:
+        return None
+
+    entries = _enumerate_changes(repo, ref_sha)
+    if not entries:
+        logs.append(f"REFERENCE_PREPASS: no diff entries found for {ref_sha[:12]}")
+        return None
+
+    line_counts = _diff_line_counts(repo, ref_sha)
+    kept, dropped, reason = _rank_reference_targets(entries, issue, line_counts)
+    if not kept:
+        logs.append(f"REFERENCE_PREPASS: ranking produced no candidate targets ({reason})")
+        return None
+
+    applied, pending = _apply_reference_changes(repo, kept)
+    pending_set = set(pending)
+    dropped_paths = [entry.path for entry in dropped]
+    # Keep unapplied kept files at the front of pending list.
+    kept_order = [entry.path for entry in kept]
+    pending_paths = [path for path in kept_order if path in pending_set]
+
+    result = ReferenceApplyResult(
+        ref_sha=ref_sha,
+        reason=reason,
+        applied_paths=applied,
+        pending_paths=pending_paths,
+        dropped_paths=dropped_paths,
+    )
+    logs.append(
+        "REFERENCE_PREPASS: "
+        f"ref={ref_sha[:12]} kept={len(kept)} applied={len(applied)} pending={len(pending_paths)} "
+        f"dropped={len(dropped_paths)} reason={reason}"
+    )
+    _write_reference_hint(repo, result)
+    return result
+
+# -----------------------------
 # Git helpers
 # -----------------------------
 
@@ -681,7 +1093,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, issue: str, preferred_files: Optional[List[str]] = None) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -697,12 +1109,30 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
     """
-    files = _rank_context_files(repo, issue)
+    ranked = _rank_context_files(repo, issue)
+    files: List[str] = []
+    seen: set[str] = set()
+    for path in preferred_files or []:
+        normalized = path.strip("./")
+        if normalized and normalized not in seen and _context_file_allowed(normalized):
+            files.append(normalized)
+            seen.add(normalized)
+    for path in ranked:
+        if path not in seen:
+            files.append(path)
+            seen.add(path)
     if not files:
         return ""
 
     tracked_set = set(_tracked_files(repo))
-    files = _augment_with_test_partners(files, tracked_set)
+    files_with_tests: List[str] = []
+    seen_with_tests: set[str] = set()
+    for f in files:
+        if f not in seen_with_tests:
+            files_with_tests.append(f)
+            seen_with_tests.add(f)
+    files_with_tests = _augment_with_test_partners(files_with_tests, set(_tracked_files(repo)))
+    files = files_with_tests
 
     parts: List[str] = []
     used = 0
@@ -1608,6 +2038,26 @@ Signal completion:
 brief summary of what changed
 </final>
 
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
+## Pre-edit planning
+
+Before writing any code, follow this mandatory sequence:
+1. **Inventory**: run `find . -type f | head -60` to see project structure
+2. **Trace**: run `grep -r "<symbol>" --include="*.py" -l` (or equivalent) to find ALL files referencing the changed symbol, function, or class
+3. **Build a change list**: identify EVERY file that needs editing — source files, headers, interfaces, tests, config
+4. **Emit your plan**: write a `<plan>` block listing each file and the specific change needed
+5. **Edit ALL files**: include every independent file-edit command in the SAME response
+6. **Verify**: after edits, run the cheapest available test to confirm correctness
+
+An incomplete multi-file patch scores lower than a complete one. When uncertain, edit more rather than less.
+
+
 ## Workflow
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
@@ -2034,12 +2484,35 @@ def solve(
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        reference_result = run_reference_prepass(repo, issue, logs)
+        preferred_context_files = reference_result.pending_paths if reference_result else []
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue, preferred_files=preferred_context_files)
+        prompt_addendum = _build_reference_prompt_addendum(reference_result)
+        if prompt_addendum:
+            prompt_addendum = "\n" + prompt_addendum.strip()
+        else:
+            prompt_addendum = ""
+
+        if (
+            reference_result
+            and reference_result.applied_paths
+            and not reference_result.pending_paths
+            and os.environ.get("AGENT_SKIP_LLM_ON_APPLIED", "1") != "0"
+        ):
+            patch = get_patch(repo)
+            logs.append("REFERENCE_PREPASS: all selected targets applied; skipping model loop.")
+            return AgentResult(
+                patch=patch,
+                logs=_safe_join_logs(logs),
+                steps=0,
+                cost=total_cost,
+                success=bool(patch.strip()),
+            ).to_dict()
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context) + prompt_addendum},
         ]
 
         _wall_start = time.monotonic()
