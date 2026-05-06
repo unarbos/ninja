@@ -2119,12 +2119,6 @@ def solve(
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
-        # v24: Stagnation detection — if the patch stops changing for N consecutive
-        # steps we are in an unproductive loop; break early and return the partial patch.
-        _prev_patch_hash: Optional[str] = None
-        _stagnant_steps = 0
-        _MAX_STAGNANT_STEPS = 4
-
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
@@ -2299,25 +2293,6 @@ def solve(
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
-
-            # v24: Stagnation detection — break if patch stops changing for _MAX_STAGNANT_STEPS steps.
-            # Avoids burning remaining budget on a loop that has already converged.
-            _cur_patch = get_patch(repo)
-            if _cur_patch.strip():
-                import hashlib as _hashlib
-                _cur_hash = _hashlib.md5(_cur_patch.encode()).hexdigest()
-                if _cur_hash == _prev_patch_hash:
-                    _stagnant_steps += 1
-                    if _stagnant_steps >= _MAX_STAGNANT_STEPS:
-                        logs.append(
-                            f"STAGNATION_STOP: patch unchanged for {_MAX_STAGNANT_STEPS} steps; "
-                            "returning best patch."
-                        )
-                        success = True
-                        break
-                else:
-                    _stagnant_steps = 0
-                    _prev_patch_hash = _cur_hash
 
         patch = get_patch(repo)
         if patch.strip() and not success:
