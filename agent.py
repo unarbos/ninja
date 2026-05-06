@@ -1536,7 +1536,7 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if lowered in _SYMBOL_STOP:
             continue
         is_compound = any(c.isupper() for c in token[1:]) or "_" in token
-        if not is_compound and len(token) < 4:
+        if not is_compound and len(token) < 5:
             continue
         seen.add(token)
         out.append(token)
@@ -1607,6 +1607,14 @@ Signal completion:
 <final>
 brief summary of what changed
 </final>
+
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
 
 ## Workflow
 
