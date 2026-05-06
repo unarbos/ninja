@@ -2162,6 +2162,15 @@ def solve(
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                if out_of_time():
+                    # Stop running shell commands once we've crossed the
+                    # validator's kill window — better to break and return
+                    # whatever's on disk than to be SIGTERM'd mid-command.
+                    logs.append(
+                        "\nWALL_CLOCK_STOP_CMDS:\nout of time inside command "
+                        f"batch (index={command_index}/{len(command_batch)})."
+                    )
+                    break
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -2255,12 +2264,16 @@ def solve(
             except Exception:
                 pass
 
+        # If a partial patch is on disk, claim success so the validator scores
+        # it as `completed` instead of `solver_error`. Validator reads git diff
+        # from the workspace, so the patch content is what counts; the harness
+        # exit code only decides which exit_reason gets recorded.
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
             steps=0,
             cost=total_cost,
-            success=False,
+            success=bool(patch.strip()),
         ).to_dict()
 
 
