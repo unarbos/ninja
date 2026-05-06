@@ -113,7 +113,7 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_CRITERIA_NUDGES = 2    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1465,11 +1465,19 @@ def _criterion_keywords(criterion: str) -> List[str]:
 
 
 def _patch_added_text(patch: str) -> str:
-    """Concat all + lines of the patch (lower-cased) for keyword search."""
+    """Concat real-code + lines of the patch (lower-cased) for keyword search.
+
+    Skips comment-only lines so the criteria gate can't be satisfied by adding
+    `# handle X` over the missing logic — the judge scores behavior, not text.
+    """
     out: List[str] = []
     for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            out.append(line[1:])
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:]
+        if _line_is_comment(body):
+            continue
+        out.append(body)
     return "\n".join(out).lower()
 
 
@@ -1488,8 +1496,11 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         keywords = _criterion_keywords(crit)
         if not keywords:
             continue
-        # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
+        # word-boundary match so `auth` doesn't satisfy on `author`/`authority`
+        hits = sum(
+            1 for kw in keywords
+            if re.search(rf"\b{re.escape(kw)}\b", added_lower)
+        )
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
