@@ -7,6 +7,12 @@ Example:
         --wallet-hotkey default \
         --hotkey 5... \
         --commit "github-pr:unarbos/ninja#12@0123456789abcdef0123456789abcdef01234567"
+
+    ./scripts/commit_on_chain.py \
+        --wallet-name my-wallet \
+        --wallet-hotkey default \
+        --hotkey 5... \
+        --commit "github-pr-head:unarbos/ninja@0123456789abcdef0123456789abcdef01234567"
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ HOTKEY_SPENT_SINCE_BLOCK = 8_104_340
 NINJA_PR_COMMITMENT_RE = re.compile(
     r"^github-pr:unarbos/ninja#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
+NINJA_PR_HEAD_COMMITMENT_RE = re.compile(
+    r"^github-pr-head:unarbos/ninja@(?P<sha>[0-9a-fA-F]{7,64})$"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,12 +43,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "commitment",
         nargs="?",
-        help='Commitment string, usually "github-pr:unarbos/ninja#<pr>@<head-sha>".',
+        help=(
+            'Commitment string: "github-pr:unarbos/ninja#<pr>@<head-sha>" '
+            'or "github-pr-head:unarbos/ninja@<head-sha>".'
+        ),
     )
     parser.add_argument(
         "--commit",
         dest="commit",
-        help='Commitment string, usually "github-pr:unarbos/ninja#<pr>@<head-sha>".',
+        help=(
+            'Commitment string: "github-pr:unarbos/ninja#<pr>@<head-sha>" '
+            'or "github-pr-head:unarbos/ninja@<head-sha>".'
+        ),
     )
     parser.add_argument(
         "--wallet-name",
@@ -129,10 +144,14 @@ def validate_commitment(commitment: str) -> None:
             f"{MAX_RAW_COMMITMENT_BYTES} bytes"
         )
 
-    if not NINJA_PR_COMMITMENT_RE.fullmatch(commitment):
+    if not (
+        NINJA_PR_COMMITMENT_RE.fullmatch(commitment)
+        or NINJA_PR_HEAD_COMMITMENT_RE.fullmatch(commitment)
+    ):
         raise ValueError(
-            "commitment must match github-pr:unarbos/ninja#<pr-number>@<head-sha>; "
-            "raw owner/repo@sha commitments are not accepted by the validator"
+            "commitment must match github-pr:unarbos/ninja#<pr-number>@<head-sha> "
+            "or github-pr-head:unarbos/ninja@<head-sha>; raw owner/repo@sha "
+            "commitments are not accepted by the validator"
         )
 
 
