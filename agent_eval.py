@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -87,12 +88,13 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
+
 # OUTPUT TOKEN CAPS — per call type. Output tokens are the dominant cost and
 # the dominant latency component (sequential generation). The previous global
 # 8192 cap was rarely needed; most turns either emit a short plan + 1-3 commands
 # or a short final summary.
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "3072"))   # exploration / patch turns
-MAX_TOKENS_REFINEMENT = 1200    # polish / self-check / syntax-fix / test-fix / coverage / criteria
+MAX_TOKENS_REFINEMENT = 1200    # polish / self-check / syntax-fix / test-fix
 MAX_TOKENS_FINAL = 256          # plain finalisation when we already know it's done
 
 # INPUT BUDGET — trimmed from previous defensive values. The agent rarely
@@ -105,17 +107,6 @@ MAX_PRELOADED_FILES = 8
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
-# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
-# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
-HTTP_MAX_RETRIES = 3
-HTTP_RETRY_BASE_BACKOFF = 1.0
-MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
-
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -123,8 +114,6 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -301,13 +290,14 @@ def chat_completion(
     api_key: Optional[str],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = 120,
-    max_retries: int = HTTP_MAX_RETRIES,
+    max_retries: int = 1,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
     """OpenAI-compatible /v1/chat/completions client.
 
-    Retries with exponential backoff on transient transport failures (timeout,
-    connection reset, HTTP 5xx, HTTP 429). Client-side 4xx (other than 429) bail
-    out immediately because retrying won't change the outcome.
+    Retries once on transient transport failures (timeout, connection reset,
+    HTTP 5xx). Client-side errors (4xx) bail out immediately because retrying
+    won't change the outcome and burns wall-clock budget that the agent needs
+    for actual editing.
 
     Note on caching: this client sends the messages list as-is. Prompt caching
     (if enabled by the validator proxy) is driven entirely by the stability of
@@ -342,24 +332,17 @@ def chat_completion(
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            retryable = (500 <= e.code < 600) or e.code == 429
-            if retryable and attempt < max_retries:
+            if 500 <= e.code < 600 and attempt < max_retries:
                 last_error = e
-                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
+                time.sleep(1.0)
                 continue
             raise RuntimeError(f"HTTP {e.code} from model endpoint: {err_body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries:
                 last_error = e
-                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
+                time.sleep(1.0)
                 continue
             raise RuntimeError(f"Model request failed: {e}") from e
-        except json.JSONDecodeError as e:
-            if attempt < max_retries:
-                last_error = e
-                time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
-                continue
-            raise RuntimeError(f"Model returned non-JSON: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
 
@@ -632,62 +615,20 @@ def get_repo_summary(repo: Path) -> str:
 
 
 TEXT_FILE_EXTENSIONS = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cs",
-    ".css",
-    ".go",
-    ".h",
-    ".hpp",
-    ".html",
-    ".java",
-    ".js",
-    ".jsx",
-    ".json",
-    ".kt",
-    ".md",
-    ".php",
-    ".py",
-    ".rb",
-    ".rs",
-    ".scss",
-    ".sh",
-    ".sql",
-    ".svelte",
-    ".swift",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".txt",
-    ".vue",
-    ".xml",
-    ".yaml",
-    ".yml",
+    ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html",
+    ".java", ".js", ".jsx", ".json", ".kt", ".md", ".php", ".py", ".rb",
+    ".rs", ".scss", ".sh", ".sql", ".svelte", ".swift", ".toml", ".ts",
+    ".tsx", ".txt", ".vue", ".xml", ".yaml", ".yml",
 }
 
 CONTEXT_SKIP_PARTS = {
-    ".git",
-    ".next",
-    ".pytest_cache",
-    ".venv",
-    "__pycache__",
-    "build",
-    "coverage",
-    "dist",
-    "node_modules",
-    "target",
-    "vendor",
+    ".git", ".next", ".pytest_cache", ".venv", "__pycache__", "build",
+    "coverage", "dist", "node_modules", "target", "vendor",
 }
 
 SECRETISH_PARTS = {
-    ".env",
-    ".npmrc",
-    ".pypirc",
-    ".netrc",
-    "credentials",
-    "secret",
-    "secrets",
+    ".env", ".npmrc", ".pypirc", ".netrc",
+    "credentials", "secret", "secrets",
 }
 
 
@@ -815,7 +756,7 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
+        r"(?<![\\w.-])([\\w./-]+\\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -828,27 +769,9 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
 
 def _issue_terms(issue: str) -> List[str]:
     stop = {
-        "about",
-        "after",
-        "also",
-        "before",
-        "change",
-        "code",
-        "file",
-        "from",
-        "have",
-        "issue",
-        "make",
-        "need",
-        "should",
-        "that",
-        "their",
-        "there",
-        "this",
-        "update",
-        "using",
-        "when",
-        "with",
+        "about", "after", "also", "before", "change", "code", "file", "from",
+        "have", "issue", "make", "need", "should", "that", "their", "there",
+        "this", "update", "using", "when", "with",
     }
     terms: List[str] = []
     for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
@@ -877,17 +800,6 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # -----------------------------
 # Hunk classifiers + diff hygiene
 # -----------------------------
-#
-# Two failure modes hurt the 2/3 Cursor-similarity score: drive-by whitespace /
-# comment / blank-line edits, and patches that cover the wrong files. The
-# helpers below detect both. They're applied at two stages:
-#
-#   1. At patch-return time: low-signal hunks are silently dropped from the
-#      final diff (so the validator never sees them).
-#   2. Inside the loop: when the model's draft contains junk, we queue a
-#      "polish" turn that asks the model to revert those hunks itself, since
-#      doing so cleanly is safer than mechanical filtering for borderline cases
-#      (e.g., a comment edit that genuinely matters).
 
 _COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
 _BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
@@ -907,13 +819,11 @@ def _line_is_comment(line: str) -> bool:
 
 
 def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
-    """Hunk that only changes blank-line layout."""
     body = [line for line in added + removed if line.strip()]
     return not body and bool(added or removed)
 
 
 def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
-    """Added and removed lines are identical after stripping whitespace."""
     if not added and not removed:
         return False
     a = sorted(line.strip() for line in added if line.strip())
@@ -931,12 +841,6 @@ def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
 
 
 def _strip_low_signal_hunks(diff_output: str) -> str:
-    """Drop blank-only / whitespace-only / comment-only hunks from each file.
-
-    Whole-file blocks with no @@ markers are kept verbatim because they are
-    file-create / file-delete / binary patches that the hunk classifier
-    can't reason about.
-    """
     if not diff_output.strip():
         return diff_output
 
@@ -969,7 +873,6 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
             substantive.append(hunk_text)
         if substantive:
             out.append(header + "".join(substantive))
-        # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
@@ -977,7 +880,6 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
 
 
 def _diff_low_signal_summary(patch: str) -> str:
-    """Human-readable summary of low-signal hunks for the polish prompt."""
     if not patch.strip():
         return ""
 
@@ -1024,7 +926,6 @@ def _diff_low_signal_summary(patch: str) -> str:
 
 
 def _patch_changed_files(patch: str) -> List[str]:
-    """Return the list of `b/` paths touched by a unified diff, in order."""
     seen: List[str] = []
     for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
         path = match.group(2)
@@ -1034,208 +935,18 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
-    """All paths the issue explicitly mentions must appear in the patch."""
-    return not _uncovered_required_paths(patch, issue_text)
-
-
-def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
-    """Required paths from the issue that the patch doesn't touch yet.
-
-    Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
-    """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
-        return []
-    changed = set(_patch_changed_files(patch))
-    missing: List[str] = []
-    for req in required:
-        if not any(req == c or c.endswith("/" + req) for c in changed):
-            missing.append(req)
-    return missing
-
-
-# Maximum number of acceptance-criterion bullets we'll surface to the model.
-_MAX_CRITERIA = 8
-# Length cap per criterion text (one short sentence).
-_MAX_CRITERION_CHARS = 220
-# Drop short / generic words when matching criteria against the patch body.
-_CRITERION_STOP = frozenset({
-    "a", "an", "and", "as", "at", "be", "but", "by", "do", "for", "from",
-    "if", "in", "is", "it", "of", "on", "or", "so", "that", "the", "this",
-    "to", "we", "with", "we", "our", "must", "should", "shall", "can", "may",
-    "will", "implement", "add", "support", "ensure", "make", "use", "create",
-    "fix", "update", "change", "set", "include", "handle", "allow", "also",
-    "when", "where", "which", "who", "what", "all", "any", "each", "every",
-    "task", "issue", "code",
-})
-
-
-def _extract_acceptance_criteria(issue_text: str) -> List[str]:
-    """Extract per-checkpoint acceptance criteria from the issue text.
-
-    The judge frequently dings king for "missing X / lacks Y / omits Z" when
-    the issue is a multi-checkpoint list. The path-coverage gate only sees
-    files; this gate sees the *checkpoints* themselves, so we can surface
-    "you addressed 1 of 5" before <final>.
-
-    Heuristic: look for numbered lines (`1.` / `1)`) and bullet lines
-    (`- ` / `* ` / `• `). Fall back to imperative sentences containing
-    must/should/implement/add/support/ensure when no list structure exists.
-    """
-    if not issue_text:
-        return []
-    lines = issue_text.splitlines()
-    bullets: List[str] = []
-    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
-    for line in lines:
-        m = bullet_re.match(line)
-        if not m:
-            continue
-        text = m.group(1).strip()
-        if len(text) < 6:
-            continue
-        bullets.append(text[:_MAX_CRITERION_CHARS])
-        if len(bullets) >= _MAX_CRITERIA:
-            break
-
-    if bullets:
-        return bullets
-
-    # No list structure — fall back to imperative sentences.
-    sentences = re.split(r"(?<=[.!?])\s+", issue_text)
-    imperative_re = re.compile(
-        r"\b(must|should|shall|implement|add|support|ensure|create|fix|update|"
-        r"return|expose|wire|require|render|emit|reject|accept|disable|enable|"
-        r"validate|persist|store|load|cache|rename|remove|delete|register)\b",
-        re.IGNORECASE,
-    )
-    for sentence in sentences:
-        s = sentence.strip()
-        if len(s) < 12 or len(s) > _MAX_CRITERION_CHARS:
-            continue
-        if imperative_re.search(s):
-            bullets.append(s[:_MAX_CRITERION_CHARS])
-            if len(bullets) >= _MAX_CRITERIA:
-                break
-    return bullets
-
-
-def _criterion_keywords(criterion: str) -> List[str]:
-    """Yank the content tokens out of one criterion sentence.
-
-    Keep tokens >= 4 chars that aren't stopwords; preserve dotted file paths
-    and identifiers as-is. Used to test whether a criterion is "mentioned"
-    anywhere in the patch's added lines.
-    """
-    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}", criterion)
-    keywords: List[str] = []
-    seen: set[str] = set()
-    for tok in raw_tokens:
-        norm = tok.strip("./-")
-        if not norm:
-            continue
-        if norm.lower() in _CRITERION_STOP:
-            continue
-        if len(norm) < 4 and not (norm[0].isupper() or "." in norm):
-            continue
-        if norm in seen:
-            continue
-        seen.add(norm)
-        keywords.append(norm)
-    return keywords
-
-
-def _patch_added_text(patch: str) -> str:
-    """Concatenate all '+' lines (excluding the '+++' file headers)."""
-    if not patch:
-        return ""
-    added: List[str] = []
-    for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            added.append(line[1:])
-    return "\n".join(added)
-
-
-def _keyword_in_text(keyword: str, lower_text: str) -> bool:
-    """True if keyword (or its dotted stem) appears in lower_text.
-
-    Path-style keywords like 'groups.tsx' should also match when the patch
-    refers to the file's stem ('groups') in surrounding code -- the path is
-    separately verified by the path-coverage gate, so we just need evidence
-    that the criterion's *substance* shows up.
-    """
-    k = keyword.lower()
-    if k in lower_text:
         return True
-    if "." in k:
-        stem = k.split(".", 1)[0]
-        if len(stem) >= 4 and stem in lower_text:
-            return True
-    return False
-
-
-def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
-    """Acceptance criteria whose substance doesn't show up in the added lines.
-
-    Dotted-path keywords (e.g. ``sms-terms.tsx``) are treated as REQUIRED:
-    if a criterion names a specific file and the patch's added lines don't
-    mention that file (or its stem), the criterion counts as unaddressed
-    regardless of how many incidental content keywords match. This avoids
-    false-positive "addressed" verdicts from generic words like ``required``
-    or ``page`` showing up in unrelated added lines.
-
-    For criteria with no path keywords, fall back to a content-keyword
-    threshold: 1 hit suffices for short criteria, 2 hits for long ones.
-    """
-    criteria = _extract_acceptance_criteria(issue_text)
-    if not criteria:
-        return []
-    added = _patch_added_text(patch)
-    if not added:
-        return list(criteria)
-    added_lower = added.lower()
-    unaddressed: List[str] = []
-    for crit in criteria:
-        keywords = _criterion_keywords(crit)
-        if not keywords:
-            continue
-        path_kws = [k for k in keywords if "." in k]
-        content_kws = [k for k in keywords if "." not in k]
-
-        if path_kws:
-            # At least one named path (or its >=4-char stem) must be touched
-            # in the added lines; otherwise the substance of the criterion
-            # is missing regardless of content overlap.
-            if not any(_keyword_in_text(k, added_lower) for k in path_kws):
-                unaddressed.append(crit)
-                continue
-
-        if not content_kws:
-            # Criterion was path-only; the path check above already passed.
-            continue
-
-        threshold = 2 if len(content_kws) >= 6 else 1
-        hits = sum(1 for k in content_kws if _keyword_in_text(k, added_lower))
-        if hits < threshold:
-            unaddressed.append(crit)
-    return unaddressed[:_MAX_CRITERIA]
+    changed = set(_patch_changed_files(patch))
+    return all(any(req == c or c.endswith("/" + req) for c in changed) for req in required)
 
 
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
-#
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
 
-
-_SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
+_SYNTAX_TIMEOUT = 6
 
 
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1261,11 +972,6 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
-    """`node --check file.js` — bytecode parse only, no execution.
-
-    Skips the check entirely when `node` is unavailable; we'd rather miss a
-    syntax issue than waste 10 seconds on a NotFound retry.
-    """
     if not _has_executable("node"):
         return None
     proc_result = run_command(
@@ -1296,95 +1002,7 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
-_BRACE_BALANCE_SUFFIXES = {
-    ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
-    ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
-}
-
-
-def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
-    """Cheap brace/paren/bracket balance check for languages without a parser.
-
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
-    """
-    full = (repo / relative_path).resolve()
-    try:
-        full.relative_to(repo.resolve())
-    except (ValueError, RuntimeError):
-        return None
-    if not full.exists():
-        return None
-    try:
-        source = full.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-
-    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
-    i = 0
-    n = len(source)
-    in_str: Optional[str] = None
-    in_line_comment = False
-    in_block_comment = False
-    while i < n:
-        ch = source[i]
-        nxt = source[i + 1] if i + 1 < n else ""
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str is not None:
-            if ch == "\\" and nxt:
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        # Not in string/comment.
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-            i += 1
-            continue
-        if ch in counts:
-            counts[ch] += 1
-        i += 1
-
-    diffs: List[str] = []
-    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
-        delta = counts[opener] - counts[closer]
-        if delta != 0:
-            diffs.append(f"{opener}/{closer} delta={delta:+d}")
-    if diffs:
-        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
-    return None
-
-
 def _check_syntax(repo: Path, patch: str) -> List[str]:
-    """Best-effort multi-language syntax check on touched files.
-
-    Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
-    """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
@@ -1393,21 +1011,14 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_python_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
-            if result is None and suffix == ".js":
-                # node was unavailable; fall back to brace balance check.
-                result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        elif suffix in _BRACE_BALANCE_SUFFIXES:
-            result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
     return errors
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
     try:
         proc = subprocess.run(
             ["command", "-v", name],
@@ -1423,28 +1034,19 @@ def _has_executable(name: str) -> bool:
 
 
 def _shell_quote(value: str) -> str:
-    """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
 # -----------------------------
-# Companion-test discovery + execution
+# Companion-test discovery
 # -----------------------------
-#
-# When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
-# repo, running that test before <final> catches a class of regressions the
-# scope/judge gates can't see. Cursor's baseline diffs almost always update
-# tests in lockstep with source edits, and a fast pytest -k catches "I broke
-# the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python — the most common shapes.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
@@ -1453,7 +1055,6 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
@@ -1461,7 +1062,6 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
 
 
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
@@ -1482,7 +1082,6 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
 
 
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
-    """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
         return files
     augmented: List[str] = []
@@ -1501,12 +1100,6 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
-#
-# `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough — a one-line bug fix often
-# names a function or class without mentioning the file. We extract identifier-
-# shaped tokens from the issue and grep the repo for them; files that contain
-# those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
 _SYMBOL_STOP = {
@@ -1523,12 +1116,6 @@ _SYMBOL_STOP = {
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
-    """Pull identifier-shaped tokens from the issue text.
-
-    Heuristic: any CamelCase or snake_case identifier, plus any all-lowercase
-    identifier of length >=4 (so we catch `pairs`, `solve`, `parse`, etc.).
-    Stop-words and very short tokens are filtered out.
-    """
     seen: set = set()
     out: List[str] = []
     for match in _SYMBOL_RE.finditer(issue_text):
@@ -1553,28 +1140,14 @@ def _symbol_grep_hits(
     tracked_set: set,
     issue_text: str,
 ) -> Dict[str, int]:
-    """Count how many extracted symbols each tracked file references.
-
-    Plain mentions get +1 per symbol; *call-site* hits (the symbol immediately
-    followed by '(') get +2 extra so caller files float to the top of the
-    preload list. Surfacing callers directly addresses the judge criticism
-    that king sometimes makes architectural mistakes (e.g. picking a
-    per-instance design when the right design is global) — the model gains
-    visibility into how an API is actually consumed before it decides what
-    to change.
-
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
-    to ranking, never the only signal.
-    """
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
-
-    def _grep_files(pattern: str) -> List[str]:
+    for symbol in symbols:
         try:
             proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", pattern],
+                ["git", "grep", "-l", "-F", "--", symbol],
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1582,28 +1155,16 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            return []
+            continue
         if proc.returncode not in (0, 1):
-            return []
-        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-
-    for symbol in symbols:
-        for relative_path in _grep_files(symbol):
-            if relative_path not in tracked_set:
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
                 continue
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
-        # Caller pass: '<symbol>(' — function-call usages (and class
-        # constructors, e.g. `Foo(...)`). Skip names too short to be useful.
-        if len(symbol) < 3 or not symbol[0].isalpha() and symbol[0] != "_":
-            continue
-        for relative_path in _grep_files(symbol + "("):
-            if relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 2
     return hits
 
 
@@ -1611,10 +1172,6 @@ def _symbol_grep_hits(
 # Prompting
 # -----------------------------
 
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
-#
 # CACHEABLE: This system prompt is identical across every task. It sits at the
 # very start of the message list, so a caching proxy will hit it on every
 # request after the first. KEEP IT STABLE — any edit invalidates the cache.
@@ -1638,13 +1195,12 @@ Plan-first: in your FIRST response, output a brief <plan> listing target files a
 
 Rules:
 - Smallest diff that meets every criterion. Surplus lines hurt the similarity score.
-- Edit the EXACT files the issue names or implies. Do not invent new files, modules, or "manager" classes the issue doesn't ask for.
 - If a file is in the preloaded snippets, edit it directly — do NOT re-read it.
 - When several files need changes, send every independent edit command in the SAME response. Do not split one patch across turns.
 - Match indentation, quotes, semicolons, trailing commas, blank-line and brace style EXACTLY from surrounding code.
 - Match identifier and string tokens to existing code.
 - The preload includes companion test files. When you patch a source file, update its companion test in the SAME response if affected.
-- AVOID: whitespace-only edits, comment-only edits, blank-line shuffling, import reorders, type-annotation drive-bys, dead-code removal, defensive checks, renames, signature changes, accent normalisation, file-mode flips, or refactors not required by the task.
+- AVOID: whitespace-only edits, comment-only edits, blank-line shuffling, import reorders, type-annotation drive-bys, dead-code removal, defensive checks, or refactors not required by the task.
 - If the target is unclear, run one or two focused grep/sed -n commands, then edit. Do not loop on inspection.
 - Verify with one cheap targeted check on a touched file (`python -m py_compile X`, `node --check X`, `pytest -k name X`, `tsc --noEmit X`). Skip full installs, full builds, broad suites.
 - If a verification command is slow or deps are missing, keep the patch and finalize.
@@ -1682,145 +1238,64 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
 
 
 def build_no_command_repair_prompt() -> str:
-    return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
-
-If the patch is complete, respond with <final>summary</final>. Otherwise continue
-by issuing exactly one bash command in this format:
-
-<command>
-your command here
-</command>
-"""
+    return (
+        "Your last response had no <command> or <final> block.\n"
+        "If the patch is complete, reply <final>summary</final>.\n"
+        "Otherwise issue exactly one command:\n\n<command>\n...\n</command>"
+    )
 
 
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
-        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
-    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
+        return "Budget check: no patch yet. Next command must edit the most likely file(s) using the issue + observed snippets. No more broad exploration."
+    return "Hard budget check: still no patch. Next command must create a minimal best-effort change for the clearest acceptance criterion. No more inspection until a patch exists."
 
 
 def build_polish_prompt(junk_summary: str) -> str:
-    """Ask the model to revert specific low-signal hunks before final.
-
-    The LLM judge frequently penalises patches for "unrelated changes",
-    "unnecessary churn", and "cosmetic edits". Be explicit about which
-    classes of changes count as scope creep so the model knows what to
-    revert and what to keep.
-    """
     return (
-        "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
-        f"  {junk_summary}\n\n"
-        "Revert ONLY those hunks (sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder "
-        "imports, do not touch unrelated lines.\n\n"
-        "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (the diff judge consistently penalises these as "
-        "'unrelated' or 'unnecessary churn'):\n"
-        "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
-        "  - Pure docstring/comment rewordings where logic is unchanged\n"
-        "  - Whitespace-only or trailing-newline-only diffs\n"
-        "  - Accent / character normalisation in identifiers or strings\n"
-        "  - Drive-by type-annotation, import reorder, or rename edits\n"
-        "  - Cosmetic refactors not asked for by the task\n\n"
-        "Keep substantive code changes. After cleanup, end with "
-        "<final>summary</final>. If you cannot cleanly revert without "
-        "breaking the substantive edits, finalize immediately and keep the "
-        "patch as-is."
-    )
-
-
-def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
-    """Tell the model which issue-mentioned paths are still untouched.
-
-    The LLM diff judge most often docks king for incomplete coverage. When the
-    issue names specific files and the draft skips them, surface that gap
-    directly — much cheaper than hoping the self-check catches it.
-    """
-    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
-    return (
-        "Coverage gap — the task explicitly mentions these path(s) but your "
-        "current patch does NOT touch them:\n"
-        f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n\n"
-        "After your edits, end with <final>summary</final>."
-    )
-
-
-def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
-    """Tell the model which acceptance-criteria checkpoints look unaddressed.
-
-    Direct response to the rationale finding that king regularly addresses
-    only 1 of N acceptance criteria — surfacing the missing checkpoints
-    explicitly, with the criterion text itself, is more actionable than
-    a generic self-check.
-    """
-    bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
-    return (
-        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
-        "the task are NOT clearly reflected in your patch's added lines:\n"
-        f"  {bullets}\n\n"
-        "For each one, decide:\n"
-        "  (a) you already addressed it but the keywords differ -> respond "
-        "with <final>summary</final> and explain why in the summary; OR\n"
-        "  (b) it really IS missing -> issue the additional <command> blocks "
-        "needed to satisfy it, then end with <final>summary</final>.\n\n"
-        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
-        "code. Add only what is required to cover the listed criteria.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n"
+        f"Cleanup: your draft has low-signal hunks: {junk_summary}\n\n"
+        "Revert ONLY those hunks (sed/cat/python). Do not add edits, refactor, "
+        "or touch unrelated lines. Then <final>summary</final>. If you can't "
+        "cleanly revert without breaking real edits, finalize as-is."
     )
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 3000
         else patch[:1500] + "\n...[truncated]...\n" + patch[-1200:]
     )
     return (
-        "Self-check pass. Review your draft patch for:\n"
-        "  - any acceptance criterion from the task NOT addressed\n"
-        "  - companion test files that the source change broke or that need updating\n"
-        "  - unrelated churn (whitespace, comments, refactors, type-annotation drive-bys)\n"
-        "  - newly-introduced bugs or syntax errors\n\n"
-        "Your patch:\n```diff\n"
-        f"{truncated}\n```\n\n"
-        "Task:\n"
-        f"{issue_text[:1500]}\n\n"
-        "If the patch is good, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response that "
-        "fix only the listed issues, then end with <final>summary</final>. "
-        "Do NOT add new features or scope. Do NOT touch lines unrelated to fixes."
+        "Self-check. Review your draft for:\n"
+        "- acceptance criteria NOT addressed\n"
+        "- companion tests broken or out of sync\n"
+        "- unrelated churn (whitespace, comments, refactors, type drive-bys)\n"
+        "- new bugs or syntax errors\n\n"
+        f"Patch:\n```diff\n{truncated}\n```\n\n"
+        f"Task:\n{issue_text[:1500]}\n\n"
+        "If good, reply exactly: <final>OK</final>\n"
+        "Otherwise emit corrective <command> blocks fixing ONLY the listed issues, "
+        "then <final>summary</final>. No new features, no unrelated edits."
     )
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
-    """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
-        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
-        "Issue the smallest possible fix command(s) to restore parseable code. "
-        "Do NOT introduce new edits, do NOT refactor. Then end with "
-        "<final>summary</final>."
+        f"Syntax check failed:\n  {bullets}\n\n"
+        "Smallest possible fix command(s) only. No new edits, no refactor. "
+        "Then <final>summary</final>."
     )
 
 
 def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2000:] if len(output) > 2000 else output
     return (
-        f"Companion test still failing after your patch: `{test_path}`.\n\n"
-        "Test output (tail):\n```\n"
-        f"{tail}\n```\n\n"
-        "Fix the cause — usually either the source patch is incomplete or the "
-        "test needs to be updated to match the new behavior. Issue the minimal "
-        "<command> blocks needed, then end with <final>summary</final>."
+        f"Companion test still failing: `{test_path}`.\n\n"
+        f"Output (tail):\n```\n{tail}\n```\n\n"
+        "Either patch is incomplete or test needs updating. Minimal "
+        "<command> blocks, then <final>summary</final>."
     )
 
 
@@ -1854,20 +1329,10 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    coverage_nudges_used = 0
-    criteria_nudges_used = 0
-    consecutive_model_errors = 0
-    solve_started_at = time.monotonic()
     # Tracks the max_tokens cap to use for the NEXT model call. Refinement turns
     # set this to a smaller value before queueing, so the corrective response
     # doesn't pay for unused output headroom.
     next_max_tokens = max_tokens
-
-    def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
-
-    def out_of_time() -> bool:
-        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -1888,18 +1353,7 @@ def solve(
         next_max_tokens = cap
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """If the current patch warrants a refinement turn, queue it.
-
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. criteria-nudge — name unaddressed acceptance-criteria checkpoints
-            5. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
-        """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         patch = get_patch(repo)
         if not patch.strip():
             return False
@@ -1923,31 +1377,6 @@ def solve(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            # Only fire when there's something concrete to surface and we
-            # actually extracted multiple criteria — single-criterion issues
-            # are already handled by path-coverage / self-check.
-            if unaddressed and len(_extract_acceptance_criteria(issue)) >= 2:
-                criteria_nudges_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:80] for c in unaddressed[:3]),
                 )
                 return True
 
@@ -1977,66 +1406,26 @@ def solve(
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if out_of_time():
-                logs.append(
-                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
-                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
-                    "exiting loop early to return whatever patch we have."
-                )
-                break
-
             # Use the per-turn output cap and reset it back to the default for
             # the turn after this one. Refinement prompts override before
             # queueing; everything else uses `max_tokens`.
             this_call_max_tokens = next_max_tokens
             next_max_tokens = max_tokens
 
-            response_text: Optional[str] = None
-            for retry_attempt in range(MAX_STEP_RETRIES + 1):
-                try:
-                    response_text, cost, _raw = chat_completion(
-                        messages=_messages_for_request(messages),
-                        model=model_name,
-                        api_base=api_base,
-                        api_key=api_key,
-                        max_tokens=this_call_max_tokens,
-                    )
-                    if cost is not None and total_cost is not None:
-                        total_cost += cost
-                    break
-                except Exception as exc:
-                    logs.append(
-                        f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
-                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
-                    )
-                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
-                        time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
-                        continue
-                    break
+            try:
+                response_text, cost, _raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=this_call_max_tokens,
+                )
+                if cost is not None and total_cost is not None:
+                    total_cost += cost
+            except Exception:
+                logs.append(f"MODEL_ERROR:\n{traceback.format_exc()}")
+                break
 
-            if response_text is None:
-                consecutive_model_errors += 1
-                # If we already have any patch staged in the repo, stop early
-                # and return that patch rather than wiping everything because
-                # the proxy hiccuped. Empty patches score 0; partial patches
-                # can still earn cursor-similarity credit.
-                if get_patch(repo).strip():
-                    logs.append(
-                        "MODEL_ERROR_RECOVER:\nReturning best partial patch "
-                        "after persistent model errors."
-                    )
-                    success = True
-                    break
-                if consecutive_model_errors >= 3 or out_of_time():
-                    logs.append(
-                        "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
-                        "errors -- ending loop."
-                    )
-                    break
-                # No patch yet but still time/budget; ride out and try again.
-                continue
-
-            consecutive_model_errors = 0
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
             commands = extract_commands(response_text)
@@ -2081,7 +1470,7 @@ def solve(
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
-                            break  # refinement queued — re-enter outer loop next iteration
+                            break
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
                         break
@@ -2093,7 +1482,6 @@ def solve(
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
                             break
@@ -2103,15 +1491,12 @@ def solve(
 
             if len(commands) > len(command_batch):
                 observations.append(
-                    f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
-                    "Continue with one command at a time if more work remains."
+                    f"NOTE: Only the first {len(command_batch)} commands ran. "
+                    "Send remaining commands one at a time if more work is needed."
                 )
 
             if final is not None and get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
-                    # Refinement turn queued; do not declare success yet. Skip
-                    # the observation append below since queue_refinement_turn
-                    # already wrote the assistant + corrective user message.
                     if success:
                         break
                     continue
@@ -2122,14 +1507,12 @@ def solve(
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
                     observation_text += (
-                        "\n\nPatch now exists. If more edits are needed, send every "
-                        "remaining independent file-edit command in your next response. "
-                        "Do not spend separate turns editing one file at a time."
+                        "\n\nPatch exists. Send all remaining edits in your next response — "
+                        "do not split one patch across turns."
                     )
                 elif not success:
                     observation_text += (
-                        "\n\nIf the observed snippets are enough to implement the issue, "
-                        "send the complete set of edit commands in your next response."
+                        "\n\nIf snippets are sufficient, send the full set of edit commands now."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
@@ -2176,22 +1559,10 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     stderr_body = _extract_observation_section(lower, "stderr")
 
     bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
+        " failed", " failures", " error", " errors",
+        "traceback", "assertionerror", "syntaxerror", "exception",
     ]
-
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
+    good_markers = [" passed", " all passed", "ok", "success"]
 
     if exit_code is not None and exit_code != 0:
         return False
@@ -2240,7 +1611,7 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
 
 
 def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
-    # Updated to match the compact observation format:
+    # Updated to match the new compact observation format:
     # "EXIT_CODE: <n>    DURATION: <d>s"
     match = re.search(r"(?m)^exit_code:\s*(-?\d+)", observation_lower)
     if not match:
@@ -2252,9 +1623,6 @@ def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
 
 
 def _extract_observation_section(observation_lower: str, section: str) -> str:
-    # Trailing `:` (no `\n`) so this works against the compact format where
-    # EXIT_CODE/DURATION sit on a single line; STDOUT/STDERR labels still own
-    # their own line.
     match = re.search(
         rf"(?ms)^{re.escape(section.lower())}:\n(.*?)(?:\n[a-z_]+:|\Z)",
         observation_lower,
@@ -2266,9 +1634,6 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
 # CLI for local testing
 # -----------------------------
 
-# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
-# CLI to make local experiments easier, but do not rely on CLI-only behavior for
-# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
