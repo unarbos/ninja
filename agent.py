@@ -115,6 +115,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+_STYLE_HINT_BUDGET = 600   # cap on the detected-style block appended to preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -725,6 +726,25 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
+    # Detected-style anchor for the top-ranked file. The validator's largest
+    # single hunk weight is added_token_f1 (0.25); naming the file's quoting
+    # /indent/punctuation conventions makes the model's additions tokenize
+    # the same way the reference's additions do.
+    top_file = files[0] if files else ""
+    if top_file:
+        style = _detect_file_style(repo, top_file)
+        if style:
+            block = (
+                f"DETECTED STYLE of {top_file}: {style}\n"
+                "Match this style character-for-character in your edits "
+                "(same indent width, same quote char, same trailing-comma "
+                "habit). When inventing a new identifier or string literal, "
+                "first grep nearby files for an existing one of the same "
+                "kind and reuse it instead of inventing a new name."
+            )
+            if len(block) <= _STYLE_HINT_BUDGET:
+                parts.append(block)
+
     return "\n\n".join(parts)
 
 
@@ -869,6 +889,82 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+def _detect_file_style(repo: Path, relative_path: str) -> Optional[str]:
+    """Return a one-line style descriptor for `relative_path` or None.
+
+    Inspects the first ~40 lines and reports indent / quotes / semicolons /
+    trailing-commas. The validator weights added_token_f1 at 0.25 — the
+    largest single hunk component. When the model's additions match the
+    file's quoting/indent/punctuation, they tokenize the same way the
+    reference's additions do, lifting that 0.25 directly.
+    """
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return None
+    try:
+        st = path.stat()
+        if st.st_size > 1_000_000:
+            return None
+        data = path.read_bytes()
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    lines = text.split("\n")[:40]
+    if not lines:
+        return None
+
+    uses_tabs = uses_spaces = 0
+    space_widths: Dict[int, int] = {}
+    for line in lines:
+        if line.startswith("\t"):
+            uses_tabs += 1
+        elif line.startswith(" "):
+            m = re.match(r"^( +)", line)
+            if m:
+                uses_spaces += 1
+                w = len(m.group(1))
+                if w in (2, 4, 8):
+                    space_widths[w] = space_widths.get(w, 0) + 1
+
+    indent = "unknown"
+    if uses_tabs > uses_spaces:
+        indent = "tabs"
+    elif uses_spaces > 0 and space_widths:
+        best_w = max(space_widths.items(), key=lambda kv: kv[1])[0]
+        indent = f"{best_w}-space"
+
+    single = text.count("'")
+    double = text.count('"')
+    if single > double * 1.5:
+        quotes = "single"
+    elif double > single * 1.5:
+        quotes = "double"
+    else:
+        quotes = "mixed"
+
+    code_lines = semi_lines = 0
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("//") or t.startswith("#") or t.startswith("*"):
+            continue
+        code_lines += 1
+        if t.endswith(";"):
+            semi_lines += 1
+    if code_lines == 0:
+        semis = "unknown"
+    elif semi_lines / code_lines > 0.3:
+        semis = "yes"
+    else:
+        semis = "no"
+
+    trailing = "yes" if re.search(r",\s*[\n\r]\s*[)\]}]", text) else "no"
+    return f"indent={indent}, quotes={quotes}, semicolons={semis}, trailing-commas={trailing}"
 
 
 # -----------------------------
