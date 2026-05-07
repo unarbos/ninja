@@ -1470,6 +1470,61 @@ def _select_companion_test_failure(
     return None
 
 
+def _recent_commit_block_for_sha(repo: Path, sha: str) -> Optional[str]:
+    """Return a fenced ``diff`` block for ``sha`` if it qualifies as a small
+    style anchor, else None.
+
+    Extracted from ``_recent_commit_examples`` so the per-SHA filter chain
+    (shortstat insertion check, diff fetch, length window, fence wrap) can
+    be reasoned about apart from the outer pick-2-and-budget loop.
+    Qualification is unchanged from the inline version: insertions in
+    (0, ``_RECENT_COMMIT_MAX_INSERTIONS``] and diff length in
+    [100, ``_RECENT_COMMIT_MAX_DIFF_CHARS``].
+
+    NOTE: previous version of the diff fetch passed ``--pretty=format:%s``
+    which caused ``git show`` to emit the commit subject in place of the
+    standard header while still appending the diff. After the ``>=100`` char
+    filter the only commits that survived were those with very long
+    subjects (e.g. squash messages); their wrapped output was a mix of
+    subject + diff, which is noise. ``--pretty=format:`` empties the header
+    entirely so we keep just the diff body.
+    """
+    stat_proc = subprocess.run(
+        ["git", "show", "--no-merges", "--shortstat", "--pretty=format:", sha],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if stat_proc.returncode != 0:
+        return None
+    insertions = 0
+    for line in stat_proc.stdout.splitlines():
+        if "insertion" in line:
+            for word in line.split(","):
+                if "insertion" in word:
+                    try:
+                        insertions = int(word.strip().split()[0])
+                    except (ValueError, IndexError):
+                        pass
+            break
+    if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
+        return None
+    diff_proc = subprocess.run(
+        ["git", "show", "--no-merges", "--pretty=format:", sha],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if diff_proc.returncode != 0:
+        return None
+    diff_text = diff_proc.stdout.strip()
+    if len(diff_text) < 100 or len(diff_text) > _RECENT_COMMIT_MAX_DIFF_CHARS:
+        return None
+    return f"```diff\n{diff_text[:_RECENT_COMMIT_MAX_DIFF_CHARS]}\n```"
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -1496,47 +1551,9 @@ def _recent_commit_examples(repo: Path) -> str:
         examples: List[str] = []
         budget_used = 0
         for sha in shas:
-            stat_proc = subprocess.run(
-                ["git", "show", "--no-merges", "--shortstat", "--pretty=format:", sha],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if stat_proc.returncode != 0:
+            block = _recent_commit_block_for_sha(repo, sha)
+            if block is None:
                 continue
-            insertions = 0
-            for line in stat_proc.stdout.splitlines():
-                if "insertion" in line:
-                    for word in line.split(","):
-                        if "insertion" in word:
-                            try:
-                                insertions = int(word.strip().split()[0])
-                            except (ValueError, IndexError):
-                                pass
-                    break
-            if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
-                continue
-            # NOTE: previous version passed --pretty=format:%s which caused
-            # `git show` to emit the commit subject in place of the standard
-            # header but git still appended the diff. After the >=100 char
-            # filter the only commits that survived were those with very long
-            # subjects (e.g. squash messages); their wrapped output was a mix
-            # of subject + diff, which is noise. --pretty=format: empties the
-            # header entirely so we keep just the diff body.
-            diff_proc = subprocess.run(
-                ["git", "show", "--no-merges", "--pretty=format:", sha],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if diff_proc.returncode != 0:
-                continue
-            diff_text = diff_proc.stdout.strip()
-            if len(diff_text) < 100 or len(diff_text) > _RECENT_COMMIT_MAX_DIFF_CHARS:
-                continue
-            block = f"```diff\n{diff_text[:_RECENT_COMMIT_MAX_DIFF_CHARS]}\n```"
             if budget_used + len(block) > _RECENT_COMMIT_BLOCK_BUDGET:
                 break
             examples.append(block)
