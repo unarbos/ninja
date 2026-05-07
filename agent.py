@@ -2202,13 +2202,13 @@ def _v54_pick_target(repo: Path, issue_text: str) -> Optional[str]:
 def _v54_emergency_solve(
     *,
     repo: Path,
-    issue: str,
+    issue_text: str,
     model: Optional[str],
     api_base: Optional[str],
     api_key: Optional[str],
     deadline: float,
 ) -> str:
-    target = _v54_pick_target(repo, issue)
+    target = _v54_pick_target(repo, issue_text)
     if not target:
         return ""
     full = repo / target
@@ -2216,7 +2216,7 @@ def _v54_emergency_solve(
         snippet = full.read_text(encoding="utf-8", errors="replace")[:2000]
     except Exception:
         return ""
-    issue_short = issue[:1200]
+    issue_short = issue_text[:1200]
     prompt = (
         f"Make the smallest possible code edit to {target} that addresses this issue.\n"
         f"Output ONLY the new content of the file, nothing else, no markdown fences, "
@@ -2304,7 +2304,7 @@ def solve(
         if _emerg_remaining > 8.0 and _n1 == 0:
             _emerg_patch = _v54_emergency_solve(
                 repo=_multishot_repo_obj,
-                issue=issue,
+                issue_text=issue,
                 model=model, api_base=api_base, api_key=api_key,
                 deadline=time.monotonic() + min(_emerg_remaining - 2.0, 45.0),
             )
