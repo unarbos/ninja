@@ -2151,6 +2151,114 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
+# Empty-diff fresh-context fallback (beammys2 PR324)
+# -----------------------------
+#
+# Empirical finding from 184 real-duel rounds: 28_alpha ships an empty diff in
+# 15% of rounds, and those lose 64% of the time (vs 27% loss rate on non-empty
+# rounds). Empty diffs are 30% of all our losses. Mechanical lift from
+# eliminating them: ~+5.6pp win rate.
+#
+# Why "fresh context" matters: the existing hail-mary turn fires INSIDE the
+# bloated 30-turn conversation where the model has been refining for ~4 min
+# and pruning context. A fresh model context with just (issue + top candidate
+# files + tight instruction) gets a clean shot at producing ANY plausible
+# minimal change. Any non-empty diff beats empty.
+
+def _request_minimal_repair_via_model(
+    repo: Path,
+    issue_text: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+) -> Optional[str]:
+    """Ask the inner model for one focused edit when the loop produced no patch.
+
+    Picks one candidate tracked file the task plausibly references, sends a
+    short focused prompt to the validator-managed inference proxy in a FRESH
+    conversation (no refinement history bloat), parses `<command>` blocks
+    from the reply, and runs the first one against the working tree. Returns
+    the relative path of the candidate file when a non-empty diff
+    materialised; otherwise None. Never raises.
+
+    Candidate source order (first qualifying wins):
+        1. Tracked files explicitly named in the task
+        2. Top of the heuristic file ranker
+    """
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return None
+    candidates: List[str] = []
+    try:
+        for mention in _extract_issue_path_mentions(issue_text):
+            rel = mention.strip("./")
+            if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
+                candidates.append(rel)
+    except Exception:
+        pass
+    try:
+        for rel in _rank_context_files(repo, issue_text)[:6]:
+            if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
+                candidates.append(rel)
+    except Exception:
+        pass
+
+    for rel in candidates:
+        target = repo / rel
+        if not target.is_file():
+            continue
+        try:
+            data = target.read_bytes()
+        except Exception:
+            continue
+        if b"\0" in data[:4096]:
+            continue
+        try:
+            current_text = data.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        snippet = current_text[:6000]
+        if len(current_text) > 6000:
+            snippet += "\n[...file truncated...]\n"
+        prompt_user = (
+            "The solver loop produced no on-disk change. Make ONE focused, "
+            f"minimal edit to `{rel}` that addresses the task below. Output "
+            "exactly one `<command>` block — `sed -i ...`, a `cat > ... <<'EOF'` "
+            "heredoc, or `python -c \"...\"` is fine — and nothing else. Do not "
+            "explain. Do not add unrelated changes.\n\n"
+            f"Task:\n{issue_text}\n\n"
+            f"Current contents of `{rel}`:\n```\n{snippet}\n```\n"
+        )
+        try:
+            response_text, _cost, _raw = chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a focused code-editing assistant. Output only `<command>` blocks."},
+                    {"role": "user", "content": prompt_user},
+                ],
+                model=model_name,
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=1024,
+                timeout=60,
+            )
+        except Exception:
+            continue
+
+        commands = extract_commands(response_text or "")
+        if not commands:
+            continue
+        try:
+            run_command(commands[0], repo, timeout=DEFAULT_COMMAND_TIMEOUT)
+        except Exception:
+            continue
+        if get_patch(repo).strip():
+            return rel
+    return None
+
+
+# -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
 
@@ -2562,6 +2670,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+
+        # v39: empty-diff fresh-context fallback (beammys2 PR324). Empirical
+        # data shows 30% of king losses come from shipping empty diffs (15%
+        # of all rounds), and those rounds lose 64% vs 27% loss rate when
+        # non-empty. A fresh model context with just (issue + top files +
+        # tight instruction) gets a clean shot — bypassing the bloated
+        # 30-turn conversation history. Any non-empty diff beats empty.
+        if not patch.strip():
+            try:
+                repaired_path = _request_minimal_repair_via_model(
+                    repo, issue, model_name, api_base, api_key,
+                )
+                if repaired_path:
+                    logs.append(f"\nMODEL_REPAIR: applied fresh-context edit to {repaired_path}")
+                    patch = get_patch(repo)
+            except Exception:
+                pass
+
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
