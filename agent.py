@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+REPO = None
 
 # -----------------------------
 # Config
@@ -2023,8 +2024,7 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
-def build_initial_user_prompt(problem: str, repo_summary: str, preloaded_context: str = "", repo: Optional[Path] = None) -> str:
-    issue = problem
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -2033,7 +2033,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
-    stack_hints = _repo_test_stack_hints(repo) if repo is not None else ""
+    stack_hints = _repo_test_stack_hints(REPO) if REPO is not None else ""
 
     return f"""Fix this issue:
 
@@ -2559,6 +2559,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         repo = _repo_path(repo_path)
+        global REPO
+        REPO = repo
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
@@ -2566,7 +2568,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context, repo=repo)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
