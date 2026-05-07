@@ -94,7 +94,8 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-MAX_CONSECUTIVE_IDENTICAL_COMMANDS = int(os.environ.get("AGENT_MAX_CONSECUTIVE_SAME_COMMAND", "2"))
+# Keep hardcoded to satisfy PR Scope Guard env-var allowlist.
+MAX_CONSECUTIVE_IDENTICAL_COMMANDS = 2
 MIN_SUCCESSFUL_VERIFICATIONS = 1
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
