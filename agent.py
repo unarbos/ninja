@@ -2447,7 +2447,7 @@ def _v14_grounded_score(repo_root: Path, issue_text: str, patch_text: str) -> fl
 
     # 2. Companion test signal: real runtime evidence.
     try:
-        test_failure = _select_companion_test_failure(repo_root, patch)
+        test_failure = _select_companion_test_failure(repo_root, patch_text)
     except Exception:
         test_failure = None
     if test_failure is not None:
@@ -2764,7 +2764,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo_root, patch_text)
+            syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
                 syntax_fix_turns_used += 1
                 total_refinement_turns_used += 1
