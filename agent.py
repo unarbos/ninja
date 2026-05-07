@@ -103,31 +103,35 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# Wall-clock budget. The previous king set this to 270s ("halved from 540 —
-# multi-shot wrapper needs room for 1 retry within validator's ~600s budget").
-# But the duel-data loss pattern was timeouts and incomplete patches, not
-# model whiffs that benefit from a fresh-context retry. Reverting to a single
-# long attempt (530s, ~88% of validator's 600s ceiling) gives the inner loop
-# room to run all refinement gates; multi-shot retry now only fires when the
-# first attempt produced literally zero substantive lines (see
-# _MULTISHOT_LOW_SIGNAL_THRESHOLD = 1 below).
-WALL_CLOCK_BUDGET_SECONDS = 530.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Wall-clock budget. The previous king set this to 270s. Duel 4123 (where this
+# challenger went 19W/21L vs king with WALL=530) showed timeouts as the dominant
+# loss mode — 15 of 21 losses involved challenger_exit_reason="time_limit_exceeded",
+# 5 of those with empty patches (LLM judge → 0.0). The validator computes per-task
+# agent timeout as max(cursor_elapsed * 2 + 1, 120) capped at 600, typically
+# landing in the 200-500s range. WALL=530 was overshooting that ceiling once the
+# inflated refinement caps fired. WALL=380 gives the loop room to run normal +
+# 2-3 refinements while staying inside the validator's kill threshold for typical-
+# cursor tasks; WALL_RESERVE=30 leaves a wider safety margin so a partial patch
+# is staged before hard exit.
+WALL_CLOCK_BUDGET_SECONDS = 380.0
+WALL_CLOCK_RESERVE_SECONDS = 30.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. The previous king capped total refinements at 2
-# total — under-investing in the highest-leverage gates. Coverage and criteria
-# nudges directly attack the LLM judge's most common gripe ("missing N of M
-# criteria", "skipped path X" — verified across duels 4090/4092/4107/4119),
-# so we let them fire twice each and raise the global cap to 6.
+# specific kind of correction. Duel 4123 showed the prior over-allocation
+# (TOTAL=6, coverage/criteria=2 each, hail-mary=3) burned per-task time and
+# pushed us into the validator's hard timeout. Pulling TOTAL back to 3 keeps
+# the highest-leverage single-fire gates (coverage, criteria, self-check) but
+# stops chained refinements from cascading into a timeout. Hail-mary stays at
+# 2 — duel 4123 had 5 empty-patch losses, one extra recovery turn is the
+# cheapest insurance against the 0.0/0.0 catastrophe.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 2    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 2    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 3    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 6  # raise from 2 to give coverage+criteria room to fire twice
+MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_HAIL_MARY_TURNS = 2    # last-resort: force a real edit when patch is empty after everything
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap chain length so refinements don't cascade past validator timeout
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -2593,7 +2597,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            # Duel 4123 had 5 rounds where challenger never produced any patch
+            # before the validator killed it (rounds 3, 5, 14, 32, 36 — all
+            # 0.0/0.0 losses). Add one extra pressure beat at step 6 so a
+            # model that's still reading at step 5 gets a hard "edit now" nudge
+            # before the wall-clock reserve cuts the loop.
+            if not get_patch(repo).strip() and step in {2, 4, 6}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
