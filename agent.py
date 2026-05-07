@@ -95,6 +95,9 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
+MAX_KEYWORDS_FOR_CONTEXT = 14
+MAX_KEYWORD_CHARS = 80
+
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
@@ -685,7 +688,132 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def _safe_json_from_text(text: str) -> Any:
+    """Parse JSON even if the model wrapped it in prose/code fences."""
+    if not text:
+        return None
+    t = text.strip()
+    # Strip ```json fences if present.
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n", "", t)
+        t = re.sub(r"\n```$", "", t).strip()
+    # Try direct parse first, then best-effort extract first JSON object/array.
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", t)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except Exception:
+        return None
+
+
+def _fallback_keywords(problem: str, max_keywords: int = MAX_KEYWORDS_FOR_CONTEXT) -> List[str]:
+    issue = problem
+    candidates: List[str] = []
+    for p in _extract_issue_path_mentions(issue):
+        candidates.append(p)
+    for m in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", issue):
+        token = m.group(0)
+        if token.lower() in {
+            "this",
+            "that",
+            "with",
+            "from",
+            "into",
+            "when",
+            "then",
+            "than",
+            "also",
+            "issue",
+            "error",
+            "fix",
+        }:
+            continue
+        candidates.append(token)
+    out: List[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        c2 = c.strip()
+        if not c2:
+            continue
+        if len(c2) > MAX_KEYWORD_CHARS:
+            c2 = c2[:MAX_KEYWORD_CHARS]
+        if c2 in seen:
+            continue
+        seen.add(c2)
+        out.append(c2)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+
+def _extract_priority_keywords(
+    problem: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    max_keywords: int = MAX_KEYWORDS_FOR_CONTEXT,
+) -> List[str]:
+    issue = problem
+    if not issue.strip() or not model or not api_base or not api_key:
+        return _fallback_keywords(issue, max_keywords=max_keywords)
+
+    prompt = (
+        "Extract a priority-ordered list of keywords from the ISSUE for code search.\n"
+        "Return ONLY valid JSON.\n\n"
+        "Rules:\n"
+        "- Include function/class names, module/package names, constants, config keys, flags, env vars.\n"
+        "- Include error substrings (e.g. 'KeyError: foo', 'undefined is not a function') but keep them short.\n"
+        "- Include file paths if mentioned.\n"
+        "- Prefer exact identifiers as they appear in code (case-sensitive when relevant).\n"
+        "- Output 8-14 items (or fewer if the issue is small).\n"
+        "- Avoid generic words like 'bug', 'fix', 'error' unless part of an error string.\n\n"
+        "Schema:\n"
+        "{\n"
+        '  "keywords": ["...", "..."]\n'
+        "}\n\n"
+        f"ISSUE:\n{issue[:5000]}\n"
+    )
+
+    try:
+        text, _cost, _raw = chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=800,
+        )
+        data = _safe_json_from_text(text)
+        if isinstance(data, dict):
+            kws = data.get("keywords")
+            if isinstance(kws, list):
+                cleaned = []
+                seen = set()
+                for kw in kws:
+                    if not isinstance(kw, str):
+                        continue
+                    kw2 = kw.strip()
+                    if not kw2:
+                        continue
+                    if len(kw2) > MAX_KEYWORD_CHARS:
+                        kw2 = kw2[:MAX_KEYWORD_CHARS]
+                    if kw2 in seen:
+                        continue
+                    seen.add(kw2)
+                    cleaned.append(kw2)
+                if cleaned:
+                    return cleaned[:max_keywords]
+    except Exception:
+        pass
+
+    return _fallback_keywords(issue, max_keywords=max_keywords)
+
+
+def build_preloaded_context(repo: Path, problem: str, model: str, api_base: str, api_key: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -701,7 +829,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
     """
-    files = _rank_context_files(repo, issue)
+    issue = problem
+    files = _rank_context_files(repo, issue, model, api_base, api_key)
     if not files:
         return ""
 
@@ -732,7 +861,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, problem: str, model: str, api_base: str, api_key: str) -> List[str]:
+    issue = problem
     tracked = _tracked_files(repo)
     if not tracked:
         return []
@@ -746,8 +876,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    terms = _issue_terms(issue)
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    terms = _extract_priority_keywords(issue, model, api_base, api_key)
+    if not terms:
+        terms = _issue_terms(issue)
+        symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    else:
+        symbol_hits = _symbol_grep_hits(repo, tracked_set, issue, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1694,17 +1828,22 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
     issue_text: str,
+    symbols: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
     """
-    symbols = _extract_issue_symbols(issue_text)
+    if symbols is None:
+        symbols = []
+    if not symbols:
+        symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
@@ -1855,6 +1994,39 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+def _issue_upfront_checklist(issue: str) -> str:
+    """Surface extracted checkpoints + path mentions before step 1.
+
+    Same heuristics as refinement nudges (`_extract_acceptance_criteria`,
+    `_extract_issue_path_mentions`) but injected up front so multi-bullet SWE
+    tasks don't rely on the model noticing every line in a long issue."""
+    blocks: List[str] = []
+    criteria = _extract_acceptance_criteria(issue)
+    if criteria:
+        numbered = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+        blocks.append(
+            "Structured checkpoints extracted from the issue (verify each before <final>):\n"
+            + numbered
+        )
+    paths = _extract_issue_path_mentions(issue)
+    if paths:
+        seen: set[str] = set()
+        uniq: List[str] = []
+        for p in paths:
+            norm = p.strip().lstrip("./")
+            if norm and norm not in seen:
+                seen.add(norm)
+                uniq.append(norm)
+        if uniq:
+            blocks.append(
+                "File paths named in the issue (confirm you touch the right files):\n"
+                + "\n".join(f"  - {p}" for p in uniq)
+            )
+    if not blocks:
+        return ""
+    return "\n\n" + "\n\n".join(blocks) + "\n"
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -1864,10 +2036,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    upfront = _issue_upfront_checklist(issue)
+    after_issue = upfront if upfront else "\n"
+
     return f"""Fix this issue:
 
-{issue}
-
+{issue}{after_issue}
 Repository summary:
 
 {repo_summary}
@@ -2151,7 +2325,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (v28 — multi-shot wrapper around _solve_attempt)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2391,7 +2565,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue, model, api_base, api_key)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -2495,7 +2669,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                # step>=2: allow early exit once patch + passing targeted test appear
+                # (step>=4 wasted budget when the model verifies on step 2–3).
+                if step >= 2 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
