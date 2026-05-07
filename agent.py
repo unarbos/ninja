@@ -1930,7 +1930,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # returned dict shape so validators can run your submission.
 def solve(
     repo_path: str,
-    iss: str = "",
+    issue: str = "",
     model: Optional[str] = None,
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -1944,10 +1944,10 @@ def solve(
     """
 
     legacy_issue = kwargs.pop("issue", "")
-    if not iss and isinstance(legacy_issue, str):
-        iss = legacy_issue
-    if not isinstance(iss, str):
-        iss = str(iss)
+    if not issue and isinstance(legacy_issue, str):
+        issue = legacy_issue
+    if not isinstance(issue, str):
+        issue = str(issue)
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -1998,7 +1998,7 @@ def solve(
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_hail_mary_prompt(iss),
+                    build_hail_mary_prompt(issue),
                     "HAIL_MARY_QUEUED: patch empty at refinement gate",
                 )
                 return True
@@ -2027,23 +2027,23 @@ def solve(
                 return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, iss)
+            missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, iss),
+                    build_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
 
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, iss)
+            unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, iss),
+                    build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
@@ -2052,7 +2052,7 @@ def solve(
             self_check_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, iss),
+                build_self_check_prompt(patch, issue),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -2064,11 +2064,11 @@ def solve(
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, iss)
+        preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(iss, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         for step in range(1, max_steps + 1):
@@ -2176,7 +2176,7 @@ def solve(
                         success = True
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
-                        if not _patch_covers_required_paths(patch, iss):
+                        if not _patch_covers_required_paths(patch, issue):
                             # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
