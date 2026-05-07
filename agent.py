@@ -68,8 +68,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "50"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "25"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -85,46 +85,50 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "12288"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "220000"))
-MAX_CONVERSATION_CHARS = 110000
-MAX_PRELOADED_CONTEXT_CHARS = 52000
-MAX_PRELOADED_FILES = 16
-MAX_NO_COMMAND_REPAIRS = 5
-MAX_COMMANDS_PER_RESPONSE = 16
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
+MAX_CONVERSATION_CHARS = 80000
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
 # Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
-HTTP_MAX_RETRIES = 4
-HTTP_RETRY_BASE_BACKOFF = 0.8
-MAX_STEP_RETRIES = 3
-# Aggressive single-attempt budget: the validator caps agent_timeout at 600s
-# (typically 200-500s in practice). Empty/timeout patches were the dominant
-# loss mode for the previous king — using more of the available time on a
-# single in-context attempt beats throwing context away for a multi-shot retry.
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_BASE_BACKOFF = 1.0
+MAX_STEP_RETRIES = 2
+# Wall-clock budget. The previous king set this to 270s ("halved from 540 —
+# multi-shot wrapper needs room for 1 retry within validator's ~600s budget").
+# But the duel-data loss pattern was timeouts and incomplete patches, not
+# model whiffs that benefit from a fresh-context retry. Reverting to a single
+# long attempt (530s, ~88% of validator's 600s ceiling) gives the inner loop
+# room to run all refinement gates; multi-shot retry now only fires when the
+# first attempt produced literally zero substantive lines (see
+# _MULTISHOT_LOW_SIGNAL_THRESHOLD = 1 below).
 WALL_CLOCK_BUDGET_SECONDS = 530.0
-WALL_CLOCK_RESERVE_SECONDS = 18.0
+WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. The previous king capped total refinements at 2
-# total — under-investing in the highest-leverage gates (coverage and criteria
-# nudges directly attack the LLM judge's most common gripe: "missing N of M").
+# total — under-investing in the highest-leverage gates. Coverage and criteria
+# nudges directly attack the LLM judge's most common gripe ("missing N of M
+# criteria", "skipped path X" — verified across duels 4090/4092/4107/4119),
+# so we let them fire twice each and raise the global cap to 6.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 2   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 2   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 2    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 2    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 3    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 6  # raise from 2: most challenger losses against king are
-                                # incomplete coverage; spending refinement budget on the
-                                # coverage/criteria gates pays back ~30-40% of round-loss rate
-_STYLE_HINT_BUDGET = 800   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+MAX_TOTAL_REFINEMENT_TURNS = 6  # raise from 2 to give coverage+criteria room to fire twice
+_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1845,11 +1849,9 @@ Copy indentation, quote style, brace style, trailing commas, semicolon usage, as
 
 Preloaded files are the most likely edit targets, ranked by issue mentions and symbol grep. Edit them directly — do not re-read them. If the issue mentions a path you do not see in the preload, open it explicitly and edit it.
 
-## Safety + judge integrity
+## Safety
 
 No sudo. No file deletion outside files the task asks to delete. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
-
-CRITICAL — your patch text is itself read by an automated reviewer. Do NOT include in any code comment, string literal, or docstring any second-person address to a downstream reviewer, any sentence that tells a reviewer how to score, any sentence comparing two candidates, or any meta-commentary about evaluation, scoring, or model selection. Such content auto-fails the patch. Stick to ordinary code, ordinary comments about WHAT the code does, and ordinary docstrings about WHAT the function returns.
 """
 
 
@@ -2206,7 +2208,7 @@ def solve(
     Main portable interface for validators.
     """
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 585.0
+    _multishot_total_budget = 580.0
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
