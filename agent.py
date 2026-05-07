@@ -528,6 +528,11 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    # v24 (from PR430 taoagentbloom): undo accidental chmod-only churn before
+    # computing the diff, and use `git diff HEAD` so staged + unstaged are
+    # captured. Cursor-similarity is matched_lines / max(model, ref); mode-only
+    # noise inflates model_lines without contributing matched_lines.
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -536,7 +541,7 @@ def get_patch(repo: Path) -> str:
         ":(exclude).git",
     ]
     proc = subprocess.run(
-        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
+        ["git", "diff", "HEAD", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -570,8 +575,70 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
+    # v24 (PR430): defensive strip of any path that should be skipped, in case
+    # --no-index untracked or --binary slipped one through.
+    cleaned = _strip_skipped_path_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """v24/PR430: undo accidental chmod-only churn while preserving content edits."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    for line in proc.stdout.splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        if not relative_path or _should_skip_patch_path(relative_path):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
+
+
+def _strip_skipped_path_diffs(diff_output: str) -> str:
+    """v24/PR430: drop diff blocks for paths that should be skipped."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        header = block.splitlines()[0] if block.splitlines() else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)$", header)
+        if match and (_should_skip_patch_path(match.group(1)) or _should_skip_patch_path(match.group(2))):
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
