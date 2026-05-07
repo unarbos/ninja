@@ -63,7 +63,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-REPO = None
 
 # -----------------------------
 # Config
@@ -627,35 +626,6 @@ def get_repo_summary(repo: Path) -> str:
         parts.append(format_observation(res))
 
     return "\n\n".join(parts)
-
-
-def _repo_test_stack_hints(repo: Path) -> str:
-    """Suggest typical verify commands from root build markers only (no network).
-
-    Cuts wrong-stack guesses (`pytest` in a Go tree, `npm test` with no package.json)
-    that waste steps before functional verification."""
-    if not repo.is_dir():
-        return ""
-    hints: List[str] = []
-    if (repo / "go.mod").is_file():
-        hints.append("Go — try `go test ./...` or a package path from the issue")
-    if (repo / "Cargo.toml").is_file():
-        hints.append("Rust — try `cargo test` (use `-p` / `--test` in workspaces)")
-    if (repo / "package.json").is_file():
-        hints.append("Node — try `npm test`, `pnpm test`, or `yarn test`")
-    if any((repo / name).is_file() for name in ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini")):
-        hints.append("Python — try `python3 -m pytest <path> -x -q`")
-    if (repo / "pom.xml").is_file():
-        hints.append("Maven — try `mvn -q test`")
-    if (repo / "build.gradle").is_file() or (repo / "build.gradle.kts").is_file():
-        hints.append("Gradle — try `./gradlew test`")
-    if not hints:
-        return ""
-    lines = "\n".join(f"  - {h}" for h in hints[:6])
-    return (
-        "\n\nRepository test-stack hints (from root files — use the narrowest command that matches the issue):\n"
-        f"{lines}\n"
-    )
 
 
 TEXT_FILE_EXTENSIONS = {
@@ -2033,8 +2003,6 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
-    stack_hints = _repo_test_stack_hints(REPO) if REPO is not None else ""
-
     return f"""Fix this issue:
 
 {issue}
@@ -2042,7 +2010,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{stack_hints}{context_section}
+{context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
@@ -2412,6 +2380,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+    # True once we see a command that looks like pytest/go test/etc. with success-shaped output.
+    saw_targeted_verify_success = False
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2559,8 +2529,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         repo = _repo_path(repo_path)
-        global REPO
-        REPO = repo
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
@@ -2665,6 +2633,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             for command_index, command in enumerate(command_batch, 1):
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
+                if _looks_like_verification_command(command) and _looks_like_successful_test_output(
+                    observation, command
+                ):
+                    saw_targeted_verify_success = True
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
@@ -2720,6 +2692,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
+                    if not saw_targeted_verify_success:
+                        observation_text += (
+                            "\n\nNOTE: No successful targeted verify command was detected in prior "
+                            "outputs (pytest/go test/npm test/tsc…). Run one before <final> if this "
+                            "environment supports it."
+                        )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
