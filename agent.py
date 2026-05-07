@@ -526,6 +526,41 @@ def ensure_git_repo(repo: Path) -> None:
     )
 
 
+def _patch_applies_clean(repo: Path, patch: str) -> bool:
+    """True if `patch` re-applies cleanly to HEAD via git apply --check.
+
+    Stashes work-tree (incl. untracked) so the check sees the pristine
+    preimage, then restores. Empty patches trivially apply. Any unexpected
+    error skips validation (returns True) — this gate is observability +
+    soft-recovery, not a hard guard."""
+    if not patch.strip():
+        return True
+    stashed = False
+    try:
+        s = subprocess.run(
+            ["git", "stash", "push", "-u", "-m", "ninja_apply_check"],
+            cwd=str(repo), capture_output=True, text=True, timeout=30, check=False,
+        )
+        if s.returncode == 0:
+            stashed = True
+        elif "no local changes to save" not in (s.stderr or "").lower() and "nothing to stash" not in (s.stderr or "").lower():
+            return True
+        c = subprocess.run(
+            ["git", "apply", "--check"],
+            cwd=str(repo), input=patch, capture_output=True, text=True, timeout=30, check=False,
+        )
+        return c.returncode == 0
+    except Exception:
+        return True
+    finally:
+        if stashed:
+            try:
+                subprocess.run(["git", "stash", "pop"],
+                    cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
+            except Exception:
+                pass
+
+
 def get_patch(repo: Path) -> str:
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
@@ -569,8 +604,14 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
-    return _strip_low_signal_hunks(cleaned)
+    cleaned = _strip_low_signal_hunks(_strip_mode_only_file_diffs(diff_output))
+    # If our hunk-stripping mangled the diff, fall back to the raw output
+    # (validator scores 0 on unappliable patches; partial-but-applicable
+    # always beats clean-but-broken).
+    if cleaned.strip() and not _patch_applies_clean(repo, cleaned):
+        if _patch_applies_clean(repo, diff_output):
+            return diff_output
+    return cleaned
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
