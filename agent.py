@@ -2178,6 +2178,12 @@ def solve(
     patches at zero — any non-empty diff beats empty. Production data shows
     50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
     the safety net converts those to "whatever partial work survived".
+
+    v44: smart-skip the multi-shot retry when the first attempt already
+    covers every file path the issue explicitly mentions. Counting only
+    substantive added lines (threshold=3) treats a correct 1-2 line surgical
+    fix the same as a whiff and burns a 180s retry on a patch that was
+    already on-target. The path-coverage guard lets these through.
     """
     return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
@@ -2207,6 +2213,24 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
+            return _result1
+
+        # v44: keep first attempt if it's non-empty AND the issue named at
+        # least one file path AND the patch covers every named path. The
+        # substantive-line count alone treats a correct surgical fix as a
+        # whiff; the path-coverage guard distinguishes "small and on-target"
+        # from "small and missed the mark". Without any named path we fall
+        # through to the retry as before — the original logic is the safer
+        # default when the issue doesn't anchor to a specific file.
+        _issue_text = kwargs.get("issue", "") or ""
+        _required_paths = _extract_issue_path_mentions(_issue_text)
+        if (
+            _patch1.strip()
+            and _required_paths
+            and _patch_covers_required_paths(_patch1, _issue_text)
+        ):
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "covers_issue_paths"
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
