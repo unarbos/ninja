@@ -628,6 +628,35 @@ def get_repo_summary(repo: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _repo_test_stack_hints(repo: Path) -> str:
+    """Suggest typical verify commands from root build markers only (no network).
+
+    Cuts wrong-stack guesses (`pytest` in a Go tree, `npm test` with no package.json)
+    that waste steps before functional verification."""
+    if not repo.is_dir():
+        return ""
+    hints: List[str] = []
+    if (repo / "go.mod").is_file():
+        hints.append("Go — try `go test ./...` or a package path from the issue")
+    if (repo / "Cargo.toml").is_file():
+        hints.append("Rust — try `cargo test` (use `-p` / `--test` in workspaces)")
+    if (repo / "package.json").is_file():
+        hints.append("Node — try `npm test`, `pnpm test`, or `yarn test`")
+    if any((repo / name).is_file() for name in ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini")):
+        hints.append("Python — try `python3 -m pytest <path> -x -q`")
+    if (repo / "pom.xml").is_file():
+        hints.append("Maven — try `mvn -q test`")
+    if (repo / "build.gradle").is_file() or (repo / "build.gradle.kts").is_file():
+        hints.append("Gradle — try `./gradlew test`")
+    if not hints:
+        return ""
+    lines = "\n".join(f"  - {h}" for h in hints[:6])
+    return (
+        "\n\nRepository test-stack hints (from root files — use the narrowest command that matches the issue):\n"
+        f"{lines}\n"
+    )
+
+
 TEXT_FILE_EXTENSIONS = {
     ".c",
     ".cc",
@@ -1994,25 +2023,12 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
-def _issue_symbol_hints(problem: str, *, max_symbols: int = 10) -> str:
-    """Surface `functionName` / `snake_case` tokens from the issue in turn 1.
-
-    Path regexes in `_extract_issue_path_mentions` only catch `foo.py` patterns;
-    many tasks name a class or function with no file path. The same symbol list
-    already feeds `_symbol_grep_hits` for ranking — echoing it here reduces
-    blind grep loops."""
-    issue = problem
-    symbols = _extract_issue_symbols(issue, max_symbols=max_symbols)
-    if not symbols:
-        return ""
-    listed = ", ".join(f"`{s}`" for s in symbols)
-    return (
-        "\n\nNamed identifiers from the issue — locate these in the repo before editing "
-        f"(grep/ctags): {listed}\n"
-    )
-
-
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(
+    issue: str,
+    repo_summary: str,
+    preloaded_context: str = "",
+    repo: Optional[Path] = None,
+) -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -2021,16 +2037,16 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
-    symbol_hints = _issue_symbol_hints(issue)
-    after_issue = symbol_hints if symbol_hints else "\n"
+    stack_hints = _repo_test_stack_hints(repo) if repo is not None else ""
 
     return f"""Fix this issue:
 
-{issue}{after_issue}
+{issue}
+
 Repository summary:
 
 {repo_summary}
-{context_section}
+{stack_hints}{context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
@@ -2554,7 +2570,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context, repo=repo)},
         ]
 
         _wall_start = time.monotonic()
