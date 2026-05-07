@@ -1727,7 +1727,7 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
-def build_initial_user_prompt(iss: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1738,7 +1738,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
     return f"""Fix this issue:
 
-{iss}
+{issue}
 
 Repository summary:
 
