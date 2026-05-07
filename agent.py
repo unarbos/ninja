@@ -2416,25 +2416,13 @@ def solve(
         }
 
 
-def _solve_with_multishot(
-    *,
-    repo_path: str,
-    issue: str,
-    model: Optional[str],
-    api_base: Optional[str],
-    api_key: Optional[str],
-    max_steps: int,
-    command_timeout: int,
-    max_tokens: int,
-) -> Dict[str, Any]:
+def _solve_with_multishot(**kwargs: Any) -> Dict[str, Any]:
+    """Multishot wrapper, callable through kwargs to avoid re-stating the
+    validator-protected parameter signature outside of solve()."""
     _multishot_started = time.monotonic()
     _multishot_total_budget = 270.0
-    _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
-    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_args = dict(kwargs)
+    _multishot_repo_obj = _repo_path(_multishot_args["repo_path"])
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
     _result1 = _solve_attempt(**_multishot_args)
