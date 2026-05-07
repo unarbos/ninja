@@ -94,6 +94,7 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+PATCH_WIDE_SCOPE_FILE_THRESHOLD = 5  # remind model about scope creep above this many paths
 
 MAX_KEYWORDS_FOR_CONTEXT = 14
 MAX_KEYWORD_CHARS = 80
@@ -1166,6 +1167,23 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+def _patch_wide_scope_note(patch: str) -> str:
+    """If the working tree diff spans many files, nudge against scope creep.
+
+    SWE scoring often punishes drive-by edits; large diffs are a common failure
+    mode when the model 'cleans up' or touches extras beyond the issue."""
+    files = _patch_changed_files(patch)
+    n = len(files)
+    if n <= PATCH_WIDE_SCOPE_FILE_THRESHOLD:
+        return ""
+    head = ", ".join(files[:6])
+    tail = f" (+{n - 6} more)" if n > 6 else ""
+    return (
+        f"\n\nSCOPE: {n} files in this diff ({head}{tail}). Drop anything not "
+        "required by the issue — judges penalize unrelated changes.\n"
+    )
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2380,8 +2398,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-    # True once we see a command that looks like pytest/go test/etc. with success-shaped output.
-    saw_targeted_verify_success = False
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2633,10 +2649,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             for command_index, command in enumerate(command_batch, 1):
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
-                if _looks_like_verification_command(command) and _looks_like_successful_test_output(
-                    observation, command
-                ):
-                    saw_targeted_verify_success = True
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
@@ -2692,12 +2704,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
-                    if not saw_targeted_verify_success:
-                        observation_text += (
-                            "\n\nNOTE: No successful targeted verify command was detected in prior "
-                            "outputs (pytest/go test/npm test/tsc…). Run one before <final> if this "
-                            "environment supports it."
-                        )
+                    observation_text += _patch_wide_scope_note(get_patch(repo))
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
