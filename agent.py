@@ -1186,6 +1186,23 @@ def _patch_wide_scope_note(patch: str) -> str:
     )
 
 
+def _required_paths_gap_note(patch: str, issue_text: str) -> str:
+    """If the issue names `path.ext` files that the diff does not touch yet, say so.
+
+    Pairs with `_patch_wide_scope_note` (too many files vs. missing named files).
+    Surfaces the same signal as the coverage refinement nudge every observation
+    cycle so the model can fix before burning refinement budget."""
+    missing = _uncovered_required_paths(patch, issue_text)
+    if not missing:
+        return ""
+    shown = ", ".join(missing[:8])
+    extra = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+    return (
+        f"\n\nREQUIRED paths named in the issue but not in this diff yet: {shown}{extra}. "
+        "Touch them in this round if the task applies.\n"
+    )
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -2705,6 +2722,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "3. Emit <final>summary</final>."
                     )
                     observation_text += _patch_wide_scope_note(get_patch(repo))
+                    observation_text += _required_paths_gap_note(get_patch(repo), issue)
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
