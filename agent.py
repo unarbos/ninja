@@ -2561,6 +2561,49 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        # Post-loop empty-patch fallback. The main for-loop can exit with
+        # no patch when the model issued only inspection commands (cat /
+        # grep / ls / find / sed-no-match) and never reached `<final>` or
+        # the early-exit branches that travel through
+        # `maybe_queue_refinement` — leaving `hail_mary_turns_used == 0`
+        # despite the patch being empty. Fire one final hail-mary turn
+        # manually so the round doesn't return a guaranteed-zero result.
+        # Multi-shot's revert+retry path (see solve()) already handles
+        # the "first attempt produced low-signal" case, but it triggers
+        # AFTER `_solve_attempt` returns; this saves the FIRST attempt
+        # before multi-shot has to spend budget on a second.
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and not out_of_time()
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={time_remaining():.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if out_of_time():
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR:\n" + traceback.format_exc())
+
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
