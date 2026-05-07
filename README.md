@@ -4,16 +4,23 @@
 `agent.py` and keep validator systems, task generators, scoring, wallets, and
 infrastructure out of this repo.
 
-Miner submissions happen through pull requests to this repo. The validator only
-runs PRs that are also committed on-chain by a registered miner hotkey.
+Miner submissions happen only through pull requests to this repo. The validator
+does not queue raw `owner/repo@sha` commitments or arbitrary external repos; it
+only runs PR heads from `unarbos/ninja` that are also committed on-chain by a
+registered miner hotkey.
+
+For a short miner-facing checklist, see `miner_readme.txt`.
 
 ## What You Are Allowed To Edit
 
-- `agent.py`
-- README/docs to clarify agent behavior for miners
+- `agent.py` for miner submissions
+
+Miner PRs must not modify anything else. Docs in this repo may be updated by
+maintainers to clarify policy, but production miner submissions are judged only
+when the PR diff is limited to `agent.py`.
 
 Nothing else should be added here for production mining, including
-( but not limited to ):
+(but not limited to):
 
 - validator service code
 - PM2 configs or service orchestration
@@ -97,6 +104,7 @@ Keep these boundaries intact:
 PRs are blocked (or fail CI) if they:
 
 - modify files outside `agent.py`
+- try to submit or point the validator at another repo instead of this PR head
 - change the `solve(...)` entry-point contract
 - add forbidden provider/secret references
 - attempt to hardcode or route around the managed model/proxy (`api_base`,
@@ -109,10 +117,60 @@ PRs are blocked (or fail CI) if they:
 
 ## Miner PR Flow
 
+There are two supported ways to bind your PR to your miner hotkey. The newer
+pre-PR flow gives you a private period: you commit the exact Git head on-chain
+before the PR is public, then open the PR after the commitment is included. The
+classic flow still works if you prefer to open the PR first and commit
+`#<pr-number>@<head-sha>` afterward.
+
+### Option A: pre-PR commitment
+
 1. Fork or branch from `unarbos/ninja`.
 2. Edit `agent.py`.
-3. Open a PR back to `unarbos/ninja:main`.
-4. Make the PR title start with your exact miner hotkey:
+3. Commit the final local change to Git. The commit SHA must be the exact commit
+   you later push/open as the PR head.
+4. Run local preflight:
+
+```bash
+./scripts/precommit_ninja_pr.py \
+  --hotkey <miner-hotkey-ss58> \
+  --judge
+```
+
+The script prints the commitment:
+
+```text
+github-pr-head:unarbos/ninja@<head-sha>
+```
+
+It refuses dirty worktrees by default, runs local static CI-style checks, and
+with `--judge` calls the same OpenRouter judge prompt used by PR CI. Set
+`OPENROUTER_API_KEY` for the judge step.
+
+5. Submit the pre-PR commitment before pushing/opening the PR:
+
+```bash
+./scripts/precommit_ninja_pr.py \
+  --hotkey <miner-hotkey-ss58> \
+  --judge \
+  --commit-on-chain \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name>
+```
+
+You can also submit the printed string directly:
+
+```bash
+./scripts/commit_on_chain.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58> \
+  --netuid 66 \
+  --commit "github-pr-head:unarbos/ninja@<head-sha>"
+```
+
+6. Push the same commit and open a PR back to `unarbos/ninja:main`.
+7. Make the PR title start with your exact miner hotkey:
 
 ```text
 <miner-hotkey> improve command loop
@@ -121,6 +179,15 @@ PRs are blocked (or fail CI) if they:
 Do not use any prefix like `hkey:` before the hotkey. The hotkey must be the
 first characters in the title.
 
+The validator will wait until it finds an open PR whose title hotkey, base repo,
+base branch, and current head SHA match the pre-PR commitment.
+
+### Option B: classic PR-number commitment
+
+1. Fork or branch from `unarbos/ninja`.
+2. Edit `agent.py`.
+3. Open a PR back to `unarbos/ninja:main`.
+4. Make the PR title start with your exact miner hotkey.
 5. Commit the PR head on-chain using:
 
 ```text
@@ -142,10 +209,12 @@ It defaults to subnet 66:
 `--hotkey` is checked against the loaded wallet hotkey so the PR title, wallet,
 and on-chain commitment all refer to the same miner.
 
-Only one commitment per miner hotkey is eligible in each 24h window. The
-validator enforces the window as 7,200 chain blocks since the last accepted
-commitment for that hotkey. A newer commitment made before that window expires
-is skipped.
+Only one accepted submission is eligible per miner hotkey registration. The
+validator uses block `8,104,340` as the hotkey-spent cutoff: commitments before
+that block do not spend a hotkey for the current submission window, while any
+accepted commitment at or after that block does. A hotkey cannot resubmit after
+24h; after an accepted submission, that hotkey is spent for future submissions
+unless it is registered again as a new miner hotkey.
 
 The validator binds the PR to the committing hotkey by checking that the PR title
 starts with the same hotkey that made the on-chain commitment. It also checks that
