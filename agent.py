@@ -116,6 +116,9 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_PLAN_COVERAGE_NUDGES = 1  # taoagentbloom PR#377 insight: gate refinement on the agent's own
+                              # <plan> block (planned target files not yet touched), independent of
+                              # whether the issue text named them. Most accurate per-task signal.
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -1059,6 +1062,81 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Plan-coverage gate (taoagentbloom PR#377)
+# -----------------------------
+#
+# The path-coverage gate (above) checks paths the ISSUE TEXT mentions. The
+# plan-coverage gate checks paths the AGENT ITSELF named in its `<plan>`
+# block. Often the model's plan is more concrete than the issue (e.g. issue
+# says "fix the bug" but the plan correctly identifies foo.py + tests/
+# test_foo.py as targets). Surfacing planned-but-untouched files makes the
+# inner agent finish what it announced it would do. Ported from
+# taoagentbloom/ninja@dda4b49 (PR#377), the strongest non-king challenger
+# observed (margin -2 in duel #4123).
+
+
+def _extract_planned_target_paths(repo: Path, assistant_text: str) -> List[str]:
+    """Resolve concrete files named in the model's <plan> to tracked paths.
+
+    Task-agnostic: if the model says a repo file/function is a planned
+    target, the final diff should usually touch that file. Catches
+    incomplete multi-file edits without keyword playbooks.
+    """
+    plan_match = re.search(r"<plan>(.*?)</plan>", assistant_text, flags=re.IGNORECASE | re.DOTALL)
+    if not plan_match:
+        return []
+    plan = plan_match.group(1)
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    tracked = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    tracked_set = set(tracked)
+    stem_to_paths: Dict[str, List[str]] = {}
+    for path in tracked:
+        if not _context_file_allowed(path):
+            continue
+        stem_to_paths.setdefault(Path(path).stem, []).append(path)
+
+    out: List[str] = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        if path not in seen and path in tracked_set and _context_file_allowed(path):
+            seen.add(path)
+            out.append(path)
+
+    for token in re.findall(r"[A-Za-z0-9_./@+-]+\.[A-Za-z0-9_+-]+", plan):
+        normalized = token.strip("`'\"(),;:[]{}")
+        if normalized in tracked_set:
+            add(normalized)
+
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", plan):
+        paths = stem_to_paths.get(token)
+        if paths and len(paths) == 1:
+            add(paths[0])
+
+    return out[:8]
+
+
+def _uncovered_planned_paths(repo: Path, assistant_text: str, patch: str) -> List[str]:
+    planned = _extract_planned_target_paths(repo, assistant_text)
+    if not planned:
+        return []
+    changed = set(_patch_changed_files(patch))
+    return [path for path in planned if path not in changed]
+
+
+# -----------------------------
 # Multi-language syntax gate
 # -----------------------------
 #
@@ -1963,6 +2041,21 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
+def build_plan_coverage_nudge_prompt(missing_paths: List[str]) -> str:
+    """Surface planned target files (from the agent's own <plan>) that the
+    patch hasn't touched. Ported from taoagentbloom PR#377."""
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    return (
+        "Plan-coverage gap — your own <plan> named these repo files as edit "
+        "targets, but the current patch does NOT touch them:\n"
+        f"  {bullets}\n\n"
+        "If a listed file truly needs no edit, say why in <final>. Otherwise "
+        "edit the missing planned file(s) now with the smallest change needed "
+        "to complete the issue. Do not add unrelated files or broaden scope. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -2237,6 +2330,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    plan_coverage_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2275,7 +2369,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, plan_coverage_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2353,6 +2447,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # Plan-coverage gate (taoagentbloom PR#377): files the agent's own
+        # <plan> block named as targets but the patch hasn't touched yet.
+        # Independent of whether the issue text named them; sometimes the
+        # plan is more accurate than the bare issue (e.g. issue says "fix
+        # the bug" and the plan correctly identifies foo.py + the
+        # companion test as targets).
+        if plan_coverage_nudges_used < MAX_PLAN_COVERAGE_NUDGES:
+            missing_planned = _uncovered_planned_paths(repo, assistant_text, patch)
+            if missing_planned:
+                plan_coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_plan_coverage_nudge_prompt(missing_planned),
+                    "PLAN_COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing_planned),
                 )
                 return True
 
@@ -2560,6 +2672,49 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # Post-loop empty-patch fallback. The main for-loop can exit with
+        # no patch when the model issued only inspection commands (cat /
+        # grep / ls / find / sed-no-match) and never reached `<final>` or
+        # the early-exit branches that travel through
+        # `maybe_queue_refinement` — leaving `hail_mary_turns_used == 0`
+        # despite the patch being empty. Fire one final hail-mary turn
+        # manually so the round doesn't return a guaranteed-zero result.
+        # Multi-shot's revert+retry path (see solve()) already handles
+        # the "first attempt produced low-signal" case, but it triggers
+        # AFTER `_solve_attempt` returns; this saves the FIRST attempt
+        # before multi-shot has to spend budget on a second.
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and not out_of_time()
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={time_remaining():.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if out_of_time():
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
