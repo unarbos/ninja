@@ -577,6 +577,29 @@ def get_patch(repo: Path) -> str:
     return _strip_low_signal_hunks(cleaned)
 
 
+def _git_diff_stat(repo: Path) -> str:
+    """Compact diff summary (paths + churn) to reduce wasted turns."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--stat", "--", "."],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    out = (proc.stdout or "").strip()
+    if not out:
+        return ""
+    if len(out) > 1600:
+        out = out[:1600] + "\n...[truncated]"
+    return out
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -2380,9 +2403,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-    last_command: str = ""
-    last_patch_snapshot: str = ""
-    repeated_no_progress = 0
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2632,17 +2652,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                # Anti-stuck-loop: if the model repeats the exact same command
-                # and the patch hasn't changed, nudge it to switch tactics.
-                if command.strip() == last_command.strip() and last_patch_snapshot:
-                    patch_before = get_patch(repo)
-                    if patch_before == last_patch_snapshot:
-                        repeated_no_progress += 1
-                    else:
-                        repeated_no_progress = 0
-                else:
-                    repeated_no_progress = 0
-
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -2672,9 +2681,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         success = True
                         break
 
-                last_command = command
-                last_patch_snapshot = get_patch(repo)
-
             if len(commands) > len(command_batch):
                 observations.append(
                     f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
@@ -2694,11 +2700,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if repeated_no_progress >= 1:
-                    observation_text += (
-                        "\n\nNOTE: The last command was repeated without changing the patch. "
-                        "Switch tactics: make an edit, run a different focused grep, or run the narrowest functional test."
-                    )
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -2708,6 +2709,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
+                    stat = _git_diff_stat(repo)
+                    if stat:
+                        observation_text += "\n\nDiff stat:\n" + stat
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
