@@ -94,7 +94,6 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-PATCH_WIDE_SCOPE_FILE_THRESHOLD = 5  # remind model about scope creep above this many paths
 
 MAX_KEYWORDS_FOR_CONTEXT = 14
 MAX_KEYWORD_CHARS = 80
@@ -1167,40 +1166,6 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
-
-
-def _patch_wide_scope_note(patch: str) -> str:
-    """If the working tree diff spans many files, nudge against scope creep.
-
-    SWE scoring often punishes drive-by edits; large diffs are a common failure
-    mode when the model 'cleans up' or touches extras beyond the issue."""
-    files = _patch_changed_files(patch)
-    n = len(files)
-    if n <= PATCH_WIDE_SCOPE_FILE_THRESHOLD:
-        return ""
-    head = ", ".join(files[:6])
-    tail = f" (+{n - 6} more)" if n > 6 else ""
-    return (
-        f"\n\nSCOPE: {n} files in this diff ({head}{tail}). Drop anything not "
-        "required by the issue — judges penalize unrelated changes.\n"
-    )
-
-
-def _required_paths_gap_note(patch: str, issue_text: str) -> str:
-    """If the issue names `path.ext` files that the diff does not touch yet, say so.
-
-    Pairs with `_patch_wide_scope_note` (too many files vs. missing named files).
-    Surfaces the same signal as the coverage refinement nudge every observation
-    cycle so the model can fix before burning refinement budget."""
-    missing = _uncovered_required_paths(patch, issue_text)
-    if not missing:
-        return ""
-    shown = ", ".join(missing[:8])
-    extra = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
-    return (
-        f"\n\nREQUIRED paths named in the issue but not in this diff yet: {shown}{extra}. "
-        "Touch them in this round if the task applies.\n"
-    )
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2415,6 +2380,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+    last_command: str = ""
+    last_patch_snapshot: str = ""
+    repeated_no_progress = 0
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2664,6 +2632,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                # Anti-stuck-loop: if the model repeats the exact same command
+                # and the patch hasn't changed, nudge it to switch tactics.
+                if command.strip() == last_command.strip() and last_patch_snapshot:
+                    patch_before = get_patch(repo)
+                    if patch_before == last_patch_snapshot:
+                        repeated_no_progress += 1
+                    else:
+                        repeated_no_progress = 0
+                else:
+                    repeated_no_progress = 0
+
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -2693,6 +2672,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         success = True
                         break
 
+                last_command = command
+                last_patch_snapshot = get_patch(repo)
+
             if len(commands) > len(command_batch):
                 observations.append(
                     f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
@@ -2712,6 +2694,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
+                if repeated_no_progress >= 1:
+                    observation_text += (
+                        "\n\nNOTE: The last command was repeated without changing the patch. "
+                        "Switch tactics: make an edit, run a different focused grep, or run the narrowest functional test."
+                    )
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -2721,8 +2708,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
-                    observation_text += _patch_wide_scope_note(get_patch(repo))
-                    observation_text += _required_paths_gap_note(get_patch(repo), issue)
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
