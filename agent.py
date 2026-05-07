@@ -1729,6 +1729,24 @@ def _symbol_grep_hits(
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+    # v32 caller-boost: weight callsites (`symbol(`) over generic mentions.
+    # For each symbol, find files that contain `symbol(` and bump those FILES
+    # in the per-file hits dict (NOT the symbol itself).
+    for sym in symbols[:8]:
+        try:
+            r = subprocess.run(
+                ["grep", "-rln", "--include=*.py", "--include=*.ts", "--include=*.tsx",
+                 "--include=*.js", "--include=*.jsx", "--include=*.go",
+                 f"{sym}(", "."],
+                cwd=str(repo), capture_output=True, text=True, timeout=15, check=False,
+            )
+            if r.returncode == 0:
+                for path_line in r.stdout.splitlines():
+                    p = path_line.strip().lstrip("./")
+                    if p in tracked_set and _context_file_allowed(p):
+                        hits[p] = hits.get(p, 0) + 2
+        except Exception:
+            pass
     return hits
 
 
@@ -1780,6 +1798,10 @@ brief summary of what changed
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
 ## Scope discipline — what to change
+
+**MINIMAL EDIT PRINCIPLE**: the smallest correct patch wins. Every line you add must be required by the issue; every line you delete must be wrong per the issue. No speculative changes.
+
+**Edit at the leaf, not the root**: when fixing a behavior in a chain of callers, edit the deepest function whose change satisfies the issue. Avoid touching public APIs unless the issue explicitly asks. Touching fewer files = higher similarity score.
 
 Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Fix X in function Y" → change only function Y
@@ -1899,7 +1921,9 @@ your command here
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
-            "Budget check: no repo change yet. "
+            "Budget check: no repo change yet. Spending steps on broad search is the most "
+            "common cause of incomplete patches — the issue almost always names enough "
+            "context to make a reasonable first edit immediately. "
             "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
             "A precise sed or python -c is better than another grep. Stop exploring."
         )
@@ -2172,6 +2196,25 @@ def solve(
     """
     Main portable interface for validators.
     """
+    # v34: per-call SIGTERM handler. The validator stops the docker exec when
+    # its per-round timer fires, sending SIGTERM ~0.5s before SIGKILL. We use
+    # that grace window to run `git add .` on the repo we were given, so any
+    # untracked file modifications are captured in the patch the validator
+    # reads. The handler does no gating; it just preserves work already on disk.
+    import signal as _v34_signal
+    _v34_repo_arg = repo_path
+    def _v34_term_handler(signum, frame):
+        try:
+            if _v34_repo_arg:
+                subprocess.run(["git", "add", "."], cwd=str(_v34_repo_arg),
+                               capture_output=True, text=True, timeout=2, check=False)
+        except Exception:
+            pass
+    try:
+        _v34_signal.signal(_v34_signal.SIGTERM, _v34_term_handler)
+    except (ValueError, OSError):
+        pass
+
     _multishot_started = time.monotonic()
     _multishot_total_budget = 580.0
     _multishot_args = dict(
