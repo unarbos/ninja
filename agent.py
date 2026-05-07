@@ -103,7 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
+
+WALL_CLOCK_BUDGET_SECONDS = 180.0  # cut from 270 — leaves validator headroom; 50-56% timeout rate in duels 4129/4131 vs king at 18-20%
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -2085,7 +2086,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # v43: raised from 90 — never start a retry unless we have at least one full attempt budget (180s) left, so the retry can't push us past the validator's soft cap.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # raised from 90 — retry only when a full attempt budget remains
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2179,27 +2180,27 @@ def solve(
     50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
     the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    return _solve_with_safety_net(**_multishot_args)
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
-    try:
-        _multishot_repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
+    """Multishot driver wrapped in an exception safety net.
 
+    Any uncaught exception returns whatever patch is on disk rather than
+    propagating — an empty-patch crash scores 0; a partial patch can still
+    earn cursor-similarity credit.
+    """
+    repo_path = kwargs.get("repo_path", "")
     try:
         _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
+        _multishot_total_budget = 400.0
+        _multishot_repo_obj = _repo_path(repo_path)
+        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
@@ -2215,8 +2216,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
@@ -2226,31 +2226,25 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _result2["multishot_winner"] = "retry"
             return _result2
 
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        if _patch1:
             _multishot_apply_patch(_multishot_repo_obj, _patch1)
         _result1["multishot_attempts"] = 2
         _result1["multishot_winner"] = "primary"
         return _result1
 
-    except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
-        salvaged = ""
+    except Exception as e:
+        patch = ""
         try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
+            patch = get_patch(_repo_path(repo_path))
         except Exception:
-            salvaged = ""
+            pass
         return AgentResult(
-            patch=salvaged or "",
-            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
+            patch=patch,
+            logs="FATAL_MULTISHOT_ERROR:\n" + traceback.format_exc(),
             steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
+            cost=None,
+            success=bool(patch.strip()),
         ).to_dict()
 
 
