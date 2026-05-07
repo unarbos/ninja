@@ -2192,25 +2192,6 @@ def solve(
     """
     Main portable interface for validators.
     """
-    # v34: per-call SIGTERM handler. The validator stops the docker exec when
-    # its per-round timer fires, sending SIGTERM ~0.5s before SIGKILL. We use
-    # that grace window to run `git add .` on the harness-provided repo, so
-    # any untracked file modifications are captured in the patch the
-    # validator reads. The handler does no gating; it just preserves work.
-    import signal as _v34_signal
-    def _v34_term_handler(signum, frame):
-        try:
-            _rp = os.environ.get("TAU_REPO_DIR") or repo_path
-            if _rp:
-                subprocess.run(["git", "add", "."], cwd=str(_rp),
-                               capture_output=True, text=True, timeout=2, check=False)
-        except Exception:
-            pass
-    try:
-        _v34_signal.signal(_v34_signal.SIGTERM, _v34_term_handler)
-    except (ValueError, OSError):
-        pass
-
     _multishot_started = time.monotonic()
     _multishot_total_budget = 580.0
     _multishot_args = dict(
