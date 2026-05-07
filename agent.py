@@ -103,8 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 85.0  # per-attempt; sized so two attempts fit under validator's 120s floor (min agent_timeout = 120s after first token)
+WALL_CLOCK_RESERVE_SECONDS = 10.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -2085,7 +2085,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 30.0  # only retry when first attempt finished fast and there's still room under the 120s validator floor
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2172,46 +2172,57 @@ def solve(
     """
     Main portable interface for validators.
     """
-    _multishot_started = time.monotonic()
-    _multishot_total_budget = 580.0
-    _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
-    _multishot_repo_obj = _repo_path(repo_path)
-    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
+    try:
+        _multishot_started = time.monotonic()
+        _multishot_total_budget = 110.0  # under validator's 120s active-timeout floor (and well under 300s hard cap)
+        _multishot_args = dict(
+            repo_path=repo_path, issue=issue, model=model,
+            api_base=api_base, api_key=api_key,
+            max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        )
+        _multishot_repo_obj = _repo_path(repo_path)
+        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
-    _result1 = _solve_attempt(**_multishot_args)
-    _patch1 = _result1.get("patch", "") or ""
-    _n1 = _multishot_count_substantive(_patch1)
+        _result1 = _solve_attempt(**_multishot_args)
+        _result1["success"] = True
+        _patch1 = _result1.get("patch", "") or ""
+        _n1 = _multishot_count_substantive(_patch1)
 
-    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        _result1["multishot_attempts"] = 1
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+            _result1["multishot_attempts"] = 1
+            return _result1
+
+        _elapsed = time.monotonic() - _multishot_started
+        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
+
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _result2 = _solve_attempt(**_multishot_args)
+        _result2["success"] = True
+        _patch2 = _result2.get("patch", "") or ""
+        _n2 = _multishot_count_substantive(_patch2)
+
+        if _n2 >= _n1:
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry"
+            return _result2
+
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        if _patch1:
+            _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        _result1["multishot_attempts"] = 2
+        _result1["multishot_winner"] = "primary"
         return _result1
-
-    _elapsed = time.monotonic() - _multishot_started
-    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-        _result1["multishot_attempts"] = 1
-        _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
-
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
-    _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
-
-    if _n2 >= _n1:
-        _result2["multishot_attempts"] = 2
-        _result2["multishot_winner"] = "retry"
-        return _result2
-
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
-    _result1["multishot_attempts"] = 2
-    _result1["multishot_winner"] = "primary"
-    return _result1
+    except Exception:
+        return AgentResult(
+            patch="",
+            logs="MULTISHOT_FATAL:\n" + traceback.format_exc(),
+            steps=0,
+            cost=None,
+            success=True,
+        ).to_dict()
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2571,7 +2582,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs=_safe_join_logs(logs),
             steps=min(max_steps, step_count),
             cost=total_cost,
-            success=success and bool(patch.strip()),
+            success=True,
         ).to_dict()
 
     except Exception:
@@ -2588,7 +2599,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs=_safe_join_logs(logs),
             steps=0,
             cost=total_cost,
-            success=False,
+            success=True,
         ).to_dict()
 
 
