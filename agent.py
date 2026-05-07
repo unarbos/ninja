@@ -94,6 +94,8 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
+MAX_CONSECUTIVE_IDENTICAL_COMMANDS = int(os.environ.get("AGENT_MAX_CONSECUTIVE_SAME_COMMAND", "2"))
+MIN_SUCCESSFUL_VERIFICATIONS = 1
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -504,6 +506,11 @@ def extract_final(model_text: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip()
+
+
+def _command_signature(command: str) -> str:
+    """Normalize command text so minor spacing doesn't bypass loop guards."""
+    return re.sub(r"\s+", " ", (command or "").strip().lower())
 
 
 # -----------------------------
@@ -1896,6 +1903,19 @@ your command here
 """
 
 
+def build_verification_required_prompt() -> str:
+    return """A code patch exists, but you have not produced a successful focused verification signal yet.
+
+Run one targeted functional check for the changed area now (for example:
+- `pytest tests/test_<module>.py -x -q`
+- `go test ./...`
+- `npm test -- <target>`
+). If no functional runner exists, run the most specific syntax/type check available and state why.
+
+Then return <final>summary</final>.
+"""
+
+
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
@@ -2201,7 +2221,7 @@ def solve(
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    if (_n2 > _n1) or (_n2 == _n1 and bool(_result2.get("success")) and not bool(_result1.get("success"))):
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
         return _result2
@@ -2240,6 +2260,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
+    successful_verification_signals = 0
+    verification_unavailable_signals = 0
+    last_command_signature = ""
+    consecutive_identical_commands = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -2464,6 +2488,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not commands:
                 if final is not None:
+                    patch_now = get_patch(repo)
+                    if patch_now.strip() and successful_verification_signals < MIN_SUCCESSFUL_VERIFICATIONS and verification_unavailable_signals == 0:
+                        messages.append({"role": "assistant", "content": response_text})
+                        messages.append({"role": "user", "content": build_verification_required_prompt()})
+                        logs.append(
+                            "\nVERIFICATION_REQUIRED:\nPatch exists but no successful focused verification signal yet."
+                        )
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
@@ -2472,6 +2504,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 consecutive_no_command += 1
                 patch = get_patch(repo)
                 if patch.strip():
+                    if successful_verification_signals < MIN_SUCCESSFUL_VERIFICATIONS and verification_unavailable_signals == 0:
+                        messages.append({"role": "assistant", "content": response_text})
+                        messages.append({"role": "user", "content": build_verification_required_prompt()})
+                        logs.append(
+                            "\nVERIFICATION_REQUIRED:\nPatch exists but model stopped before producing verification evidence."
+                        )
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nPATCH_READY:\nModel stopped issuing commands after creating a patch.")
@@ -2490,13 +2529,39 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                command_signature = _command_signature(command)
+                if command_signature and command_signature == last_command_signature:
+                    consecutive_identical_commands += 1
+                else:
+                    consecutive_identical_commands = 1
+                    last_command_signature = command_signature
+
+                if consecutive_identical_commands > MAX_CONSECUTIVE_IDENTICAL_COMMANDS:
+                    observation = (
+                        "COMMAND:\n"
+                        + command
+                        + "\n\nEXIT_CODE:\n125\n\nDURATION_SECONDS:\n0.000\n\nSTDERR:\n"
+                        + f"Blocked repeated command loop: this command was repeated more than {MAX_CONSECUTIVE_IDENTICAL_COMMANDS} times consecutively. "
+                        + "Issue a different high-signal command (edit, targeted test, or focused diff review).\n"
+                    )
+                    observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
+                    logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                    continue
+
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
+                patch_after_command = get_patch(repo)
+                if patch_after_command.strip() and _looks_like_verification_command(command):
+                    if _looks_like_successful_test_output(observation, command):
+                        successful_verification_signals += 1
+                    elif _looks_like_runner_unavailable(observation):
+                        verification_unavailable_signals += 1
+
                 if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
+                    patch = patch_after_command
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
@@ -2526,6 +2591,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
 
             if final is not None and get_patch(repo).strip():
+                if successful_verification_signals < MIN_SUCCESSFUL_VERIFICATIONS and verification_unavailable_signals == 0:
+                    messages.append({"role": "user", "content": build_verification_required_prompt()})
+                    logs.append(
+                        "\nVERIFICATION_REQUIRED:\nIgnoring <final> until at least one successful focused verification signal."
+                    )
+                    continue
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
@@ -2547,6 +2618,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
+                    if successful_verification_signals < MIN_SUCCESSFUL_VERIFICATIONS and verification_unavailable_signals == 0:
+                        observation_text += (
+                            "\n4. Required gate: provide at least one successful focused verification command output before finalizing."
+                        )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
@@ -2659,6 +2734,18 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
         re.search(r"\bgit\s+(diff|status)\b", lowered)
         or re.search(r"\bgit\s+show\s+--stat\b", lowered)
     )
+
+
+def _looks_like_runner_unavailable(observation: str) -> bool:
+    lower = observation.lower()
+    markers = [
+        "command not found",
+        "no module named pytest",
+        "cannot find module",
+        "not recognized as an internal or external command",
+        "no such file or directory",
+    ]
+    return any(marker in lower for marker in markers)
 
 
 def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
