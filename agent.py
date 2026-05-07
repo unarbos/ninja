@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+WALL_CLOCK_BUDGET_SECONDS = 240.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -1793,8 +1793,15 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
+    # Bound the cascade: N sequential 4s greps could spend a minute+ on pre-solve
+    # before first model token. Symbol-grep is a *boost* to ranking, not the
+    # only signal — cap symbols and total wall-clock so it doesn't tax solving.
+    symbols = symbols[:12]
     hits: Dict[str, int] = {}
+    grep_budget_started = time.monotonic()
     for symbol in symbols:
+        if time.monotonic() - grep_budget_started > 6.0:
+            break
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -1802,7 +1809,7 @@ def _symbol_grep_hits(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=4,
+                timeout=2,
             )
         except Exception:
             continue
@@ -2265,7 +2272,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 5  # raised from 3 — duel logs show 3-4-line
                                      # patches frequently lose to challengers
                                      # who cover more of the criterion list.
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 130.0
 
 
 def _multishot_quality_score(repo: Path, patch: str) -> float:
@@ -2377,8 +2384,51 @@ def solve(
     """
     Main portable interface for validators.
     """
+    try:
+        return _solve_with_multishot(
+            repo_path=repo_path, issue=issue, model=model,
+            api_base=api_base, api_key=api_key,
+            max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        )
+    except Exception as exc:
+        # Convert any unhandled exception into a `completed` exit with whatever
+        # patch is already on disk. solver_error means the validator never even
+        # judges our work; an empty/partial patch with a crash log is strictly
+        # better — the validator collects the patch via `git diff` inside the
+        # container regardless of what we put in the dict.
+        recovered_patch = ""
+        try:
+            recovered_patch = get_patch(_repo_path(repo_path))
+        except Exception:
+            pass
+        return {
+            "patch": recovered_patch,
+            "logs": (
+                "SOLVE_TOPLEVEL_EXCEPTION: "
+                + repr(exc)
+                + "\n"
+                + traceback.format_exc()
+            ),
+            "steps": 0,
+            "cost": 0.0,
+            "success": False,
+            "exit_reason": "agent_exception",
+        }
+
+
+def _solve_with_multishot(
+    *,
+    repo_path: str,
+    issue: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    max_steps: int,
+    command_timeout: int,
+    max_tokens: int,
+) -> Dict[str, Any]:
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 580.0
+    _multishot_total_budget = 270.0
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
