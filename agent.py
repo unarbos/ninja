@@ -1888,14 +1888,14 @@ _V14_EXCERPT_PER_SYMBOL_LINES = 14
 _V14_EXCERPT_BLOCK_BUDGET = 3500
 
 
-def _v14_extract_issue_symbols(issue: str, limit: int = 6) -> List[str]:
+def _v14_extract_issue_symbols(issue_text: str, limit: int = 6) -> List[str]:
     """Extract identifier-shaped tokens (CamelCase, snake_case) from the issue.
     These are the most reliable anchors for finding the right edit region."""
-    if not issue:
+    if not issue_text:
         return []
     out: List[str] = []
     seen: set[str] = set()
-    for m in _V14_SYMBOL_RE.finditer(issue):
+    for m in _V14_SYMBOL_RE.finditer(issue_text):
         tok = m.group(0)
         if len(tok) < 4 or tok.lower() in seen:
             continue
@@ -1908,16 +1908,16 @@ def _v14_extract_issue_symbols(issue: str, limit: int = 6) -> List[str]:
     return out
 
 
-def _v14_build_excerpt_block(repo: Path, issue: str) -> str:
+def _v14_build_excerpt_block(repo_root: Path, issue_text: str) -> str:
     """Light excerpt layer: for top 1-2 ranked files, grep the issue's
     identifier-shaped symbols and pull a small context window around each
     hit. This complements the existing whole-file preload — same files,
     sharper localisation. Skips silently when no symbols or no hits."""
-    symbols = _v14_extract_issue_symbols(issue, limit=4)
+    symbols = _v14_extract_issue_symbols(issue_text, limit=4)
     if not symbols:
         return ""
     try:
-        ranked = _rank_context_files(repo, issue)[:2]
+        ranked = _rank_context_files(repo_root, issue_text)[:2]
     except Exception:
         return ""
     if not ranked:
@@ -1925,7 +1925,7 @@ def _v14_build_excerpt_block(repo: Path, issue: str) -> str:
     sections: List[str] = []
     used = 0
     for relative_path in ranked:
-        full = repo / relative_path
+        full = repo_root / relative_path
         try:
             text = full.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -2429,12 +2429,12 @@ def _v14_count_substantive_hunks(patch: str) -> int:
     return n
 
 
-def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
+def _v14_grounded_score(repo_root: Path, issue_text: str, patch_text: str) -> float:
     """Real-signal score for a candidate patch, used to pick between multishot
     attempts. Replaces _multishot_count_substantive."""
-    if not patch.strip():
+    if not patch_text.strip():
         return _V14_FAIL_EMPTY
-    if _v14_contains_injection_markers(patch):
+    if _v14_contains_injection_markers(patch_text):
         return _V14_FAIL_INJECTION
 
     score = 0.0
@@ -2448,7 +2448,7 @@ def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
 
     # 2. Companion test signal: real runtime evidence.
     try:
-        test_failure = _select_companion_test_failure(repo, patch)
+        test_failure = _select_companion_test_failure(repo_root, patch)
     except Exception:
         test_failure = None
     if test_failure is not None:
@@ -2459,10 +2459,10 @@ def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
 
     # 3. Coverage: did we touch the files the issue named?
     try:
-        missing_paths = _uncovered_required_paths(patch, issue)
+        missing_paths = _uncovered_required_paths(patch_text, issue_text)
     except Exception:
         missing_paths = []
-    mentioned = _extract_issue_path_mentions(issue)
+    mentioned = _extract_issue_path_mentions(issue_text)
     if mentioned:
         covered = max(0, len(mentioned) - len(missing_paths))
         coverage_ratio = covered / len(mentioned)
@@ -2471,13 +2471,13 @@ def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
 
     # 4. Criteria: did we address the acceptance bullets?
     try:
-        unaddressed = _unaddressed_criteria(patch, issue)
+        unaddressed = _unaddressed_criteria(patch_text, issue_text)
     except Exception:
         unaddressed = []
     score += 18.0 - 6.0 * min(4, len(unaddressed))
 
     # 5. Source-edit / companion-test pairing.
-    changed_files = _v14_extract_changed_files(patch)
+    changed_files = _v14_extract_changed_files(patch_text)
     has_source = any(
         not (cf.startswith("test") or "test_" in cf or cf.endswith(("_test.go", ".test.ts", ".test.js")))
         for cf in changed_files
@@ -2495,9 +2495,9 @@ def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
             score -= 14.0
 
     # 6. Footprint penalty: continuous, mirrors the gpt-5.4 anti-churn bias.
-    fp = _v14_patch_footprint(patch)
-    score -= _v14_footprint_penalty(fp, issue)
-    if _v14_patch_is_comment_only_or_rename_only(patch):
+    fp = _v14_patch_footprint(patch_text)
+    score -= _v14_footprint_penalty(fp, issue_text)
+    if _v14_patch_is_comment_only_or_rename_only(patch_text):
         score -= 18.0
 
     # 7. Cohesion bonus: small, focused patch on path-mentioned files.
@@ -2505,7 +2505,7 @@ def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
         score += 8.0
 
     # 8. Non-empty bonus (tie-breaker; NOT a positive objective).
-    if _v14_count_substantive_hunks(patch) >= 1:
+    if _v14_count_substantive_hunks(patch_text) >= 1:
         score += 6.0
 
     return score
