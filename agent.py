@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -68,7 +69,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
-# observation size, and max_tokens. Do not set sampling parameters; validator
+# observation size, and max_tokens. Do not set sampling parameters; the
+# validator controls sampling server-side.
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
@@ -112,7 +114,8 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+# Companion-test auto-repair turn removed because it was never wired into the
+# solve() refinement loop and only left dead prompt/config surface.
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
@@ -708,7 +711,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, iss: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -724,7 +727,7 @@ def build_preloaded_context(repo: Path, iss: str) -> str:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
     """
-    files = _rank_context_files(repo, iss)
+    files = _rank_context_files(repo, issue)
     if not files:
         return ""
 
@@ -752,13 +755,13 @@ def build_preloaded_context(repo: Path, iss: str) -> str:
     return "\n\n".join(parts)
 
 
-def _rank_context_files(repo: Path, iss: str) -> List[str]:
+def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
 
-    issue_lower = iss.lower()
-    path_mentions = _extract_issue_path_mentions(iss)
+    issue_lower = issue.lower()
+    path_mentions = _extract_issue_path_mentions(issue)
     mentioned: List[str] = []
     tracked_set = set(tracked)
     for mention in path_mentions:
@@ -766,8 +769,8 @@ def _rank_context_files(repo: Path, iss: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    terms = _issue_terms(iss)
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, iss)
+    terms = _issue_terms(issue)
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -834,20 +837,20 @@ def _context_file_allowed(relative_path: str) -> bool:
     return True
 
 
-def _extract_issue_path_mentions(iss: str) -> List[str]:
+def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(iss):
+    for match in pattern.finditer(issue):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
     return mentions
 
 
-def _issue_terms(iss: str) -> List[str]:
+def _issue_terms(issue: str) -> List[str]:
     stop = {
         "about",
         "after",
@@ -872,7 +875,7 @@ def _issue_terms(iss: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", iss.lower()):
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
         if raw in stop or raw in terms:
             continue
         terms.append(raw)
@@ -1073,12 +1076,13 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+# Keep this set conservative: Rust lifetimes (`'a`) can look like unclosed
+# single-quoted strings to this lightweight parser and cause false positives.
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".cs",
         ".java",
         ".go",
-        ".rs",
         ".kt",
         ".kts",
         ".scala",
@@ -1321,19 +1325,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
-    try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
-    except Exception:
-        return False
+    """Cross-platform executable presence check."""
+    return shutil.which(name) is not None
 
 
 def _shell_quote(value: str) -> str:
@@ -1413,7 +1406,11 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """Read recent small-diff commits as style anchors for the model."""
+    """Read recent small-diff commits as style anchors for the model.
+
+    Returns an empty string when history is unavailable or unsuitable. This is
+    best-effort context enrichment; it must never fail the solve loop.
+    """
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1452,7 +1449,7 @@ def _recent_commit_examples(repo: Path) -> str:
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
             diff_proc = subprocess.run(
-                ["git", "show", "--no-merges", "--pretty=format:%s", sha],
+                ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
@@ -1807,6 +1804,7 @@ def build_polish_prompt(junk_summary: str) -> str:
 
 
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
+    """Tell the model which issue-mentioned paths are still untouched."""
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
         "Coverage gap — the task explicitly mentions these path(s) but your "
@@ -1823,6 +1821,7 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
 
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
+    """Tell the model which acceptance-criteria checkpoints look unaddressed."""
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
         "Criterion-coverage gap — these acceptance-criterion checkpoints from "
@@ -1841,6 +1840,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
 
 
 def build_hail_mary_prompt(issue_text: str) -> str:
+    """Last-resort instruction when all refinement turns still yielded no patch."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
         "EMERGENCY: after all refinement attempts your patch is still empty. "
@@ -1904,22 +1904,6 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
-def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """When the companion-test gate fails, hand the model the exact failure tail."""
-    tail = output[-2400:] if len(output) > 2400 else output
-    return (
-        f"Companion test is failing after your patch: `{test_path}`.\n\n"
-        "Test output (tail):\n```\n"
-        f"{tail}\n```\n\n"
-        "Diagnose first: is the source patch incomplete (missing part of the fix), "
-        "or does the test itself need updating to match new correct behaviour?\n"
-        "- If the source fix is incomplete, extend it now.\n"
-        "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
-        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
-        "then end with <final>summary</final>."
-    )
-
-
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -1937,17 +1921,10 @@ def solve(
     max_steps: int = DEFAULT_MAX_STEPS,
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
     """
-
-    legacy_issue = kwargs.pop("issue", "")
-    if not issue and isinstance(legacy_issue, str):
-        issue = legacy_issue
-    if not isinstance(issue, str):
-        issue = str(issue)
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2372,17 +2349,17 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
-    iss = args.get("issue") or ""
+    issue = args.get("issue") or ""
     if args.get("issue_file"):
-        iss = Path(args["issue_file"]).read_text(encoding="utf-8")
+        issue = Path(args["issue_file"]).read_text(encoding="utf-8")
 
-    if not iss.strip():
+    if not issue.strip():
         print("ERROR: provide --issue or --issue-file", file=sys.stderr)
         return 2
 
     result = solve(
         repo_path=args["repo"],
-        iss=iss,
+        issue=issue,
         model=args["model"],
         api_base=args["api_base"],
         api_key=args["api_key"],
