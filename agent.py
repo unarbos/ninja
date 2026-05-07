@@ -1865,20 +1865,19 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 _V14_SURGICAL_SUFFIX = """
 
 PROFILE: SURGICAL.
-The validator's LLM judge (gpt-5.4 era) explicitly penalises "unrelated
-churn", "comment-only edits", and any patch that touches more than the
-issue actually requires. Make the smallest patch that passes every
-acceptance criterion and the relevant test. Prefer 1-3 file edits with
-tight per-hunk minimums. Reject every drive-by change."""
+Make the smallest patch that passes every acceptance criterion and the
+relevant test. Prefer 1-3 file edits with tight per-hunk minimums.
+Avoid comment-only edits or unrelated drive-by changes — every line
+of the diff should be there because a stated requirement demands it."""
 
 _V14_SURGICAL_PLUS_SUFFIX = """
 
 PROFILE: SURGICAL-PLUS.
-Same scope discipline as SURGICAL — no broad rewrites, no unrelated
-churn. The only relaxation: when the issue text or coverage signal
-clearly implies a second touched file (companion test, paired
-type/interface, or a single caller), include that edit in the same
-response. Do NOT widen scope further. Per-hunk minimums still apply."""
+Same scope discipline as SURGICAL — minimal patches, no unrelated edits.
+The only relaxation: when the issue text or context clearly implies a
+second touched file (companion test, paired type/interface, or a single
+caller), include that edit in the same response. Do NOT widen scope
+further. Per-hunk minimums still apply."""
 
 
 _V14_SYMBOL_RE = re.compile(
@@ -2439,7 +2438,7 @@ def _v14_grounded_score(repo_root: Path, issue_text: str, patch_text: str) -> fl
 
     # 1. Syntax correctness: huge swing both ways. Broken parse is unrecoverable.
     try:
-        syntax_errors = _check_syntax(repo, patch)
+        syntax_errors = _check_syntax(repo_root, patch_text)
     except Exception:
         syntax_errors = []
     score += 42.0 if not syntax_errors else -85.0
@@ -2763,7 +2762,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
+            syntax_errors = _check_syntax(repo_root, patch_text)
             if syntax_errors:
                 syntax_fix_turns_used += 1
                 total_refinement_turns_used += 1
