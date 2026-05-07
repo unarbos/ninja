@@ -106,6 +106,24 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
+# v26: per-operation pre-flight time guards. Before committing to an
+# operation that we know takes time (LLM round-trip, command run,
+# refinement turn, epilogue repair), we check that the remaining wall
+# budget exceeds the operation's minimum-required-time PLUS the global
+# reserve. Any operation that would push past the reserve is skipped
+# rather than started — the loop exits with whatever patch exists.
+#
+# Numbers calibrated against the king PR #185 retry profile:
+#   - chat_completion: 90 s timeout × up to 3 attempts ≈ 270 s worst case;
+#     in practice steady state ~30–60 s. Use 60 s as the practical floor.
+#   - command run: DEFAULT_COMMAND_TIMEOUT (15 s) + format overhead.
+#   - refinement turn = LLM call + observation queueing.
+#   - epilogue repair = single LLM call + minimal-stub I/O.
+TIME_GUARD_LLM_CALL_S = 60.0
+TIME_GUARD_COMMAND_S = float(DEFAULT_COMMAND_TIMEOUT + 5)
+TIME_GUARD_REFINEMENT_S = 75.0
+TIME_GUARD_EPILOGUE_REPAIR_S = 45.0
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -115,6 +133,9 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_REQUIREMENT_NUDGES = 1 # surface unaddressed natural-language requirements
+MAX_IDENTIFIER_NUDGES = 1  # surface task-mentioned identifiers absent from the patch
+MAX_PATCH_SHRINK_TURNS = 1 # ask the model to compress oversized patches
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -1072,6 +1093,805 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
 
+_C_LIKE_SUFFIXES = {
+    ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
+    ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
+}
+
+_CSS_LIKE_SUFFIXES = {".css", ".scss", ".less", ".styl"}
+
+_SHELL_SUFFIXES = {".sh", ".bash", ".zsh", ".ksh"}
+
+_JS_TS_SUFFIXES = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}
+
+_ESCAPE_SCAN_SUFFIXES = (
+    {".py"} | _JS_TS_SUFFIXES | _C_LIKE_SUFFIXES | _CSS_LIKE_SUFFIXES
+    | {".java", ".kt", ".swift", ".scala", ".rs", ".go", ".cs",
+       ".c", ".cc", ".cpp", ".h", ".hpp", ".sh", ".bash", ".zsh"}
+)
+
+# ---------------------------------------------------------------------------
+# Static-sanity battery
+#
+# A model edit that produces unparseable text on disk costs the agent a step
+# and burns budget for no signal. The helpers below are cheap, opt-in checks
+# that look at each touched file in a language-appropriate way: brace balance,
+# tag balance, indent regularity, escape integrity. None of them aim to be a
+# full linter — they just catch obvious "this can't possibly be right" output
+# before we hand the patch off downstream. Each checker returns either a one-
+# line error string or None, and `_lint_one_file` dispatches to the right one
+# by file extension.
+# ---------------------------------------------------------------------------
+
+def _strip_string_and_comment_noise(source: str) -> str:
+    """Strip string literals and comments so brace counts stay honest."""
+    out: List[str] = []
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                out.append("  ")
+                i += 2
+                continue
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                out.append("  ")
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+                out.append(ch)
+                i += 1
+                continue
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        # Not inside string/comment.
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            out.append("  ")
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            out.append("  ")
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+def _match_brackets(source: str, comment_style: str = "c") -> Dict[str, int]:
+    """Pair-match brackets in source, returning the imbalance and first-mismatch position."""
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    in_html_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_html_comment:
+            if ch == "-" and source[i:i + 3] == "-->":
+                in_html_comment = False
+                i += 3
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if comment_style == "c":
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        elif comment_style in ("py", "shell"):
+            if ch == "#":
+                in_line_comment = True
+                i += 1
+                continue
+        elif comment_style == "html":
+            if source[i:i + 4] == "<!--":
+                in_html_comment = True
+                i += 4
+                continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+    return counts
+
+def _count_bracket_drift(source: str, comment_style: str = "c") -> List[str]:
+    """Return ['{/} delta=+1', ...] for each unbalanced bracket pair, or []."""
+    counts = _match_brackets(source, comment_style)
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    return diffs
+
+def _load_text(repo: Path, relative_path: str) -> Optional[str]:
+    """Read a tracked file as UTF-8 text; return None on any failure."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.is_file():
+        return None
+    try:
+        data = full.read_bytes()
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+_ESCAPE_CORRUPT_RE = re.compile(r"\\{4,}[ntrxu0bfv]")
+_ESCAPE_LONG_BS_RE = re.compile(r"\\{6,}")
+_JS_CLASS_HEAD_RE = re.compile(
+    r"\bclass\s+[A-Za-z_$][\w$]*(?:\s*<[^>]*>)?(?:\s+extends\s+[\w$.<>,\s]+?)?\s*\Z"
+)
+_JS_INVALID_DECLS = ("const ", "let ", "var ", "import ", "return ")
+_PY_RAW_STR_RE = re.compile(r"""([rRbBuU]+)['\"]""")
+
+def _scan_python_extras(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch common LLM glitches AST already covers, plus mixed indent."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    seen_tabs = False
+    seen_spaces = False
+    for line in source.splitlines():
+        if not line:
+            continue
+        leading = line[: len(line) - len(line.lstrip(" \t"))]
+        if "\t" in leading and " " in leading:
+            return f"{relative_path}: mixed tabs and spaces in indentation"
+        if "\t" in leading:
+            seen_tabs = True
+        if leading and leading[0] == " ":
+            seen_spaces = True
+    if seen_tabs and seen_spaces:
+        return f"{relative_path}: file mixes tab- and space-indented blocks"
+    return None
+
+def _lint_yaml(repo: Path, relative_path: str) -> Optional[str]:
+    """YAML disallows TAB characters at start of indentation."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    for lineno, line in enumerate(source.splitlines(), 1):
+        if line.startswith("\t") or (line.startswith(" ") and "\t" in line[:len(line) - len(line.lstrip())]):
+            return f"{relative_path}:{lineno}: TAB in YAML indentation"
+    return None
+
+def _lint_toml(repo: Path, relative_path: str) -> Optional[str]:
+    """Sanity-check section headers and obvious key=value shape."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    for lineno, raw in enumerate(source.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            if not line.endswith("]"):
+                return f"{relative_path}:{lineno}: unterminated TOML section header"
+            inner = line[1:-1]
+            if inner.startswith("[") and not inner.endswith("]"):
+                return f"{relative_path}:{lineno}: unterminated TOML array-of-tables header"
+        # leave key=value alone — too many edge cases to catch cheaply
+    diffs = _count_bracket_drift(source, comment_style="py")
+    if diffs:
+        return f"{relative_path}: TOML bracket imbalance ({', '.join(diffs)})"
+    return None
+
+def _lint_html(repo: Path, relative_path: str) -> Optional[str]:
+    """Lightweight HTML / XML well-formedness sniff for tag-balance mistakes."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    void_tags = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    }
+    counts: Dict[str, int] = {}
+    # Strip comments to avoid false positives.
+    cleaned = re.sub(r"<!--.*?-->", "", source, flags=re.DOTALL)
+    for match in re.finditer(r"<\s*(/?)([A-Za-z][A-Za-z0-9-]*)\b[^>]*?(/?)>", cleaned):
+        is_close = match.group(1) == "/"
+        tag = match.group(2).lower()
+        self_close = match.group(3) == "/"
+        if tag in void_tags or self_close:
+            continue
+        delta = -1 if is_close else 1
+        counts[tag] = counts.get(tag, 0) + delta
+    bad = [f"{tag} delta={delta:+d}" for tag, delta in counts.items() if delta != 0]
+    if bad:
+        # Limit output to the most-skewed tags so we don't spam the prompt.
+        bad.sort(key=lambda s: abs(int(s.split("=")[1])), reverse=True)
+        return f"{relative_path}: HTML tag imbalance ({', '.join(bad[:4])})"
+    return None
+
+def _lint_markdown(repo: Path, relative_path: str) -> Optional[str]:
+    """Markdown code fences must come in pairs."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    fences = 0
+    for line in source.splitlines():
+        s = line.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            fences += 1
+    if fences % 2 != 0:
+        return f"{relative_path}: odd number of markdown code fences ({fences})"
+    return None
+
+def _lint_shell(repo: Path, relative_path: str) -> Optional[str]:
+    """Bash/sh paired keyword balance + bracket balance."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+
+    # Strip strings + comments so we don't count keywords inside quotes.
+    stripped_lines: List[str] = []
+    for raw in source.splitlines():
+        line = raw
+        # remove inline comments (very rough: # not preceded by $ or escape)
+        line = re.sub(r"(?<![\\\$])#.*$", "", line)
+        # remove single-quoted strings
+        line = re.sub(r"'[^']*'", "''", line)
+        # remove double-quoted strings
+        line = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
+        stripped_lines.append(line)
+    stripped = "\n".join(stripped_lines)
+
+    # Counter-approach: tokens per pair. We use the leading word at each
+    # statement start (after whitespace, ;, &&, ||, `then`, `do`, `else`).
+    tokens = re.findall(r"(?:^|[\s;&|])(if|fi|case|esac|for|while|until|done)\b", stripped)
+    counts = {k: 0 for k in ("if", "fi", "case", "esac", "for", "while", "until", "done")}
+    for t in tokens:
+        counts[t] += 1
+
+    diffs: List[str] = []
+    if counts["if"] != counts["fi"]:
+        diffs.append(f"if/fi delta={counts['if'] - counts['fi']:+d}")
+    if counts["case"] != counts["esac"]:
+        diffs.append(f"case/esac delta={counts['case'] - counts['esac']:+d}")
+    loop_open = counts["for"] + counts["while"] + counts["until"]
+    if loop_open != counts["done"]:
+        diffs.append(f"for|while|until/done delta={loop_open - counts['done']:+d}")
+
+    bracket_diffs = _count_bracket_drift(source, comment_style="shell")
+    if bracket_diffs:
+        diffs.extend(bracket_diffs)
+
+    if diffs:
+        return f"{relative_path}: shell imbalance ({', '.join(diffs)})"
+    return None
+
+def _lint_makefile(repo: Path, relative_path: str) -> Optional[str]:
+    """Recipe lines (under a target) must start with a TAB, not spaces."""
+    source = _load_text(repo, relative_path)
+    if source is None:
+        return None
+    in_recipe = False
+    for lineno, raw in enumerate(source.splitlines(), 1):
+        if not raw.strip():
+            in_recipe = False
+            continue
+        if raw.startswith("\t"):
+            in_recipe = True
+            continue
+        # Target line `name: deps` enters recipe mode for following lines.
+        if not raw.startswith(" ") and re.match(r"[A-Za-z_./%][^=]*:", raw) and "=" not in raw.split(":", 1)[0]:
+            in_recipe = True
+            continue
+        if in_recipe and raw.startswith("    "):
+            return f"{relative_path}:{lineno}: Makefile recipe must start with TAB, not spaces"
+        in_recipe = False
+    return None
+
+def _scan_class_body_decls(source: str) -> Optional[str]:
+    """Catch declarations that the language disallows directly inside a class body."""
+    if not source:
+        return None
+    cleaned = _strip_string_and_comment_noise(source)
+    n = len(cleaned)
+    stack: List[str] = []
+    paren_depth = 0
+    line = 1
+    i = 0
+    line_start = 0
+    while i < n:
+        ch = cleaned[i]
+        if ch == "\n":
+            # End-of-line: examine the just-completed line if its enclosing
+            # block is a class body.
+            if stack and stack[-1] == "class":
+                segment = cleaned[line_start:i]
+                stripped = segment.lstrip(" \t")
+                head = stripped[:12]
+                for kw in _JS_INVALID_DECLS:
+                    if head.startswith(kw):
+                        return (
+                            f"line {line}: invalid `{kw.strip()}` declaration "
+                            "directly inside class body"
+                        )
+                if head.startswith("function ") or head.startswith("function("):
+                    return (
+                        f"line {line}: invalid free `function` declaration "
+                        "inside class body (use a method)"
+                    )
+            line += 1
+            line_start = i + 1
+            i += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+        elif ch == "{":
+            preview = cleaned[max(0, i - 240):i]
+            is_class = bool(_JS_CLASS_HEAD_RE.search(preview))
+            # Don't classify as class body if the brace is inside parens.
+            if paren_depth > 0:
+                is_class = False
+            stack.append("class" if is_class else "other")
+        elif ch == "}":
+            if stack:
+                stack.pop()
+        i += 1
+    return None
+
+def _scan_escape_artifacts(source: str, *, language: str = "c") -> Optional[str]:
+    """Detect text that looks like over-escaped backslash sequences from bad serialization."""
+    if not source:
+        return None
+    # For Python, blank out the contents of r"..." / r'...' before scanning.
+    if language == "py":
+        scrubbed_chars = list(source)
+        i = 0
+        n = len(source)
+        while i < n:
+            m = _PY_RAW_STR_RE.match(source, i)
+            if m and "r" in m.group(1).lower():
+                quote = source[m.end() - 1]
+                triple = source[m.end() - 1: m.end() + 2] == quote * 3
+                if triple:
+                    end_marker = quote * 3
+                    j = source.find(end_marker, m.end() + 2)
+                else:
+                    j = m.end()
+                    while j < n:
+                        c = source[j]
+                        if c == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if c == quote:
+                            break
+                        j += 1
+                if j < 0:
+                    j = n
+                # Blank out raw-string body (preserve newlines / quotes).
+                k = m.end()
+                while k < j:
+                    if scrubbed_chars[k] != "\n":
+                        scrubbed_chars[k] = " "
+                    k += 1
+                i = j + 1
+                continue
+            i += 1
+        scan_text = "".join(scrubbed_chars)
+    else:
+        scan_text = source
+
+    m = _ESCAPE_CORRUPT_RE.search(scan_text)
+    if m:
+        line = scan_text.count("\n", 0, m.start()) + 1
+        return f"line {line}: suspicious escape sequence `{m.group(0)}` (likely double-escape corruption)"
+    m = _ESCAPE_LONG_BS_RE.search(scan_text)
+    if m:
+        line = scan_text.count("\n", 0, m.start()) + 1
+        return f"line {line}: {len(m.group(0))} consecutive backslashes (likely escape corruption)"
+    return None
+
+def _lint_one_file(repo: Path, relative_path: str) -> Optional[str]:
+    """Dispatch one touched file through the cheapest qualifying static-sanity checker."""
+    suffix = Path(relative_path).suffix.lower()
+    name = Path(relative_path).name.lower()
+
+    # Read once for the cross-language secondary checks.
+    source = _load_text(repo, relative_path) if suffix in _ESCAPE_SCAN_SUFFIXES else None
+
+    primary: Optional[str] = None
+    if suffix == ".py":
+        primary = _check_python_syntax_one(repo, relative_path)
+        if not primary:
+            primary = _scan_python_extras(repo, relative_path)
+    elif suffix in {".js", ".mjs", ".cjs"}:
+        primary = _check_node_syntax_one(repo, relative_path)
+        if primary is None:
+            # node missing — fall back to brace balance.
+            primary = _check_brace_balance_one(repo, relative_path, comment_style="c")
+    elif suffix in {".json"}:
+        primary = _check_json_syntax_one(repo, relative_path)
+    elif suffix in {".yml", ".yaml"}:
+        primary = _lint_yaml(repo, relative_path)
+    elif suffix in {".toml"}:
+        primary = _lint_toml(repo, relative_path)
+    elif suffix in {".md", ".markdown", ".mdx"}:
+        primary = _lint_markdown(repo, relative_path)
+    elif suffix in {".html", ".htm", ".xhtml", ".vue", ".svelte"}:
+        primary = _lint_html(repo, relative_path)
+    elif suffix in _CSS_LIKE_SUFFIXES:
+        primary = _check_brace_balance_one(repo, relative_path, comment_style="c")
+    elif suffix in _SHELL_SUFFIXES or name in ("makefile",):
+        if name in ("makefile",) or suffix == ".mk":
+            primary = _lint_makefile(repo, relative_path)
+        else:
+            primary = _lint_shell(repo, relative_path)
+    elif suffix in _C_LIKE_SUFFIXES:
+        primary = _check_brace_balance_one(repo, relative_path, comment_style="c")
+    # Other suffixes: no primary check (trust the model).
+
+    if primary:
+        return primary
+
+    # Secondary checks (apply to source-bearing files even when the primary
+    # check passes — these catch things parsers accept but that still cause
+    # downstream failures).
+    if source is not None:
+        # Escape-character corruption (almost always a shell-quoting glitch).
+        lang = "py" if suffix == ".py" else "c"
+        esc_err = _scan_escape_artifacts(source, language=lang)
+        if esc_err:
+            return f"{relative_path}:{esc_err}"
+        # Free declarations directly in JS/TS class bodies are invalid even
+        # though `node --check` accepts the file at module scope.
+        if suffix in _JS_TS_SUFFIXES:
+            cb_err = _scan_class_body_decls(source)
+            if cb_err:
+                return f"{relative_path}:{cb_err}"
+
+    return None
+
+def _collect_issue_identifiers(issue_text: str) -> List[str]:
+    """Pull function/class/flag identifiers out of natural-language issue text."""
+    seen: List[str] = []
+    seen_set = set()
+    for pattern in _IDENTIFIER_RES:
+        for match in pattern.finditer(issue_text):
+            token = match.group(1)
+            if not token or len(token) < 3:
+                continue
+            if token.lower() in _IDENTIFIER_STOPWORDS or token in _IDENTIFIER_STOPWORDS:
+                continue
+            if token in seen_set:
+                continue
+            seen.append(token)
+            seen_set.add(token)
+    return seen[:20]
+
+# ---------------------------------------------------------------------------
+# Issue introspection + completeness signals
+#
+# The model's main failure mode on partially-completed patches is "I edited
+# something plausible but didn't actually do what the issue asked for." The
+# helpers below extract two coarse signals from the natural-language issue
+# text: (1) action-verb sentences that look like requirements, and (2)
+# identifier-shaped tokens that the issue mentions by name. We later compare
+# both against the produced patch so a refinement turn can surface gaps in
+# concrete terms ("you didn't touch identifier X / didn't satisfy clause Y")
+# rather than just nagging the model in the abstract.
+# ---------------------------------------------------------------------------
+
+def _collect_issue_requirements(issue_text: str) -> List[str]:
+    """Extract action-verb sentences from the issue text as a coarse requirement list."""
+    bullets: List[str] = []
+    for match in _REQUIREMENT_LINE_RE.finditer(issue_text):
+        candidate = re.sub(r"\s+", " ", match.group(1).strip())
+        if candidate and candidate not in bullets:
+            bullets.append(candidate)
+    if len(bullets) >= 2:
+        return bullets[:8]
+
+    sentences: List[str] = []
+    for match in _REQUIREMENT_SENTENCE_RE.finditer(issue_text):
+        sentence = re.sub(r"\s+", " ", match.group(1).strip())
+        if sentence and sentence not in sentences:
+            sentences.append(sentence)
+    if bullets:
+        return (bullets + sentences)[:8]
+    return sentences[:8]
+
+def _unreferenced_identifiers(patch: str, issue_text: str) -> List[str]:
+    """Issue-named identifiers that don't appear anywhere in the patch."""
+    idents = _collect_issue_identifiers(issue_text)
+    if not idents:
+        return []
+    added = _patch_added_text(patch)
+    paths_text = "\n".join(_patch_changed_files(patch))
+    missing: List[str] = []
+    for ident in idents:
+        if ident in added or ident in paths_text:
+            continue
+        # Also check case-insensitive in paths (e.g., "loginForm" in
+        # "LoginForm.tsx").
+        if ident.lower() in paths_text.lower():
+            continue
+        missing.append(ident)
+    return missing
+
+def _diff_line_counts(patch: str) -> Tuple[int, int]:
+    added = 0
+    removed = 0
+    for line in patch.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
+
+def _median_file_size(repo: Path, patch: str) -> int:
+    sizes: List[int] = []
+    for rel in _patch_changed_files(patch):
+        text = _load_text(repo, rel)
+        if text is None:
+            continue
+        sizes.append(len(text.splitlines()) or 1)
+    if not sizes:
+        return 0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+PATCH_SIZE_HARD_LIMIT = 4500       # absolute changed-line ceiling (sum of +/-)
+
+PATCH_SIZE_RATIO_LIMIT = 8.0       # vs median touched-file existing line count
+
+_IDENTIFIER_RES = (
+    # function() or method() — strong signal
+    re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(\)"),
+    # CamelCase and snake_case names in backticks
+    re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,})`"),
+    # CamelCase identifiers (likely class/component names)
+    re.compile(r"\b([A-Z][a-z][A-Za-z0-9]{2,}[A-Z][A-Za-z0-9]+)\b"),
+    # snake_case multi-word identifiers
+    re.compile(r"\b([a-z]{2,}_[a-z][A-Za-z0-9_]{1,})\b"),
+    # CLI-style --flag-name
+    re.compile(r"(--[a-z][a-z0-9-]+)\b"),
+)
+
+_IDENTIFIER_STOPWORDS = {
+    "the_", "and_", "for_", "but_", "this_", "that_", "with_",
+    "todo", "fixme", "readme", "github", "docker", "license",
+    "license_", "package_", "import_", "return_", "should_",
+    "TODO", "FIXME", "GitHub", "PullRequest", "MergeRequest",
+}
+
+_REQUIREMENT_LINE_RE = re.compile(
+    r"(?im)^\s*(?:[-*•]|\d+[.)])\s+(.{6,200})\s*$"
+)
+
+_REQUIREMENT_SENTENCE_RE = re.compile(
+    r"([A-Z][^.!?\n]{12,200}?\b(?:should|must|needs?\s+to|has\s+to|requires?|add|"
+    r"create|implement|return|update|remove|fix|ensure|make|allow|prevent|"
+    r"display|show|render|expose|support|handle|wire|hook)\b[^.!?\n]{0,200}[.!?])"
+)
+
+def _oversize_diff_note(repo: Path, patch: str) -> Optional[str]:
+    """Return a short summary if the patch is suspiciously oversized."""
+    if not patch.strip():
+        return None
+    added, removed = _diff_line_counts(patch)
+    total = added + removed
+    if total >= PATCH_SIZE_HARD_LIMIT:
+        return (
+            f"patch is {total} changed lines (+{added}/-{removed}); "
+            f"hard limit is {PATCH_SIZE_HARD_LIMIT}. A diff this large for a "
+            "single issue almost always contains unrelated rewrites"
+        )
+    median = _median_file_size(repo, patch)
+    if median and total >= max(200, int(median * PATCH_SIZE_RATIO_LIMIT)):
+        return (
+            f"patch is {total} changed lines on files with median size {median}; "
+            f"that's >{PATCH_SIZE_RATIO_LIMIT}x and likely full-file rewrites"
+        )
+    return None
+
+def build_completeness_nudge(missing_requirements: List[str], issue_text: str) -> str:
+    """Surface natural-language requirements not yet visible in the patch."""
+    bullets = "\n  ".join(f"- {r}" for r in missing_requirements[:6]) or "(none)"
+    return (
+        "Completeness gap — these requirements from the task are not yet "
+        "visibly satisfied by your patch:\n"
+        f"  {bullets}\n\n"
+        "For each, either (a) extend the patch with the missing edit in "
+        "this same response, or (b) confirm in your final summary why the "
+        "current patch already covers it. Do not add unrelated work.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+def build_identifier_check_prompt(missing_identifiers: List[str]) -> str:
+    """Tell the model which issue-named identifiers don't appear in the diff yet."""
+    return (
+        "Identifier check — the task names these identifiers, but they do "
+        "not appear in your patch's added lines or touched paths:\n"
+        f"  {', '.join(missing_identifiers[:10])}\n\n"
+        "If you silently renamed an existing symbol the issue refers to, "
+        "callers elsewhere in the codebase will break — restore the name "
+        "the issue uses unless the issue itself asked you to rename it. "
+        "If you simply forgot a function/flag/class the issue requires, "
+        "add it now in the same response. After fixing, end with "
+        "<final>summary</final>."
+    )
+
+def build_diff_shrink_prompt(summary: str) -> str:
+    """Ask the model to shrink an oversized patch."""
+    return (
+        f"Patch-size guard tripped — {summary}.\n\n"
+        "A diff this large for a single issue is almost always carrying "
+        "unrelated work — full-file rewrites, comment churn, drive-by "
+        "refactors of code the issue did not ask you to touch. Each extra "
+        "edit is a regression risk against tests you cannot see.\n\n"
+        "In this response, emit revert commands (sed/cat/python) that "
+        "restore the lines your fix does NOT need. Keep ONLY the hunks "
+        "that implement what the issue actually asks for. After "
+        "shrinking, end with <final>summary</final>."
+    )
+
+# ---------------------------------------------------------------------------
+# Epilogue repair
+#
+# Sometimes the inner loop exits with no patch on disk at all — the model
+# burned its budget reasoning, asking for context, or emitting <final> too
+# early. When that happens we have a small window of remaining budget that
+# would otherwise be wasted; the helper below spends one short focused turn
+# asking for the single most likely minimal edit on a tracked file. The call
+# is wrapped so any I/O or proxy hiccup can never fail-block the epilogue —
+# at worst we exit with the same empty state we already had.
+# ---------------------------------------------------------------------------
+
+def _run_epilogue_repair_turn(
+    repo: Path,
+    issue_text: str,
+    model_name: str,
+    api_base: str,
+    api_key: str,
+) -> Optional[str]:
+    """On empty-loop exit, request one focused minimal edit via the validator's model."""
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return None
+    candidates: List[str] = []
+    try:
+        for mention in _extract_issue_path_mentions(issue_text):
+            rel = mention.strip("./")
+            if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
+                candidates.append(rel)
+    except Exception:
+        pass
+    try:
+        for rel in _rank_context_files(repo, issue_text)[:6]:
+            if rel in tracked and _context_file_allowed(rel) and rel not in candidates:
+                candidates.append(rel)
+    except Exception:
+        pass
+
+    for rel in candidates:
+        target = repo / rel
+        if not target.is_file():
+            continue
+        try:
+            data = target.read_bytes()
+        except Exception:
+            continue
+        if b"\0" in data[:4096]:
+            continue
+        try:
+            current_text = data.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        snippet = current_text[:6000]
+        if len(current_text) > 6000:
+            snippet += "\n[...file truncated...]\n"
+        prompt_user = (
+            "The solver loop produced no on-disk change. Make ONE focused, "
+            f"minimal edit to `{rel}` that addresses the task below. Output "
+            "exactly one `<command>` block — `sed -i ...`, a `cat > ... <<'EOF'` "
+            "heredoc, or `python -c \"...\"` is fine — and nothing else. Do not "
+            "explain. Do not add unrelated changes.\n\n"
+            f"Task:\n{issue_text}\n\n"
+            f"Current contents of `{rel}`:\n```\n{snippet}\n```\n"
+        )
+        try:
+            response_text, _cost, _raw = chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a focused code-editing assistant. Output only `<command>` blocks."},
+                    {"role": "user", "content": prompt_user},
+                ],
+                model=model_name,
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=1024,
+                timeout=60,
+            )
+        except Exception:
+            continue
+
+        commands = extract_commands(response_text or "")
+        if not commands:
+            continue
+        try:
+            run_command(commands[0], repo, timeout=DEFAULT_COMMAND_TIMEOUT)
+        except Exception:
+            continue
+        if get_patch(repo).strip():
+            return rel
+    return None
+
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     full = (repo / relative_path).resolve()
     try:
@@ -1145,105 +1965,33 @@ _BRACE_BALANCE_SUFFIXES = {
 }
 
 
-def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
-    """Cheap brace/paren/bracket balance check for languages without a parser.
-
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
-    """
-    full = (repo / relative_path).resolve()
-    try:
-        full.relative_to(repo.resolve())
-    except (ValueError, RuntimeError):
+def _check_brace_balance_one(repo: Path, relative_path: str, comment_style: str = "c") -> Optional[str]:
+    """Cheap brace/paren/bracket balance check for parser-less languages."""
+    source = _load_text(repo, relative_path)
+    if source is None:
         return None
-    if not full.exists():
-        return None
-    try:
-        source = full.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-
-    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
-    i = 0
-    n = len(source)
-    in_str: Optional[str] = None
-    in_line_comment = False
-    in_block_comment = False
-    while i < n:
-        ch = source[i]
-        nxt = source[i + 1] if i + 1 < n else ""
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str is not None:
-            if ch == "\\" and nxt:
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        # Not in string/comment.
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-            i += 1
-            continue
-        if ch in counts:
-            counts[ch] += 1
-        i += 1
-
-    diffs: List[str] = []
-    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
-        delta = counts[opener] - counts[closer]
-        if delta != 0:
-            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    diffs = _count_bracket_drift(source, comment_style=comment_style)
     if diffs:
-        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+        return f"{relative_path}: bracket imbalance ({', '.join(diffs)})"
     return None
 
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
-    """Best-effort multi-language syntax check on touched files.
+    """Best-effort multi-language static sanity check on touched files.
 
-    Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    Dispatches via `_lint_one_file` so each touched file is run through the
+    cheapest qualifying checker for its extension (Python AST, `node --check`,
+    JSON parse, brace balance, YAML / TOML / Markdown / HTML / shell /
+    Makefile heuristics, escape-corruption scan, JS/TS class-body decl
+    scanner). Returns a flat list of error strings; an empty list means every
+    file we know how to check parsed.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        result: Optional[str] = None
-        if suffix == ".py":
-            result = _check_python_syntax_one(repo, relative_path)
-        elif suffix in {".js", ".mjs", ".cjs"}:
-            result = _check_node_syntax_one(repo, relative_path)
-            if result is None and suffix == ".js":
-                # node was unavailable; fall back to brace balance check.
-                result = _check_brace_balance_one(repo, relative_path)
-        elif suffix in {".json"}:
-            result = _check_json_syntax_one(repo, relative_path)
-        elif suffix in _BRACE_BALANCE_SUFFIXES:
-            result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        try:
+            result = _lint_one_file(repo, relative_path)
+        except Exception:
+            result = None
         if result:
             errors.append(result)
     return errors
@@ -2237,6 +2985,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    requirement_nudges_used = 0
+    identifier_nudges_used = 0
+    patch_shrink_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2247,6 +2998,35 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
+
+    def time_for(op_seconds: float) -> bool:
+        """Return True iff time_remaining ≥ op_seconds + reserve.
+
+        Per-operation pre-flight predicate. Use the matching constant
+        TIME_GUARD_*_S so all guards consult the same calibration table.
+        """
+        return time_remaining() >= op_seconds + WALL_CLOCK_RESERVE_SECONDS
+
+    def time_for_llm_call() -> bool:
+        return time_for(TIME_GUARD_LLM_CALL_S)
+
+    def time_for_command() -> bool:
+        return time_for(TIME_GUARD_COMMAND_S)
+
+    def time_for_refinement() -> bool:
+        return time_for(TIME_GUARD_REFINEMENT_S)
+
+    def time_for_epilogue_repair() -> bool:
+        return time_for(TIME_GUARD_EPILOGUE_REPAIR_S)
+
+    def log_time_guard(op_label: str) -> None:
+        """Emit a single-line marker so post-hoc analysis can see which
+        guard tripped first. Logs are kept short to avoid bloating the
+        capped log surface."""
+        logs.append(
+            f"TIME_GUARD_TRIP[{op_label}]: remaining={time_remaining():.1f}s "
+            f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- skipping op."
+        )
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2275,15 +3055,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, requirement_nudges_used, identifier_nudges_used, patch_shrink_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
+
+        # v26 pre-refinement guard. A refinement turn means an additional
+        # LLM round-trip plus observation building. Skip the entire chain
+        # when there's not enough budget; the caller's `if maybe_queue_refinement: continue`
+        # branch naturally falls through to the success/break path.
+        # Exception: hail-mary (handled below) gets a bare LLM-call check
+        # because it's the last line of defence against a zero-diff round.
+        if patch.strip() and not time_for_refinement():
+            log_time_guard("refinement-chain")
+            return False
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
         if not patch.strip():
-            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+            # v26 hail-mary gate: only queue if there's enough budget
+            # for one more LLM call. Otherwise queueing wastes the few
+            # remaining seconds we could have used to flush state.
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS and time_for_llm_call():
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
@@ -2291,12 +3084,31 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "HAIL_MARY_QUEUED: patch empty at refinement gate",
                 )
                 return True
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                log_time_guard("hail-mary")
             return False
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
+
+        # v24 addition — patch-shrink fires BEFORE polish: if the diff is
+        # already oversized for the touched files (sum of +/- > hard limit
+        # OR > N x median touched-file line count), polishing won't help
+        # because there's too much surplus content to scrub. Ask the model
+        # to compress first.
+        if patch_shrink_turns_used < MAX_PATCH_SHRINK_TURNS:
+            oversize = _oversize_diff_note(repo, patch)
+            if oversize:
+                patch_shrink_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_diff_shrink_prompt(oversize),
+                    f"PATCH_SHRINK_QUEUED:\n  {oversize}",
+                )
+                return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -2374,6 +3186,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v24 addition — identifier-nudge: when the issue mentions specific
+        # PascalCase / camelCase / snake_case / backticked identifiers and the
+        # patch's added text doesn't reference them, surface that gap so the
+        # model knows which identifiers to land in this round.
+        if identifier_nudges_used < MAX_IDENTIFIER_NUDGES:
+            missing_ids = _unreferenced_identifiers(patch, issue)
+            if missing_ids:
+                identifier_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_identifier_check_prompt(missing_ids),
+                    "IDENTIFIER_NUDGE_QUEUED:\n  " + ", ".join(missing_ids[:6]),
+                )
+                return True
+
+        # v24 addition — requirement-nudge: parses bullet items / "must"
+        # / "should" clauses out of the issue text and surfaces those whose
+        # surface form is not visible in the added-text portion of the patch.
+        if requirement_nudges_used < MAX_REQUIREMENT_NUDGES:
+            try:
+                requirements = _collect_issue_requirements(issue)
+            except Exception:
+                requirements = []
+            if requirements:
+                added = _patch_added_text(patch).lower()
+                missing_reqs = [r for r in requirements if r and r.lower()[:80] not in added][:6]
+                if missing_reqs:
+                    requirement_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_completeness_nudge(missing_reqs, issue),
+                        "REQUIREMENT_NUDGE_QUEUED:\n  " + " | ".join(r[:60] for r in missing_reqs[:4]),
+                    )
+                    return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2403,6 +3252,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            # v26 pre-step guard #1: hard wall-clock stop.
             if out_of_time():
                 logs.append(
                     f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
@@ -2411,8 +3261,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 break
 
+            # v26 pre-step guard #2: minimum-time-for-an-LLM-call.
+            # If the budget can't fit one chat_completion round-trip,
+            # exit before starting it. Avoids partial-LLM-response
+            # cases where the validator SIGTERMs mid-stream.
+            if not time_for_llm_call():
+                log_time_guard("step-llm-call")
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
+                # v26 retry-level guard: also skip starting another
+                # attempt when the remaining budget is too short.
+                if retry_attempt > 0 and not time_for_llm_call():
+                    log_time_guard(f"retry-{retry_attempt}")
+                    break
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -2490,6 +3353,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                # v26 pre-command guard. A single command can run for
+                # command_timeout seconds; if the wall-budget can't
+                # accommodate that without blowing the reserve, drop
+                # the rest of the batch. Loud log so we know which
+                # batch was truncated by which guard.
+                if not time_for_command():
+                    log_time_guard(f"command-{command_index}")
+                    observations.append(
+                        f"NOTE: Command batch truncated at {command_index - 1}/"
+                        f"{len(command_batch)} due to wall-clock budget."
+                    )
+                    break
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -2562,6 +3437,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+
+        # v24 addition — optional model-driven repair turn.
+        # If the inner loop produced no on-disk change AND the inner-loop
+        # hail-mary did not fire OR did not produce a patch either, send one
+        # short focused chat_completion to ask the model for a single
+        # minimal edit on the most-likely-target tracked file. The edit is
+        # therefore model-authored and task-relevant rather than a
+        # deterministic rewrite. Wrapped in a broad try/except so any I/O
+        # or proxy issue cannot fail-block the epilogue.
+        if not patch.strip():
+            # v26 pre-epilogue-repair guard. If the budget can't fit one
+            # more focused chat_completion, skip and accept the empty
+            # patch — calling _request_minimal_repair would just SIGTERM
+            # mid-stream, leaving us in a worse state than just exiting.
+            if time_for_epilogue_repair():
+                try:
+                    repaired_path = _run_epilogue_repair_turn(
+                        repo, issue, model_name, api_base, api_key,
+                    )
+                    if repaired_path:
+                        logs.append(f"\nMODEL_REPAIR: applied model edit to {repaired_path}")
+                        patch = get_patch(repo)
+                except Exception:
+                    pass
+            else:
+                log_time_guard("epilogue-repair")
+
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
