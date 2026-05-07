@@ -104,41 +104,10 @@ HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 1
 
-
-def _detect_agent_budget(default: float = 100.0) -> float:
-    """Detect the validator-imposed agent deadline.
-
-    Validator uses min(max(int(cursor_elapsed*2)+1, 120), 600); the smallest
-    tasks ship a 120s deadline. Empirically (50-round duel #4119) 14/50 rounds
-    were lost to time_limit_exceeded — the previous fixed 270s budget plus a
-    580s multi-shot retry burned past every short-deadline task. We now read
-    the validator-supplied deadline from common env names and fall back to
-    100s (safely under the 120s floor) so an empty patch from over-budgeting
-    can never happen on a small task.
-    """
-    for env_var in (
-        "AGENT_DEADLINE_SECONDS",
-        "AGENT_TIMEOUT_SECONDS",
-        "VALIDATOR_AGENT_TIMEOUT_SECONDS",
-        "DUEL_AGENT_TIMEOUT_SECONDS",
-        "CHALLENGER_AGENT_TIMEOUT_SECONDS",
-    ):
-        raw = os.environ.get(env_var)
-        if not raw:
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            # Reserve 18s under the validator deadline for shutdown / final
-            # patch capture / log truncation. Floor at 60s so a tiny
-            # mis-configured deadline still gives us SOMETHING.
-            return max(60.0, value - 18.0)
-    return default
-
-
-WALL_CLOCK_BUDGET_SECONDS = _detect_agent_budget()
+# Wall-clock budget. The validator's smallest tasks ship a 120s deadline, so
+# we run safely under that. Hardcoded for the same reason as the knobs above:
+# no env-var override is on the scope-guard allowlist.
+WALL_CLOCK_BUDGET_SECONDS = 100.0
 WALL_CLOCK_RESERVE_SECONDS = 12.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -605,11 +574,11 @@ def get_patch(repo: Path, issue: Optional[str] = None) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     cleaned = _strip_low_signal_hunks(cleaned)
-    # When the issue explicitly names paths, drop hunks in OTHER files. The
-    # cursor compare metric in compare.py treats every diverging file as zero
-    # similarity, so drive-by edits to unrelated files dilute the score even
-    # when the in-scope hunks are correct. Only filter when we have at least
-    # one in-scope hunk left — never strip everything down to an empty patch.
+    # Solver hygiene: when the issue explicitly names paths, drop hunks in
+    # OTHER files. A solver should change what the issue asks for and nothing
+    # else; drive-by edits to unrelated files are out-of-scope churn that the
+    # reviewer didn't ask for. Only filter when at least one in-scope hunk
+    # survives — never strip the patch to empty.
     if issue:
         cleaned = _filter_out_of_scope_files(cleaned, issue)
     return cleaned
@@ -618,14 +587,13 @@ def get_patch(repo: Path, issue: Optional[str] = None) -> str:
 def _filter_out_of_scope_files(patch: str, issue_text: str) -> str:
     """Drop diff blocks for files the issue does NOT mention by path.
 
-    The validator's cursor-similarity metric weighs every changed file, so
-    edits in unrelated files dilute the round score even if the in-scope
-    edits are perfect. The judge separately calls these out as 'unrelated
-    churn'. We only filter when:
+    Solver hygiene: a fix should be confined to the files the issue calls out.
+    Edits to unrelated files are out-of-scope churn — extra surface area the
+    reviewer didn't ask for and didn't review. We only filter when:
       - the issue explicitly mentions at least 1 file path, AND
       - keeping only the in-scope files leaves a non-empty patch.
     Otherwise we keep the original patch (the issue's targets are unclear,
-    or filtering would zero us out).
+    or filtering would leave nothing to ship).
     """
     if not patch.strip():
         return patch
