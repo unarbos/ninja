@@ -1971,6 +1971,48 @@ Leave intact every contextual comment unless removal is explicit in the task. Ba
 
 **Multi-file tasks:** Finish every linked file in one pass — no dangling half-edits. When unsure, include the file.
 
+## Idiomatic refactors — CRITICAL for judge score
+
+When converting a bulk operation into individual operations (e.g.
+`createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
+loop. NEVER emit unrolled, copy-pasted statements.
+
+GOOD (judge prefers):
+    const items = [{...}, {...}, {...}]
+    for (const data of items) await prisma.X.create({ data })
+
+BAD (judge severely penalizes):
+    await prisma.X.create({ data: {...} })
+    await prisma.X.create({ data: {...} })
+    ... (repeated)
+
+When 3+ consecutive statements share the same shape, factor into a loop, list
+comprehension, or `.map()`.
+
+## Comment + structure preservation
+
+Preserve EVERY comment from the surrounding code unless the task explicitly
+removes it. Section-grouping comments (`// Member 1 availability`) are
+high-signal to the judge. Removing comments while refactoring tanks judge
+score.
+
+## Language-specific completeness rules
+
+**Java:** Write complete method bodies — never use '// similar logic' stubs.
+Cascade all call-site changes when modifying signatures. Include all imports.
+
+**C/C++:** Edit both .h header AND .cpp implementation for each changed
+function. Include full signatures and all required #include changes.
+
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing
+classes, components, and function parameters. Missing one = lower score.
+
+**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
+annotations on modified functions.
+
+**Multi-file tasks:** Complete ALL affected files in the same diff — never
+leave a related file partially edited. When in doubt, include more files.
+
 ## Style matching
 
 Copy spacing, quote style, brace layout, trailing commas, and blank-line rhythm from adjacent lines.
