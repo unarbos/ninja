@@ -88,7 +88,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 # clamped to [120, 600] seconds. We pace ourselves to a conservative budget
 # and reserve a hail-mary slot at the end so the worst-case round still
 # returns a non-empty patch.
-WALL_CLOCK_BUDGET_SECONDS = float(os.environ.get("AGENT_WALL_BUDGET", "260"))
+WALL_CLOCK_BUDGET_SECONDS = 260.0
 WALL_CLOCK_RESERVE_SECONDS = 18.0   # leave room for sanitiser/return packaging
 HAIL_MARY_RESERVE_SECONDS = 38.0    # reserve at least this much for emergency edit
 HTTP_REQUEST_TIMEOUT = 75
@@ -98,6 +98,7 @@ HTTP_MAX_RETRIES = 1
 MAX_POLISH_TURNS = 1
 MAX_SELF_CHECK_TURNS = 1
 MAX_SYNTAX_FIX_TURNS = 1
+MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_CRITERIA_NUDGES = 1
 MAX_HAIL_MARY_TURNS = 1
 MAX_TOTAL_REFINEMENT_TURNS = 2
@@ -123,9 +124,16 @@ DANGEROUS_PATTERNS = [
 
 # Validator's prompt-injection deny list (validate.py:_find_diff_judge_prompt_injection).
 # Patches containing ANY of these phrases (case-insensitive substring) are
-# auto-scored 0 by the LLM judge. We mirror the list so we can scrub the
-# final patch defensively — even if the underlying repo legitimately has a
-# `grader.md` file, we will not include it in our diff.
+# auto-scored 0 by the LLM judge. We mirror the *narrow* subset that is
+# implausible in legitimate task-repo code so we can scrub the final patch
+# defensively without dropping real edits as false positives.
+#
+# Deliberately omitted: 'grader', 'reward model', and the 'king/challenger'
+# subnet-vocabulary phrases. Those are common words in education/ML/game
+# code and would silently drop legitimate file blocks. The validator only
+# triggers when the *full phrase* appears in evaluator-targeted form, so
+# scrubbing the subnet-vocabulary tokens preemptively costs more in lost
+# real edits than it saves in injection defense.
 _VALIDATOR_TRIGGER_PHRASES = (
     "ignore previous instructions",
     "ignore prior instructions",
@@ -134,23 +142,11 @@ _VALIDATOR_TRIGGER_PHRASES = (
     "as the judge",
     "dear evaluator",
     "dear judge",
-    "choose king",
-    "choose challenger",
-    "pick king",
-    "pick challenger",
-    "select king",
-    "select challenger",
-    "king is correct",
-    "challenger is correct",
-    "king wins",
-    "challenger wins",
     "the evaluator should",
     "the judge should",
     "other candidate is malicious",
     "the other candidate is malicious",
     "automatic fail",
-    "grader",
-    "reward model",
 )
 
 # Build artefacts and other low-value paths we never want in our diff.
@@ -1224,6 +1220,106 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _run_companion_test(
+    repo: Path,
+    test_path: str,
+    timeout_seconds: int = 8,
+) -> Optional[str]:
+    """Best-effort companion-test execution. Returns failure-output tail on FAIL,
+    or None when the test passed, the runner is unavailable, or the language
+    isn't supported. Errors degrade to None so the refinement chain doesn't
+    queue a fix for something the agent can't actually act on."""
+    full = repo / test_path
+    if not full.exists() or not full.is_file():
+        return None
+
+    suffix = Path(test_path).suffix.lower()
+
+    if suffix == ".py":
+        runner_cmds: List[List[str]] = []
+        if _has_executable("pytest"):
+            runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+        runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            unrunnable_markers = (
+                "No module named pytest",
+                "No module named 'pytest'",
+                "command not found",
+                "/usr/bin/env: python3",
+            )
+            if any(marker in output for marker in unrunnable_markers):
+                continue
+            if proc.returncode == 0:
+                return None
+            return output[-2400:] if len(output) > 2400 else output
+
+        return None
+
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        if not _has_executable("node"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["node", "--check", test_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` parse timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    return None
+
+
+def _select_companion_test_failure(
+    repo: Path,
+    patch: str,
+    test_timeout_seconds: int = 8,
+) -> Optional[Tuple[str, str]]:
+    """For files touched by the patch, find the first companion test that fails.
+    Stops at the first failure to keep the refinement budget tight."""
+    edited = _patch_changed_files(patch)
+    if not edited:
+        return None
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return None
+    for relative_path in edited:
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (partner, output)
+    return None
+
+
 # =====================================================================
 # Acceptance-criteria detection
 # =====================================================================
@@ -1552,6 +1648,22 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
+def build_test_fix_prompt(test_path: str, output: str) -> str:
+    """When the companion-test gate fails, hand the model the exact failure tail."""
+    tail = output[-2400:] if len(output) > 2400 else output
+    return (
+        f"Companion test is failing after your patch: `{test_path}`.\n\n"
+        "Test output (tail):\n```\n"
+        f"{tail}\n```\n\n"
+        "Diagnose first: is the source patch incomplete (missing part of the fix), "
+        "or does the test itself need updating to match new correct behaviour?\n"
+        "- If the source fix is incomplete, extend it now.\n"
+        "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
+        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
+        "then end with <final>summary</final>."
+    )
+
+
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
@@ -1609,6 +1721,7 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0
@@ -1636,7 +1749,8 @@ def solve(
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
-        nonlocal criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal test_fix_turns_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal total_refinement_turns_used
 
         # Always check for empty patch before declaring success — empty is
         # a guaranteed forfeit on both halves of the round score.
@@ -1679,6 +1793,23 @@ def solve(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Companion-test execution gate: the only refinement step backed by a
+        # real runner rather than heuristics. If a partner test for any edited
+        # file actually fails, surface the failure tail to the model as one
+        # fix turn.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
 
