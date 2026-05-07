@@ -103,8 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 245.0  # keep solve comfortably below validator Docker hard timeout
+WALL_CLOCK_RESERVE_SECONDS = 18.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -703,6 +703,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     """
     files = _rank_context_files(repo, issue)
     if not files:
+        files = _fallback_context_files(repo)
+    if not files:
         return ""
 
     tracked_set = set(_tracked_files(repo))
@@ -799,6 +801,33 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _fallback_context_files(repo: Path) -> List[str]:
+    """Small fallback context when the issue has no path/symbol hits."""
+    tracked = _tracked_files(repo)
+    if not tracked:
+        return []
+    priority_names = {
+        "pyproject.toml", "package.json", "go.mod", "cargo.toml",
+        "setup.py", "requirements.txt", "README.md", "readme.md",
+    }
+    chosen: List[str] = []
+    for relative_path in tracked:
+        name = Path(relative_path).name
+        if name in priority_names and _context_file_allowed(relative_path):
+            chosen.append(relative_path)
+    for relative_path in tracked:
+        if len(chosen) >= 6:
+            break
+        if relative_path in chosen or not _context_file_allowed(relative_path):
+            continue
+        lowered = relative_path.lower()
+        if "/test" in lowered or "spec." in lowered or ".test." in lowered:
+            continue
+        if Path(relative_path).suffix.lower() in {".py", ".ts", ".js", ".go", ".rs"}:
+            chosen.append(relative_path)
+    return chosen[:6]
 
 
 def _context_file_allowed(relative_path: str) -> bool:
@@ -1303,29 +1332,81 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
+def _find_test_partners(relative_path: str, tracked: set, *, limit: int = 3) -> List[str]:
+    """Return plausible companion tests for a source path.
+
+    Template matches are tried first, then a basename search catches common
+    layouts such as `pkg/foo_test.py`, `tests/unit/foo.spec.ts`, and nested
+    mirror directories that are not covered by the static template list.
+    """
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
-        return None
+        return []
     stem = path.stem
-    suffix = path.suffix
+    suffix = path.suffix.lower()
     if not stem or not suffix:
-        return None
+        return []
+
     parent = str(path.parent) if str(path.parent) not in {".", ""} else ""
+    candidates: List[str] = []
+    seen: set = set()
+
+    def add(candidate: str) -> None:
+        normalized = str(Path(candidate.lstrip("/")))
+        if normalized in seen:
+            return
+        if normalized in tracked and _context_file_allowed(normalized):
+            seen.add(normalized)
+            candidates.append(normalized)
+
     for source_template, test_template in _TEST_PARTNER_TEMPLATES:
-        if not source_template.endswith(suffix):
-            continue
-        candidate = test_template.format(stem=stem, dir=parent).lstrip("/")
-        candidate = str(Path(candidate))
-        if candidate in tracked and _context_file_allowed(candidate):
-            return candidate
-    return None
+        if source_template.endswith(suffix):
+            add(test_template.format(stem=stem, dir=parent))
+
+    if len(candidates) < limit:
+        test_suffixes = {
+            ".py": (f"test_{stem}.py", f"{stem}_test.py"),
+            ".ts": (f"{stem}.test.ts", f"{stem}.spec.ts"),
+            ".tsx": (f"{stem}.test.tsx", f"{stem}.spec.tsx"),
+            ".js": (f"{stem}.test.js", f"{stem}.spec.js"),
+            ".jsx": (f"{stem}.test.jsx", f"{stem}.spec.jsx"),
+            ".go": (f"{stem}_test.go",),
+            ".rs": (f"{stem}_test.rs",),
+            ".rb": (f"{stem}_spec.rb",),
+        }.get(suffix, ())
+        if test_suffixes:
+            for candidate in sorted(tracked):
+                candidate_name = Path(candidate).name
+                candidate_lower = candidate.lower()
+                if candidate_name not in test_suffixes:
+                    continue
+                if not _context_file_allowed(candidate):
+                    continue
+                # Prefer obvious test/spec directories but allow root-level
+                # test files when the basename is exact.
+                if (
+                    "/test" in candidate_lower
+                    or "/spec" in candidate_lower
+                    or candidate_name.startswith("test_")
+                    or candidate_name.endswith(("_test.py", "_test.go", "_test.rs", "_spec.rb"))
+                    or ".test." in candidate_name
+                    or ".spec." in candidate_name
+                ):
+                    add(candidate)
+                    if len(candidates) >= limit:
+                        break
+
+    return candidates[:limit]
+
+
+def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
+    partners = _find_test_partners(relative_path, tracked, limit=1)
+    return partners[0] if partners else None
 
 
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
-    """Slot each ranked source file's companion test in immediately after it."""
+    """Slot ranked source files' companion tests immediately after them."""
     if not tracked:
         return files
     augmented: List[str] = []
@@ -1334,10 +1415,10 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
         if relative_path not in seen:
             augmented.append(relative_path)
             seen.add(relative_path)
-        partner = _find_test_partner(relative_path, tracked)
-        if partner and partner not in seen:
-            augmented.append(partner)
-            seen.add(partner)
+        for partner in _find_test_partners(relative_path, tracked, limit=2):
+            if partner and partner not in seen:
+                augmented.append(partner)
+                seen.add(partner)
     return augmented
 
 
@@ -1461,12 +1542,10 @@ def _select_companion_test_failure(
     if not tracked:
         return None
     for relative_path in edited:
-        partner = _find_test_partner(relative_path, tracked)
-        if not partner:
-            continue
-        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
-        if output:
-            return (partner, output)
+        for partner in _find_test_partners(relative_path, tracked, limit=3):
+            output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+            if output:
+                return (partner, output)
     return None
 
 
@@ -1614,10 +1693,16 @@ def _criterion_keywords(criterion: str) -> List[str]:
 
 
 def _patch_added_text(patch: str) -> str:
-    """Concat all + lines of the patch (lower-cased) for keyword search."""
+    """Concat changed lines and paths (lower-cased) for criterion keyword search.
+
+    Criteria often describe a bug fixed by changing or deleting existing code,
+    so looking only at added lines creates false "missing criterion" nudges.
+    """
     out: List[str] = []
+    for path in _patch_changed_files(patch):
+        out.append(path)
     for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
+        if (line.startswith("+") and not line.startswith("+++")) or (line.startswith("-") and not line.startswith("---")):
             out.append(line[1:])
     return "\n".join(out).lower()
 
@@ -2085,7 +2170,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # v43: raised from 90 — never start a retry unless we have at least one full attempt budget (180s) left, so the retry can't push us past the validator's soft cap.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 120.0  # retry only when there is enough wall-clock for a bounded second attempt
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2171,87 +2256,51 @@ def solve(
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
-
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = 285.0
+    _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    _result1 = _solve_attempt(**_multishot_args, wall_clock_budget=min(WALL_CLOCK_BUDGET_SECONDS, 245.0))
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
-    try:
-        _multishot_repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
-
-    try:
-        _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
-
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
-
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
-
-        _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-
-        if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _result1["multishot_attempts"] = 1
         return _result1
 
-    except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
-        salvaged = ""
-        try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
-        except Exception:
-            salvaged = ""
-        return AgentResult(
-            patch=salvaged or "",
-            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
+    _elapsed = time.monotonic() - _multishot_started
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _remaining_for_retry = max(60.0, _multishot_total_budget - (time.monotonic() - _multishot_started) - 12.0)
+    _retry_steps = max(6, min(max_steps, int(max_steps * 0.65)))
+    _retry_args = dict(_multishot_args)
+    _retry_args["max_steps"] = _retry_steps
+    _result2 = _solve_attempt(**_retry_args, wall_clock_budget=min(170.0, _remaining_for_retry))
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
+
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2265,6 +2314,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    wall_clock_budget = float(kwargs.get("wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2283,7 +2333,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return wall_clock_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2460,6 +2510,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=max(20, min(120, int(time_remaining() - 4))),
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -2530,7 +2581,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                result = run_command(command, repo, timeout=max(3, min(command_timeout, int(time_remaining() - 4))))
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
