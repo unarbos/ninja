@@ -1852,6 +1852,13 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 ## Safety
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+
+
+Before writing any edits, state:
+ROOT CAUSE: [origin of the bug, not the symptom]
+FILES TO CHANGE: [all files that need edits]
+CALL SITES: [callers of any function you will modify]
+Then implement edits covering all required files and call sites.
 """
 
 
@@ -2421,6 +2428,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 assistant_text,
                 build_self_check_prompt(patch, issue),
                 "SELF_CHECK_QUEUED",
+            )
+            return True
+
+        if not maybe_queue_refinement.__dict__.get("wiring_done"):
+            maybe_queue_refinement.__dict__["wiring_done"] = True
+            queue_refinement_turn(
+                assistant_text,
+                "Check your patch: are there callers, importers, or "
+                "consumers of the changed code NOT yet updated? Update them now.",
+                "WIRING_CHECK",
             )
             return True
 
