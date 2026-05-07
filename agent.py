@@ -1994,6 +1994,39 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+def _issue_upfront_checklist(issue: str) -> str:
+    """Surface extracted checkpoints + path mentions before step 1.
+
+    Same heuristics as refinement nudges (`_extract_acceptance_criteria`,
+    `_extract_issue_path_mentions`) but injected up front so multi-bullet SWE
+    tasks don't rely on the model noticing every line in a long issue."""
+    blocks: List[str] = []
+    criteria = _extract_acceptance_criteria(issue)
+    if criteria:
+        numbered = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+        blocks.append(
+            "Structured checkpoints extracted from the issue (verify each before <final>):\n"
+            + numbered
+        )
+    paths = _extract_issue_path_mentions(issue)
+    if paths:
+        seen: set[str] = set()
+        uniq: List[str] = []
+        for p in paths:
+            norm = p.strip().lstrip("./")
+            if norm and norm not in seen:
+                seen.add(norm)
+                uniq.append(norm)
+        if uniq:
+            blocks.append(
+                "File paths named in the issue (confirm you touch the right files):\n"
+                + "\n".join(f"  - {p}" for p in uniq)
+            )
+    if not blocks:
+        return ""
+    return "\n\n" + "\n\n".join(blocks) + "\n"
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2003,10 +2036,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    upfront = _issue_upfront_checklist(issue)
+    after_issue = upfront if upfront else "\n"
+
     return f"""Fix this issue:
 
-{issue}
-
+{issue}{after_issue}
 Repository summary:
 
 {repo_summary}
@@ -2290,7 +2325,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (v28 — multi-shot wrapper around _solve_attempt)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2634,7 +2669,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                # step>=2: allow early exit once patch + passing targeted test appear
+                # (step>=4 wasted budget when the model verifies on step 2–3).
+                if step >= 2 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
