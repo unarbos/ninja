@@ -1994,13 +1994,14 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
-def _issue_symbol_hints(issue: str, *, max_symbols: int = 10) -> str:
+def _issue_symbol_hints(problem: str, *, max_symbols: int = 10) -> str:
     """Surface `functionName` / `snake_case` tokens from the issue in turn 1.
 
     Path regexes in `_extract_issue_path_mentions` only catch `foo.py` patterns;
     many tasks name a class or function with no file path. The same symbol list
     already feeds `_symbol_grep_hits` for ranking — echoing it here reduces
     blind grep loops."""
+    issue = problem
     symbols = _extract_issue_symbols(issue, max_symbols=max_symbols)
     if not symbols:
         return ""
