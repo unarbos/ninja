@@ -114,6 +114,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_WIRING_CHECK_TURNS = 1 # verify end-to-end connectivity before self-check
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1594,7 +1595,17 @@ SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two way
 1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
 2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else. A buildable 70% solution beats a broken 95% attempt.
+
+## Priority order
+
+Implement in this order — never advance until earlier priorities are solid:
+1. Core behavior (the primary fix, working end-to-end)
+2. Compile correctness (imports, syntax, types — every new symbol imported/defined)
+3. Required integration (wire all call sites, update consumers of changed interfaces)
+4. Tests / types / config (update what the change requires)
+5. Polish (only if time remains)
+6. Refactors (never, unless explicitly requested)
 
 ## Command format
 
@@ -1610,29 +1621,40 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**1. Extract ALL requirements**: Read the FULL issue. List EVERY explicit requirement and acceptance criterion. Identify implicit integration needs (call sites, types, config, tests, migrations). Missing any criterion loses completeness points.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**2. Inspect before editing**: Study preloaded snippets and nearby code to learn the local architecture — existing service shapes, constants, patterns, state management, error handling, endpoint conventions, test style. You MUST imitate these patterns.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**3. Plan**: In the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function. Then immediately issue the command.
 
-**Edit surgically**: change only the lines that implement the fix.
+**4. Implement the smallest complete core path first**: Make the feature work end-to-end before secondary requirements. Verify this wiring checklist:
+  - Data/schema changed → backend endpoint/service updated
+  - Backend changed → frontend/client call updated
+  - New component/route → rendered in parent, reachable by user
+  - New helper/service → imported and called from existing code
+  - Changed interface/type → all consumers updated
+  - Existing call sites → updated for new signatures
+  Disconnected code (unrendered components, uncalled endpoints, unused helpers) is treated as incomplete.
+
+**5. Edit surgically**: Change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
 - Larger edits: a minimal Python script or heredoc
 - Never rewrite an entire function when only 1–3 lines need changing
 
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+**6. Multi-file edits**: Emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+**7. Companion tests**: If a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**8. Verify**: After patching, run the most targeted real test available — `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+**9. Compile-safety check before finishing**: Verify imports exist, new identifiers are defined, JSX/TS/Python syntax is valid, props/interfaces match, routes exist, renamed fields are updated everywhere.
+
+**10. Finish**: Once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
 ## Scope discipline — what to change
 
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
+Fix the ROOT CAUSE, not just the symptom:
 - "Fix X in function Y" → change only function Y
 - "Add feature Z to class C" → add only what Z requires inside C
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
@@ -1649,6 +1671,26 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
+
+## Preserve existing behavior
+
+Before modifying or removing any existing code:
+- Was this removal explicitly requested by the task?
+- Could existing tests rely on this behavior?
+- Could this break login/logout, loading/error states, validation, cache, lifecycle, or auth?
+If in doubt, keep it. Add new behavior alongside, not as a replacement.
+
+For removal/refactor tasks, do a full-reference sweep: imports, props/interfaces, state variables, render paths, API fields, tests, comments. Partial removal is incomplete.
+
+## Architecture alignment
+
+Prefer existing patterns over invented ones:
+- Existing service shape > new custom shape
+- Existing constants > string literals
+- Existing mapper/helper > manual object construction
+- Existing endpoint style > new route convention
+- Existing test style > new framework pattern
+- Existing state/query-key pattern > new state pattern
 
 ## Style matching
 
@@ -1681,9 +1723,17 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before coding, do this checklist extraction:
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+1. Read the ENTIRE issue. List every EXPLICIT requirement (there may be multiple bullets/criteria). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+2. Identify IMPLICIT integration needs: call sites to update, types to change, config to adjust, tests to fix, migrations to add.
+3. Note regression-sensitive areas your change could break (auth, loading/error states, cache, existing routes/flows).
+
+Strategy:
+- INSPECT the preloaded code to learn the local architecture before editing. Use existing patterns, constants, service shapes — do not invent new ones.
+- Implement the smallest complete end-to-end core path first. Every new component must be rendered, every new endpoint must be called, every new helper must be used.
+- The fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+- Preserve existing behavior unless the task explicitly asks to remove it.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -1710,13 +1760,16 @@ def build_budget_pressure_prompt(step: int) -> str:
         return (
             "Budget check: no repo change yet. "
             "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "A precise sed or python -c is better than another grep. Stop exploring. "
+            "Remember: a buildable partial solution beats timing out with nothing."
         )
     return (
         "Hard budget check: still no patch. "
         "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
         "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        "Use `sed -i` or a python one-liner to make the targeted edit now. "
+        "Priority: core behavior > compile correctness > integration. "
+        "A safe partial fix scores far higher than an empty submission."
     )
 
 
@@ -1773,36 +1826,54 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+    """Show the model its own draft and run comprehensive verification gates."""
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Review your patch against ALL gates — the LLM judge and "
+        "similarity scorer penalize failures in each:\n\n"
+        "CORRECTNESS (high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "  - Are ALL edge cases mentioned in the issue handled?\n"
+        "  - If you have not yet run a functional test, run one now.\n\n"
+        "COMPLETENESS (high impact):\n"
+        "  - List every requirement from the task. Is EACH ONE addressed?\n"
+        "  - Companion tests updated if source change affects them?\n\n"
+        "COMPILE SAFETY:\n"
+        "  - All new symbols have matching imports\n"
+        "  - No undefined variables, wrong argument counts, or type mismatches\n"
+        "  - JSX/TS/Python syntax is valid\n"
+        "  - Props/interfaces match between producer and consumer\n"
+        "  - Routes and file paths referenced actually exist\n"
+        "  - Renamed/changed fields updated in ALL locations\n"
+        "  - Hook rules not violated (React)\n\n"
+        "END-TO-END WIRING:\n"
+        "  - Every new component is rendered in the actual tree\n"
+        "  - Every new endpoint is called by a client\n"
+        "  - Every new helper/service is imported and used\n"
+        "  - All consumers of changed interfaces are updated\n"
+        "  - Feature is reachable by user through UI or API\n\n"
+        "DIFF HYGIENE:\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "  - No refactoring, renaming, or reordering not in the task\n"
+        "  - No unrelated imports, dead code, or placeholder comments\n"
+        "  - Every changed file maps directly to a task requirement\n\n"
+        "EXISTING BEHAVIOR:\n"
+        "  - No existing behavior removed unless task explicitly requested it\n"
+        "  - Loading/error states, auth flows, cache, lifecycle hooks preserved\n"
+        "  - For removal tasks: all references swept (imports, props, state, render paths, tests)\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
+        "If the patch passes ALL gates, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
+        "(fix missing imports, wire disconnected code, add missing tests, "
+        "revert scope-creep hunks, restore removed behavior), "
         "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
     )
 
@@ -1839,6 +1910,47 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_wiring_check_prompt(patch: str, issue_text: str) -> str:
+    """Verify end-to-end connectivity: every new element is reachable."""
+    truncated = (
+        patch
+        if len(patch) <= 3000
+        else patch[:1500] + "\n...[truncated]...\n" + patch[-1200:]
+    )
+    return (
+        "End-to-end wiring check. Verify every new/changed element is fully "
+        "connected:\n\n"
+        "  - New component/route → rendered in parent, reachable by user\n"
+        "  - New endpoint/API → called by at least one client\n"
+        "  - New helper/service → imported and invoked from existing code\n"
+        "  - Changed function signature → all callers updated\n"
+        "  - Changed type/interface → all consumers updated\n"
+        "  - New config/env var → referenced where needed\n"
+        "  - Schema/migration change → backend queries updated\n"
+        "  - New imports → actually used; no missing imports for new symbols\n\n"
+        "Your patch:\n```diff\n"
+        f"{truncated}\n```\n\n"
+        "Task:\n"
+        f"{issue_text[:1200]}\n\n"
+        "If everything is wired end-to-end, respond: <final>Wiring verified</final>\n\n"
+        "If anything is disconnected (component not rendered, endpoint not called, "
+        "helper not used, missing import, caller not updated), issue the minimal "
+        "<command> blocks to wire it, then <final>summary</final>. "
+        "Do NOT add unrelated scope."
+    )
+
+
+def build_time_pressure_finalize_prompt() -> str:
+    """Push agent to finalize when wall clock is running low."""
+    return (
+        "TIME PRESSURE: Wall clock is running low and you have a patch staged. "
+        "Do NOT start new explorations, broad refactors, or secondary features. "
+        "If you have not yet run a quick test, run ONE targeted test (<10s). "
+        "Then immediately emit <final>summary</final>. "
+        "A buildable partial solution scores far higher than timing out."
     )
 
 
@@ -1917,6 +2029,7 @@ def solve(
     syntax_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    wiring_check_turns_used = 0
     hail_mary_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -1949,7 +2062,7 @@ def solve(
             4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, wiring_check_turns_used, hail_mary_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2019,6 +2132,17 @@ def solve(
                 )
                 return True
 
+        if wiring_check_turns_used < MAX_WIRING_CHECK_TURNS:
+            changed = _patch_changed_files(patch)
+            if len(changed) >= 2:
+                wiring_check_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_wiring_check_prompt(patch, issue),
+                    "WIRING_CHECK_QUEUED:\n  files=" + ", ".join(changed[:6]),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             queue_refinement_turn(
@@ -2053,6 +2177,14 @@ def solve(
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
+                break
+
+            if time_remaining() < 60 and get_patch(repo).strip():
+                logs.append(
+                    "TIME_PRESSURE_STOP:\nPatch exists and <60s remaining. "
+                    "Returning safe partial patch rather than risking timeout."
+                )
+                success = True
                 break
 
             response_text: Optional[str] = None
@@ -2182,20 +2314,30 @@ def solve(
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                has_patch = get_patch(repo).strip()
+                remaining = time_remaining()
+                if not success and has_patch and remaining < 120:
+                    observation_text += (
+                        "\n\n" + build_time_pressure_finalize_prompt()
+                    )
+                elif not success and has_patch:
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
-                        "2. Run the most targeted functional test available "
-                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
-                        "3. Emit <final>summary</final>."
+                        "2. Verify end-to-end wiring: every new component rendered, "
+                        "every new endpoint called, every changed interface's consumers updated.\n"
+                        "3. Check compile safety: imports exist, syntax valid, no undefined symbols.\n"
+                        "4. Run the most targeted functional test available "
+                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.).\n"
+                        "5. Emit <final>summary</final>."
                     )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
                         "edit commands in your next response — all files at once, covering EVERY requirement "
-                        "in the issue. Use sed or python -c for surgical edits."
+                        "in the issue. Use sed or python -c for surgical edits. "
+                        "Imitate the existing code patterns you see in preloaded snippets. "
+                        "Wire everything end-to-end so the feature is reachable."
                     )
                 messages.append({"role": "user", "content": observation_text})
 
