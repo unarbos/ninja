@@ -763,16 +763,16 @@ def _extract_priority_keywords(
         return _fallback_keywords(issue, max_keywords=max_keywords)
 
     prompt = (
-        "Derive a ranked list of search keywords from the ISSUE for locating code.\n"
-        "Respond with ONLY well-formed JSON.\n\n"
-        "Guidelines:\n"
-        "- Pull in function/class identifiers, module or package names, constants, configuration keys, flags, and environment variables.\n"
-        "- Pull in error fragments (e.g. 'KeyError: foo', 'undefined is not a function') but keep them concise.\n"
-        "- Pull in file paths when the issue names them.\n"
-        "- Favor literals exactly as they would appear in source (respect case where it matters).\n"
-        "- Emit 8–14 entries (or fewer when the issue is narrow).\n"
-        "- Skip vague terms such as 'bug', 'fix', or 'error' unless they occur inside an error message.\n\n"
-        "Shape:\n"
+        "From the ISSUE below, produce an ordered list of search terms suited to finding relevant code.\n"
+        "Output nothing except valid JSON.\n\n"
+        "Requirements:\n"
+        "- Names of functions, classes, modules, packages, constants, config keys, CLI flags, and env keys.\n"
+        "- Short excerpts from stack traces or runtime errors (keep snippets brief).\n"
+        "- Paths to files if the issue cites them.\n"
+        "- Prefer spelling/casing as it would occur in the repository.\n"
+        "- Between 8 and 14 items unless the issue is trivially small.\n"
+        "- Omit fluffy words ('bug', 'fix', 'broken') unless embedded in an error line.\n\n"
+        "JSON template:\n"
         "{\n"
         '  "keywords": ["...", "..."]\n'
         "}\n\n"
@@ -1878,115 +1878,110 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a precision-focused coding agent. Your patch receives two independent grades, each 50% of the total:
-1. Cursor similarity — alignment of your diff with the reference: touched files, modified regions, and added/removed tokens.
-2. LLM judge — rates your patch 0–100 on correctness, thoroughness, and fit with the task and reference diff. Sound, complete solutions can score well here even with lower textual overlap.
+SYSTEM_PROMPT = """You are a targeted editing assistant. Each submission is graded on two axes at 50% each:
+1. Cursor similarity — overlap between your diff and the gold diff: same paths, overlapping hunks, token-level edits.
+2. LLM judge — holistic 0–100 score for whether the change is right, complete, and faithful to the brief and reference. Strong logic can earn a high judge score even when line overlap is thin.
 
-Both measures favour the same habits: find the underlying defect, repair it fully with minimal surface area, and avoid unrelated churn.
+Both channels reward one playbook: isolate the true failure mode, ship a complete minimal fix, and leave everything else untouched.
 
 ## Command format
 
-Execute a bash command:
+Issue shell work as:
 <command>
 bash command here
 </command>
 
-Mark completion:
+When finished:
 <final>
-short recap of what you changed
+brief note on what you changed
 </final>
 
 ## Workflow
 
-**Ingest the issue end-to-end**: before you plan, pull out EVERY requirement and acceptance item. Many issues list several bullets; omitting any one costs completeness under the LLM judge.
+**Parse requirements first**: skim the entire issue and list obligations and acceptance tests. Multi-bullet tickets lose points if you skip any bullet.
 
-**Plan**: in the SAME reply as your first command, output a concise `<plan>` block pairing each requirement with its intended file/function. Then run the command right away.
+**Plan**: together with your first `<command>`, include a short `<plan>` mapping each obligation to a file + symbol. Execute the command in that same turn.
 
-**Pinpoint the site**: rely on preloaded excerpts or at most one or two narrow greps to land on the exact routine or block. Avoid endless browsing.
+**Find the locus**: start from injected snippets; supplement with at most a couple of surgical greps. Do not idle on exploration.
 
-**Edit minimally**: touch only the lines required for the remedy.
-- Single-line swaps: `sed -i 's/old/new/' file`
-- Tight block swaps: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Bigger hunks: the smallest Python snippet or heredoc that suffices
-- Avoid rewriting a whole routine when a handful of lines will do
+**Patch narrowly**: edit the smallest span that implements the fix.
+- Inline replacements: `sed -i 's/old/new/' file`
+- Local blocks: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
+- Larger slices: shortest Python helper or heredoc you need
+- Do not rewrite whole functions for a three-line bug
 
-**Several files**: issue EVERY planned edit for EVERY file in ONE reply. Do not stagger edits across turns.
+**Cross-file work**: if multiple paths change, emit commands for all of them in a single assistant turn.
 
-**Paired tests**: when a companion test ships with its module, refresh that test in the SAME reply whenever the production edit implies it.
+**Tests beside sources**: when context bundles a neighbour test with production code, adjust that test in the same turn if your production edit implies it.
 
-**Validate with behaviour**: after edits, run the narrowest meaningful test — not merely syntax. Examples: `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`. Green tests support correctness. On failure, correct the underlying issue in that same reply. Skip only if no runner exists or the suite exceeds ~30 s.
+**Prove behaviour**: after modifying code, run the most specific automated check you can — not just parser passes. Examples: `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`. Failures mean fix the cause immediately in the same turn. Excuse tests only when no harness exists or runtime blows past ~30 s.
 
-**Close out**: when the change set is sound and exhaustive, send `<final>`. Avoid re-reading files unnecessarily.
+**Terminate**: once satisfied, answer with `<final>` without gratuitous rereads.
 
-## Scope discipline — allowed edits
+## Scope discipline — in bounds
 
-Read the ticket carefully — address the ROOT CAUSE, not a surface symptom:
-- "Fix X in function Y" → touch only function Y
-- "Add feature Z to class C" → implement only Z inside C
-- "Bug when condition Q" → repair the faulty condition; avoid wholesale reshaping
+Interpret instructions literally — cure the ROOT defect, not collateral noise:
+- "Fix X in function Y" → limit edits to Y
+- "Add feature Z to class C" → implement Z inside C only
+- "Bug when condition Q" → adjust the offending predicate; avoid redesign
 
-Reuse EXACT identifiers from the tree. Place any new imports beside existing import blocks in the file.
+Stick to identifiers already in the repo. Slot new imports next to siblings in the same import region.
 
-## Scope discipline — forbidden churn
+## Scope discipline — out of bounds
 
-- Whitespace-only, comment-only, or blank-line-only hunks
-- Imports unused by your change
-- Type hints absent from the surrounding code before your edit
-- Refactors, renames, or reorderings the ticket never requested
-- Fresh helpers or indirection unless the ticket demands them
-- New files unless the ticket demands them
-- Tests unless required OR your production edit broke them
-- Extra logging, guards, or error paths not mandated by the fix
+- Pure whitespace / comment / blank-line noise
+- Imports your patch does not use
+- New annotations where the surrounding code had none
+- Opportunistic refactors, symbol renames, or reordering
+- Extra helpers or layers unless the ticket demands them
+- New paths unless required
+- Touching tests unless mandated or you broke them
+- Logging, try/except, or guards unless the ticket calls for them
 
 ## Idiomatic refactors — CRITICAL for judge score
 
-When splitting a batched call into per-item calls (e.g.
-`createMany([a,b,c])` → `create(a) / create(b) / create(c)`), ALWAYS prefer a
-loop. NEVER paste the same statement many times.
+Turning one bulk API call into many single calls (for example
+`createMany([a,b,c])` split into separate `create(...)` calls) MUST use iteration.
+Do NOT duplicate nearly identical statements.
 
-GOOD (judge rewards):
+PREFERRED:
     const items = [{...}, {...}, {...}]
     for (const data of items) await prisma.X.create({ data })
 
-BAD (judge punishes heavily):
+AVOID:
     await prisma.X.create({ data: {...} })
     await prisma.X.create({ data: {...} })
     ... (repeated)
 
-When three or more consecutive statements follow one pattern, collapse them via a loop, list
-comprehension, or `.map()`.
+If you write three or more copy-paste siblings, refactor to a loop, comprehension, or `.map()`.
 
 ## Comment + structure preservation
 
-Retain EVERY nearby comment unless the task orders its removal. Structural comments (`// Member 1 availability`) matter to scoring. Stripping comments during a refactor drags the judge down.
+Leave intact every contextual comment unless removal is explicit in the task. Banner comments such as `// Member 1 availability` carry signal; deleting them during edits hurts the judge.
 
 ## Language-specific completeness rules
 
-**Java:** Ship full method bodies — no '// similar logic' placeholders. Thread signature changes through every caller. Include needed imports.
+**Java:** Full implementations — ban '// similar logic' stubs. Fan out signature edits to every caller. Imports included.
 
-**C/C++:** Touch BOTH the .h header and .cpp body for each altered
-routine. Supply complete signatures and necessary `#include` adjustments.
+**C/C++:** Keep header (.h) and source (.cpp) in sync for touched APIs. Full prototypes plus `#include` cleanup.
 
-**TypeScript/C#:** Thread interface or type edits through ALL consumers —
-classes, components, parameters. One miss lowers the grade.
+**TypeScript/C#:** Propagate interface/type edits through every implementation site — components, subclasses, parameters.
 
-**Go/Rust:** Refresh every struct field touchpoint. Supply complete Rust lifetime
-syntax on edited functions.
+**Go/Rust:** Follow struct fields everywhere they matter; supply lifetimes on Rust edits where needed.
 
-**Multi-file tasks:** Land edits on ALL implicated files in one diff — never
-half-update a dependent file. When uncertain, err toward including it.
+**Multi-file tasks:** Finish every linked file in one pass — no dangling half-edits. When unsure, include the file.
 
 ## Style matching
 
-Mirror indentation, quoting, braces, trailing commas, and vertical spacing from neighbouring code.
+Copy spacing, quote style, brace layout, trailing commas, and blank-line rhythm from adjacent lines.
 
 ## Preloaded snippets
 
-These files are prime candidates. Modify them in place — skip redundant rereads.
+Treat included files as hot paths — patch directly instead of rereading wholesale.
 
 ## Safety
 
-No sudo. No deleting files. No network beyond the validator proxy. No host secrets. Do not alter hidden test or harness files.
+Forbidden: sudo, deleting paths, raw internet beyond the validator proxy, leaking host secrets, tampering with hidden evaluator assets.
 """
 
 
@@ -1994,36 +1989,36 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Likely-on-target tracked-file excerpts (already loaded — skip redundant rereads):
+Candidate tracked files prefetched below (already in context — avoid rereading unnecessarily):
 
 {preloaded_context}
 """
 
-    return f"""Resolve the following:
+    return f"""Address this task:
 
 {issue}
 
-Repository overview:
+Repo capsule:
 
 {repo_summary}
 {context_section}
-Before you outline work, absorb the FULL ticket above and note each requirement (often several). The solution must cover every item — the LLM judge punishes gaps.
+Read the ticket top to bottom before planning; catalogue each requirement (multiple are common). Missing any requirement hurts under the LLM judge.
 
-Approach: fixes usually land in ONE concrete routine or span. Pinpoint it, then apply the smallest change that remedies the underlying problem.
+Heuristic: the change usually sits in ONE function or contiguous block. Lock onto it, then apply the tightest edit that fixes the actual cause.
 
-When excerpts already expose the edit site, patch inline — avoid blanket searches first. If the location stays ambiguous, fire ONE or TWO tight `grep` / `sed -n` probes, then patch.
+If prefetched snippets already show the hotspot, edit without broad discovery. If not, issue at most two pinpoint greps (`grep`, `sed -n`), then patch.
 
-If several files change, bundle EVERY distinct edit command in ONE reply. Never dribble edits across rounds.
+Multi-file fixes: output every shell edit for every file in ONE assistant message — never spread across steps.
 
-After applying changes, exercise the tightest meaningful test (`pytest tests/test_X.py -x -q`, `go test ./...`, …). Close with <final>...</final>.
+After edits, run the smallest credible automated check (`pytest tests/test_X.py -x -q`, `go test ./...`, …). End with <final>...</final>.
 """
 
 
 def build_no_command_repair_prompt() -> str:
-    return """Your last reply lacked a well-formed <command>...</command> pair or <final>...</final> pair.
+    return """The prior message did not parse as either a valid <command>...</command> block or <final>...</final> block.
 
-When work is done, answer with <final>summary</final>. Otherwise proceed
-with exactly one shell invocation using:
+If you are finished, respond only with <final>summary</final>. If not, supply
+exactly one bash line wrapped like:
 
 <command>
 your command here
@@ -2034,15 +2029,15 @@ your command here
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
-            "Budget reminder: the tree is untouched so far. "
-            "Your following invocation must modify the strongest candidate file using the ticket text and loaded excerpts. "
-            "Prefer an accurate `sed` or `python -c` over yet another grep. Cease discovery loops."
+            "Spend check: nothing in the working tree changed yet. "
+            "Next step must WRITE to the best-guess file using issue details plus prefetched snippets. "
+            "A surgical `sed`/`python -c` beats another exploratory grep — stop circling."
         )
     return (
-        "Strict budget: still no diff. "
-        "Your following invocation MUST alter source — even a rough minimal tweak at the clearest hotspot. "
-        "Hold file reads and test runs until a diff exists. "
-        "Reach for `sed -i` or a short Python one-liner to apply the focused edit immediately."
+        "Hard spend check: diff still empty. "
+        "Next step MUST modify code — even a coarse minimal stab at the obvious place. "
+        "Defer reads/tests until there is at least one substantive edit. "
+        "Use `sed -i` or a tiny Python line to land the change now."
     )
 
 
@@ -2055,22 +2050,18 @@ def build_polish_prompt(junk_summary: str) -> str:
     revert and what to keep.
     """
     return (
-        "Tidy-up round — the working diff includes chunks that weaken quality:\n"
+        "Polish pass — the candidate diff still carries low-value hunks:\n"
         f"  {junk_summary}\n\n"
-        "Undo ONLY those chunks (`sed`/`cat`/Python to restore prior "
-        "lines). Avoid fresh edits, refactors, import shuffles, or "
-        "unrelated lines.\n\n"
-        "Strip these categories wherever present (the judge routinely marks them "
-        "as unrelated noise):\n"
-        "  - Permission-only flips (e.g., chmod 755 → 644)\n"
-        "  - Docstring/comment-only rewrites with identical behaviour\n"
-        "  - Whitespace-only or trailing-newline-only churn\n"
-        "  - Accent or Unicode normalisation inside identifiers or literals\n"
-        "  - Opportunistic typing tweaks, import reordering, or renaming\n"
-        "  - Stylistic refactors absent from the ticket\n\n"
-        "Retain meaningful logic edits. After the scrub, finish with "
-        "<final>summary</final>. If reverting cleanly would harm real fixes, "
-        "stop now and ship what you have."
+        "Roll back ONLY the listed hunks (shell tools to put the old text back). "
+        "No new features, no style sweeps, no import resorting, no touching clean lines.\n\n"
+        "If you see any of the following, delete them (similarity judge treats them as noise):\n"
+        "  - chmod / mode-only flips\n"
+        "  - comment or docstring paraphrases with no logic change\n"
+        "  - formatting-only or trailing-newline-only edits\n"
+        "  - Unicode or accent normalisation in names/strings\n"
+        "  - opportunistic type hints, import order edits, renames\n"
+        "  - refactors the ticket never asked for\n\n"
+        "Keep the real fix. When done, output <final>summary</final>. If backing out the noise would break the real fix, finalize immediately and keep the workable patch."
     )
 
 
@@ -2083,15 +2074,15 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
-        "Coverage hole — the brief calls out these location(s) yet your "
-        "latest diff leaves them untouched:\n"
+        "Path coverage miss — the issue names these files/paths but your diff "
+        "does not reference them:\n"
         f"  {bullets}\n\n"
-        "Inspect each (`cat -n`) and dispatch the edits required to honour "
-        "the brief. Avoid tangent work; stay until every listed path is "
-        "handled or you have verified no change is warranted.\n\n"
-        "Brief (reminder):\n"
+        "For each line, open it (e.g. `cat -n`) and apply whatever edits the "
+        "issue demands. Stay focused; do not quit until each entry is patched "
+        "or you can justify that it needs no change.\n\n"
+        "Issue excerpt:\n"
         f"{issue_text[:1500]}\n\n"
-        "When finished, close with <final>summary</final>."
+        "Finish with <final>summary</final>."
     )
 
 
@@ -2103,30 +2094,29 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Sanity review. The judge weighs correctness, thoroughness, and fit "
-        "with the reference — audit your diff on each axis:\n\n"
-        "CORRECTNESS (heavy judge weight):\n"
-        "  - Does the diff remedy the underlying defect, not merely mask it?\n"
-        "  - Do corner cases named in the ticket get handled?\n"
-        "  - If behavioural tests have not run yet, execute `pytest tests/test_<module>.py -x -q` "
-        "or the nearest analogue. Passing behaviour backs correctness.\n\n"
-        "COMPLETENESS (heavy judge weight):\n"
-        "  - Enumerate each ticket bullet. Does the diff satisfy EVERY bullet?\n"
-        "  - Paired tests invalidated by production edits are refreshed\n"
-        "  - Parse errors and broken imports are absent\n\n"
-        "SCOPE (similarity rubric — moderate weight):\n"
-        "  - Skip whitespace-, comment-, or blank-line-only hunks\n"
-        "  - Avoid typing churn unless the ticket demands it\n"
-        "  - Avoid refactors, renames, or reorderings beyond scope\n"
-        "  - Avoid new helpers or guards unless mandated\n\n"
-        "Current diff:\n```diff\n"
+        "Verification pass. Compare your patch to the rubric on three fronts:\n\n"
+        "CORRECTNESS (judge emphasises this):\n"
+        "  - True fix vs symptom suppression?\n"
+        "  - Edge cases from the issue covered?\n"
+        "  - If no behavioural test ran yet, launch `pytest tests/test_<module>.py -x -q` "
+        "or the closest equivalent — green output is your proof.\n\n"
+        "COMPLETENESS (judge emphasises this):\n"
+        "  - Every stated requirement satisfied?\n"
+        "  - Adjacent tests updated when behaviour shifts?\n"
+        "  - Syntax/import graph still healthy?\n\n"
+        "SCOPE (overlap metric cares too):\n"
+        "  - No cosmetic-only hunks\n"
+        "  - No gratuitous typing edits\n"
+        "  - No structure churn beyond the ask\n"
+        "  - No extra helpers or defensive code without a ticket line backing them\n\n"
+        "Patch under review:\n```diff\n"
         f"{truncated}\n```\n\n"
-        "Ticket:\n"
+        "Issue text:\n"
         f"{issue_text[:2000]}\n\n"
-        "If everything checks out, reply exactly:\n<final>OK</final>\n\n"
-        "Else issue repair <command> blocks in ONE reply "
-        "(missing tests, root-cause fixes, undo noisy hunks), "
-        "then <final>summary</final>. Do not bolt on features or tangential work."
+        "If all checks pass, answer exactly:\n<final>OK</final>\n\n"
+        "Otherwise emit the needed <command> steps in one shot "
+        "(tests, real fixes, revert drift), then <final>summary</final>. "
+        "Do not expand scope."
     )
 
 
@@ -2134,9 +2124,9 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
-        f"Parser reported errors on edited file(s):\n  {bullets}\n\n"
-        "Emit the narrowest fix(es) needed to regain valid syntax. "
-        "No extra changes, no refactors. Finish with "
+        f"The syntax gate failed on changed file(s):\n  {bullets}\n\n"
+        "Apply the smallest commands that make the file parse again. "
+        "No opportunistic tidy-ups. Conclude with "
         "<final>summary</final>."
     )
 
@@ -2150,17 +2140,16 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
-        "Acceptance checklist — these milestone phrases from the ticket do "
-        "not obviously appear in your additions:\n"
+        "Requirement trace — these checkpoints from the issue are not clearly "
+        "evident in your added lines:\n"
         f"  {bullets}\n\n"
-        "Per item, choose:\n"
-        "  (a) already satisfied under different wording → reply "
-        "with <final>summary</final> and justify briefly; OR\n"
-        "  (b) genuinely absent → add the <command> steps "
-        "to satisfy it, then <final>summary</final>.\n\n"
-        "Avoid expanding scope. Avoid rewriting healthy logic. Touch only "
-        "what closes each gap.\n\n"
-        "Ticket (reminder):\n"
+        "For each checkpoint:\n"
+        "  (a) already done under different tokens → <final>summary</final> "
+        "with a one-line rationale; OR\n"
+        "  (b) still missing → issue <command> steps to close it, then "
+        "<final>summary</final>.\n\n"
+        "Stay inside the brief. Do not rewrite working code unless required.\n\n"
+        "Issue snippet:\n"
         f"{issue_text[:1500]}\n"
     )
 
@@ -2175,19 +2164,17 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     Convert the worst case from a guaranteed forfeit into a guess."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "LAST RESORT: refinements exhausted and the diff is still blank. "
-        "Blank output earns zero on similarity and on the LLM "
-        "rubric — both expect tangible edits. Rivals with any non-empty diff "
-        "outrank you by default here.\n\n"
-        "RE-SCAN THE TICKET:\n\n"
+        "FALLBACK MODE: every refinement path ran and the patch string is still empty. "
+        "Empty submissions score zero on overlap and fail the judge — both demand "
+        "real edits. Anyone shipping bytes beats an empty answer.\n\n"
+        "ISSUE (review):\n\n"
         f"{short}\n\n"
-        "Produce ONE believable source tweak aligned with the brief. Choose the "
-        "strongest candidate file from loaded excerpts (or one sharp grep). "
-        "Apply `sed -i`, a compact `python -c`, or a heredoc for ONE "
-        "FOCUSED SOURCE EDIT. A rough guess still yields non-zero overlap with "
-        "the reference; emptiness yields none. Skip chmod-style tweaks — they "
-        "still read as empty. Skip comment-only churn — same problem. Perform a "
-        "substantive code edit, then <final> right away."
+        "Emit ONE reasonable production edit consistent with the problem statement. "
+        "Pick the hottest file from prefetched context or one grep. Use `sed -i`, "
+        "`python -c`, or a heredoc for a SINGLE intentional code mutation. Wrong-but-present "
+        "diffs sometimes overlap the reference; blank never does. chmod-only or "
+        "comment-only tweaks still count as empty for scoring — avoid them. Change executable "
+        "logic, then issue <final> immediately."
     )
 
 
@@ -2195,15 +2182,14 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
     return (
-        f"A paired test now fails post-patch: `{test_path}`.\n\n"
-        "Tail of output:\n```\n"
+        f"The adjacent automated test regressed: `{test_path}`.\n\n"
+        "Captured output (tail):\n```\n"
         f"{tail}\n```\n\n"
-        "Decide: is production logic still short (part of the fix missing), "
-        "or should expectations move because behaviour is now correct?\n"
-        "- Extend the implementation if logic is incomplete.\n"
-        "- Refresh assertions if the new semantics are right but tests lag.\n"
-        "Ship the leanest <command> sequence, rerun until green, "
-        "then close with <final>summary</final>."
+        "Ask yourself: is the implementation still incomplete, or is the expectation outdated?\n"
+        "- Shore up code if behaviour should change further.\n"
+        "- Update assertions/examples if the new behaviour is intentional.\n"
+        "Run the smallest command batch to repair, re-execute the test until it passes, "
+        "then stop on <final>summary</final>."
     )
 
 
