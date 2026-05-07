@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+WALL_CLOCK_BUDGET_SECONDS = 540.0  # validator caps round at ~600s; 540s + 60s overhead margin
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -116,8 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap fits criteria + coverage + one quality turn within budget
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -2283,27 +2282,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
+        Order (completeness gates first; the LLM judge's most-common
+        complaint is "missing N of M criteria", so address that BEFORE
+        cosmetic polish or speculative test-fixing):
+            0. hail-mary — patch empty: force one real edit (cap-exempt)
+            1. criteria-nudge — issue acceptance bullets not addressed
+            2. coverage-nudge — issue-mentioned paths still untouched
+            3. syntax-fix — quote parser errors back at the model
+            4. test-fix — run companion test, surface failure tail
+            5. polish — drop low-signal hunks
+            6. self-check — final read-through
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
+        # Empty-patch hail-mary is exempt from the refinement cap — without
+        # it an empty patch goes to the validator and scores 0.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2315,54 +2309,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
+        # Completeness gates first — judge's most common "loses on N of M
+        # criteria" complaint is best closed by surfacing the gap directly.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -2378,21 +2338,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Companion-test execution gate (alexlange1 PR#44 scaffolded the
+        # constants + helpers but never wired solve(); king PR#312 wired it
+        # up). The only refinement step backed by a real runner.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
 
