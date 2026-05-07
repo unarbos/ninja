@@ -116,7 +116,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_FOOTPRINT_TURNS = 1     # V14: continuous-penalty footprint shrink turn
+MAX_TOTAL_REFINEMENT_TURNS = 3  # bumped 2->3 to make room for footprint shrink after coverage/criteria;
+                                # ninjaking66 PR#268 cap insight retained at higher limit
+# Originally MAX_TOTAL_REFINEMENT_TURNS = 2 // ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1855,6 +1858,144 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+# -----------------------------
+# V14 — profile suffixes + excerpt builder
+# -----------------------------
+
+_V14_SURGICAL_SUFFIX = """
+
+PROFILE: SURGICAL.
+The validator's LLM judge (gpt-5.4 era) explicitly penalises "unrelated
+churn", "comment-only edits", and any patch that touches more than the
+issue actually requires. Make the smallest patch that passes every
+acceptance criterion and the relevant test. Prefer 1-3 file edits with
+tight per-hunk minimums. Reject every drive-by change."""
+
+_V14_SURGICAL_PLUS_SUFFIX = """
+
+PROFILE: SURGICAL-PLUS.
+Same scope discipline as SURGICAL — no broad rewrites, no unrelated
+churn. The only relaxation: when the issue text or coverage signal
+clearly implies a second touched file (companion test, paired
+type/interface, or a single caller), include that edit in the same
+response. Do NOT widen scope further. Per-hunk minimums still apply."""
+
+
+_V14_SYMBOL_RE = re.compile(
+    r"\b(?:[A-Z][a-zA-Z0-9]+(?:[A-Z][a-zA-Z0-9]+){1,}|[a-z][a-z0-9]+(?:_[a-z0-9]+){1,})\b"
+)
+_V14_EXCERPT_PER_SYMBOL_LINES = 14
+_V14_EXCERPT_BLOCK_BUDGET = 3500
+
+
+def _v14_extract_issue_symbols(issue: str, limit: int = 6) -> List[str]:
+    """Extract identifier-shaped tokens (CamelCase, snake_case) from the issue.
+    These are the most reliable anchors for finding the right edit region."""
+    if not issue:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for m in _V14_SYMBOL_RE.finditer(issue):
+        tok = m.group(0)
+        if len(tok) < 4 or tok.lower() in seen:
+            continue
+        if tok.lower() in {"none", "true", "false", "self", "this", "null", "void"}:
+            continue
+        seen.add(tok.lower())
+        out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _v14_build_excerpt_block(repo: Path, issue: str) -> str:
+    """Light excerpt layer: for top 1-2 ranked files, grep the issue's
+    identifier-shaped symbols and pull a small context window around each
+    hit. This complements the existing whole-file preload — same files,
+    sharper localisation. Skips silently when no symbols or no hits."""
+    symbols = _v14_extract_issue_symbols(issue, limit=4)
+    if not symbols:
+        return ""
+    try:
+        ranked = _rank_context_files(repo, issue)[:2]
+    except Exception:
+        return ""
+    if not ranked:
+        return ""
+    sections: List[str] = []
+    used = 0
+    for relative_path in ranked:
+        full = repo / relative_path
+        try:
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if not text or len(text) > 200_000:
+            continue
+        lines = text.splitlines()
+        if not lines:
+            continue
+        windows: List[Tuple[int, int]] = []
+        per_file_lines = 0
+        for sym in symbols:
+            sym_lower = sym.lower()
+            for i, line in enumerate(lines):
+                if sym in line or sym_lower in line.lower():
+                    start = max(0, i - 4)
+                    end = min(len(lines) - 1, i + _V14_EXCERPT_PER_SYMBOL_LINES - 4)
+                    if windows and start <= windows[-1][1] + 2:
+                        windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+                    else:
+                        windows.append((start, end))
+                    per_file_lines += end - start + 1
+                    break  # one hit per symbol per file
+            if per_file_lines >= 30:
+                break
+        if not windows:
+            continue
+        body_lines: List[str] = []
+        for start, end in windows[:3]:
+            for ln in range(start, end + 1):
+                body_lines.append(f"{ln + 1:>5}: {lines[ln]}")
+                if len(body_lines) >= 30:
+                    break
+            if len(body_lines) >= 30:
+                break
+        block = f"### excerpt: {relative_path}\n```\n" + "\n".join(body_lines) + "\n```"
+        if used + len(block) > _V14_EXCERPT_BLOCK_BUDGET:
+            break
+        sections.append(block)
+        used += len(block) + 2
+    if not sections:
+        return ""
+    return "Focused excerpts (issue-symbol anchored, line-numbered):\n\n" + "\n\n".join(sections)
+
+
+def _build_v14_footprint_shrink_prompt(footprint: Dict[str, int], penalty: int, issue_text: str) -> str:
+    """Specific shrink prompt with concrete numbers + the requirements list, so
+    the model knows exactly which slack to trim. Avoids generic 'shrink your
+    patch' phrasing that often causes mass-revert."""
+    head = issue_text[:1200]
+    return (
+        "Footprint review — your draft accumulated penalty "
+        f"{penalty} (trigger {_V14_FOOTPRINT_TRIGGER_PENALTY}):\n"
+        f"  - files touched: {footprint['files']}\n"
+        f"  - total changed lines: {footprint['total_changed']}\n"
+        f"  - largest hunk: {footprint['largest_hunk']} lines\n"
+        f"  - fat hunks (>{_V14_FOOTPRINT_FAT_HUNK_LINES} lines): {footprint['fat_hunks']}\n\n"
+        "The validator's gpt-5.4 judge explicitly penalises 'unrelated churn'\n"
+        "and the Cursor F1 ratio is matched / max(model_changed, ref_changed).\n"
+        "Both axes punish over-broad patches. Identify and revert lines that\n"
+        "are NOT required to satisfy the requirements below, then keep every\n"
+        "line that is. Use sed/python -c/cat to revert non-required lines.\n\n"
+        "Issue (head):\n"
+        f"{head}\n\n"
+        "If after revert the patch still satisfies every requirement, finish\n"
+        "with <final>summary</final>. If the current draft is genuinely\n"
+        "already minimal, respond exactly <final>OK</final>."
+    )
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2088,6 +2229,286 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
+# -----------------------------
+# V14 — grounded multishot scorer
+# -----------------------------
+#
+# Replaces the previous king's _multishot_count_substantive selection with a
+# grounded scorer that combines real correctness signals (syntax, companion
+# test, coverage, criteria) with anti-churn penalties tuned for gpt-5.4 era
+# judging. The judge prompt explicitly rewards correctness/completeness/
+# alignment-with-reference and penalizes unrelated churn, empty/timeout, and
+# evaluator manipulation, so the scorer mirrors those priorities rather than
+# the old "more lines = better" heuristic.
+
+_V14_FAIL_EMPTY = -10000.0
+_V14_FAIL_INJECTION = -10000.0
+
+# Footprint thresholds (V14-lite-Core profile). The strict variant overrides
+# these to be tighter.
+_V14_FOOTPRINT_TOTAL_LINES_CAP = 600
+_V14_FOOTPRINT_FILE_BUDGET_BASE = 4
+_V14_FOOTPRINT_FAT_HUNK_LINES = 80
+_V14_FOOTPRINT_HUGE_HUNK_LINES = 160
+_V14_FOOTPRINT_MEDIUM_TOTAL = 220
+_V14_FOOTPRINT_LARGE_TOTAL = 350
+_V14_FOOTPRINT_LARGE_FAT = 120
+_V14_FOOTPRINT_TRIGGER_PENALTY = 18
+
+# Diff-judge prompt-injection blacklist. Mirrors the validator's own scan
+# (validate.py:_find_diff_judge_prompt_injection) so we never produce a
+# patch that would be auto-zeroed by the judge.
+_V14_INJECTION_PHRASES = (
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "ignore the above instructions",
+    "as the evaluator",
+    "as the judge",
+    "dear evaluator",
+    "dear judge",
+    "choose king",
+    "choose challenger",
+    "pick king",
+    "pick challenger",
+    "select king",
+    "select challenger",
+    "king is correct",
+    "challenger is correct",
+    "king wins",
+    "challenger wins",
+    "you are the judge",
+    "you are the evaluator",
+    "respond with king",
+    "respond with challenger",
+)
+
+
+def _v14_contains_injection_markers(patch: str) -> bool:
+    """True if the patch text contains any phrase from the validator's
+    injection blacklist. Such patches are auto-failed by the judge, so the
+    scorer hard-fails them at this stage too."""
+    if not patch:
+        return False
+    lowered = patch.lower()
+    return any(phrase in lowered for phrase in _V14_INJECTION_PHRASES)
+
+
+def _v14_patch_footprint(patch: str) -> Dict[str, int]:
+    """Quantify patch shape: changed files, +/- lines, largest hunk, fat hunks."""
+    files: set[str] = set()
+    plus_lines = 0
+    minus_lines = 0
+    largest_hunk = 0
+    fat_hunks = 0
+    cur_hunk = 0
+
+    def _flush():
+        nonlocal cur_hunk, largest_hunk, fat_hunks
+        if cur_hunk > largest_hunk:
+            largest_hunk = cur_hunk
+        if cur_hunk > _V14_FOOTPRINT_FAT_HUNK_LINES:
+            fat_hunks += 1
+        cur_hunk = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            _flush()
+            m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+            if m:
+                files.add(m.group(1))
+        elif line.startswith("@@"):
+            _flush()
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus_lines += 1
+            cur_hunk += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus_lines += 1
+            cur_hunk += 1
+    _flush()
+
+    return {
+        "files": len(files),
+        "plus": plus_lines,
+        "minus": minus_lines,
+        "total_changed": plus_lines + minus_lines,
+        "largest_hunk": largest_hunk,
+        "fat_hunks": fat_hunks,
+    }
+
+
+def _v14_target_file_budget(issue_text: str) -> int:
+    """Inferred file-count budget for this task. Path-mention based with a
+    sane floor; missing mentions fall back to the absolute base budget."""
+    mentioned = _extract_issue_path_mentions(issue_text)
+    if mentioned:
+        return max(_V14_FOOTPRINT_FILE_BUDGET_BASE, 2 * len(mentioned))
+    return _V14_FOOTPRINT_FILE_BUDGET_BASE
+
+
+def _v14_footprint_penalty(fp: Dict[str, int], issue_text: str) -> int:
+    """Continuous (additive) penalty replacing v3b's binary oversize trigger.
+    Fires the shrink turn at >= _V14_FOOTPRINT_TRIGGER_PENALTY."""
+    target = _v14_target_file_budget(issue_text)
+    penalty = 0
+    if fp["files"] > target:
+        penalty += 6 * (fp["files"] - target)
+    if fp["total_changed"] > _V14_FOOTPRINT_LARGE_TOTAL:
+        penalty += 6
+    elif fp["total_changed"] > _V14_FOOTPRINT_MEDIUM_TOTAL:
+        penalty += 4
+    if fp["largest_hunk"] > _V14_FOOTPRINT_LARGE_FAT:
+        penalty += 6
+    if fp["fat_hunks"] >= 1:
+        penalty += 4
+    if fp["fat_hunks"] >= 2:
+        penalty += 4
+    if fp["files"] > 8:
+        penalty += 6
+    return penalty
+
+
+def _v14_extract_changed_files(patch: str) -> set[str]:
+    out: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+            if m:
+                out.add(m.group(1))
+    return out
+
+
+def _v14_patch_is_comment_only_or_rename_only(patch: str) -> bool:
+    """Detect patches whose every change is comments / whitespace / pure rename
+    boilerplate. The judge punishes these heavily as 'unrelated churn'."""
+    if not patch.strip():
+        return True
+    saw_substantive = False
+    for line in patch.splitlines():
+        if (line.startswith("+") and not line.startswith("+++")) or (
+            line.startswith("-") and not line.startswith("---")
+        ):
+            body = line[1:].strip()
+            if not body:
+                continue
+            # Single-line comment markers across common languages.
+            if body.startswith(("#", "//", "/*", "*/", "* ", "<!--", "-->", '"""', "'''")):
+                continue
+            # Pure import shuffle.
+            if body.startswith(("import ", "from ")) and "(" not in body:
+                continue
+            saw_substantive = True
+            break
+    return not saw_substantive
+
+
+def _v14_count_substantive_hunks(patch: str) -> int:
+    """How many hunks contain at least one non-comment / non-whitespace edit."""
+    n = 0
+    cur_substantive = False
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            if cur_substantive:
+                n += 1
+            cur_substantive = False
+            continue
+        if line.startswith("diff --git "):
+            if cur_substantive:
+                n += 1
+            cur_substantive = False
+            continue
+        if (line.startswith("+") and not line.startswith("+++")) or (
+            line.startswith("-") and not line.startswith("---")
+        ):
+            body = line[1:].strip()
+            if body and not body.startswith(("#", "//", "/*", "*/", "* ", "<!--", "-->", '"""', "'''")):
+                cur_substantive = True
+    if cur_substantive:
+        n += 1
+    return n
+
+
+def _v14_grounded_score(repo: Path, issue: str, patch: str) -> float:
+    """Real-signal score for a candidate patch, used to pick between multishot
+    attempts. Replaces _multishot_count_substantive."""
+    if not patch.strip():
+        return _V14_FAIL_EMPTY
+    if _v14_contains_injection_markers(patch):
+        return _V14_FAIL_INJECTION
+
+    score = 0.0
+
+    # 1. Syntax correctness: huge swing both ways. Broken parse is unrecoverable.
+    try:
+        syntax_errors = _check_syntax(repo, patch)
+    except Exception:
+        syntax_errors = []
+    score += 42.0 if not syntax_errors else -85.0
+
+    # 2. Companion test signal: real runtime evidence.
+    try:
+        test_failure = _select_companion_test_failure(repo, patch)
+    except Exception:
+        test_failure = None
+    if test_failure is not None:
+        # Failure tail returned -> companion test we ran ACTUALLY failed.
+        score -= 42.0
+    # PASS / no-runner: 0 (no penalty, no bonus). The validator may still
+    # disagree, so don't over-bias on green tests.
+
+    # 3. Coverage: did we touch the files the issue named?
+    try:
+        missing_paths = _uncovered_required_paths(patch, issue)
+    except Exception:
+        missing_paths = []
+    mentioned = _extract_issue_path_mentions(issue)
+    if mentioned:
+        covered = max(0, len(mentioned) - len(missing_paths))
+        coverage_ratio = covered / len(mentioned)
+        score += max(-10.0, min(24.0, coverage_ratio * 24.0 - 6.0))
+    # If issue names no paths, this signal is silent.
+
+    # 4. Criteria: did we address the acceptance bullets?
+    try:
+        unaddressed = _unaddressed_criteria(patch, issue)
+    except Exception:
+        unaddressed = []
+    score += 18.0 - 6.0 * min(4, len(unaddressed))
+
+    # 5. Source-edit / companion-test pairing.
+    changed_files = _v14_extract_changed_files(patch)
+    has_source = any(
+        not (cf.startswith("test") or "test_" in cf or cf.endswith(("_test.go", ".test.ts", ".test.js")))
+        for cf in changed_files
+    )
+    has_test = any(
+        cf.startswith("test") or "test_" in cf or cf.endswith(("_test.go", ".test.ts", ".test.js"))
+        for cf in changed_files
+    )
+    if has_source and len(changed_files) >= 2:
+        # Source change without paired test is a common failure mode the judge
+        # docks for. Reward when paired, penalize when notably absent.
+        if has_test:
+            score += 10.0
+        else:
+            score -= 14.0
+
+    # 6. Footprint penalty: continuous, mirrors the gpt-5.4 anti-churn bias.
+    fp = _v14_patch_footprint(patch)
+    score -= _v14_footprint_penalty(fp, issue)
+    if _v14_patch_is_comment_only_or_rename_only(patch):
+        score -= 18.0
+
+    # 7. Cohesion bonus: small, focused patch on path-mentioned files.
+    if mentioned and fp["files"] <= 3 and fp["total_changed"] <= 200 and fp["fat_hunks"] == 0:
+        score += 8.0
+
+    # 8. Non-empty bonus (tie-breaker; NOT a positive objective).
+    if _v14_count_substantive_hunks(patch) >= 1:
+        score += 6.0
+
+    return score
+
+
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
         return 0
@@ -2172,45 +2593,73 @@ def solve(
     """
     Main portable interface for validators.
     """
+    # V14-lite multishot: grounded best-of-2 with surgical + surgical-plus
+    # profile diversification. Replaces the previous king's substantive-line
+    # selection (which was biased toward big patches) with a grounded scorer
+    # that combines real correctness signals (syntax, companion test,
+    # coverage, criteria, footprint) tuned for gpt-5.4 era judging.
     _multishot_started = time.monotonic()
     _multishot_total_budget = 580.0
-    _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
     _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
-    _result1 = _solve_attempt(**_multishot_args)
+    def _attempt_args(profile: str) -> Dict[str, Any]:
+        return dict(
+            repo_path=repo_path, issue=issue, model=model,
+            api_base=api_base, api_key=api_key,
+            max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+            _v14_profile=profile,
+        )
+
+    # Attempt 1: surgical — minimum-change discipline.
+    _result1 = _solve_attempt(**_attempt_args("surgical"))
     _patch1 = _result1.get("patch", "") or ""
+    _score1 = _v14_grounded_score(_multishot_repo_obj, issue, _patch1)
     _n1 = _multishot_count_substantive(_patch1)
 
-    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+    # Strong-attempt early stop: substantive AND non-empty AND non-failure.
+    _early_stop1 = (
+        _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+        and _score1 > 0  # not failed via injection / empty
+    )
+    if _early_stop1:
         _result1["multishot_attempts"] = 1
+        _result1["multishot_score"] = _score1
         return _result1
 
+    # Budget guard before the second attempt.
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
+        _result1["multishot_score"] = _score1
         _result1["multishot_skipped_retry"] = "insufficient_time"
         return _result1
 
+    # Attempt 2: surgical-plus — same scope discipline, slightly more willing
+    # to add the missing companion test or second touched file when coverage
+    # signal demands it. NOT a broad rewrite mode (gpt-5.4 leaks judge score
+    # on unrelated churn).
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
+    _result2 = _solve_attempt(**_attempt_args("surgical_plus"))
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
+    _score2 = _v14_grounded_score(_multishot_repo_obj, issue, _patch2)
 
-    if _n2 >= _n1:
+    # Pick the winner by grounded score, not substantive count.
+    if _score2 > _score1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_score"] = _score2
+        _result2["multishot_other_score"] = _score1
         return _result2
 
+    # Primary won — restore its patch into the worktree.
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     if _patch1:
         _multishot_apply_patch(_multishot_repo_obj, _patch1)
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
+    _result1["multishot_score"] = _score1
+    _result1["multishot_other_score"] = _score2
     return _result1
 
 
@@ -2225,6 +2674,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    # V14-lite: profile = "surgical" | "surgical_plus". Optional; None ⇒ surgical.
+    v14_profile = kwargs.get("_v14_profile", "surgical")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2237,6 +2688,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    footprint_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2275,7 +2727,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, footprint_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2374,6 +2826,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # vB-hedge: NO continuous footprint refinement turn (deliberate
+        # strip vs core). The grounded scorer at solve()-level already
+        # uses _v14_footprint_penalty to pick between candidates; we don't
+        # add a refinement-time shrink here, to keep the variant clean of
+        # any over-constraint risk on the patch-shape side.
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2392,9 +2850,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        # vB-hedge: NO excerpt augmentation (deliberate strip vs core; this
+        # variant is the clean fallback in case the excerpt machinery is
+        # over-constraining or misdirecting).
+
+        # vB-hedge: profile-aware system prompt — surgical = minimum-change;
+        # surgical_plus variant relaxes the "single small edit" framing just
+        # enough to add a paired companion test or an obvious second file
+        # when the coverage signal demands it. NEITHER profile asks for
+        # broad rewrites — gpt-5.4 punishes unrelated churn.
+        if v14_profile == "surgical_plus":
+            sys_prompt = SYSTEM_PROMPT + _V14_SURGICAL_PLUS_SUFFIX
+        else:
+            sys_prompt = SYSTEM_PROMPT + _V14_SURGICAL_SUFFIX
 
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
