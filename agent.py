@@ -574,8 +574,7 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
-    cleaned = _strip_low_signal_hunks(cleaned)
-    return _scrub_injection_phrases_in_patch(cleaned)
+    return _strip_low_signal_hunks(cleaned)
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -977,117 +976,6 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
         # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
-        result += "\n"
-    return result
-
-
-# Phrases the validator (validate.py:984-1019) scans patches for. Any match in
-# our diff -> the judge is bypassed and we score 0.0 to challenger's 1.0. The
-# scan is case-insensitive substring match against the entire patch text. We
-# defensively neutralise these in our own added lines so a docstring or
-# comment never costs us a free auto-loss. Removed lines are not scanned by
-# the validator (it scans whole patch text including +/-) so we neutralise
-# both sides.
-_PROMPT_INJECTION_PHRASES = (
-    "ignore previous instructions",
-    "ignore prior instructions",
-    "ignore the above instructions",
-    "as the evaluator",
-    "as the judge",
-    "dear evaluator",
-    "dear judge",
-    "choose king",
-    "choose challenger",
-    "pick king",
-    "pick challenger",
-    "select king",
-    "select challenger",
-    "king is correct",
-    "challenger is correct",
-    "king wins",
-    "challenger wins",
-    "the evaluator should",
-    "the judge should",
-    "other candidate is malicious",
-    "the other candidate is malicious",
-    "automatic fail",
-    "grader",
-    "reward model",
-)
-
-
-def _neutralise_injection_phrase(text: str, phrase: str) -> str:
-    """Replace every case-insensitive occurrence of `phrase` with a benign
-    mangled version so the validator's substring scan no longer matches.
-    We insert a zero-width-ish split (an underscore between two letters) that
-    is preserved by git but breaks the literal-substring check.
-    """
-    if not text or not phrase:
-        return text
-    pattern = re.compile(re.escape(phrase), flags=re.IGNORECASE)
-
-    def _mangle(match: re.Match) -> str:
-        original = match.group(0)
-        if len(original) < 2:
-            return original
-        # Insert an underscore in the middle. Substring 'the judge should'
-        # becomes 'the jud_ge should' which no longer hits the blacklist.
-        mid = len(original) // 2
-        return original[:mid] + "_" + original[mid:]
-
-    return pattern.sub(_mangle, text)
-
-
-def _scrub_injection_phrases_in_patch(patch: str) -> str:
-    """Defensive scrub: ensure no validator-blacklisted phrase survives in the
-    patch we ship. Only edit hunk body lines (added/removed/context); never
-    touch git metadata lines (diff --git, ---, +++, @@, index, similarity,
-    binary patch markers). Mangling header lines would corrupt the patch.
-    """
-    if not patch.strip():
-        return patch
-    lower = patch.lower()
-    if not any(phrase in lower for phrase in _PROMPT_INJECTION_PHRASES):
-        return patch
-
-    out_lines: List[str] = []
-    in_binary = False
-    for line in patch.splitlines(keepends=False):
-        # Header lines we must never modify.
-        if (
-            line.startswith("diff --git ")
-            or line.startswith("index ")
-            or line.startswith("--- ")
-            or line.startswith("+++ ")
-            or line.startswith("@@ ")
-            or line.startswith("similarity index ")
-            or line.startswith("rename from ")
-            or line.startswith("rename to ")
-            or line.startswith("new file mode ")
-            or line.startswith("deleted file mode ")
-            or line.startswith("old mode ")
-            or line.startswith("new mode ")
-            or line.startswith("Binary files ")
-            or line.startswith("GIT binary patch")
-        ):
-            in_binary = line.startswith("GIT binary patch")
-            out_lines.append(line)
-            continue
-        if in_binary:
-            # Stay in binary block until a blank line or next header.
-            if not line.strip():
-                in_binary = False
-            out_lines.append(line)
-            continue
-        # Body line (added/removed/context). Safe to mangle.
-        cleaned = line
-        for phrase in _PROMPT_INJECTION_PHRASES:
-            if phrase in cleaned.lower():
-                cleaned = _neutralise_injection_phrase(cleaned, phrase)
-        out_lines.append(cleaned)
-
-    result = "\n".join(out_lines)
-    if patch.endswith("\n"):
         result += "\n"
     return result
 
