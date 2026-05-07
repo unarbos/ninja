@@ -103,8 +103,12 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 280.0   # v59: balance between PR#524's "cap is harmful on long-clamp tasks"
+                                     # and king's PR#312 graceful-exit need. 280 fits under typical 300s docker
+                                     # cutoff so we always flush a partial patch on time, but is high enough
+                                     # that on tight 120s clamps the agent still hits docker first (which is
+                                     # fine — the docker cutoff is the real limit anyway).
+WALL_CLOCK_RESERVE_SECONDS = 10.0   # v59: 10s reserve so chat call inside reserve is forced to abort early.
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -2154,6 +2158,107 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
 
+def _v54_score_path_against_issue(path: str, issue_lower: str) -> int:
+    score = 0
+    name = path.rsplit("/", 1)[-1].lower()
+    base = name.rsplit(".", 1)[0]
+    if name and name in issue_lower:
+        score += 5
+    if base and len(base) > 2 and base in issue_lower:
+        score += 3
+    parts = [p for p in path.lower().split("/") if p]
+    for p in parts:
+        if len(p) > 3 and p in issue_lower:
+            score += 1
+    return score
+
+def _v54_pick_target(repo: Path, issue_text: str) -> Optional[str]:
+    issue_lower = issue_text.lower()
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo), capture_output=True, text=True, timeout=8, check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    best_path: Optional[str] = None
+    best_score = 0
+    for line in proc.stdout.splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        if any(seg in path for seg in ("__pycache__/", "node_modules/", ".git/", "dist/", "build/")):
+            continue
+        if path.endswith((".pyc", ".lock", ".min.js", ".min.css")):
+            continue
+        s = _v54_score_path_against_issue(path, issue_lower)
+        if s > best_score:
+            best_score = s
+            best_path = path
+    return best_path if best_score > 0 else None
+
+def _v54_emergency_solve(
+    *,
+    repo: Path,
+    issue: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    deadline: float,
+) -> str:
+    target = _v54_pick_target(repo, issue)
+    if not target:
+        return ""
+    full = repo / target
+    try:
+        snippet = full.read_text(encoding="utf-8", errors="replace")[:2000]
+    except Exception:
+        return ""
+    issue_short = issue[:1200]
+    prompt = (
+        f"Make the smallest possible code edit to {target} that addresses this issue.\n"
+        f"Output ONLY the new content of the file, nothing else, no markdown fences, "
+        f"no explanation. The file must remain syntactically valid.\n\n"
+        f"ISSUE:\n{issue_short}\n\nCURRENT FILE CONTENT (first 2000 chars):\n{snippet}\n"
+    )
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining < 5.0:
+        return ""
+    try:
+        text, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "You output ONLY the new file content. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model, api_base=api_base, api_key=api_key,
+            max_tokens=1024, timeout=int(remaining), max_retries=0,
+        )
+    except Exception:
+        return ""
+    new_content = text.strip()
+    if new_content.startswith("```"):
+        # strip a markdown fence if the model emits one despite instructions
+        lines = new_content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        new_content = "\n".join(lines)
+    if not new_content or new_content == snippet:
+        return ""
+    try:
+        full.write_text(new_content, encoding="utf-8")
+    except Exception:
+        return ""
+    try:
+        return get_patch(repo)
+    except Exception:
+        return ""
+
+
+
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
 # signature as upstream, but the body runs the inner attempt twice with
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
@@ -2173,7 +2278,7 @@ def solve(
     Main portable interface for validators.
     """
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 580.0
+    _multishot_total_budget = 580.0  # v55: kept at 580 (matches validator's max clamp 600s); king's value.
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -2192,6 +2297,21 @@ def solve(
 
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        # v57: when retry is skipped due to time AND first attempt is empty,
+        # try a fast emergency single-shot on the most-relevant file (PR#518
+        # idea). A non-empty patch beats empty by a huge judge margin.
+        _emerg_remaining = _multishot_total_budget - _elapsed
+        if _emerg_remaining > 8.0 and _n1 == 0:
+            _emerg_patch = _v54_emergency_solve(
+                repo=_multishot_repo_obj,
+                issue=issue,
+                model=model, api_base=api_base, api_key=api_key,
+                deadline=time.monotonic() + min(_emerg_remaining - 2.0, 45.0),
+            )
+            if _emerg_patch:
+                _result1["patch"] = _emerg_patch
+                _result1["success"] = True
+                _result1["multishot_emergency"] = True
         _result1["multishot_attempts"] = 1
         _result1["multishot_skipped_retry"] = "insufficient_time"
         return _result1
@@ -2201,7 +2321,7 @@ def solve(
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    if _n2 > _n1:  # v58: strict (PR#513) + no WALL_CLOCK + emergency fallback
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
         return _result2
@@ -2560,6 +2680,46 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # v60 post-loop hail-mary (re-implemented from ninjaking66 PR#467 idea).
+        # The main for-loop can exit with no patch when the model issued only
+        # inspection commands (cat / grep / ls / find / sed-no-match) and never
+        # reached `<final>` or the early-exit branches that travel through
+        # `maybe_queue_refinement` — leaving `hail_mary_turns_used == 0` despite
+        # the patch being empty. Fire one final hail-mary turn here so the
+        # round doesn't return a guaranteed-zero result. This stacks on top of
+        # the v54 emergency single-shot fallback (which fires later, in the
+        # multishot wrapper, only when first attempt is empty AND retry is
+        # skipped due to time). Two layers of empty-patch defense.
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and not out_of_time()
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY_v60: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={time_remaining():.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name, api_base=api_base, api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE_v60:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if out_of_time():
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION_v60:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR_v60:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
