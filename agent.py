@@ -1757,6 +1757,21 @@ Signal completion:
 brief summary of what changed
 </final>
 
+## Language completeness
+
+**Java** - complete method bodies, no stubs, all imports, all call-site cascades.
+**C/C++** - edit both .h header and .cpp implementation, full signatures, all includes.
+**TypeScript/C#** - cascade interface changes to all implementing classes.
+**Multi-file** - complete ALL affected files; include more when uncertain.
+
+## Scope discipline
+
+Edit ONLY files needing functional changes:
+- Do NOT chmod executable files (.sh, mvnw, gradlew, .githooks/).
+- Do NOT reformat unchanged lines.
+- When a change implies cascade (service/DTO/test), make ALL changes in ONE response.
+
+
 ## Workflow
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
@@ -1776,6 +1791,18 @@ brief summary of what changed
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+## Pre-final completeness checklist (CHECK BEFORE <final>)
+
+Before emitting <final>, verify ALL of these in your reasoning:
+
+1. Every requirement or acceptance criterion from the issue has a corresponding diff hunk.
+2. All TypeScript/Java/C# interface changes cascaded to all implementors (use grep to verify).
+3. All comments in modified functions are preserved unless the task explicitly removes them.
+4. No `// TODO`, `// similar logic`, or stub implementations left in edited regions.
+5. If the issue says "create [filename]", the diff contains `new file mode` for that path.
+
+If ANY check fails → issue the corrective commands NOW before `<final>`.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
@@ -1840,6 +1867,99 @@ annotations on modified functions.
 
 **Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
+
+## Task classification — BEFORE you do anything else
+
+Identify the task type from the FIRST WORD of the issue title or description:
+
+| First word(s) | Task type | Expected files | Strategy |
+|---------------|-----------|----------------|----------|
+| Implement, Integrate, Introduce, Create | FEATURE_BUILD | 7-12 files | Create new code, new imports, async/await, error handling |
+| Enhance, Extend, Expand, Improve, Refine, Enable, Add | FEATURE_EXTEND | 6-10 files | Extend existing code, cascade to all consumers |
+| Refactor, Reorganize, Restructure, Rename, Unify, Standardize, Simplify | REFACTOR | 3-6 files | Move/rename ONLY — never add features |
+| Add, Include, Attach, Introduce | ADD | 4-7 files | Targeted addition, minimal new files |
+| Migrate, Upgrade, Port, Convert | MIGRATION | 7-12 files | Touch every file using old API/pattern |
+| Fix, Repair, Resolve, Correct, Debug | BUG_FIX | 1-4 files | Surgical — root cause only, no restructuring |
+
+**Emit your classification as the FIRST LINE of your response:**
+`Task type: FEATURE_BUILD | Expected files: 7-12 | Strategy: create, cascade, import`
+
+Use this classification to calibrate how many files to touch and how much to implement.
+
+## Feature implementation protocol (FEATURE_BUILD and FEATURE_EXTEND only)
+
+When task type is FEATURE_BUILD or FEATURE_EXTEND:
+
+**Before touching any file, discover all required files:**
+```bash
+# Find files related to the feature keyword
+grep -r "KEYWORD" --include="*.ts" --include="*.tsx" --include="*.py" --include="*.js" -l . 2>/dev/null | head -20
+# Find service/repository layer if issue mentions routes or API
+grep -r "router\|@Controller\|app\.\(get\|post\|put\|delete\)\|@app\." --include="*.ts" --include="*.js" --include="*.py" -l . 2>/dev/null | head -10
+# Find schema/model if issue mentions data structures
+grep -r "schema\|model\|interface\|dataclass\|@Entity" --include="*.ts" --include="*.py" --include="*.java" -l . 2>/dev/null | head -10
+```
+
+**For FEATURE_BUILD tasks, expect to change:**
+- Primary module/component file
+- Type definitions (types.ts, interfaces.ts, schema.ts, models.py)
+- Route/controller that exposes it (if API-facing)
+- Service/repository that handles it (if data-touching)
+- UI component that renders it (if frontend-facing)
+- Import statements in index files (__init__.py, index.ts)
+
+**Mandatory rules for FEATURE_BUILD:**
+- Always add new import statements at the TOP of each modified file
+- If the feature involves I/O (API, DB, file): add async/await and error handling
+- If you touch fewer than 4 files on a FEATURE_BUILD task, run grep again — you are likely missing cascade targets
+- Do not submit until you have verified all feature entry points are wired up
+
+## Per-language cascade rules (MANDATORY when changing shared code)
+
+### Python
+When changing a module X.py:
+- Check `__init__.py` in the same package (exports may need updating)
+- Check `conftest.py` if test fixtures need updating
+- Run: `grep -r "from.*X import\|import.*X" --include="*.py" -l . 2>/dev/null`
+
+### TypeScript/JavaScript
+When changing an interface, type, or function signature:
+- Run: `grep -r "TypeName\|functionName" --include="*.ts" --include="*.tsx" --include="*.js" -l . 2>/dev/null`
+- Update ALL files that import or implement the changed interface
+- Check for barrel exports: `grep -r "export.*from.*filename" --include="*.ts" -l . 2>/dev/null`
+
+### TSX (React components)
+When changing component props or API:
+- Run: `grep -r "ComponentName" --include="*.tsx" --include="*.jsx" -l . 2>/dev/null`
+- Update all parent components that pass the changed props
+- Check story files: `grep -r "ComponentName" --include="*.stories.*" -l . 2>/dev/null`
+
+### Java
+When changing a class or interface:
+- Run: `grep -r "ClassName" --include="*.java" -l . 2>/dev/null`
+- Check all subclasses (`extends ClassName`) and implementing classes (`implements ClassName`)
+
+### Go
+When changing a struct or interface:
+- Run: `grep -r "StructName\|InterfaceName" --include="*.go" -l . 2>/dev/null`
+- Update all types that embed or implement the changed type
+
+## TypeScript/React cascade protocol (MANDATORY when changing types, interfaces, or components)
+
+When you change an interface, type, function signature, or component API, execute these BEFORE emitting <final>:
+
+```bash
+# For interface/type changes:
+grep -r "InterfaceName" --include="*.ts" --include="*.tsx" -l .
+# For function signature changes:
+grep -r "functionName" --include="*.ts" --include="*.tsx" --include="*.js" -l .
+# For component API changes:
+grep -r "ComponentName" --include="*.tsx" --include="*.jsx" -l .
+```
+
+Update EVERY file returned by these greps. TypeScript cascade errors (missing interface update,
+stale prop usage, unmatched types) are the most common cause of incomplete patches in this codebase.
+Never assume the issue lists all affected files — TypeScript cascades silently.
 
 ## Style matching
 
