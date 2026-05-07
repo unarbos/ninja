@@ -730,6 +730,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -743,6 +750,22 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_notificacoes`) are deliberate signals from the task author about
+    # the code surface that matters. When they pick out a small specific set
+    # of tracked files by path-substring, treat those files as explicit
+    # mentions so they get the same +100 ranking boost as path-mentioned
+    # files. Skipped when the identifier matches too many files (filters out
+    # generic identifiers like `basic.py` or `any2txt`).
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
