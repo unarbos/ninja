@@ -116,9 +116,17 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_FOOTPRINT_TURNS = 1    # v13: shrink an over-broad patch to minimum-sufficient diff
+MAX_TOTAL_REFINEMENT_TURNS = 2  # v15: reverted to 2; footprint competes for budget instead of extending it
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+
+# v13 — Footprint guard. Cursor's F1 ratio = matched / max(model_changed,
+# ref_changed). An over-broad patch inflates the denominator without adding
+# numerator. Bounding the patch shape directly optimizes the cursor score.
+FOOTPRINT_MAX_FILES_FACTOR = 3      # patch should not touch >3x the count named in the issue
+FOOTPRINT_MAX_TOTAL_FILES = 8       # cap regardless of issue (most real fixes <=8 files)
+FOOTPRINT_MAX_HUNK_LINES = 80       # any single hunk over this is suspicious
+FOOTPRINT_MAX_TOTAL_LINES = 600     # whole-patch line cap
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -528,6 +536,11 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    # v17 (from PR430 taoagentbloom): undo accidental chmod-only churn before
+    # computing the diff, and use `git diff HEAD` so staged + unstaged are
+    # captured. Cursor-similarity is matched_lines / max(model, ref); mode-only
+    # noise inflates model_lines without contributing matched_lines.
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -536,7 +549,7 @@ def get_patch(repo: Path) -> str:
         ":(exclude).git",
     ]
     proc = subprocess.run(
-        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
+        ["git", "diff", "HEAD", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -570,8 +583,70 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
+    # v17 (PR430): defensive strip of any path that should be skipped, in case
+    # the --no-index untracked path or --binary slipped one through.
+    cleaned = _strip_skipped_path_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """v17/PR430: undo accidental chmod-only churn while preserving content edits."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    for line in proc.stdout.splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        if not relative_path or _should_skip_patch_path(relative_path):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
+
+
+def _strip_skipped_path_diffs(diff_output: str) -> str:
+    """v17/PR430: drop diff blocks for paths that should be skipped."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        header = block.splitlines()[0] if block.splitlines() else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)$", header)
+        if match and (_should_skip_patch_path(match.group(1)) or _should_skip_patch_path(match.group(2))):
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -706,10 +781,21 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
+    # v17 (PR430): for cache/Supabase/multi-file tasks the issue often names a
+    # behavior family without exact paths. Augment context with likely sibling
+    # files BEFORE the budget split so we don't end up with one-hook-only fixes.
+    files = _augment_with_domain_siblings(repo, files, tracked_set, issue)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
     used = 0
+    # v17 (PR430): emit a removal-task action/import inventory for broad
+    # feature-removal issues. Compact (path:lineno: signature) summary lets
+    # the model see the surface area without re-reading whole service files.
+    inventory = _removal_inventory_context(repo, tracked_set, issue)
+    if inventory:
+        parts.append(inventory)
+        used += len(inventory)
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
@@ -1324,6 +1410,95 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _removal_inventory_context(repo: Path, tracked_set: set, issue: str) -> str:
+    """v17/PR430: compact action/import map for broad feature-removal tasks.
+
+    When the issue says "remove/strip/omit/only/non-core" we surface
+    `path:lineno: signature` lines for likely files instead of letting the
+    model re-read whole service files. Lifts coverage on removal-style tasks
+    without burning preloaded-file slots."""
+    issue_lower = issue.lower()
+    if not re.search(r"\b(remove|strip|omit|only|non-core|no longer|without)\b", issue_lower):
+        return ""
+    issue_terms = set(re.findall(r"[a-z][a-z0-9_]{3,}", issue_lower))
+    candidates: List[str] = []
+    for path in sorted(tracked_set):
+        path_lower = path.lower()
+        if not path_lower.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".txt")):
+            continue
+        if not _context_file_allowed(path):
+            continue
+        name = Path(path).name.lower()
+        score = sum(1 for term in issue_terms if term in path_lower or term in name)
+        if score or any(key in path_lower for key in ("backend", "api", "route", "service", "function", "requirements", "tests")):
+            candidates.append(path)
+        if len(candidates) >= 12:
+            break
+    line_re = re.compile(
+        r"(^\s*(?:if|elif)\s+action\s*==|^\s*def\s+|^\s*import\s+|^\s*from\s+|"
+        r"@(?:app|router)\.|(?:app|router)\.(?:get|post|put|delete|patch)\(|"
+        r"\"action\"\s*:|^[A-Za-z0-9_.-]+[<=>~]=?)"
+    )
+    lines: List[str] = []
+    for path in candidates:
+        text = _read_context_file(repo, path, 20000)
+        emitted = 0
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if line_re.search(line):
+                lines.append(f"{path}:{lineno}: {line.strip()[:180]}")
+                emitted += 1
+                if emitted >= 24:
+                    break
+        if len(lines) >= 140:
+            break
+    if not lines:
+        return ""
+    return (
+        "Removal-task action/import inventory. Use this instead of reading whole large service files:\n"
+        + "\n".join(lines)
+    )
+
+
+def _augment_with_domain_siblings(repo: Path, files: List[str], tracked_set: set, issue: str) -> List[str]:
+    """v17/PR430: add likely sibling files for behavior-family issues (cache/
+    offline, Supabase/RLS/RPC) before the first edit. Read-only, improves
+    initial context when issue names a family without exact paths."""
+    issue_lower = issue.lower()
+    priority: List[str] = []
+    augmented = list(files)
+
+    def add(path: str) -> None:
+        if path in tracked_set and _context_file_allowed(path) and path not in priority:
+            priority.append(path)
+
+    if re.search(r"cache|offline|localstorage|reload|refresh|persist|blank", issue_lower):
+        for path in sorted(tracked_set):
+            if re.search(r"(^|/)src/hooks/use[^/]+\.(ts|tsx|js|jsx)$", path):
+                text = _read_context_file(repo, path, 2000)
+                if (
+                    re.search(r"useState<[^>]*\[\]>\(\[\]\)|setStatus|remove\s*=", text)
+                    and ("supabase" in text or ".from(" in text or "fetch(" in text)
+                ):
+                    add(path)
+            elif path.endswith(("index.css", "main.tsx", "main.jsx", "App.tsx", "App.jsx")):
+                add(path)
+
+    if re.search(r"supabase|rls|rpc|policy|migration|push notification|notification preference|do not disturb|dnd", issue_lower):
+        for path in sorted(tracked_set):
+            if path.startswith(("supabase/functions/", "supabase/migrations/")) and path.endswith((".ts", ".sql")):
+                add(path)
+            elif path.endswith(("push-notifications.ts", "pushNotifications.ts")):
+                add(path)
+            elif path in {".claude/architecture.md", ".claude/roadmap.md", ".claude/conventions.md", "CLAUDE.md"}:
+                add(path)
+
+    ordered: List[str] = []
+    for path in priority + augmented:
+        if path not in ordered:
+            ordered.append(path)
+    return ordered[: max(MAX_PRELOADED_FILES * 2, len(files))]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -1855,6 +2030,65 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+# v10 — task-modifier detection. The default king prompt says "don't edit
+# tests unless source change broke them", which is correct for bug fixes but
+# WRONG when the issue explicitly requires test additions ("add a test for
+# X", "write a spec that...", "test the new behavior"). Real validator
+# rationales: "Challenger lacks test additions entirely" appeared multiple
+# times as a king-win reason. This regex flips the default to ENCOURAGE
+# test edits when the task asks for them.
+_TEST_ADDITION_RE = re.compile(
+    r"\b("
+    r"add\s+(?:a\s+|new\s+|the\s+)?(?:test|spec|unittest|coverage)|"
+    r"write\s+(?:a\s+|the\s+)?(?:test|spec|unittest)|"
+    r"test\s+(?:that|the\s+\w+|coverage)|"
+    r"new\s+test\s+(?:case|file|fixture)|"
+    r"spec\s+for\s+|"
+    r"should\s+(?:include|have|add)\s+(?:a\s+|new\s+)?(?:test|spec|coverage)|"
+    r"unit\s+test"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# v10 — removal-task detection. When the issue says "remove X" / "delete X" /
+# "deprecate X" / "drop X", the patch's `-` lines should reference X. If
+# the patch only adds new code without removing the named target, that's
+# scope-incomplete. (Volume-task detection in v2 catches the prompt-strategy
+# branch; this edge is the in-loop verification.)
+_REMOVAL_TASK_RE = re.compile(
+    r"\b(?:remove|delete|deprecate|drop|strip|retire)\s+(?:the\s+|all\s+|every\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]+)?)",
+    re.IGNORECASE,
+)
+
+
+def _is_test_addition_task(issue: str) -> bool:
+    if not issue:
+        return False
+    return bool(_TEST_ADDITION_RE.search(issue))
+
+
+def _extract_removal_targets(issue_text: str, max_targets: int = 6) -> List[str]:
+    """Names the issue says to remove / delete / deprecate / drop."""
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for m in _REMOVAL_TASK_RE.finditer(issue_text):
+        name = m.group(1)
+        if name in seen or len(name) < 3:
+            continue
+        # Skip generic words
+        lower = name.lower()
+        if lower in {"the", "all", "any", "this", "that", "these", "those", "old"}:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= max_targets:
+            break
+    return out
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -1864,6 +2098,30 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    # v10 — when the task literally requires test additions, override the
+    # default "don't edit tests" stance.
+    test_block = ""
+    if _is_test_addition_task(issue):
+        test_block = (
+            "\nTEST-ADDITION TASK detected: this issue explicitly asks for new tests / specs. "
+            "OVERRIDE the default scope rule that says 'do not edit test files'. ADD the test(s) "
+            "the issue describes — failing to add tests when the task requires them is the most "
+            "common reason challengers lose these tasks per real validator data.\n"
+        )
+
+    # v10 — when the task is a removal, surface the named targets.
+    removal_targets = _extract_removal_targets(issue)
+    removal_block = ""
+    if removal_targets:
+        bullets = ", ".join(f"`{t}`" for t in removal_targets[:6])
+        removal_block = (
+            f"\nREMOVAL TASK detected. Targets named in the issue: {bullets}. "
+            "Your patch's `-` (removed) lines MUST reference these names — adding "
+            "replacements without actually removing the named code is scope-incomplete. "
+            "Use `git grep -n <name>` to find every call site, then sed -i / patch out the "
+            "actual usages, not just modify around them.\n"
+        )
+
     return f"""Fix this issue:
 
 {issue}
@@ -1871,7 +2129,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
+{context_section}{test_block}{removal_block}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
@@ -2030,6 +2288,153 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+# v13 — Footprint guard. Cursor F1 = matched / max(model_changed,
+# ref_changed). An over-broad patch inflates the denominator without adding
+# numerator. Bounding the patch shape directly optimizes the cursor score.
+
+def _patch_footprint_summary(patch: str) -> Dict[str, int]:
+    """Quantify the patch shape for the oversize check."""
+    files = set()
+    plus_lines = 0
+    minus_lines = 0
+    largest_hunk = 0
+    fat_hunks = 0
+    cur_hunk = 0
+
+    def _flush_hunk():
+        nonlocal cur_hunk, largest_hunk, fat_hunks
+        if cur_hunk > largest_hunk:
+            largest_hunk = cur_hunk
+        if cur_hunk > FOOTPRINT_MAX_HUNK_LINES:
+            fat_hunks += 1
+        cur_hunk = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            _flush_hunk()
+            m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+            if m:
+                files.add(m.group(1))
+        elif line.startswith("@@"):
+            _flush_hunk()
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus_lines += 1
+            cur_hunk += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus_lines += 1
+            cur_hunk += 1
+    _flush_hunk()
+
+    return {
+        "files": len(files),
+        "plus": plus_lines,
+        "minus": minus_lines,
+        "total_changed": plus_lines + minus_lines,
+        "largest_hunk": largest_hunk,
+        "fat_hunks": fat_hunks,
+    }
+
+
+def _cache_family_missing_paths(repo: Path, patch: str, issue_text: str) -> List[str]:
+    """v20/PR430: For cache/offline tasks, catch "fixed one hook only" miss."""
+    if not re.search(r"cache|offline|localstorage|reload|refresh|persist|blank", issue_text.lower()):
+        return []
+    changed = set(_patch_changed_files(patch))
+    hook_dirs = {
+        str(Path(p).parent)
+        for p in changed
+        if re.search(r"(^|/)src/hooks/use[^/]+\.(ts|tsx|js|jsx)$", p)
+    }
+    if not hook_dirs:
+        return []
+    changed_hook_text = "\n".join(
+        _read_context_file(repo, p, 2000)
+        for p in changed
+        if re.search(r"(^|/)src/hooks/use[^/]+\.(ts|tsx|js|jsx)$", p)
+    )
+    semester_family = "semesterId" in changed_hook_text
+    missing: List[str] = []
+    for path in sorted(_tracked_files(repo)):
+        if path in changed or str(Path(path).parent) not in hook_dirs:
+            continue
+        if not re.search(r"(^|/)src/hooks/use[^/]+\.(ts|tsx|js|jsx)$", path):
+            continue
+        text = _read_context_file(repo, path, 2500)
+        if semester_family and "semesterId" not in text and "export function useSemester" not in text:
+            continue
+        if (
+            "useState" in text
+            and ("readSync" in text or "recordSync" in text)
+            and ("supabase" in text or ".from(" in text or "fetch(" in text)
+        ):
+            missing.append(path)
+            if len(missing) >= 5:
+                break
+    return missing
+
+
+def build_cache_family_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:5]) or "(none)"
+    return (
+        "Cache/offline family gap: you added persistence to one remote data hook, "
+        "but sibling hooks in the same app data family still clear React state and "
+        "reload from the network before rendering:\n"
+        f"  {bullets}\n\n"
+        "Inspect and patch these sibling hooks with the same pattern: initialize "
+        "state from the local cache immediately, refresh in the background, and "
+        "write the cache after successful loads or local mutations. Keep the edits "
+        "minimal and consistent with the hook you already changed.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+
+def _patch_oversized(patch: str, issue_text: str) -> Optional[Dict[str, int]]:
+    """If the patch looks substantively over-broad for the task, return its
+    footprint summary so the prompt can reference concrete numbers. Otherwise
+    None, so the refinement step is skipped."""
+    if not patch.strip():
+        return None
+    fp = _patch_footprint_summary(patch)
+    mentioned = _extract_issue_path_mentions(issue_text)
+    target_count = max(1, len(mentioned))
+
+    file_overshoot = (
+        fp["files"] > target_count * FOOTPRINT_MAX_FILES_FACTOR
+        or fp["files"] > FOOTPRINT_MAX_TOTAL_FILES
+    )
+    line_overshoot = fp["total_changed"] > FOOTPRINT_MAX_TOTAL_LINES
+    hunk_overshoot = fp["fat_hunks"] >= 2 or fp["largest_hunk"] > FOOTPRINT_MAX_HUNK_LINES * 2
+
+    if file_overshoot or line_overshoot or hunk_overshoot:
+        fp["target_files"] = target_count
+        return fp
+    return None
+
+
+def build_footprint_shrink_prompt(footprint: Dict[str, int], issue_text: str) -> str:
+    """Show concrete oversize numbers and ask for a minimum-sufficient diff."""
+    head = issue_text[:1200]
+    return (
+        "Footprint guard — your draft looks substantively over-broad for this task:\n"
+        f"  - files touched: {footprint['files']}"
+        f" (issue names ~{footprint.get('target_files', 1)})\n"
+        f"  - total changed lines: {footprint['total_changed']} (cap {FOOTPRINT_MAX_TOTAL_LINES})\n"
+        f"  - largest hunk: {footprint['largest_hunk']} lines\n"
+        f"  - fat hunks (>{FOOTPRINT_MAX_HUNK_LINES} lines): {footprint['fat_hunks']}\n\n"
+        "The scoring is matched_lines / max(model_changed, ref_changed): every\n"
+        "oversize hunk inflates the denominator without adding matched numerator.\n\n"
+        "Issue (head):\n"
+        f"{head}\n\n"
+        "Revert any unrelated drive-by edits, narrow each hunk to the minimum\n"
+        "lines that actually implement the requirement, and KEEP every change\n"
+        "the issue truly demands. Use sed/python -c/cat to revert non-required\n"
+        "lines back to original. Then end with <final>summary</final>. If the\n"
+        "patch is genuinely already minimal, respond exactly <final>OK</final>."
     )
 
 
@@ -2238,6 +2643,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    footprint_turns_used = 0  # v13: shrink over-broad patches
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2275,7 +2681,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, footprint_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2356,6 +2762,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+            # v20 (PR430): cache/offline coverage variant. Fires only on
+            # cache/offline tasks AND only when path-mention coverage already
+            # passed but the family-of-hooks coverage failed. Reuses the same
+            # MAX_COVERAGE_NUDGES cap so does NOT extend total budget.
+            cache_missing = _cache_family_missing_paths(repo, patch, issue)
+            if cache_missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cache_family_nudge_prompt(cache_missing, issue),
+                    "CACHE_FAMILY_NUDGE_QUEUED:\n  " + ", ".join(cache_missing[:5]),
+                )
+                return True
+
         # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
         # FILES the issue mentions; criteria gates on the acceptance-criterion
         # CHECKPOINTS (numbered list / bullets / imperative sentences). The
@@ -2371,6 +2792,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # v13 — footprint guard. Runs AFTER coverage+criteria (so we know the
+        # right files are touched) but BEFORE self_check (so model still has
+        # budget to actually shrink). Cursor F1 = matched / max(model_changed,
+        # ref_changed): every spurious line inflates denominator without
+        # adding numerator. This is a direct attack on the scoring formula.
+        if footprint_turns_used < MAX_FOOTPRINT_TURNS:
+            oversized = _patch_oversized(patch, issue)
+            if oversized:
+                footprint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_footprint_shrink_prompt(oversized, issue),
+                    f"FOOTPRINT_SHRINK_QUEUED:\n  files={oversized['files']} "
+                    f"lines={oversized['total_changed']} largest_hunk={oversized['largest_hunk']}",
                 )
                 return True
 
