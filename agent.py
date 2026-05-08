@@ -153,15 +153,22 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ncat(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?scp(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?rsync(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?telnet(?:\s|$))",
+    # Word-boundary network/exfil filter: matches the binary name in any
+    # position so `find -exec curl ...` and `xargs -I{} curl ...` style
+    # bypasses are still caught. Anchoring to command-position only would
+    # let those slip through.
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bssh\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\btelnet\b",
+    r"\bnc\b",
+    r"\bncat\b",
+    r"\bnetcat\b",
+    # bash's built-in TCP redirection — covers `>/dev/tcp/host/port` and
+    # `exec 3<>/dev/tcp/...` style egress that doesn't spawn an external
+    # binary, so the word-boundary entries above can't catch it.
     r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
 
@@ -203,16 +210,7 @@ class AgentResult:
 # Utility
 # -----------------------------
 
-_TRACEBACK_MARKERS = (
-    "Traceback (most recent",
-    "panic:",
-    "FAIL\t",
-    "error TS",
-    "error[E",
-    "  at ",
-    "FAILED\n",
-    "FAILED ",
-)
+_TRACEBACK_MARKERS = ("Traceback (most recent", "panic:", "FAIL\t", "error TS", "error[E", "  at ", "FAILED\n", "FAILED ")
 
 
 def _looks_like_traceback(text: str) -> bool:
@@ -1279,7 +1277,7 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
-    return len(_uncovered_required_paths(patch, issue_text)) == 0
+    return not _uncovered_required_paths(patch, issue_text)
 
 
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
