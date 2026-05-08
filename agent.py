@@ -95,6 +95,14 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
+# Main loop heuristics (single named constants — PR scope guard allowlists AGENT_* env names).
+AUTO_STOP_AFTER_PATCH_MIN_STEP = 4
+PATCH_REVIEW_SUCCESS_MIN_STEP = 8
+BUDGET_PRESSURE_STEPS = frozenset({2, 4})
+
+# Multi-shot outer budget (validator wall-clock–oriented).
+MULTISHOT_TOTAL_BUDGET_SECONDS = 580.0
+
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
@@ -130,6 +138,16 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
+
+# Preload: earlier ranks get more characters (implicit score decay by position).
+_PRELOAD_TOP_FILE_WEIGHT = 2.35
+_PRELOAD_WEIGHT_DECAY_PER_RANK = 0.34
+_PRELOAD_MIN_WEIGHT = 1.0
+TRACE_PATH_SCORE_BOOST = 92
+
+# Dynamic refinement: extra refinement slot when ample wall-clock remains (derived).
+_REFINEMENT_EXTRA_SLOT_REMAINING_SEC = 125.0
+_REFINEMENT_DISABLE_REMAINING_SEC = 28.0
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -211,6 +229,25 @@ def _truncate(text: str, max_chars: int) -> str:
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
+
+
+def _wall_clock_inner_budget_exceeded(started: float) -> bool:
+    """True when this inner attempt should stop early to respect wall-clock budget."""
+    elapsed = time.monotonic() - started
+    limit = max(0.0, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS)
+    return elapsed >= limit
+
+
+def _effective_refinement_turn_cap(started: float) -> int:
+    """Max refinement turns (excluding hail-mary) from remaining inner wall-clock."""
+    elapsed = time.monotonic() - started
+    remaining = WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS - elapsed
+    base = MAX_TOTAL_REFINEMENT_TURNS
+    if remaining <= _REFINEMENT_DISABLE_REMAINING_SEC:
+        return 1
+    if remaining >= _REFINEMENT_EXTRA_SLOT_REMAINING_SEC:
+        return base + 1
+    return base
 
 
 def _message_chars(messages: List[Dict[str, str]]) -> int:
@@ -498,8 +535,57 @@ ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOT
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
+def _normalize_response_for_tags(model_text: str) -> str:
+    """Reduce tag-adjacent Unicode punctuation variants models sometimes emit."""
+    if not model_text:
+        return model_text
+    return (
+        model_text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+
+def _unwrap_outer_markdown_fence(model_text: str) -> str:
+    """If the entire assistant blob is one fenced block, unwrap it so tags parse."""
+    t = model_text.strip()
+    if not t.startswith("```"):
+        return model_text
+    first_nl = t.find("\n")
+    if first_nl == -1:
+        return model_text
+    closing = t.rfind("```")
+    if closing <= first_nl:
+        return model_text
+    inner = t[first_nl + 1 : closing].strip()
+    return inner if inner else model_text
+
+
+def _strip_command_body_fence(body: str) -> str:
+    """Remove inner ```bash / ```sh fences inside a <command> body."""
+    b = body.strip()
+    if not b.startswith("```"):
+        return b
+    nl = b.find("\n")
+    if nl == -1:
+        return b.strip("`").strip()
+    tail = b[nl + 1 :].strip()
+    if tail.endswith("```"):
+        tail = tail[:-3].rstrip()
+    return tail.strip()
+
+
 def extract_commands(model_text: str) -> List[str]:
-    return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    text = _normalize_response_for_tags(model_text)
+    text = _unwrap_outer_markdown_fence(text)
+    text = _normalize_response_for_tags(text)
+    out: List[str] = []
+    for match in ACTION_RE.finditer(text):
+        inner = _strip_command_body_fence(match.group(1)).strip()
+        if inner:
+            out.append(inner)
+    return out
 
 
 def extract_command(model_text: str) -> Optional[str]:
@@ -508,10 +594,13 @@ def extract_command(model_text: str) -> Optional[str]:
 
 
 def extract_final(model_text: str) -> Optional[str]:
-    match = FINAL_RE.search(model_text)
+    text = _normalize_response_for_tags(model_text)
+    text = _unwrap_outer_markdown_fence(text)
+    match = FINAL_RE.search(text)
     if not match:
         return None
-    return match.group(1).strip()
+    inner = _strip_command_body_fence(match.group(1)).strip()
+    return inner or None
 
 
 # -----------------------------
@@ -785,9 +874,15 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_batch = min(len(files), MAX_PRELOADED_FILES)
+    base_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, n_batch))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
+    for rank_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        weight = max(
+            _PRELOAD_MIN_WEIGHT,
+            _PRELOAD_TOP_FILE_WEIGHT - rank_idx * _PRELOAD_WEIGHT_DECAY_PER_RANK,
+        )
+        per_file_budget = int(base_budget * weight)
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
@@ -817,6 +912,50 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+_ISSUE_TRACE_FILE_RE = re.compile(r'File\s+["\']([^"\']+)["\']', re.IGNORECASE)
+_ISSUE_COLON_LINE_RE = re.compile(
+    r"(?<![\w.-])([\w./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|kts|rb|cs|cpp|cc|c|h|hpp|php|swift)):(?:\d+)(?::\d+)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_issue_trace_paths(issue: str, tracked_set: set) -> List[str]:
+    """Resolve paths from tracebacks or path:line anchors in the issue text to tracked relatives."""
+    found: List[str] = []
+    seen: set = set()
+    candidates: List[str] = []
+    for m in _ISSUE_TRACE_FILE_RE.finditer(issue):
+        candidates.append(m.group(1).strip())
+    for m in _ISSUE_COLON_LINE_RE.finditer(issue):
+        candidates.append(m.group(1).strip())
+
+    for raw in candidates:
+        raw = raw.replace("\\", "/").strip()
+        if not raw:
+            continue
+
+        resolved = ""
+        if raw in tracked_set and _context_file_allowed(raw):
+            resolved = raw
+        else:
+            parts = raw.strip("/").split("/")
+            for start in range(len(parts)):
+                suffix = "/".join(parts[start:])
+                if suffix in tracked_set and _context_file_allowed(suffix):
+                    resolved = suffix
+                    break
+            if not resolved and len(raw) >= 10:
+                for rel in tracked_set:
+                    if _context_file_allowed(rel) and (rel.endswith(raw) or raw.endswith(rel)):
+                        resolved = rel
+                        break
+
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            found.append(resolved)
+
+    return found
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -849,6 +988,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
                     mentioned.append(m)
                     seen_mentioned.add(m)
 
+    trace_hit_set = frozenset(_extract_issue_trace_paths(issue, tracked_set))
+    for tp in trace_hit_set:
+        if tp not in seen_mentioned:
+            mentioned.append(tp)
+            seen_mentioned.add(tp)
+
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
@@ -873,6 +1018,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        if relative_path in trace_hit_set:
+            score += TRACE_PATH_SCORE_BOOST
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1405,10 +1552,17 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "tests/{stem}.test.js"),
     ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
+    ("{stem}.tsx", "tests/{stem}.test.tsx"),
+    ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.py", "tests/{stem}_test.py"),
+    ("{stem}.py", "test/{stem}_test.py"),
+    # Other languages — common test suffix conventions.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    ("{stem}.kt", "{dir}/{stem}Test.kt"),
+    ("{stem}.java", "{dir}/{stem}Test.java"),
 )
 
 
@@ -2042,6 +2196,16 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+def build_second_attempt_context() -> str:
+    """Injected on multi-shot retry after a working-tree reset (generic, task-agnostic)."""
+    return (
+        "Multi-shot retry: the repository was reset to its initial commit state for another full attempt. "
+        "If the prior trajectory produced an empty or overly shallow diff, correct that here: implement every "
+        "requirement from the issue, touch companion tests when your source change implies it, run one minimal "
+        "real verification command from the project hints, then finish with <final>."
+    )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -2304,11 +2468,16 @@ def solve(
     Main portable interface for validators.
     """
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 580.0
     _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        repo_path=repo_path,
+        issue=issue,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        max_steps=max_steps,
+        command_timeout=command_timeout,
+        max_tokens=max_tokens,
+        _attempt_index=1,
     )
     _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
@@ -2322,13 +2491,13 @@ def solve(
         return _result1
 
     _elapsed = time.monotonic() - _multishot_started
-    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+    if (MULTISHOT_TOTAL_BUDGET_SECONDS - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
         _result1["multishot_skipped_retry"] = "insufficient_time"
         return _result1
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
+    _result2 = _solve_attempt(**{**_multishot_args, "_attempt_index": 2})
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
@@ -2356,6 +2525,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    attempt_index = int(kwargs.get("_attempt_index", 1))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2418,9 +2588,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+        # Dynamic cap: fewer refinement slots when inner wall-clock is almost exhausted.
+        if total_refinement_turns_used >= _effective_refinement_turn_cap(solve_started_at):
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -2522,10 +2691,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
-
-        _wall_start = time.monotonic()
+        if attempt_index >= 2:
+            messages.append({"role": "user", "content": build_second_attempt_context()})
 
         for step in range(1, max_steps + 1):
+            if _wall_clock_inner_budget_exceeded(solve_started_at):
+                logs.append("\nWALL_CLOCK_STOP:\nInner wall-clock budget exhausted.\n")
+                break
+
             logs.append(f"\n\n===== STEP {step} =====\n")
 
             response_text: Optional[str] = None
@@ -2612,7 +2785,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                if step >= AUTO_STOP_AFTER_PATCH_MIN_STEP or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
@@ -2626,7 +2799,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
                         success = True
                         break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
+                    if patch.strip() and step >= PATCH_REVIEW_SUCCESS_MIN_STEP and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
                             # Required path not yet touched — keep working instead of accepting.
                             continue
@@ -2675,7 +2848,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in BUDGET_PRESSURE_STEPS:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -2737,6 +2910,15 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
 
     has_good = any(marker in lower for marker in good_markers)
     has_bad = any(marker in lower for marker in bad_markers)
+
+    # Pytest-style summary lines (structured; avoids weak "ok" substring hits).
+    if exit_code == 0 and re.search(r"\b\d+\s+passed\b", lower):
+        if re.search(r"\b[1-9]\d*\s+failed\b", lower) or re.search(
+            r"\b[1-9]\d*\s+error\b", lower
+        ):
+            has_bad = True
+        elif re.search(r"\b0\s+failed\b", lower) or " 0 failed" in lower:
+            has_good = True
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
@@ -2755,7 +2937,11 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r"\bnpx\s+tsc\b",
+        r"\bnpx\s+(tsc|vitest|jest)\b",
+        r"\bvitest\b",
+        r"\bjest\b",
+        r"\bbun\s+(test|run\s+test)\b",
+        r"\bdeno\s+test\b",
         r"\btsc\b",
         r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
