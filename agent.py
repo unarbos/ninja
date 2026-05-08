@@ -103,6 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -526,6 +528,11 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    # v24 (from PR430 taoagentbloom): undo accidental chmod-only churn before
+    # computing the diff, and use `git diff HEAD` so staged + unstaged are
+    # captured. Cursor-similarity is matched_lines / max(model, ref); mode-only
+    # noise inflates model_lines without contributing matched_lines.
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -534,7 +541,7 @@ def get_patch(repo: Path) -> str:
         ":(exclude).git",
     ]
     proc = subprocess.run(
-        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
+        ["git", "diff", "HEAD", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -568,8 +575,70 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
+    # v24 (PR430): defensive strip of any path that should be skipped, in case
+    # --no-index untracked or --binary slipped one through.
+    cleaned = _strip_skipped_path_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """v24/PR430: undo accidental chmod-only churn while preserving content edits."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    for line in proc.stdout.splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        if not relative_path or _should_skip_patch_path(relative_path):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
+
+
+def _strip_skipped_path_diffs(diff_output: str) -> str:
+    """v24/PR430: drop diff blocks for paths that should be skipped."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        header = block.splitlines()[0] if block.splitlines() else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)$", header)
+        if match and (_should_skip_patch_path(match.group(1)) or _should_skip_patch_path(match.group(2))):
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -730,13 +799,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files — only treat as
-                              # "mentioned" when an identifier picks out a
-                              # specific small handful in the tracked set.
-
-
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -750,22 +812,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
-
-    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
-    # `email_notificacoes`) are deliberate signals from the task author about
-    # the code surface that matters. When they pick out a small specific set
-    # of tracked files by path-substring, treat those files as explicit
-    # mentions so they get the same +100 ranking boost as path-mentioned
-    # files. Skipped when the identifier matches too many files (filters out
-    # generic identifiers like `basic.py` or `any2txt`).
-    seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
-        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
-        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
-            for m in matches:
-                if m not in seen_mentioned:
-                    mentioned.append(m)
-                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -2313,6 +2359,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
+
     def queue_refinement_turn(
         assistant_text: str,
         prompt_text: str,
@@ -2468,6 +2520,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2486,7 +2546,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES:
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2504,7 +2564,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3:
+                if consecutive_model_errors >= 3 or out_of_time():
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
