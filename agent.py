@@ -192,9 +192,30 @@ class AgentResult:
 # Utility
 # -----------------------------
 
+# Markers that imply the text is a stack trace / compiler error. For these the
+# tail (actual exception line, user-frame file:line) is far higher signal than
+# the head (framework/stdlib intro frames), so head+tail equal-halves is wrong.
+_TRACEBACK_MARKERS = (
+    "Traceback (most recent",
+    "panic:",
+    "FAIL\t",
+    "error TS",
+    "error[E",
+    "FAILED\n",
+    "FAILED ",
+)
+
+
+def _looks_like_traceback(text: str) -> bool:
+    return any(marker in text for marker in _TRACEBACK_MARKERS)
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
+    if _looks_like_traceback(text):
+        dropped = len(text) - max_chars
+        return f"...[head dropped {dropped} chars]...\n" + text[-max_chars:]
     half = max_chars // 2
     return (
         text[:half]
@@ -1632,6 +1653,10 @@ _SYMBOL_STOP = {
     "reset", "return", "should", "static", "string", "support", "test", "tests",
     "their", "there", "thing", "this", "true", "type", "types", "update",
     "using", "value", "values", "when", "with", "will", "without", "write",
+    "a", "an", "and", "as", "at", "be", "but", "by", "did", "do", "for",
+    "from", "had", "has", "have", "if", "in", "is", "it", "its", "not",
+    "of", "on", "or", "so", "than", "that", "the", "then", "to", "was",
+    "we",
 }
 
 
@@ -2261,6 +2286,91 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+# Compiler/test error-location patterns. The tail of an error usually contains
+# the actual file:line we need to edit; LLMs often skim past it. Extracting
+# (path, line) deterministically and surfacing it back into the next user turn
+# converts a passive observation into a directional nudge.
+_ERR_LOC_PATTERNS = [
+    re.compile(r'File "([^"]+)", line (\d+)'),
+    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
+    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
+    re.compile(r"\(([\w]+\.java):(\d+)\)"),
+    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
+    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
+]
+
+
+def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
+    """Extract (path, line) pairs from compiler/test error output."""
+    seen: set = set()
+    results: List[Tuple[str, str]] = []
+    for pat in _ERR_LOC_PATTERNS:
+        for m in pat.finditer(text):
+            key = (m.group(1), m.group(2))
+            if key not in seen:
+                seen.add(key)
+                results.append(key)
+    return results[:8]
+
+
+def _last_failed_command(result: Dict[str, Any]) -> str:
+    """Pull the last non-zero-exit command from an attempt's logs.
+
+    Used by the multishot memo so attempt 2 can see what attempt 1 tried last
+    instead of repeating the same dead-end. We scan in order so the LAST hit
+    is the most recent failing command before the attempt ended.
+    """
+    logs_text = result.get("logs", "") or ""
+    last_fail = ""
+    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
+        if "EXIT_CODE:\n" in chunk:
+            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
+            if ec_match and ec_match.group(1) != "0":
+                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
+                if cmd_match:
+                    last_fail = cmd_match.group(1).strip()[:200]
+    return last_fail
+
+
+def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
+    """Summarise attempt 1 so attempt 2 takes a different angle.
+
+    Without this, the retry path is two independent attempts and tends to
+    repeat attempt 1's blind spots. Surfacing files-touched, line-count,
+    untouched-required-paths, and last-failing-command turns the retry into
+    a targeted second pass.
+    """
+    patch = result.get("patch", "") or ""
+    return {
+        "attempt1_files_touched": _patch_changed_files(patch),
+        "attempt1_substantive_lines": _multishot_count_substantive(patch),
+        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
+        "attempt1_last_failed_command": _last_failed_command(result),
+    }
+
+
+def _format_multishot_memo(memo: Dict[str, Any]) -> str:
+    """Render the memo as a short PRIOR ATTEMPT NOTES block for the user prompt."""
+    files = memo.get("attempt1_files_touched") or []
+    lines = memo.get("attempt1_substantive_lines", 0)
+    missing = memo.get("attempt1_unaddressed_paths") or []
+    last_fail = memo.get("attempt1_last_failed_command", "")
+    parts = [
+        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
+        f"  Files touched: {', '.join(files) if files else 'none'}",
+        f"  Substantive lines added: {lines}",
+    ]
+    if missing:
+        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
+    if last_fail:
+        parts.append(f"  Last failing command: {last_fail}")
+    parts.append(
+        "  Strategy: focus on the paths/functions listed above that were missed; "
+        "do not repeat the same approach."
+    )
+    return "\n".join(parts)
+
+
 # -----------------------------
 # Main agent (multi-shot wrapper around _solve_attempt)
 # -----------------------------
@@ -2322,7 +2432,20 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # Retry only when the patch is empty OR has too few substantive lines
+        # AND fails to touch any path the issue explicitly mentions. A surgical
+        # 1-2 line fix that already covers the required paths IS the ideal
+        # reference-style patch — discarding it for a retry costs us rounds.
+        _issue = kwargs["issue"]
+        _covered_required = (
+            bool(_patch1.strip())
+            and not _uncovered_required_paths(_patch1, _issue)
+        )
+        _should_retry = (
+            (not _patch1.strip())
+            or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+        )
+        if not _should_retry:
             _result1["multishot_attempts"] = 1
             return _result1
 
@@ -2334,7 +2457,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        # Hand attempt 2 a memo summarising attempt 1 so it doesn't repeat the
+        # same blind spots (mode-collapse). Memo is consumed inside
+        # _solve_attempt as an optional kwarg and prepended to the user prompt.
+        _memo = _build_multishot_memo(_result1, _issue)
+        _result2 = _solve_attempt(**kwargs, _multishot_memo=_memo)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2384,6 +2511,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2422,12 +2550,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         """If the current patch warrants a refinement turn, queue it.
 
         Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
+        means the caller can declare success. With MAX_TOTAL_REFINEMENT_TURNS=2
+        only the first 2 gates that hit are spent, so order matters: judge-half
+        gates (coverage, criteria, companion test) fire BEFORE cursor-half
+        gates (polish, syntax) so the budget lands on the highest-paying
+        signals first. Order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
+            1. coverage-nudge — issue-mentioned paths still untouched (judge-half)
+            2. criteria-nudge — issue acceptance bullets unaddressed (judge-half)
+            3. test-fix — companion test failed against current patch (real signal)
+            4. polish — drop low-signal hunks (cursor-half)
+            5. syntax — quote any parser error back at the model (cursor-half)
+            6. wiring-check — multi-file connectivity (preserved from prior king)
+            7. self-check — comprehensive review of the draft
         Each refinement runs at most once per cycle.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, wiring_check_turns_used, hail_mary_turns_used, total_refinement_turns_used
@@ -2450,43 +2585,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
             if missing:
@@ -2508,6 +2606,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -2542,9 +2677,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
+        initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if multishot_memo:
+            initial_user = _format_multishot_memo(multishot_memo) + "\n\n" + initial_user
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": initial_user},
         ]
 
         _wall_start = time.monotonic()
@@ -2695,6 +2834,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
+                if not success:
+                    err_locs = _extract_error_locations(observation_text)
+                    if err_locs:
+                        loc_lines = "\n".join(f"  - {p}:{ln}" for p, ln in err_locs)
+                        observation_text += (
+                            "\n\nERROR LOCATIONS DETECTED:\n"
+                            f"{loc_lines}\n"
+                            "Address these on your next response."
+                        )
                 has_patch = get_patch(repo).strip()
                 remaining = time_remaining()
                 if not success and has_patch and remaining < 120:
