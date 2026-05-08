@@ -116,23 +116,29 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_TYPECHECK_TURNS = 1    # `tsc --noEmit` on touched .ts/.tsx. Real compiler errors are the
+                           # highest-precision signal we can surface for TS-heavy tasks.
+MAX_LINT_TURNS = 1         # ruff/eslint on touched files; runs only when project config exists.
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_I18N_CASCADE_TURNS = 1 # one locale touched but sibling locales untouched in the same dir.
+MAX_MIGRATION_CASCADE_TURNS = 1  # model file changed without a corresponding migration file.
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_STUB_FIX_TURNS = 1     # the LLM judge consistently dings patches for "incomplete", "stub",
-                           # "lacks", "// similar logic". This gate scans the diff for those
-                           # incomplete-fragment markers and forces a completion turn before <final>.
-MAX_IDIOM_FIX_TURNS = 1    # judge "severely penalizes" 3+ unrolled same-shape statements per the
-                           # SYSTEM_PROMPT. This gate detects unrolled patterns and refactors to loop.
+MAX_STUB_FIX_TURNS = 1     # stub / placeholder bodies (`pass`, `# TODO`, `// similar logic`,
+                           # `raise NotImplementedError`, bare `...`) mean the implementation
+                           # isn't actually there. This gate scans the diff for those markers
+                           # and forces a completion turn before <final>.
+MAX_IDIOM_FIX_TURNS = 1    # 3+ unrolled same-shape statements are almost always a loop in disguise.
+                           # This gate detects the pattern and refactors to a loop / .map / list-comp.
 MAX_HAIL_MARY_TURNS = 2    # last-resort: force a real edit when patch is empty after everything.
                            # Bumped from 1 -> 2 because empty patches scored zero in ~10% of duel rounds
                            # (4214 r12/19/26/49). One extra emergency turn is cheap insurance against
                            # the worst-case forfeit when the first hail-mary still produced no edit.
-MAX_TOTAL_REFINEMENT_TURNS = 4  # bumped from 3 -> 4 alongside the new stub-fix and idiom-fix gates.
-                                # The 270s wall budget comfortably fits ~6-8 refinements at 25-35s
-                                # each; the cap exists to stop runaway chains, not to ration
-                                # genuinely-needed corrections. LLM judge score is 50% of the round
-                                # score — extra correction passes pay for themselves on borderline rounds.
+MAX_TOTAL_REFINEMENT_TURNS = 5  # bumped from 4 -> 5 alongside the typecheck/lint/i18n/migration
+                                # gates. Most gates are no-ops on most patches (typecheck only on
+                                # TS, lint only when project config exists, etc.) so this cap is a
+                                # ceiling for the rare round where many gates have something to say,
+                                # not a typical-case budget. Each refinement runs ~25-35s.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1063,13 +1069,11 @@ def _diff_low_signal_summary(patch: str) -> str:
 
 # Stub / incomplete-fragment detection.
 #
-# The LLM judge's most-cited reason for low completeness scores is "stub",
-# "incomplete", "// similar logic", "lacks the implementation". This detector
-# scans the patch's added (`+`) lines for those markers and surfaces them so a
-# refinement turn can demand the actual implementation. We only inspect added
-# lines (per the phrase-scrubber-scope convention: narrow, `+`-only, never
-# auto-revert files) and we deliberately exclude tests where TODO is sometimes
-# legitimate test scaffolding.
+# Stub markers ("# TODO", "pass", "raise NotImplementedError", "// similar
+# logic", bare "...") in a function body mean the implementation is missing.
+# This detector scans the patch's added (`+`) lines for those markers so a
+# refinement turn can demand the actual code. Test files are excluded because
+# TODO is sometimes legitimate test scaffolding (xfail markers, etc.).
 _STUB_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"^\s*(?://|#)\s*todo\b", re.IGNORECASE),
     re.compile(r"^\s*(?://|#)\s*fixme\b", re.IGNORECASE),
@@ -1141,11 +1145,11 @@ def _detect_stub_fragments(patch: str) -> List[str]:
 
 # Unrolled-statements idiom detection.
 #
-# The SYSTEM_PROMPT calls out "When 3+ consecutive statements share the same
-# shape, factor into a loop" as something the judge "severely penalizes" when
-# violated. We enforce it: scan the patch for runs of 3+ added lines that share
-# a syntactic prefix (function-call shape, e.g. `await prisma.X.create({`,
-# `db.execute(insert into`, etc.) and queue a refactor-to-loop turn if found.
+# 3+ consecutive same-shape statements (e.g. `await db.create({...})` three
+# times in a row) are almost always a loop in disguise — the data varies but
+# the call site is identical. This detector finds runs of 3+ added lines that
+# share a syntactic prefix and queues a refactor-to-loop turn so the patch
+# expresses the iteration explicitly.
 _UNROLLED_PREFIX_LEN = 28  # number of leading non-space chars that must match
 _UNROLLED_MIN_RUN = 3       # minimum same-prefix run that triggers the gate
 
@@ -1201,18 +1205,16 @@ def _detect_unrolled_runs(patch: str) -> List[str]:
 def build_stub_fix_prompt(stub_hits: List[str], issue_text: str) -> str:
     """When the patch contains TODO / stub / NotImplementedError / similar-logic
     placeholders, demand the real implementation. Empty bodies look like
-    completed work to a string-match scorer but the LLM judge sees them as
-    "stub" or "incomplete" and drops completeness sharply."""
+    completed work to a string-match check but the implementation isn't
+    actually there. The patch isn't a fix until the body is real code."""
     bullets = "\n  ".join(stub_hits[:8])
     return (
         "STUB / INCOMPLETE-FRAGMENT GAP — your patch contains placeholder "
-        "fragments that the LLM judge will mark as 'incomplete' or 'stub' "
-        "and drop your completeness score sharply:\n"
+        "fragments where real implementations belong:\n"
         f"  {bullets}\n\n"
-        "Replace EACH placeholder with the actual implementation now. The "
-        "judge has the privileged reference patch as context; the reference "
-        "will have a real body where you currently have TODO/pass/`...`/"
-        "NotImplementedError. Open the file at the listed line, then issue "
+        "Replace EACH placeholder with the actual implementation now. A "
+        "function whose body is `pass` or `TODO` doesn't implement anything; "
+        "the task isn't done. Open the file at the listed line, then issue "
         "the edit command (sed / python -c / heredoc) that fills in the body.\n\n"
         "Do NOT delete the placeholder line and leave nothing in its place — "
         "that just changes the failure mode from 'stub' to 'missing'. The "
@@ -1228,8 +1230,8 @@ def build_idiom_fix_prompt(unrolled_runs: List[str], issue_text: str) -> str:
     """Force a refactor-to-loop when the patch unrolls 3+ same-shape statements."""
     bullets = "\n  ".join(f"- {r}" for r in unrolled_runs[:4])
     return (
-        "IDIOM GAP — the LLM judge severely penalizes unrolled, copy-pasted "
-        "statements. Your patch has the following unrolled runs:\n"
+        "IDIOM GAP — your patch contains unrolled, copy-pasted statements "
+        "where a loop / .map / list-comp would express the intent more clearly:\n"
         f"  {bullets}\n\n"
         "Refactor each run into a loop / .map() / list-comprehension. "
         "Example transformation:\n"
@@ -1262,8 +1264,8 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
     Used by the coverage-nudge refinement turn to tell the model concretely
     which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
+    When the issue lists specific paths the patch needs to touch and
+    the draft skips them, surface the gap to the model directly.
     """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
@@ -1366,9 +1368,8 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
+    Imbalanced braces are a syntax error a real compiler would catch. This
+    naive counter ignores braces inside string and comment context (best-effort)
     and reports an imbalance with file + count delta.
     """
     full = (repo / relative_path).resolve()
@@ -1461,10 +1462,333 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: no parser available; trust the model.
         if result:
             errors.append(result)
     return errors
+
+
+# -----------------------------
+# Compile / lint gates (deterministic engineering checks)
+# -----------------------------
+#
+# These gates run real tools (tsc, ruff, eslint) on the touched files and
+# surface their first errors back to the model. They're deterministic — no
+# extra LLM calls — and they describe properties of the patch (does it
+# compile, does it pass the project's lint config), not properties of the
+# scorer. Each helper silently no-ops when the tool isn't available.
+
+_TYPECHECK_TIMEOUT = 25       # tsc on a single file with --skipLibCheck
+_LINT_TIMEOUT = 10            # ruff/eslint per file
+_TYPECHECK_SUFFIXES = {".ts", ".tsx"}
+
+
+def _has_local_tsc(repo: Path) -> bool:
+    """True if the repo has a usable TypeScript compiler available."""
+    if (repo / "node_modules" / ".bin" / "tsc").exists():
+        return True
+    if _has_executable("npx") and (repo / "package.json").exists():
+        return True
+    return _has_executable("tsc")
+
+
+def _check_typescript_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Run `tsc --noEmit` on a single TS/TSX file. Returns the first
+    `error TS####:` line attributed to this file, or None.
+
+    Strategy: prefer the repo's local tsc (`./node_modules/.bin/tsc` or
+    `npx tsc`) so project tsconfig + strictness applies. Fall back to a
+    standalone `tsc` if available. Skip silently when nothing's installed.
+    """
+    if not _has_local_tsc(repo):
+        return None
+
+    # Try local tsc first (matches project config), then npx, then global.
+    candidates: List[str] = []
+    local_bin = repo / "node_modules" / ".bin" / "tsc"
+    if local_bin.exists():
+        candidates.append(f"{_shell_quote(str(local_bin))} --noEmit --skipLibCheck --pretty false {_shell_quote(relative_path)}")
+    if _has_executable("npx") and (repo / "package.json").exists():
+        candidates.append(f"npx --no-install tsc --noEmit --skipLibCheck --pretty false {_shell_quote(relative_path)}")
+    if _has_executable("tsc"):
+        candidates.append(f"tsc --noEmit --skipLibCheck --pretty false {_shell_quote(relative_path)}")
+
+    for cmd in candidates:
+        proc = run_command(cmd, repo, timeout=_TYPECHECK_TIMEOUT)
+        # tsc returns non-zero on errors AND on "tsc not found"; distinguish
+        # via stderr / stdout content.
+        combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if "command not found" in combined or "ENOENT" in combined or "not found" in combined.lower():
+            continue
+        if proc.exit_code == 0:
+            return None
+        # Find the first error line that mentions this file.
+        for line in combined.splitlines():
+            if "error TS" in line and (relative_path in line or Path(relative_path).name in line):
+                return f"{relative_path}: {line.strip()[:240]}"
+        # Fall back to the first error TS line at all.
+        for line in combined.splitlines():
+            if "error TS" in line:
+                return f"{relative_path}: {line.strip()[:240]}"
+        # Non-zero exit but no error TS line — likely a config issue. Bail.
+        return None
+    return None
+
+
+def _check_typescript(repo: Path, patch: str) -> List[str]:
+    """Type-check every touched TS/TSX file. Returns first 6 errors total."""
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        if Path(relative_path).suffix.lower() not in _TYPECHECK_SUFFIXES:
+            continue
+        err = _check_typescript_one(repo, relative_path)
+        if err:
+            errors.append(err)
+            if len(errors) >= 6:
+                break
+    return errors
+
+
+def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
+    """Run `ruff check` on a Python file. Returns the first issue or None."""
+    if not _has_executable("ruff"):
+        return None
+    proc = run_command(
+        f"ruff check --no-fix --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_LINT_TIMEOUT,
+    )
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or "").strip()
+    if not output:
+        return None
+    first_line = output.splitlines()[0].strip()[:200]
+    return f"{relative_path}: {first_line}"
+
+
+def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
+    """Run `eslint` on a JS/TS file. Returns first issue or None.
+
+    Uses the repo's local eslint (via npx --no-install) so project config
+    applies. Skips when no eslint config or no local install is present.
+    """
+    has_config = any(
+        (repo / name).exists()
+        for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
+    )
+    if not has_config:
+        return None
+    has_eslint = (repo / "node_modules" / ".bin" / "eslint").exists() or _has_executable("eslint")
+    if not has_eslint:
+        return None
+
+    if (repo / "node_modules" / ".bin" / "eslint").exists():
+        cmd = f"./node_modules/.bin/eslint --no-color --format compact {_shell_quote(relative_path)}"
+    else:
+        cmd = f"eslint --no-color --format compact {_shell_quote(relative_path)}"
+
+    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT)
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or "").strip()
+    if not output:
+        return None
+    # `compact` format: <file>: line N, col M, <severity> - <msg> (<rule>)
+    for line in output.splitlines():
+        if "Error" in line or "Warning" in line:
+            return f"{relative_path}: {line.strip()[:240]}"
+    return f"{relative_path}: {output.splitlines()[0].strip()[:240]}"
+
+
+def _check_lint(repo: Path, patch: str) -> List[str]:
+    """Lint every touched file with the appropriate tool. Up to 6 errors."""
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        err: Optional[str] = None
+        if suffix == ".py":
+            err = _check_lint_python(repo, relative_path)
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            err = _check_lint_js(repo, relative_path)
+        if err:
+            errors.append(err)
+            if len(errors) >= 6:
+                break
+    return errors
+
+
+# -----------------------------
+# Structural-cascade gates: i18n + migrations
+# -----------------------------
+#
+# When a change touches a file that has structural siblings (locales, model
+# files), a complete patch usually also touches the siblings. These detectors
+# look at the diff structure (not the content) and warn when the cascade looks
+# half-done.
+
+# Locale-file shapes we recognise. Each path matches "<base>/<lang>.<ext>" or
+# "<base>/<lang>/<file>.<ext>". The detector groups files by base dir.
+_LOCALE_PATH_RE = re.compile(
+    r"(?P<base>(?:.*/)?(?:locales?|i18n|translations|lang|messages))/"
+    r"(?P<rest>[^/]+(?:/[^/]+)?)"
+    r"\.(?P<ext>json|ya?ml|po|properties|ts|js)$",
+    re.IGNORECASE,
+)
+
+
+def _detect_i18n_cascade_gap(repo: Path, patch: str) -> List[str]:
+    """When the patch touches one locale file, list sibling locale files in
+    the same base directory that were NOT touched. Returns up to 6 sibling
+    suggestions, formatted as `touched.json -> sibling1.json, sibling2.json`.
+
+    This is a structural detector — it doesn't parse JSON keys, just notices
+    when a multi-locale repo got a single-locale edit.
+    """
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+    by_base: Dict[str, List[str]] = {}
+    for relative_path in changed:
+        m = _LOCALE_PATH_RE.match(relative_path.lower())
+        if not m:
+            continue
+        base = m.group("base")
+        by_base.setdefault(base, []).append(relative_path)
+    if not by_base:
+        return []
+
+    suggestions: List[str] = []
+    tracked = set(_tracked_files(repo))
+    for base, touched_in_base in by_base.items():
+        # Find sibling locale files in the same base directory that weren't touched.
+        siblings: List[str] = []
+        touched_set = set(touched_in_base)
+        for tp in tracked:
+            if tp.lower().startswith(base + "/") and tp not in touched_set:
+                m2 = _LOCALE_PATH_RE.match(tp.lower())
+                if m2 and m2.group("base") == base:
+                    siblings.append(tp)
+        if siblings:
+            siblings_short = sorted(siblings)[:4]
+            suggestions.append(
+                f"{touched_in_base[0]} edited; siblings not touched: {', '.join(siblings_short)}"
+                + (f" (+{len(siblings) - 4} more)" if len(siblings) > 4 else "")
+            )
+        if len(suggestions) >= 6:
+            break
+    return suggestions
+
+
+# Model / migration cascade. When the patch touches a model definition file
+# but no new migration file appears in the patch, the schema change probably
+# isn't applied at runtime.
+_MODEL_PATH_HINTS: Tuple[str, ...] = (
+    "models.py",        # Django, SQLAlchemy
+    "/models/",         # Django apps with split models
+    "schema.prisma",    # Prisma
+    "schema.rb",        # Rails (db/schema.rb is generated; a real change shows up in db/migrate too)
+)
+_MIGRATION_PATH_HINTS: Tuple[str, ...] = (
+    "/migrations/",     # Django, Rails
+    "alembic/versions/",
+    "prisma/migrations/",
+    "db/migrate/",
+)
+
+
+def _detect_migration_cascade_gap(patch: str) -> List[str]:
+    """Return a description if the patch edits a model file but no migration
+    file is added. Empty list = no cascade gap detected."""
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+    edited_models = [
+        p for p in changed
+        if any(hint in p for hint in _MODEL_PATH_HINTS)
+    ]
+    if not edited_models:
+        return []
+    has_migration = any(
+        any(hint in p for hint in _MIGRATION_PATH_HINTS)
+        for p in changed
+    )
+    if has_migration:
+        return []
+    return [
+        f"Model file(s) edited without a corresponding migration: "
+        f"{', '.join(edited_models[:3])}"
+        + (f" (+{len(edited_models) - 3} more)" if len(edited_models) > 3 else "")
+    ]
+
+
+def build_typecheck_fix_prompt(errors: List[str]) -> str:
+    """Surface tsc errors back to the model and demand a minimal fix."""
+    bullets = "\n  ".join(errors[:6])
+    return (
+        "TYPE-CHECK FAILED — `tsc --noEmit` reports type errors on your "
+        "touched files:\n  "
+        f"{bullets}\n\n"
+        "Issue the smallest possible fix command(s) to resolve each error. "
+        "Cascade type changes through every implementer / caller / consumer "
+        "of the changed type. Do NOT widen scope or refactor. Then end "
+        "with <final>summary</final>."
+    )
+
+
+def build_lint_fix_prompt(errors: List[str]) -> str:
+    """Surface ruff/eslint errors back to the model and demand a minimal fix."""
+    bullets = "\n  ".join(errors[:6])
+    return (
+        "LINT CHECK FAILED — the project's linter reports issues on your "
+        "touched files:\n  "
+        f"{bullets}\n\n"
+        "Fix each issue with the smallest possible edit. Match the project's "
+        "existing conventions; do not disable rules unless the existing code "
+        "already disables the same rule on similar lines. Then end with "
+        "<final>summary</final>."
+    )
+
+
+def build_i18n_cascade_prompt(suggestions: List[str], issue_text: str) -> str:
+    """When sibling locale files are untouched, ask the model to mirror keys."""
+    bullets = "\n  ".join(suggestions[:4])
+    return (
+        "I18N CASCADE GAP — your patch added or modified locale entries in "
+        "one file, but sibling locale files in the same directory were not "
+        "updated:\n  "
+        f"{bullets}\n\n"
+        "Apply the same key additions / modifications to every sibling locale "
+        "file. Use the appropriate translation per language; if you don't "
+        "know the translation, mirror the source-locale value (typically "
+        "English) verbatim — leaving the key out entirely breaks the build "
+        "for users in that locale.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+
+def build_migration_cascade_prompt(warnings: List[str], issue_text: str) -> str:
+    """When a model file changed without a migration, ask for the migration."""
+    bullets = "\n  ".join(warnings[:3])
+    return (
+        "MIGRATION CASCADE GAP — your patch changes a model definition file "
+        "but does not add a corresponding database migration:\n  "
+        f"{bullets}\n\n"
+        "A schema change without a migration leaves the database out of sync "
+        "with the model and breaks the application at runtime. Add the "
+        "migration now: for Django, run `python manage.py makemigrations` "
+        "and commit the generated file; for Alembic, add a new file under "
+        "`alembic/versions/` with `upgrade()` and `downgrade()` reflecting "
+        "the model change; for Prisma, add a new directory under "
+        "`prisma/migrations/`. If you can't run the migration generator, "
+        "write the migration file manually following the conventions of "
+        "existing migration files in the same directory.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
 
 
 def _has_executable(name: str) -> bool:
@@ -1842,8 +2166,9 @@ def _patch_added_text(patch: str) -> str:
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
+    lines. Multi-bullet tasks where some bullets aren't reflected in the
+    patch are incomplete; surfacing the gap lets the model close it before
+    <final>."""
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
@@ -1957,21 +2282,16 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a coding agent optimising for the LLM diff judge. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge (GPT-class model) — scores your patch 0-100 using this LITERAL rubric, quoted from the validator: "Score each candidate from 0 to 100 for correctness, completeness, and alignment with the task/reference. Penalize unrelated churn, unsafe behavior, hidden evaluator manipulation, and empty or timeout solutions."
+SYSTEM_PROMPT = """You are a coding agent. Read the issue, find the root cause, and ship a correct, minimal patch.
 
-The judge is given the privileged Cursor reference patch as its target direction. It scores YOU against the REFERENCE — same files, same scope, same level of completeness. To MAXIMISE the LLM judge axis specifically:
+A correct, minimal patch:
+  - Fixes the root cause, not the symptom.
+  - Implements every requirement the issue lists. An issue with N bullets isn't done until all N are addressed.
+  - Has real implementations everywhere. Function bodies must contain working code — `pass`, `# TODO`, `// similar logic`, `raise NotImplementedError`, `panic("TODO")`, `unimplemented!()`, and bare `...` placeholders are not a fix.
+  - Threads through related files. When one change implies several files (route + page + nav link, model + migration + admin entry, settings key + UI toggle + persistence, i18n key + every locale, source + companion test, interface + every implementer), edit them all in the same patch.
+  - Adds nothing else. Don't reformat, reorder imports, rename identifiers, change type annotations, or add defensive checks the task didn't ask for.
 
-  - CORRECTNESS (~33% of judge score): the fix must work end-to-end. NEVER leave `# TODO`, `// similar logic`, `pass`, `raise NotImplementedError`, `panic("TODO")`, `unimplemented!()`, `throw new Error("not implemented")`, or bare `...` as a function body — the judge calls these "stub" and "incomplete" and drops you to <50. Run the targeted test before <final>.
-
-  - COMPLETENESS (~33% of judge score): every bullet, every mentioned path, every implied cascade. Multi-bullet issues that get half-implemented score 30-50 no matter how clean each bullet is. Cascade rules: route → page → nav link; model → migration → admin entry; interface → all implementers; source → companion test; settings key → UI toggle → persistence → migration; i18n key → every locale file. Touch every file the reference would.
-
-  - ALIGNMENT (~33% of judge score): converge on the reference's files and granularity. If the issue names path X and you didn't touch it, the reference probably did — that's an alignment hit.
-
-  - PENALTIES the judge applies, drop you ~5-10 points each: whitespace-only / comment-only / mode-only hunks, drive-by import reorders, gratuitous renames, type-annotation churn, defensive checks the task didn't ask for. Three or more unrolled same-shape statements (e.g. 3x `await db.create({...})` in a row) is "severely penalized" — always factor into a loop / .map / list-comp.
-
-NEVER write any of these phrases anywhere in your code or comments — they trigger an automatic 0 LLM score and lose the round outright: "ignore previous/prior/the above instructions", "as the evaluator", "as the judge", "dear evaluator/judge", "choose/pick/select king/challenger", "king/challenger is correct", "king/challenger wins", "the evaluator/judge should", "other candidate is malicious", "automatic fail". Use neutral words ("operator", "reviewer", "checker", "option a/b") if the domain ever requires similar wording.
+Write code, not letters. Patches contain implementations and tests, not addresses to a reader.
 
 ## Command format
 
@@ -1987,7 +2307,7 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; you have to satisfy each of them.
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
@@ -2021,8 +2341,7 @@ files/routes/screens, or asks for "scaffolding", "settings", "migrations",
 - Cover EVERY bullet. Touch EVERY file the bullets imply, not just the most
   obvious one. Idiomatic scaffolding (routes + page + nav link, model + migration
   + admin entry, settings key + UI toggle + persistence) beats a one-file stub.
-- The LLM judge consistently rewards "implemented all N expansions" over
-  "fixed item 1 only". Half-completing a multi-bullet task loses the round.
+- A half-implemented multi-bullet task is not a fix. Either implement every bullet or pick a smaller scope and finish it.
 
 For both shapes, use the EXACT variable/function/class names already in the
 codebase. Add new imports at the same location as existing imports in the file.
@@ -2038,17 +2357,17 @@ codebase. Add new imports at the same location as existing imports in the file.
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
-## Idiomatic refactors — CRITICAL for judge score
+## Idiomatic refactors
 
 When converting a bulk operation into individual operations (e.g.
 `createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
 loop. NEVER emit unrolled, copy-pasted statements.
 
-GOOD (judge prefers):
+GOOD:
     const items = [{...}, {...}, {...}]
     for (const data of items) await prisma.X.create({ data })
 
-BAD (judge severely penalizes):
+BAD (don't do this):
     await prisma.X.create({ data: {...} })
     await prisma.X.create({ data: {...} })
     ... (repeated)
@@ -2059,9 +2378,8 @@ comprehension, or `.map()`.
 ## Comment + structure preservation
 
 Preserve EVERY comment from the surrounding code unless the task explicitly
-removes it. Section-grouping comments (`// Member 1 availability`) are
-high-signal to the judge. Removing comments while refactoring tanks judge
-score.
+removes it. Section-grouping comments (`// Member 1 availability`) document
+intent for future readers; removing them while refactoring loses information.
 
 ## Language-specific completeness rules
 
@@ -2072,7 +2390,8 @@ Cascade all call-site changes when modifying signatures. Include all imports.
 function. Include full signatures and all required #include changes.
 
 **TypeScript/C#:** Cascade interface and type changes to ALL implementing
-classes, components, and function parameters. Missing one = lower score.
+classes, components, and function parameters. Missing one breaks compilation
+and leaves the system inconsistent.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
 annotations on modified functions.
@@ -2111,7 +2430,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — half-implemented multi-bullet tasks are not a fix.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2153,10 +2472,10 @@ def build_budget_pressure_prompt(step: int) -> str:
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
-    The LLM judge frequently penalises patches for "unrelated changes",
-    "unnecessary churn", and "cosmetic edits". Be explicit about which
-    classes of changes count as scope creep so the model knows what to
-    revert and what to keep.
+    Unrelated whitespace / comment / mode-only / import-reorder hunks are
+    scope creep — they widen the diff without addressing the task. Be
+    explicit about which classes count as scope creep so the model knows
+    what to revert and what to keep.
     """
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
@@ -2165,8 +2484,8 @@ def build_polish_prompt(junk_summary: str) -> str:
         "lines). Do not add new edits, do not refactor, do not reorder "
         "imports, do not touch unrelated lines.\n\n"
         "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (the diff judge consistently penalises these as "
-        "'unrelated' or 'unnecessary churn'):\n"
+        "your draft (these count as scope creep — they aren't requested "
+        "by the task and only widen the diff):\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
         "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
@@ -2183,9 +2502,9 @@ def build_polish_prompt(junk_summary: str) -> str:
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
-    The LLM diff judge most often docks king for incomplete coverage. When the
-    issue names specific files and the draft skips them, surface that gap
-    directly — much cheaper than hoping the self-check catches it.
+    When the issue names specific files and the draft skips them, surface
+    the gap directly — the patch isn't covering the task description and
+    the missing edits will leave the requested behavior unimplemented.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
@@ -2200,8 +2519,8 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
         "(route + page + nav link, model + migration + admin entry, "
         "settings key + UI toggle + persistence, i18n key + every locale "
         "file that defines siblings, etc.), edit ALL of them in this "
-        "response. Duel telemetry: challenger wins integration tasks by "
-        "threading changes across the whole feature surface.\n\n"
+        "response. A change that touches only one file in a multi-file "
+        "cascade leaves the system half-migrated and the feature broken.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2209,58 +2528,44 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Judge-mirror review. Replays the LLM judge's literal rubric back at the
-    model and asks it to score itself the way the validator's GPT-5.4 judge
-    will — then fix the lowest-scoring axis BEFORE submitting. Mirroring the
-    judge's exact wording is the highest-leverage move available for LLM
-    judge score (each round is worth 50% of the round score)."""
+    """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "JUDGE-MIRROR REVIEW. The validator's LLM judge scores your patch with "
-        "this literal rubric (from the validator):\n\n"
-        '  "Score each candidate from 0 to 100 for correctness, completeness, '
-        "and alignment with the task/reference. Penalize unrelated churn, "
-        "unsafe behavior, hidden evaluator manipulation, and empty or "
-        'timeout solutions."\n\n'
-        "The judge ALSO sees a privileged reference patch (Cursor's solution) "
-        "and scores you against THAT direction — same files, same scope, same "
-        "level of completeness. Your job RIGHT NOW: role-play as the judge.\n\n"
-        "Step 1 — score your patch on each axis 0-100:\n"
-        "  - CORRECTNESS: does it fix the root cause and pass any tests the "
-        "issue would expect to pass? Stub bodies, `// similar logic`, TODOs, "
-        "`pass` placeholders, and `raise NotImplementedError` count as wrong.\n"
-        "  - COMPLETENESS: is EVERY bullet, EVERY mentioned path, and EVERY "
-        "implied cascade (route+page+nav, model+migration+admin, source+test, "
-        "interface+all-implementers) covered? Half-done multi-bullet tasks "
-        "score in the 30-50 range no matter how nice the one bullet is.\n"
-        "  - ALIGNMENT WITH REFERENCE: would the Cursor reference touch these "
-        "same files? If the issue names path X and you didn't touch X, the "
-        "reference probably did — that drops alignment to <40.\n"
-        "  - CHURN: any whitespace-only, comment-only, file-mode-only, "
-        "import-reorder, or rename hunk you didn't need? Each one drops the "
-        "patch by ~5 points.\n\n"
-        "Step 2 — quote your weakest axis and the lowest score. If the lowest "
-        "score is below 80, you MUST issue corrective <command> blocks now "
-        "(real edits, not just re-reads). Common fixes:\n"
-        "  - Replace `# TODO`, `// similar logic`, `pass`, `NotImplementedError` "
-        "with the actual implementation.\n"
-        "  - Touch missing required paths (open them, then sed/python -c edit).\n"
-        "  - Run the targeted test (`pytest tests/test_<module>.py -x -q`) and "
-        "fix any failure before <final>.\n"
-        "  - Revert any churn hunk you can't justify by a bullet in the issue.\n"
-        "  - Convert 3+ same-shape consecutive statements into a loop.\n\n"
-        "Step 3 — when every axis is >=80, end with <final>summary</final>. "
-        "Do NOT escape via 'I already did it' if you can't quote the literal "
-        "patch lines that did it.\n\n"
+        "Self-check pass. Review your patch against the task:\n\n"
+        "CORRECTNESS:\n"
+        "  - Does the patch fix the root cause, not just suppress the symptom?\n"
+        "  - Are edge cases mentioned in the issue handled?\n"
+        "  - Are all function bodies real implementations? `pass`, `# TODO`, "
+        "`// similar logic`, `raise NotImplementedError`, and bare `...` are "
+        "not a fix — replace them with working code.\n"
+        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
+        "or equivalent now.\n\n"
+        "COMPLETENESS:\n"
+        "  - List every requirement from the task. Is each one addressed by the patch?\n"
+        "  - When one change implies several files (route + page + nav, model + "
+        "migration + admin, settings key + UI + persistence, source + companion "
+        "test, interface + every implementer), are all the related files edited?\n"
+        "  - No syntax errors or broken imports introduced?\n\n"
+        "SCOPE:\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks?\n"
+        "  - No type annotation changes not required by the task?\n"
+        "  - No refactoring, renaming, or reordering not required by the task?\n"
+        "  - No new helper functions, defensive checks, or files the task didn't ask for?\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
-        f"{issue_text[:2000]}\n"
+        f"{issue_text[:2000]}\n\n"
+        "If the patch passes all three sections, respond exactly:\n<final>OK</final>\n\n"
+        "Otherwise emit corrective <command> blocks in the SAME response "
+        "(replace stub bodies, run missing tests, fix root causes, revert "
+        "scope-creep hunks), then end with <final>summary</final>. Do NOT add "
+        "new features or unrelated scope."
     )
+
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
@@ -2277,18 +2582,18 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
-    The LLM judge frequently dings the king for "missing N of M criteria" on
-    multi-bullet issues. The path-coverage gate sees files; this gate sees the
-    criterion checkpoints themselves and surfaces them with the original text.
+    The path-coverage gate sees files; this gate sees the criterion
+    checkpoints themselves (numbered list / bullets / imperative sentences)
+    and surfaces any whose significant tokens don't appear in the patch.
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
         "Criterion-coverage gap — these acceptance-criterion checkpoints from "
         "the task are NOT clearly reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
-        "Duel telemetry shows the LLM judge consistently penalizes king for "
-        "'missing N of M criteria' on multi-bullet tasks. Half-implemented "
-        "tasks lose the round. For each bullet above, ISSUE THE EDIT COMMAND "
+        "A multi-bullet task isn't finished until every bullet is "
+        "implemented. Half-done tasks leave the requested behavior broken. "
+        "For each bullet above, ISSUE THE EDIT COMMAND "
         "needed to satisfy it now (cat-the-file + sed/python -c / heredoc as "
         "appropriate), then end with <final>summary</final>.\n\n"
         "Default action is to EDIT, not to self-justify. Only skip a bullet "
@@ -2365,8 +2670,8 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # restored from challenger that beat king
 # Error-location pinpointing: when a command emits a Python/JS/TS/Go/Rust/Java/
 # C++ stack trace or compiler error, surface (file, line) pairs in the
 # observation feedback so the next turn edits the exact site. Ported from the
-# challenger that beat the king on debug-heavy rounds — the LLM judge frequently
-# rewards "patch lands at the line the error pointed to".
+# challenger that beat the king on debug-heavy rounds — landing the patch
+# at the line the error pointed to is usually the right move.
 _ERR_LOC_PATTERNS = [
     re.compile(r'File "([^"]+)", line (\d+)'),
     re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
@@ -2642,8 +2947,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    typecheck_turns_used = 0
+    lint_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
+    i18n_cascade_turns_used = 0
+    migration_cascade_turns_used = 0
     criteria_nudges_used = 0
     stub_fix_turns_used = 0
     idiom_fix_turns_used = 0
@@ -2685,7 +2994,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, stub_fix_turns_used, idiom_fix_turns_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, typecheck_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, i18n_cascade_turns_used, migration_cascade_turns_used, criteria_nudges_used, stub_fix_turns_used, idiom_fix_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2732,6 +3041,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # TypeScript type-check gate. Real `tsc --noEmit` errors are by far the
+        # highest-precision signal we can surface for TS-heavy tasks. Fires
+        # only when the repo has a usable local tsc; silently no-ops otherwise.
+        if typecheck_turns_used < MAX_TYPECHECK_TURNS:
+            type_errors = _check_typescript(repo, patch)
+            if type_errors:
+                typecheck_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_typecheck_fix_prompt(type_errors),
+                    "TYPECHECK_QUEUED:\n  " + "\n  ".join(type_errors),
+                )
+                return True
+
+        # Lint gate. Runs ruff (Python) / eslint (JS/TS) when project config
+        # exists. Linters describe properties of "does this match the project's
+        # conventions" — a different axis from syntax/typecheck, and a
+        # different axis from the heuristic gates below.
+        if lint_turns_used < MAX_LINT_TURNS:
+            lint_errors = _check_lint(repo, patch)
+            if lint_errors:
+                lint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_lint_fix_prompt(lint_errors),
+                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                )
+                return True
+
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
         # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
         # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
@@ -2766,6 +3106,36 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # i18n cascade gate. When the patch touches one locale file but
+        # sibling locales in the same directory are untouched, the feature
+        # is half-translated and breaks for users in those locales.
+        if i18n_cascade_turns_used < MAX_I18N_CASCADE_TURNS:
+            i18n_gaps = _detect_i18n_cascade_gap(repo, patch)
+            if i18n_gaps:
+                i18n_cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_i18n_cascade_prompt(i18n_gaps, issue),
+                    "I18N_CASCADE_QUEUED:\n  " + "\n  ".join(i18n_gaps),
+                )
+                return True
+
+        # Migration cascade gate. When a model definition file changed but
+        # no migration file is in the patch, the schema change won't be
+        # applied at runtime.
+        if migration_cascade_turns_used < MAX_MIGRATION_CASCADE_TURNS:
+            migration_warnings = _detect_migration_cascade_gap(patch)
+            if migration_warnings:
+                migration_cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_migration_cascade_prompt(migration_warnings, issue),
+                    "MIGRATION_CASCADE_QUEUED:\n  " + "\n  ".join(migration_warnings),
+                )
+                return True
+
         # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
         # FILES the issue mentions; criteria gates on the acceptance-criterion
         # CHECKPOINTS (numbered list / bullets / imperative sentences). The
@@ -2784,10 +3154,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Stub / incomplete-fragment gate. The LLM judge consistently dings
-        # patches for "stub", "incomplete", "// similar logic", "TODO".
-        # Empty bodies look done to a string-match check but the judge sees
-        # them as low-completeness. Demand the real implementation.
+        # Stub / incomplete-fragment gate. Function bodies that contain
+        # only `pass` / `# TODO` / `// similar logic` / `NotImplementedError`
+        # don't actually implement anything; the patch isn't a fix.
+        # Demand the real implementation.
         if stub_fix_turns_used < MAX_STUB_FIX_TURNS:
             stub_hits = _detect_stub_fragments(patch)
             if stub_hits:
@@ -2800,9 +3170,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Idiom gate. The SYSTEM_PROMPT calls out unrolled-statements as
-        # "severely penalized" by the judge but never enforced it. Detector
-        # finds runs of 3+ same-shape `+` lines and queues a refactor turn.
+        # Idiom gate. Runs of 3+ same-shape consecutive statements are
+        # almost always a loop in disguise. Detector finds them and queues
+        # a refactor-to-loop turn.
         if idiom_fix_turns_used < MAX_IDIOM_FIX_TURNS:
             unrolled = _detect_unrolled_runs(patch)
             if unrolled:
@@ -2995,7 +3365,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
+                        "to verify correctness — a passing test is the strongest evidence the fix actually works.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
