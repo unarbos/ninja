@@ -2316,6 +2316,68 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 """
 
 
+# v75: issue-body code block + error-literal extraction.
+# Many bug reports include the EXACT code snippet showing the bug or the
+# verbatim error string the user hit. Surfacing those at the top of the
+# preloaded context — separately from prose — gives the model precise
+# anchor patterns to grep against, instead of inferring from natural language.
+_ISSUE_CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9+_-]+)?\n(.*?)```", re.DOTALL)
+_ISSUE_ERROR_LITERAL_RE = re.compile(r'["“‘]([^"”’\n]{18,160})["”’]')
+_ISSUE_OUTPUT_LINE_PREFIXES = ("$", ">>>", "# ", "=== ", "----")
+_ISSUE_CODE_BLOCK_BUDGET = 1500
+_ISSUE_CODE_BLOCK_PER = 600
+_ISSUE_CODE_BLOCK_MAX = 4
+_ISSUE_ERROR_LITERAL_MAX = 5
+
+
+def _extract_issue_code_blocks(issue_text: str) -> List[str]:
+    """v75: pull triple-backtick code/diff/python blocks from issue body.
+
+    Skips pure shell-session/output dumps (lines starting with $, >>>, ===)
+    so we don't waste prompt budget on stack traces the model already saw
+    inline. Caps at 4 blocks × 600 chars each, total 1500 chars budget.
+    """
+    blocks: List[str] = []
+    used = 0
+    for m in _ISSUE_CODE_BLOCK_RE.finditer(issue_text):
+        block = m.group(1).strip("\n")
+        first_line = block.lstrip().splitlines()[0] if block.strip() else ""
+        if any(first_line.startswith(p) for p in _ISSUE_OUTPUT_LINE_PREFIXES):
+            continue
+        chunk = block[:_ISSUE_CODE_BLOCK_PER]
+        if used + len(chunk) > _ISSUE_CODE_BLOCK_BUDGET:
+            break
+        blocks.append(chunk)
+        used += len(chunk)
+        if len(blocks) >= _ISSUE_CODE_BLOCK_MAX:
+            break
+    return blocks
+
+
+def _extract_issue_error_literals(issue_text: str) -> List[str]:
+    """v75: pull quoted strings 18–160 chars long, excluding plain code
+    identifiers and PR/issue tags. These are likely error messages, log
+    lines, or config keys the model can grep for verbatim."""
+    seen: set = set()
+    out: List[str] = []
+    for m in _ISSUE_ERROR_LITERAL_RE.finditer(issue_text):
+        literal = m.group(1).strip()
+        if not literal or literal in seen:
+            continue
+        # Skip pure identifiers / file paths the symbol-grep already covers.
+        if literal.startswith("#") or literal.startswith(("/", "./", "https://")):
+            continue
+        # Need at least one space — single-token strings are usually identifiers
+        # or paths the existing symbol/path extractors handle.
+        if " " not in literal:
+            continue
+        seen.add(literal)
+        out.append(literal)
+        if len(out) >= _ISSUE_ERROR_LITERAL_MAX:
+            break
+    return out
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2325,6 +2387,28 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    # v75: surface high-signal anchors from the issue body. Code blocks come
+    # first because they show the EXACT shape the fix needs to land at; error
+    # literals second because they're verbatim grep targets pointing at the
+    # raise/log site.
+    code_blocks = _extract_issue_code_blocks(issue)
+    error_literals = _extract_issue_error_literals(issue)
+    anchor_section = ""
+    if code_blocks or error_literals:
+        anchor_lines: List[str] = ["", "Issue body anchors (use as direct grep targets):"]
+        if code_blocks:
+            anchor_lines.append("Code/diff blocks:")
+            for block in code_blocks:
+                anchor_lines.append("```")
+                anchor_lines.append(block)
+                anchor_lines.append("```")
+        if error_literals:
+            anchor_lines.append("Error/log literals (grep these verbatim to find the raise/log site):")
+            for literal in error_literals:
+                anchor_lines.append(f"  - {literal!r}")
+        anchor_lines.append("")
+        anchor_section = "\n".join(anchor_lines)
+
     return f"""Fix this issue:
 
 {issue}
@@ -2332,12 +2416,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
+{context_section}{anchor_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately. v75: when the issue body anchors above include code blocks or error literals, grep for those verbatim — they're the highest-signal pointers to the fix site.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
