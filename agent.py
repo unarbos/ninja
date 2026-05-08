@@ -98,12 +98,12 @@ MAX_COMMANDS_PER_RESPONSE = 12
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
-# Hardcoded -- not user-tunable. The PR Scope Guard's env-var allowlist
+# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 -- multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -124,7 +124,7 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 # real history. The validator clones the real repo with full git history; the
 # pilot stages snapshots with one synthetic commit so this is a no-op locally
 # but high-leverage live. Cursor's reference patches ARE recent commits in this
-# codebase's style -- showing the model 1-2 actual examples teaches the codebase's
+# codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
@@ -804,7 +804,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) -- the helper returns "" and we add nothing.
+    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -814,7 +814,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files -- only treat as
+                              # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
@@ -1147,7 +1147,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
     Used by the coverage-nudge refinement turn to tell the model concretely
     which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" -- surfacing
+    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
     the gap to the model directly is the cheapest way to close it.
     """
     required = _extract_issue_path_mentions(issue_text)
@@ -1172,7 +1172,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 # back as (path:line: msg) strings so the syntax-fix prompt can quote them.
 
 
-_SYNTAX_TIMEOUT = 6  # per-file cap -- enough for `node --check` on big files
+_SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
 
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1198,7 +1198,7 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
-    """`node --check file.js` -- bytecode parse only, no execution.
+    """`node --check file.js` — bytecode parse only, no execution.
 
     Skips the check entirely when `node` is unavailable; we'd rather miss a
     syntax issue than waste 10 seconds on a NotFound retry.
@@ -1236,10 +1236,10 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # Languages where ' is unambiguously a string delimiter. The brace-balance
 # parser below treats ' as a string-mode toggle, which produces false
 # positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala -- `'X'` is a character literal
+#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
 #     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust -- `'a` is a lifetime annotation
-#   - Go -- `'X'` is a rune literal
+#   - Rust — `'a` is a lifetime annotation
+#   - Go — `'X'` is a rune literal
 # Net effect of including those: a single `'X'` in any function would yield
 # a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
 # to JS-family + Swift, where ' is a real string delimiter.
@@ -1252,7 +1252,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
     The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" -- issues a real compiler would catch. This naive
+    "duplicate brace" — issues a real compiler would catch. This naive
     counter ignores braces inside string and comment context (best-effort)
     and reports an imbalance with file + count delta.
     """
@@ -1384,7 +1384,7 @@ def _shell_quote(value: str) -> str:
 # the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python -- the most common shapes.
+    # Python — the most common shapes.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
@@ -1393,7 +1393,7 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "test/{stem}_test.py"),
     ("{stem}.py", "test/test_{stem}.py"),
     ("{stem}.py", "{dir}/{stem}_test.py"),
-    # TypeScript / JavaScript -- Jest / Vitest conventions.
+    # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
@@ -1405,7 +1405,7 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "tests/{stem}.test.js"),
     ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages -- single canonical convention each.
+    # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
@@ -1462,7 +1462,7 @@ def _run_companion_test(
     Languages handled:
       - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
         the failure when output indicates pytest itself isn't importable
-        (ModuleNotFoundError) -- that's not a real test failure.
+        (ModuleNotFoundError) — that's not a real test failure.
       - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
         they require project-level config we can't synthesize in 8s on an
         unknown repo.
@@ -1472,7 +1472,7 @@ def _run_companion_test(
     so the refinement chain doesn't queue a fix for something the agent can't
     actually act on. The whole gate is best-effort.
 
-    Pairs with build_test_fix_prompt -- when this returns a non-None failure
+    Pairs with build_test_fix_prompt — when this returns a non-None failure
     tail, that tail is fed back to the model as one extra refinement turn.
     Companion-test execution was scaffolded by previous king alexlange1 (the
     constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
@@ -1601,7 +1601,7 @@ def _recent_commit_examples(repo: Path) -> str:
             return ""
         shas = [s.strip() for s in proc.stdout.splitlines() if s.strip()]
         if len(shas) < 2:
-            return ""  # single synthetic commit (pilot) -- silent no-op
+            return ""  # single synthetic commit (pilot) — silent no-op
         examples: List[str] = []
         budget_used = 0
         for sha in shas:
@@ -1655,7 +1655,7 @@ def _recent_commit_examples(repo: Path) -> str:
         if not examples:
             return ""
         return (
-            "\n\nRECENT REFERENCE PATCHES from this codebase (style anchors -- "
+            "\n\nRECENT REFERENCE PATCHES from this codebase (style anchors — "
             "match the shape, scale, and conventions of these real recent "
             "commits when writing your patch):\n\n" + "\n\n".join(examples)
         )
@@ -1681,13 +1681,13 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     """Pull acceptance-criterion checkpoints from the issue text.
 
     Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `-`) first; fallback to imperative sentences (must/should/implement/add/
+    `•`) first; fallback to imperative sentences (must/should/implement/add/
     support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
     so the nudge prompt stays compact."""
     if not issue_text:
         return []
     bullets: List[str] = []
-    bullet_re = re.compile(r"^\s*(?:[-*-]|\d+[.)])\s+(.+?)\s*$")
+    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
     for line in issue_text.splitlines():
         m = bullet_re.match(line)
         if not m:
@@ -1729,7 +1729,7 @@ def _criterion_keywords(criterion: str) -> List[str]:
 # substring check on the natural-language form misses these matches and
 # inflates the criteria-nudge false-positive rate. Stripping the suffix
 # (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language <-> identifier gap.
+# matching `react`) bridges the natural-language ↔ identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
@@ -1780,7 +1780,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # -----------------------------
 #
 # `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough -- a one-line bug fix often
+# overlap. For multi-file repos that's not enough — a one-line bug fix often
 # names a function or class without mentioning the file. We extract identifier-
 # shaped tokens from the issue and grep the repo for them; files that contain
 # those identifiers get a context-rank boost.
@@ -1871,8 +1871,8 @@ def _symbol_grep_hits(
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity -- how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge -- scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
+2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
 
 Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
 
@@ -1900,21 +1900,21 @@ brief summary of what changed
 - One-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
 - Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1-3 lines need changing
+- Never rewrite an entire function when only 1–3 lines need changing
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available -- NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
-## Scope discipline -- what to change
+## Scope discipline — what to change
 
 ## Pre-edit analysis (mandatory)
 
-**ROOT CAUSE TRACE (state this FIRST before any code):**
+**ROOT CAUSE TRACE (state this FIRST, before any code):**
   SYMPTOM: What is the observable failure? (one sentence)
   ROOT CAUSE LOCATION: Exact file + function + line that needs changing
   FILES TO CHANGE: All files requiring edits (not just the primary)
@@ -1923,7 +1923,7 @@ brief summary of what changed
 
 **ACCEPTANCE CRITERIA SWEEP:**
 Extract EVERY requirement from the issue -- explicit, implicit, edge cases.
-List them as: [x] Req 1: ... [x] Req 2: ... [x] Req 3: ...
+List them as: [ ] Req 1: ... [ ] Req 2: ... [ ] Req 3: ...
 Check each against your planned diff before outputting. Missing any one = score drop.
 
 **WIRING COMPLETENESS (user-visible changes only):**
@@ -1937,18 +1937,18 @@ Missing one case = same score as not implementing.
 
 **ZERO-CHURN FINAL SCAN:**
 Before emitting <final>, for each file in your diff:
-[x] Did ROOT CAUSE TRACE identify it as needed? If NO and it's not a required call site -> REMOVE IT.
-[x] Remove: whitespace-only edits, comment-only edits, unrelated enum values.
+[ ] Did ROOT CAUSE TRACE identify it as needed? If NO and it's not a required call site -> REMOVE IT.
+[ ] Remove: whitespace-only edits, comment-only edits, unrelated enum values.
 Both judges penalize churn. Sonnet judge penalizes it severely.
 
-Study the issue precisely -- fix the ROOT CAUSE, not just the symptom:
-- "Fix X in function Y" -> change only function Y
-- "Add feature Z to class C" -> add only what Z requires inside C
-- "Bug when condition Q" -> fix the condition that causes it, do not restructure
+Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
+- "Fix X in function Y" → change only function Y
+- "Add feature Z to class C" → add only what Z requires inside C
+- "Bug when condition Q" → fix the condition that causes it, do not restructure
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
-## Scope discipline -- what NOT to change
+## Scope discipline — what NOT to change
 
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
@@ -1959,7 +1959,7 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
-## Idiomatic refactors -- CRITICAL for judge score
+## Idiomatic refactors — CRITICAL for judge score
 
 When converting a bulk operation into individual operations (e.g.
 `createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
@@ -1986,7 +1986,9 @@ score.
 
 ## Language-specific completeness rules
 
-**Java:** Write complete method bodies -- never use '// similar logic' stubs.
+**Python:** Check all call sites when modifying keyword-argument functions. Match existing import style. Never leave `pass` or `# TODO` stubs.
+
+**Java:** Write complete method bodies — never use '// similar logic' stubs.
 Cascade all call-site changes when modifying signatures. Include all imports.
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed
@@ -1995,11 +1997,10 @@ function. Include full signatures and all required #include changes.
 **TypeScript/C#:** Cascade interface and type changes to ALL implementing
 classes, components, and function parameters. Missing one = lower score.
 
-**Go/Rust:** Update EVERY struct field usage site after struct changes. For Rust: provide complete lifetime annotations on modified functions. For Go: update every file importing the changed package's types.
+**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
+annotations on modified functions.
 
-**Python:** When modifying a function with keyword arguments, check all call sites for compatibility. When subclassing, update `__init__` and call `super().__init__()` if parent changes. Match existing import style. Never leave `pass` or `# TODO` stubs.
-
-**Multi-file tasks:** Complete ALL affected files in the same diff -- never
+**Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
 
 ## Style matching
@@ -2008,7 +2009,7 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 ## Preloaded snippets
 
-Preloaded files are the most likely edit targets. Edit them directly -- do not re-read them.
+Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
 
 ## Safety
 
@@ -2020,7 +2021,7 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets (already read for you -- do not re-read):
+Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
 """
@@ -2033,11 +2034,11 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them -- the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
-If the preloaded snippets show the target code, edit them directly -- do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
@@ -2066,7 +2067,7 @@ def build_budget_pressure_prompt(step: int) -> str:
         )
     return (
         "Hard budget check: still no patch. "
-        "Your next command MUST make a code change -- even a best-effort minimal edit to the most obvious location. "
+        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
         "Do not read files or run tests until after a patch exists. "
         "Use `sed -i` or a python one-liner to make the targeted edit now."
     )
@@ -2081,7 +2082,7 @@ def build_polish_prompt(junk_summary: str) -> str:
     revert and what to keep.
     """
     return (
-        "Cleanup pass -- your draft contains hunks that hurt diff quality:\n"
+        "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
         f"  {junk_summary}\n\n"
         "Revert ONLY those hunks (sed/cat/python to restore the original "
         "lines). Do not add new edits, do not refactor, do not reorder "
@@ -2107,11 +2108,11 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
     The LLM diff judge most often docks king for incomplete coverage. When the
     issue names specific files and the draft skips them, surface that gap
-    directly -- much cheaper than hoping the self-check catches it.
+    directly — much cheaper than hoping the self-check catches it.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
-        "Coverage gap -- the task explicitly mentions these path(s) but your "
+        "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
         "Open each of those paths now (cat -n) and then issue the edit "
@@ -2133,17 +2134,17 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference -- review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight -- high impact):\n"
+        "with the reference — review your patch against all three:\n\n"
+        "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight -- high impact):\n"
+        "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight -- medium impact):\n"
+        "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2179,7 +2180,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
-        "Criterion-coverage gap -- these acceptance-criterion checkpoints from "
+        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
         "the task are NOT clearly reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
         "For each one, decide:\n"
@@ -2206,7 +2207,7 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     return (
         "EMERGENCY: after all refinement attempts your patch is still empty. "
         "An empty patch scores 0% on the validator's similarity AND on the LLM "
-        "judge -- both rubrics expect actual code edits. Every other miner in "
+        "judge — both rubrics expect actual code edits. Every other miner in "
         "this round will beat you on this task by default if you submit empty.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
@@ -2215,8 +2216,8 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
         "TARGETED CODE CHANGE in that file. Even a partially-wrong guess "
         "scores some Jaccard similarity against the reference. An empty patch "
-        "scores zero. Do NOT change file modes / permissions -- those count as "
-        "empty. Do NOT add comments only -- those also count as empty. Make a "
+        "scores zero. Do NOT change file modes / permissions — those count as "
+        "empty. Do NOT add comments only — those also count as empty. Make a "
         "real code edit, then <final> immediately."
     )
 
@@ -2312,7 +2313,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
-# Main agent (v28 -- multi-shot wrapper around _solve_inner)
+# Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2418,14 +2419,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
-            0. hail-mary -- patch empty after everything: force one real edit
-            1. polish -- drop low-signal hunks the model still emitted
-            2. syntax -- quote any parser error back at the model
-            3. test -- actually run the companion test if one exists; if it
+            0. hail-mary — patch empty after everything: force one real edit
+            1. polish — drop low-signal hunks the model still emitted
+            2. syntax — quote any parser error back at the model
+            3. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge -- name issue-mentioned paths still untouched
-            5. criteria-nudge -- name issue acceptance bullets not addressed
-            6. self-check -- show the diff and ask "did you cover everything?"
+            4. coverage-nudge — name issue-mentioned paths still untouched
+            5. criteria-nudge — name issue acceptance bullets not addressed
+            6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
@@ -2433,7 +2434,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # v20 edge -- close the architectural hole at the empty-patch early
+        # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
@@ -2515,7 +2516,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # FILES the issue mentions; criteria gates on the acceptance-criterion
         # CHECKPOINTS (numbered list / bullets / imperative sentences). The
         # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues -- surfacing the unaddressed
+        # the king loses on multi-bullet issues — surfacing the unaddressed
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
@@ -2646,7 +2647,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
-                            break  # refinement queued -- re-enter outer loop next iteration
+                            break  # refinement queued — re-enter outer loop next iteration
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
                         break
@@ -2658,7 +2659,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched -- keep working instead of accepting.
+                            # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
                             break
@@ -2691,13 +2692,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness -- the LLM judge rewards passing tests.\n"
+                        "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
-                        "edit commands in your next response -- all files at once, covering EVERY requirement "
+                        "edit commands in your next response — all files at once, covering EVERY requirement "
                         "in the issue. Use sed or python -c for surgical edits."
                     )
                 messages.append({"role": "user", "content": observation_text})
