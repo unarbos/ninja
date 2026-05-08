@@ -1557,6 +1557,72 @@ _CRITICAL_TAG_RE = re.compile(
 )
 
 
+# Duplicate-import detection. Duel #4227 round 6 was lost outright on the
+# rationale "King had fatal duplicate import" — same import line emitted twice
+# after a sed/heredoc mishap. ast.parse and node --check happily accept this
+# (it's syntactically valid), so the existing _check_syntax gate misses it. We
+# scan touched .py / .ts / .tsx / .js / .jsx / .mjs / .cjs files for repeated
+# import statements at line granularity and surface them through the syntax-
+# fix turn so the model can drop the duplicate before <final>.
+_DUP_IMPORT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_PY_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+[\w.]+\s+import\s+.+|import\s+[\w.,\s]+(?:\s+as\s+\w+)?)\s*(?:#.*)?$"
+)
+_JS_IMPORT_RE = re.compile(r"^\s*import\s+.+\s*;?\s*$")
+_JS_REQUIRE_RE = re.compile(
+    r"^\s*(?:const|let|var)\s+[\w{}\s,:.]+\s*=\s*require\([\"'][^\"']+[\"']\)\s*;?\s*$"
+)
+
+
+def _check_duplicate_imports_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag identical import lines repeated in a touched source file.
+
+    Conservative: matches lines verbatim (after whitespace + trailing-`;`
+    normalisation), so re-imports of different symbols from the same module
+    never trip it. Only the first three duplicates are surfaced — that's
+    enough signal for the model to dedupe the whole file in one pass.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in _DUP_IMPORT_SUFFIXES:
+        return None
+    if suffix == ".py":
+        matchers = (_PY_IMPORT_RE,)
+    else:
+        matchers = (_JS_IMPORT_RE, _JS_REQUIRE_RE)
+
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not source:
+        return None
+
+    seen: Dict[str, int] = {}
+    duplicates: List[str] = []
+    for lineno, raw in enumerate(source.splitlines(), 1):
+        if not any(rx.match(raw) for rx in matchers):
+            continue
+        key = " ".join(raw.strip().split())
+        if key.endswith(";"):
+            key = key[:-1].rstrip()
+        if key in seen:
+            duplicates.append(
+                f"line {lineno} duplicates line {seen[key]}: {key[:80]}"
+            )
+        else:
+            seen[key] = lineno
+    if duplicates:
+        return f"{relative_path}: duplicate import(s) — " + "; ".join(duplicates[:3])
+    return None
+
+
 def _check_critical_tag_removals(patch: str) -> List[str]:
     """Detect removed top-level closing HTML/Vue tags without matching adds.
 
@@ -1650,6 +1716,13 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         corruption = _check_corruption_one(repo, relative_path)
         if corruption:
             errors.append(corruption)
+
+        # Duplicate-import check — catches the duel #4227 round 6 failure mode
+        # ("King had fatal duplicate import"); ast.parse / node --check accept
+        # it as valid syntax so the per-language gates above miss it.
+        dup_imports = _check_duplicate_imports_one(repo, relative_path)
+        if dup_imports:
+            errors.append(dup_imports)
 
     # Patch-level structural integrity (Vue/HTML closing tags). Cheap; runs once.
     errors.extend(_check_critical_tag_removals(patch))
@@ -2275,6 +2348,28 @@ annotations on modified functions.
 
 **Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
+
+## Integration completeness — wire what you add
+
+A new file or top-level symbol that nothing imports is dead code; the judge
+treats it as incomplete even when the file's own contents are right. In the
+SAME diff:
+- Register new files in the entry point that consumes them (`__init__.py`,
+  `index.ts`, route tables, exports section, `mod.rs`, `main.go`).
+- Import or call new top-level symbols from at least one existing site so
+  the new code is actually reachable.
+- Wire new CLI subcommands / API endpoints into the router or arg parser.
+
+## Reuse existing identifiers — no duplicate imports
+
+When the codebase already has a method, class, or field name for the
+concept you're touching, REUSE it. A one-line `grep -n` finds the existing
+name. Renaming a working identifier while changing its body looks like an
+unrequested refactor and loses correctness + alignment points.
+
+After edits, scan each touched file for repeated `import` / `from ... import`
+/ `import ... from "..."` / `require(...)` lines and remove duplicates —
+the judge treats duplicate imports as a hard correctness defect.
 
 ## Style matching
 
