@@ -2189,7 +2189,7 @@ def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
     return last_fail
 
 
-def _build_multishot_memo(result: Dict[str, Any], issue: str, repo: Path) -> Dict[str, Any]:
+def _build_multishot_memo(result: Dict[str, Any], repo: Path, issue: str) -> Dict[str, Any]:
     patch = result.get("patch", "") or ""
     syntax_errors = _check_syntax(repo, patch) if patch.strip() else []
     return {
@@ -2308,7 +2308,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _memo_kw: Dict[str, Any] = dict(kwargs)
         if _multishot_repo_obj is not None:
-            _memo_kw["_multishot_memo"] = _build_multishot_memo(_result1, _issue_text, _multishot_repo_obj)
+            _memo_kw["_multishot_memo"] = _build_multishot_memo(_result1, _multishot_repo_obj, _issue_text)
         _result2 = _solve_attempt(**_memo_kw)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
