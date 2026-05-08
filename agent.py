@@ -115,6 +115,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_VISIBLE_SURFACE_NUDGES = 1  # catch visible feature patches that only edit support code
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -848,6 +849,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
+    files = _augment_with_named_scope(repo, files, tracked_set, issue)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
@@ -877,6 +879,47 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+def _augment_with_named_scope(repo: Path, files: List[str], tracked_set: set[str], issue: str) -> List[str]:
+    """If an issue names a project/subdir, prioritize files inside that scope."""
+    issue_lower = issue.lower()
+    scope_prefixes: List[str] = []
+
+    for match in re.finditer(r"\bproject\s+([A-Za-z0-9_-]{2,})\b", issue, flags=re.IGNORECASE):
+        name = match.group(1).strip("/")
+        for prefix in (f"projects/{name}/", f"project/{name}/", f"{name}/"):
+            if any(path.startswith(prefix) for path in tracked_set):
+                scope_prefixes.append(prefix)
+
+    for mention in _extract_issue_path_mentions(issue):
+        parts = Path(mention.strip("./")).parts
+        if len(parts) >= 2:
+            prefix = "/".join(parts[:2]) + "/"
+            if any(path.startswith(prefix) for path in tracked_set):
+                scope_prefixes.append(prefix)
+
+    if not scope_prefixes:
+        return files
+
+    scope_prefixes = list(dict.fromkeys(scope_prefixes))
+    terms = set(_issue_terms(issue))
+    scoped: List[str] = []
+    for path in sorted(tracked_set):
+        if not _context_file_allowed(path):
+            continue
+        if not any(path.startswith(prefix) for prefix in scope_prefixes):
+            continue
+        lower = path.lower()
+        name = Path(path).name.lower()
+        if any(term in lower for term in terms) or re.search(r"(app|main|index|draw|editor|code|blob|shader)", name):
+            scoped.append(path)
+
+    ordered: List[str] = []
+    for path in scoped + files:
+        if path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -2152,6 +2195,34 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+def _visible_surface_missing(issue_text: str, patch: str) -> bool:
+    """UI/task asks for rendered behavior but patch only touched support code."""
+    issue_lower = issue_text.lower()
+    if not re.search(
+        r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
+        r"panel|control|slider|simulator|simulation|editor|appointment|booking|"
+        r"workshop|taller|resident|apartment)\b",
+        issue_lower,
+    ):
+        return False
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return False
+    ui_re = re.compile(
+        r"(^|/)(app|main|index)\.(jsx|tsx|js|ts)$|"
+        r"(^|/)(pages?|views?|components?|screens?)/.*\.(jsx|tsx|js|ts)$",
+        re.IGNORECASE,
+    )
+    if any(ui_re.search(path) for path in changed):
+        return False
+    support_only = all(
+        re.search(r"(^|/)(stores?|hooks?|services?|api|lib|types?|models?|utils?)/", path, re.IGNORECASE)
+        or path.endswith((".json", ".sql", ".md", ".css"))
+        for path in changed
+    )
+    return support_only
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2271,7 +2342,7 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection. Never concatenate many large files with `cat`; use `rg` for names and one focused `sed -n 'start,endp' file` range.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -2492,6 +2563,31 @@ def build_budget_pressure_prompt(step: int) -> str:
     )
 
 
+def _oversized_context_dump_reason(command: str) -> Optional[str]:
+    """Reject unfocused whole-repo/file dumps before any patch exists."""
+    for raw_line in command.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line or line.startswith("#") or ">" in line or "<<" in line:
+            continue
+        if re.match(r"^cat\s+", lowered):
+            tokens = [
+                token for token in re.split(r"\s+", line)[1:]
+                if token and not token.startswith("-") and not re.search(r"[|;&$()]", token)
+            ]
+            if len(tokens) > 3:
+                return (
+                    "Blocked unfocused context dump. Do not concatenate many files; "
+                    "use one focused rg/sed range or edit from preloaded snippets."
+                )
+        if re.match(r"^grep\s+-n\s+(['\"]{2}|''|\"\")\s+", lowered) and len(re.split(r"\s+", line)) > 5:
+            return (
+                "Blocked whole-file grep dump. Inspect one focused range or edit "
+                "from preloaded snippets."
+            )
+    return None
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -2633,6 +2729,21 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_visible_surface_nudge_prompt(issue_text: str) -> str:
+    return (
+        "Visible-feature gap — the task asks for rendered controls, a page, "
+        "dashboard, form, simulator, or workflow, but your patch only changes "
+        "supporting state/config/service files.\n\n"
+        "Patch the component/page/view that renders the requested behavior now. "
+        "Use the existing UI architecture and the smallest edit: wire the "
+        "visible control/list/empty-state/submit usage required by the issue. "
+        "Do not rewrite unrelated components.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "Then end with <final>summary</final>."
     )
 
 
@@ -2840,6 +2951,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    visible_surface_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2878,7 +2990,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2976,6 +3088,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
+
+        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
+            visible_surface_nudges_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_visible_surface_nudge_prompt(issue),
+                "VISIBLE_SURFACE_NUDGE_QUEUED",
+            )
+            return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -3093,7 +3215,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                block_reason = _oversized_context_dump_reason(command) if not get_patch(repo).strip() else None
+                if block_reason:
+                    result = CommandResult(
+                        command=command,
+                        exit_code=1,
+                        stdout="",
+                        stderr=block_reason,
+                        duration_sec=0.0,
+                        blocked=True,
+                    )
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
