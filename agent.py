@@ -148,8 +148,12 @@ DANGEROUS_PATTERNS = [
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ncat(?:\s|$))",
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?scp(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?rsync(?:\s|$))",
+    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?telnet(?:\s|$))",
     r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
 
@@ -729,6 +733,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+    Tradeoff note for next forkers: this variant intentionally does NOT append
+    a `_project_hint_block`. In live runs, broad config dumps (package.json,
+    pyproject, CI YAML, Makefiles) consumed preloaded budget and displaced
+    source/test snippets that are usually higher-signal for patch similarity.
+    Re-add project hints only if you also raise context budget or tighten hint
+    extraction enough to avoid crowding out likely edit targets.
     """
     files = _rank_context_files(repo, issue)
     if not files:
