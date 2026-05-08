@@ -2215,7 +2215,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 5
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
@@ -2675,7 +2675,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 4, 6}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -2725,20 +2725,22 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "exception",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
+    # Anchored patterns to avoid false positives (e.g. "ok" inside "broken", "mocked")
+    good_patterns = [
+        r"\d+\s+passed",
+        r"\ball\s+passed\b",
+        r"\bsuccess\b",
+        r"\bok\b",
+        r"\btest\s+passed\b",
+        r"\btests\s+passed\b",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(re.search(p, lower) for p in good_patterns)
+    # Check bad markers only if exit code is zero, to avoid false positives from non-test commands that print "error" or "failed" in their normal output.
     has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
-        has_bad = True
 
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
@@ -2764,6 +2766,10 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bmake\s+(test|check|lint)\b",
         r"\bruff\b",
         r"\beslint\b",
+        r"\bbundle\s+exec\s+rspec\b",
+        r"\brspec\b",
+        r"\bdotnet\s+test\b",
+        r"\bphp\s+artisan\s+test\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
