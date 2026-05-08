@@ -55,6 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -103,7 +104,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
+WALL_CLOCK_BUDGET_SECONDS = 120.0  # manual tighten: 180 still saw 5/10 timeouts on subnet-tight tasks (120-246s). 100s leaves ≥20s of cleanup headroom even at the 120s minimum subnet timeout so a partial patch flushes before validator kill.
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -116,6 +117,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_APPLY_CHECK_TURNS = 1  # verify patch applies cleanly; exempt from total cap like hail-mary
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -574,6 +576,40 @@ def get_patch(repo: Path) -> str:
     return _strip_low_signal_hunks(cleaned)
 
 
+def _validate_patch_applies(repo: Path, patch: str) -> Optional[str]:
+    """Write patch to a temp file and run git apply --check --3way.
+
+    Returns the stderr tail (≤600 chars) when the patch would fail to apply,
+    or None when it applies cleanly. An unapplyable patch is a guaranteed
+    zero-score round — catching it here lets the model fix it before <final>.
+    """
+    if not patch.strip():
+        return None  # empty patch handled by hail-mary gate
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+            f.write(patch)
+            tmp = f.name
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "--check", "--3way", tmp],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                return None
+            tail = (proc.stderr or proc.stdout or "").strip()
+            return tail[-600:] if tail else "git apply --check failed (no output)"
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except Exception as exc:
+        return f"patch-apply check error: {exc}"
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -732,6 +768,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -745,6 +788,22 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_notificacoes`) are deliberate signals from the task author about
+    # the code surface that matters. When they pick out a small specific set
+    # of tracked files by path-substring, treat those files as explicit
+    # mentions so they get the same +100 ranking boost as path-mentioned
+    # files. Skipped when the identifier matches too many files (filters out
+    # generic identifiers like `basic.py` or `any2txt`).
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1221,12 +1280,79 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_toml_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Parse a TOML file using tomllib (stdlib ≥3.11). Silent no-op on older Python."""
+    try:
+        import tomllib  # stdlib in 3.11+
+    except ModuleNotFoundError:
+        return None
+    full = (repo / rel).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        with open(full, "rb") as f:
+            tomllib.load(f)
+        return None
+    except Exception as exc:
+        return f"{rel}: TOML parse error: {str(exc)[:200]}"
+
+
+def _check_yaml_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Best-effort YAML syntax check. Returns None when no parser is available."""
+    full = (repo / rel).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    # No stdlib YAML parser; graceful pass-through when PyYAML is absent.
+    return None
+
+
+def _check_go_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Run gofmt -l -e on a Go file. Silent no-op when gofmt is not on PATH."""
+    if not _has_executable("gofmt"):
+        return None
+    proc = subprocess.run(
+        ["gofmt", "-l", "-e", rel],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc.returncode != 0 and (proc.stderr or "").strip():
+        return f"{rel}: gofmt error: {proc.stderr.strip()[:300]}"
+    return None
+
+
+def _check_rust_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Run rustc parse-check on a Rust file. Silent no-op when rustc is absent."""
+    if not _has_executable("rustc"):
+        return None
+    proc = subprocess.run(
+        ["rustc", "--edition=2021", "--emit=metadata", "-o", "/dev/null", rel],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip()[-300:]
+        return f"{rel}: rustc error: {tail}" if tail else None
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed
+    through (matches the existing convention for unknown suffixes).
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1243,6 +1369,14 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+        elif suffix == ".toml":
+            result = _check_toml_syntax_one(repo, relative_path)
+        elif suffix in {".yml", ".yaml"}:
+            result = _check_yaml_syntax_one(repo, relative_path)
+        elif suffix == ".go":
+            result = _check_go_syntax_one(repo, relative_path)
+        elif suffix == ".rs":
+            result = _check_rust_syntax_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
@@ -1613,6 +1747,28 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
+# Verb/noun suffixes commonly used in acceptance-criterion English that don't
+# appear in source-code identifiers. The criteria say "clicking", "loads",
+# "selection", "displayed", "correctly"; the corresponding code uses
+# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
+# substring check on the natural-language form misses these matches and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix
+# (with a minimum-stem length to avoid false positives like `action`->`act`
+# matching `react`) bridges the natural-language ↔ identifier gap.
+_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+
+
+def _keyword_in_added(keyword: str, added_lower: str) -> bool:
+    if keyword in added_lower:
+        return True
+    for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
+        if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
+            if keyword[:-len(suffix)] in added_lower:
+                return True
+            break
+    return False
+
+
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -1638,7 +1794,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if not keywords:
             continue
         # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
+        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
@@ -2060,6 +2216,25 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_apply_check_prompt(stderr_tail: str, patch: str) -> str:
+    """When git apply --check fails, quote the failure and ask for a corrective edit."""
+    truncated_patch = (
+        patch if len(patch) <= 3000 else patch[:1500] + "\n...[truncated]...\n" + patch[-1000:]
+    )
+    return (
+        "Apply-check failed — your current patch does NOT apply cleanly to the repo:\n\n"
+        "```\n"
+        f"{stderr_tail}\n"
+        "```\n\n"
+        "This means the validator's `git apply` will reject it and score the round at zero.\n\n"
+        "Current patch:\n```diff\n"
+        f"{truncated_patch}\n```\n\n"
+        "Diagnose the conflict (context lines that no longer match, header offset wrong, "
+        "hunk applied twice, etc.) and issue the corrective <command> blocks to fix the "
+        "underlying files so the diff applies. Then end with <final>summary</final>."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2085,7 +2260,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # v43: raised from 90 — never start a retry unless we have at least one full attempt budget (180s) left, so the retry can't push us past the validator's soft cap.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 120.0  # manual tighten paired with WALL_CLOCK_BUDGET_SECONDS = 100; same headroom rationale.
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2178,12 +2353,6 @@ def solve(
     patches at zero — any non-empty diff beats empty. Production data shows
     50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
     the safety net converts those to "whatever partial work survived".
-
-    v44: smart-skip the multi-shot retry when the first attempt already
-    covers every file path the issue explicitly mentions. Counting only
-    substantive added lines (threshold=3) treats a correct 1-2 line surgical
-    fix the same as a whiff and burns a 180s retry on a patch that was
-    already on-target. The path-coverage guard lets these through.
     """
     return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
@@ -2204,7 +2373,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
+        _multishot_total_budget = 280.0  # manual tighten: fits two 100s attempts + 20s overhead, well under most subnet timeouts (120-600s).
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
         _result1 = _solve_attempt(**kwargs)
@@ -2215,24 +2384,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        # v44: keep first attempt if it's non-empty AND the issue named at
-        # least one file path AND the patch covers every named path. The
-        # substantive-line count alone treats a correct surgical fix as a
-        # whiff; the path-coverage guard distinguishes "small and on-target"
-        # from "small and missed the mark". Without any named path we fall
-        # through to the retry as before — the original logic is the safer
-        # default when the issue doesn't anchor to a specific file.
-        _issue_text = kwargs.get("issue", "") or ""
-        _required_paths = _extract_issue_path_mentions(_issue_text)
-        if (
-            _patch1.strip()
-            and _required_paths
-            and _patch_covers_required_paths(_patch1, _issue_text)
-        ):
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "covers_issue_paths"
-            return _result1
-
         _elapsed = time.monotonic() - _multishot_started
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
@@ -2241,7 +2392,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _result2 = _solve_attempt(**{**kwargs, "retry_pass": True})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2278,6 +2429,25 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+def _adaptive_max_steps(issue_text: str, default: int) -> int:
+    """Scale the step budget to issue complexity.
+
+    Trivial single-line fixes need fewer exploration turns; multi-criterion
+    feature issues need more. Heuristic: bullet count, file path mentions,
+    and raw length each contribute one complexity point.
+    """
+    text = issue_text or ""
+    bullet_count = len(re.findall(r"^\s*[-*\d]+[.)\s]", text, re.MULTILINE))
+    path_mentions = len(re.findall(r"\b[\w./-]+\.(py|js|ts|tsx|go|rs|java|rb)\b", text))
+    length = len(text)
+    score = bullet_count + path_mentions + (1 if length > 1500 else 0)
+    if score >= 4:
+        return min(default + 8, 40)   # complex — give extra steps
+    if score <= 1 and length < 400:
+        return max(default - 8, 18)   # trivial — exit earlier, save refinement budget
+    return default
+
+
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     """Original solve loop, callable through kwargs to avoid re-stating the
     validator-protected parameter signature outside of solve()."""
@@ -2289,6 +2459,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    retry_pass: bool = bool(kwargs.get("retry_pass", False))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2302,15 +2473,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    apply_check_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    # Retry pass gets one extra refinement slot (first attempt already used some budget).
+    _max_refinements = MAX_TOTAL_REFINEMENT_TURNS + (1 if retry_pass else 0)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-
-    def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
-
-    def out_of_time() -> bool:
-        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2339,7 +2507,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, apply_check_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2357,9 +2525,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
+        # Apply-check gate: verify the patch would actually apply cleanly.
+        # Exempt from the total cap (same rationale as hail-mary — an
+        # unapplyable patch is a guaranteed zero regardless of content).
+        if apply_check_turns_used < MAX_APPLY_CHECK_TURNS:
+            apply_err = _validate_patch_applies(repo, patch)
+            if apply_err:
+                apply_check_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_apply_check_prompt(apply_err, patch),
+                    "APPLY_CHECK_QUEUED: patch fails git apply --check",
+                )
+                return True
+
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+        if total_refinement_turns_used >= _max_refinements:
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -2438,7 +2620,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+        if self_check_turns_used < MAX_SELF_CHECK_TURNS and not retry_pass:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
@@ -2456,9 +2638,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        max_steps = _adaptive_max_steps(issue, max_steps)
+
+        system_content = SYSTEM_PROMPT
+        if retry_pass:
+            system_content = (
+                "RETRY ATTEMPT — diverge from prior: assume the first edit set was wrong; "
+                "do not repeat the same file targets unless the issue explicitly names them. "
+                "Be more aggressive about deletions and replacements.\n\n"
+                + system_content
+            )
 
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
@@ -2466,14 +2658,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            if out_of_time():
-                logs.append(
-                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
-                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
-                    "exiting loop early to return whatever patch we have."
-                )
-                break
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
@@ -2493,7 +2677,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
+                    if retry_attempt < MAX_STEP_RETRIES:
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2511,7 +2695,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3 or out_of_time():
+                if consecutive_model_errors >= 3:
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
