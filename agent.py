@@ -2224,15 +2224,33 @@ def _multishot_count_substantive(patch: str) -> int:
         return 0
     n = 0
     for line in patch.splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
             continue
         body = line[1:].strip()
         if not body:
             continue
         if _line_is_comment(body):
             continue
+        # Retry signal should track meaningful code edits, not pure formatting.
+        if not any(ch.isalnum() for ch in body):
+            continue
         n += 1
     return n
+
+
+def _multishot_patch_score(patch: str) -> Tuple[int, int]:
+    """Score a patch for multi-shot selection.
+
+    Primary objective: prefer patches with more substantive code edits.
+    Secondary objective: prefer patches with fewer low-signal hunks (blank /
+    whitespace / comment-only) that tend to hurt judge score.
+
+    Returned tuple is ordered so normal tuple comparison works: higher is better.
+    """
+    substantive = _multishot_count_substantive(patch)
+    junk = _diff_low_signal_summary(patch)
+    junk_count = 0 if not junk else len([p for p in junk.split("; ") if p.strip()])
+    return (substantive, -junk_count)
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2254,7 +2272,7 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
             subprocess.run(["git", "reset", "--hard", head],
                            cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
         else:
-            subprocess.run(["git", "checkout", "."],
+            subprocess.run(["git", "reset", "--hard"],
                            cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
         subprocess.run(["git", "clean", "-fd"],
                        cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
@@ -2316,30 +2334,39 @@ def solve(
     _result1 = _solve_attempt(**_multishot_args)
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
+    _score1 = _multishot_patch_score(_patch1)
 
     if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
         _result1["multishot_attempts"] = 1
+        _result1["multishot_score_primary"] = _score1
         return _result1
 
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
         _result1["multishot_skipped_retry"] = "insufficient_time"
+        _result1["multishot_score_primary"] = _score1
         return _result1
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args)
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
+    _score2 = _multishot_patch_score(_patch2)
 
-    if _n2 >= _n1:
+    _result1["multishot_score_primary"] = _score1
+    _result2["multishot_score_retry"] = _score2
+
+    if _score2 >= _score1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        applied = _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        if not applied:
+            _result1["multishot_apply_patch_failed"] = True
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
     return _result1
@@ -2457,7 +2484,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            # Avoid burning wall-clock budget on tests when we're close to the
+            # validator's soft cap. Instead of stopping all refinements, just
+            # skip the test gate and allow coverage/criteria/self-check to run.
+            remaining_for_test = time_remaining() - WALL_CLOCK_RESERVE_SECONDS - 2.0
+            if remaining_for_test >= 2.0:
+                failure = _select_companion_test_failure(
+                    repo,
+                    patch,
+                    test_timeout_seconds=max(2, min(8, int(remaining_for_test))),
+                )
+            else:
+                failure = None
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
