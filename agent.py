@@ -578,8 +578,36 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
+    # v54: after the block-level mode-only stripper drops files whose ENTIRE
+    # change is a mode change, also strip standalone `old mode / new mode`
+    # metadata lines from any block that has BOTH content edits AND a mode
+    # change. The block-level stripper alone leaves those lines intact; the
+    # LLM judge consistently flags them as "unrelated chmod churn outside
+    # scope" in close-call rounds. Order matters: do block-level first, then
+    # line-level — otherwise a pure mode-only block becomes an orphan
+    # `diff --git` header and slips past the block-level pattern.
     cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+_MODE_METADATA_LINE_RE = re.compile(r"^(?:old|new) mode \d+$")
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Remove top-level `old mode NNNNNN` / `new mode NNNNNN` lines from
+    the diff. These are git metadata, not functional content; `git apply`
+    ignores them. Anchored regex so context lines that happen to contain
+    the text "old mode 100644" inside a hunk are preserved.
+    """
+    if not diff_output:
+        return diff_output
+    out_lines: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        if _MODE_METADATA_LINE_RE.match(line.rstrip("\r\n")):
+            continue
+        out_lines.append(line)
+    return "".join(out_lines)
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -2235,6 +2263,33 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+def _multishot_quality(patch: str, issue_text: str) -> int:
+    """v55 quality-weighted score for the multi-shot retry tiebreaker.
+
+    The original tiebreaker (`n2 >= n1`) compares only substantive added
+    lines. A retry can have MORE lines but cover FEWER acceptance
+    criteria — and that worse patch wins the tiebreaker. The quality
+    score adds two on-target signals:
+
+      - +20 if the patch covers every file path the issue named
+      - +5 per acceptance-criterion bullet that looks addressed
+
+    Tuned so a small but on-target patch (covers paths, addresses
+    criteria) beats a larger but off-target patch.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    if _patch_covers_required_paths(patch, issue_text):
+        base += 20
+    criteria = _extract_acceptance_criteria(issue_text)
+    if criteria:
+        missing = _unaddressed_criteria(patch, issue_text)
+        addressed = max(0, len(criteria) - len(missing))
+        base += addressed * 5
+    return base
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -2321,6 +2376,23 @@ def solve(
         _result1["multishot_attempts"] = 1
         return _result1
 
+    # v55: keep first attempt if it's non-empty AND the issue named at least
+    # one file path AND the patch covers every named path. The substantive-
+    # line count alone treats a correct surgical fix as a whiff; the path-
+    # coverage guard distinguishes "small and on-target" from "small and
+    # missed the mark". Without any named path we fall through to the retry
+    # as before — the original logic is the safer default when the issue
+    # does not anchor to a specific file.
+    _required_paths = _extract_issue_path_mentions(issue)
+    if (
+        _patch1.strip()
+        and _required_paths
+        and _patch_covers_required_paths(_patch1, issue)
+    ):
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "covers_issue_paths"
+        return _result1
+
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
@@ -2330,11 +2402,17 @@ def solve(
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args)
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    # v55: tiebreak on quality, not just substantive line count. The line
+    # count alone lets a larger but off-target retry beat a smaller but
+    # on-target first attempt — exactly the kind of swap that drives the
+    # primary-passes-but-confirmation-fails variance seen in re-evals.
+    _q1 = _multishot_quality(_patch1, issue)
+    _q2 = _multishot_quality(_patch2, issue)
+    if _q2 >= _q1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_quality"] = (_q1, _q2)
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
