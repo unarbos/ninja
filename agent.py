@@ -704,6 +704,15 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
     "Cargo.toml",
     "jest.config.js",
     "vitest.config.ts",
+    "requirements.txt",
+    "Dockerfile",
+    "Gemfile",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "mix.exs",
+    "pubspec.yaml",
 )
 
 
@@ -1907,6 +1916,8 @@ brief summary of what changed
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+**Pre-final completeness check**: before emitting `<final>`, mentally verify each acceptance criterion in the issue maps to a hunk in your current diff. If the issue names a specific function, file path, component, or behavior that you haven't touched, fix it now — don't ship the gap. Most judge "missing N of M criteria" complaints come from skipping one or two bullets in a multi-bullet issue.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
