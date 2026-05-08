@@ -91,7 +91,7 @@ MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -123,7 +123,7 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
 # pilot stages snapshots with one synthetic commit so this is a no-op locally
-# but high-leverage live. Cursor's reference patches ARE recent commits in this
+# but high-leverage live. Recent commits are concrete examples of this
 # codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
@@ -135,6 +135,7 @@ _RECENT_COMMIT_BLOCK_BUDGET = 4500
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
+    r"\brm\s+",
     r"\bsudo\b",
     r"\bshutdown\b",
     r"\breboot\b",
@@ -146,7 +147,10 @@ DANGEROUS_PATTERNS = [
     r"\biptables\b",
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
+    r"\bchmod\s+",
     r"\bchmod\s+-R\s+777\s+/",
+    r"\bgit\s+reset\s+--hard\b",
+    r"\bgit\s+clean\b",
     r"\bcurl\b",
     r"\bwget\b",
     r"\bscp\b",
@@ -639,17 +643,23 @@ TEXT_FILE_EXTENSIONS = {
     ".cpp",
     ".cs",
     ".css",
+    ".env",
+    ".gradle",
     ".go",
+    ".graphql",
     ".h",
     ".hpp",
     ".html",
     ".java",
     ".js",
     ".jsx",
+    ".lock",
     ".json",
     ".kt",
     ".md",
     ".php",
+    ".properties",
+    ".proto",
     ".py",
     ".rb",
     ".rs",
@@ -666,6 +676,13 @@ TEXT_FILE_EXTENSIONS = {
     ".xml",
     ".yaml",
     ".yml",
+}
+
+TEXT_FILE_BASENAMES = {
+    "Dockerfile",
+    "Gemfile",
+    "Makefile",
+    "Podfile",
 }
 
 CONTEXT_SKIP_PARTS = {
@@ -704,6 +721,54 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
     "Cargo.toml",
     "jest.config.js",
     "vitest.config.ts",
+)
+
+_INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
+    "api",
+    "app",
+    "client",
+    "component",
+    "components",
+    "config",
+    "controller",
+    "controllers",
+    "context",
+    "db",
+    "form",
+    "handler",
+    "handlers",
+    "layout",
+    "migration",
+    "migrations",
+    "model",
+    "models",
+    "page",
+    "pages",
+    "repository",
+    "repositories",
+    "route",
+    "routes",
+    "router",
+    "schema",
+    "schemas",
+    "screen",
+    "screens",
+    "service",
+    "services",
+    "store",
+    "types",
+    "view",
+    "views",
+)
+
+_INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
+    "Dockerfile",
+    "Makefile",
+    "build.gradle",
+    "docker-compose.yml",
+    "package.json",
+    "pyproject.toml",
+    "settings.gradle",
 )
 
 
@@ -763,7 +828,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Two improvements over a vanilla rank-and-read loop:
+    Three improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -775,6 +840,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+      3. A small number of integration partners (routes, API helpers, schemas,
+         migrations, UI entry points, package/build files) are appended after
+         the direct hits. This improves file targeting on feature tasks without
+         displacing the primary target files.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -782,6 +852,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_integration_partners(files, tracked_set, issue)
 
     parts: List[str] = []
     used = 0
@@ -887,6 +958,99 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     return ranked
 
 
+def _split_path_tokens(relative_path: str) -> set:
+    """Lower-case path/name tokens used for cheap related-file discovery."""
+    tokens: set = set()
+    for part in Path(relative_path).parts:
+        for token in re.findall(r"[a-z0-9]+", part.lower()):
+            if len(token) >= 3:
+                tokens.add(token)
+    return tokens
+
+
+def _looks_like_integration_surface(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.name in _INTEGRATION_ROOT_FILES:
+        return True
+    tokens = _split_path_tokens(relative_path)
+    return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Append a few likely integration files after direct hits and tests.
+
+    The agent was already good at finding the local function named by an issue,
+    but duel losses showed repeated misses in adjacent wiring: routes, API
+    clients, schemas, migrations, UI entry pages, and build metadata. This keeps
+    the direct ranking intact and only appends high-confidence neighbors.
+    """
+    if not files or not tracked:
+        return files
+
+    seen = set(files)
+    anchors = files[:6]
+    anchor_dirs = {
+        str(Path(p).parent).replace("\\", "/")
+        for p in anchors
+        if str(Path(p).parent) not in {"", "."}
+    }
+    anchor_top_dirs = {
+        Path(p).parts[0]
+        for p in anchors
+        if Path(p).parts
+    }
+    anchor_tokens = set()
+    for path in anchors:
+        anchor_tokens.update(_split_path_tokens(path))
+
+    issue_tokens = set(_issue_terms(issue))
+    issue_symbols = {s.lower() for s in _extract_issue_symbols(issue, max_symbols=16)}
+    signal_tokens = {t for t in (anchor_tokens | issue_tokens | issue_symbols) if len(t) >= 4}
+    root_file_wanted = bool(
+        issue_tokens
+        & {
+            "build", "cli", "config", "dependency", "dependencies", "docker",
+            "package", "script", "setup", "workflow",
+        }
+    )
+
+    candidates: List[Tuple[int, str]] = []
+    for relative_path in sorted(tracked):
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        if not _looks_like_integration_surface(relative_path):
+            continue
+
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        parent = str(path.parent).replace("\\", "/")
+        parts = path.parts
+        score = 0
+
+        if parent in anchor_dirs:
+            score += 6
+        if parts and parts[0] in anchor_top_dirs:
+            score += 3
+        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
+        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
+        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
+            score += 5
+        if "test" in path_lower or "spec" in path_lower:
+            score -= 2  # companion-test loading already handles tests.
+
+        if score >= 6:
+            candidates.append((score, relative_path))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:4]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+    return augmented
+
+
 def _tracked_files(repo: Path) -> List[str]:
     try:
         proc = subprocess.run(
@@ -912,18 +1076,23 @@ def _context_file_allowed(relative_path: str) -> bool:
         return False
     if name_lower.startswith(".env") or name_lower in SECRETISH_PARTS or parts_lower & SECRETISH_PARTS:
         return False
-    if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
+    if path.name not in TEXT_FILE_BASENAMES and path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
         return False
     return True
 
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|env|go|gradle|graphql|h|hpp|html|java|js|jsx|json|kt|lock|md|php|properties|proto|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w/-]|\.[A-Za-z0-9])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
     for match in pattern.finditer(issue):
+        value = match.group(1).strip("`'\"()[]{}:,;")
+        if value and value not in mentions:
+            mentions.append(value)
+    basename_pattern = re.compile(r"(?<![\w./-])(" + "|".join(re.escape(name) for name in TEXT_FILE_BASENAMES) + r")(?![\w./-])")
+    for match in basename_pattern.finditer(issue):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
@@ -1586,9 +1755,8 @@ def _recent_commit_examples(repo: Path) -> str:
     this is a silent no-op locally and a real lift live where the validator
     clones the upstream repo with full history.
 
-    The model imitates concrete examples better than abstract rules. Cursor's
-    reference patch IS a one-off commit in this codebase's style; showing the
-    model 1-2 real recent commits gives it the same anchor."""
+    The model imitates concrete examples better than abstract rules. Showing the
+    model 1-2 real recent commits gives it a concise local style anchor."""
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1870,11 +2038,9 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are a surgical coding agent. Produce a patch that is correct, complete for the task, semantically aligned with the existing code, and low-churn.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+Reviewers reward the same core behaviour: identify the root cause, fix it precisely and completely, preserve existing intent, and add nothing else.
 
 ## Command format
 
@@ -1890,11 +2056,13 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one makes the solution incomplete.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. For multi-file work, include the integration point for each requirement (route/controller/API client/schema/migration/UI entry/config/test) or explicitly say why no integration point is needed. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block AND its call/wiring point. If a preloaded snippet is truncated around the edit site, inspect only the narrow missing range before editing. Do not loop on inspection.
+
+**Align semantically**: match the task's requested behaviour, not just its keywords. Preserve public APIs, data shapes, error types, ordering, and compatibility unless the issue explicitly asks to change them.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -1904,7 +2072,9 @@ brief summary of what changed
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+**Integration targeting**: when a task changes user-visible behaviour, API shape, persistence, routing, build/CLI wiring, or shared types, update the required integration files in the same patch. Common required companions are routes/controllers, clients/services, schemas/types, migrations/snapshots, page/screen entry points, package/build config, and tests. Do not stop after editing only the local helper if the behaviour is exposed elsewhere.
+
+**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects the expected behaviour.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
@@ -1930,17 +2100,17 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
-## Idiomatic refactors — CRITICAL for judge score
+## Idiomatic refactors — critical for patch quality
 
 When converting a bulk operation into individual operations (e.g.
 `createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
 loop. NEVER emit unrolled, copy-pasted statements.
 
-GOOD (judge prefers):
+GOOD:
     const items = [{...}, {...}, {...}]
     for (const data of items) await prisma.X.create({ data })
 
-BAD (judge severely penalizes):
+BAD:
     await prisma.X.create({ data: {...} })
     await prisma.X.create({ data: {...} })
     ... (repeated)
@@ -1952,8 +2122,8 @@ comprehension, or `.map()`.
 
 Preserve EVERY comment from the surrounding code unless the task explicitly
 removes it. Section-grouping comments (`// Member 1 availability`) are
-high-signal to the judge. Removing comments while refactoring tanks judge
-score.
+high-signal to maintainers. Removing comments while refactoring hurts
+alignment with the surrounding code.
 
 ## Language-specific completeness rules
 
@@ -1969,8 +2139,9 @@ classes, components, and function parameters. Missing one = lower score.
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
 annotations on modified functions.
 
-**Multi-file tasks:** Complete ALL affected files in the same diff — never
-leave a related file partially edited. When in doubt, include more files.
+**Multi-file tasks:** Complete ALL genuinely affected files in the same diff —
+never leave a related file partially edited, but do not broaden the patch beyond
+the task's behaviour.
 
 ## Style matching
 
@@ -1978,11 +2149,11 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 ## Preloaded snippets
 
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+Preloaded files are the most likely edit targets. Use them directly when they show the full target context; otherwise inspect only the missing nearby lines. Some snippets are integration partners, not mandatory edit targets; use them to avoid missing required wiring, but leave them unchanged when the issue does not require that surface.
 
 ## Safety
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+No sudo. No file deletion. No chmod. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
 """
 
 
@@ -2003,11 +2174,11 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is often rooted in ONE specific function or block, but many tasks also require a wiring surface. Identify the root edit and any required integration point (route/controller/API client/schema/migration/UI entry/config/test), then make the minimal complete change while preserving existing behaviour outside the issue.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the complete target code and required integration point, edit them directly — do not re-read or run broad searches first. If the target or wiring is unclear/truncated, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
@@ -2045,8 +2216,8 @@ def build_budget_pressure_prompt(step: int) -> str:
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
-    The LLM judge frequently penalises patches for "unrelated changes",
-    "unnecessary churn", and "cosmetic edits". Be explicit about which
+    Reviewers penalise patches for "unrelated changes", "unnecessary churn",
+    and "cosmetic edits". Be explicit about which
     classes of changes count as scope creep so the model knows what to
     revert and what to keep.
     """
@@ -2057,8 +2228,7 @@ def build_polish_prompt(junk_summary: str) -> str:
         "lines). Do not add new edits, do not refactor, do not reorder "
         "imports, do not touch unrelated lines.\n\n"
         "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (the diff judge consistently penalises these as "
-        "'unrelated' or 'unnecessary churn'):\n"
+        "your draft (these are consistently treated as unrelated churn):\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
         "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
@@ -2075,9 +2245,9 @@ def build_polish_prompt(junk_summary: str) -> str:
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
-    The LLM diff judge most often docks king for incomplete coverage. When the
-    issue names specific files and the draft skips them, surface that gap
-    directly — much cheaper than hoping the self-check catches it.
+    Incomplete coverage is common on multi-file tasks. When the issue names
+    specific files and the draft skips them, surface that gap directly — much
+    cheaper than hoping the self-check catches it.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
@@ -2102,18 +2272,21 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Review your patch for correctness, completeness, semantic alignment, "
+        "low churn, and safe engineering behaviour:\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - If behaviour is exposed through routes, API clients, schemas/types, migrations, UI pages, package/build config, or tests, did you update those integration points too?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SEMANTIC ALIGNMENT + SCOPE:\n"
+        "  - Existing public APIs, data shapes, ordering, and error semantics are preserved unless the task changes them\n"
+        "  - The patch solves the task's intended behaviour, not only keyword overlap\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2125,7 +2298,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
+        "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
     )
 
 
@@ -2143,9 +2316,9 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
-    The LLM judge frequently dings the king for "missing N of M criteria" on
-    multi-bullet issues. The path-coverage gate sees files; this gate sees the
-    criterion checkpoints themselves and surfaces them with the original text.
+    Multi-bullet issues often fail because one criterion is skipped. The
+    path-coverage gate sees files; this gate sees the criterion checkpoints
+    themselves and surfaces them with the original text.
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
@@ -2168,26 +2341,21 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
     early-exit ('if not patch.strip(): return False'), which silently accepted
-    empty patches and cost ~10% of rounds in the live duel that promoted this
-    king. An empty patch has Jaccard = 0 against any non-empty reference; a
-    plausible-but-wrong edit has Jaccard > 0 with non-zero probability.
-    Convert the worst case from a guaranteed forfeit into a guess."""
+    empty patches. The emergency turn still requires a task-supported code edit;
+    it must not guess blindly or touch unrelated files."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "EMERGENCY: after all refinement attempts your patch is still empty. "
-        "An empty patch scores 0% on the validator's similarity AND on the LLM "
-        "judge — both rubrics expect actual code edits. Every other miner in "
-        "this round will beat you on this task by default if you submit empty.\n\n"
+        "EMERGENCY: after all refinement attempts your patch is still empty, "
+        "so the task is not solved yet.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
-        "Make ONE plausible code edit consistent with the issue. Pick the most "
-        "likely target file from the preloaded snippets (or one focused grep). "
+        "Make ONE task-supported code edit consistent with the issue. Pick the most "
+        "likely target file from the preloaded snippets, or use one focused grep if the target is still unclear. "
         "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
-        "TARGETED CODE CHANGE in that file. Even a partially-wrong guess "
-        "scores some Jaccard similarity against the reference. An empty patch "
-        "scores zero. Do NOT change file modes / permissions — those count as "
-        "empty. Do NOT add comments only — those also count as empty. Make a "
-        "real code edit, then <final> immediately."
+        "TARGETED CODE CHANGE in that file. Do NOT change file modes or permissions. "
+        "Do NOT delete files. Do NOT add comments only. If no safe edit is supported "
+        "by the issue and visible code, inspect one narrow range, then make the smallest "
+        "root-cause fix you can justify and <final> immediately."
     )
 
 
@@ -2661,7 +2829,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
+                        "to verify correctness — passing tests are strong evidence for the final patch.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
