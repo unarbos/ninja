@@ -210,8 +210,7 @@ class AgentResult:
             "cost": self.cost,
             "success": self.success,
         }
-
-
+    
 # -----------------------------
 # Utility
 # -----------------------------
@@ -227,7 +226,6 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
-
 
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
@@ -267,7 +265,6 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
     }
     return [*head, note, *tail]
 
-
 def _normalize_api_base(api_base: str) -> str:
     base = api_base.rstrip("/")
     if base.endswith("/chat/completions"):
@@ -275,7 +272,6 @@ def _normalize_api_base(api_base: str) -> str:
     if base.endswith("/v1"):
         return base
     return base + "/v1"
-
 
 def _resolve_inference_config(
     model: Optional[str],
