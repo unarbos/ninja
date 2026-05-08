@@ -103,8 +103,6 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
-WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -116,7 +114,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  
+MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -187,18 +185,9 @@ class AgentResult:
 # Utility
 # -----------------------------
 
-_TRACEBACK_MARKERS = ("Traceback (most recent", "panic:", "FAIL\t", "error TS", "error[E", "  at ", "FAILED\n", "FAILED ")
-
-
-def _looks_like_traceback(text: str) -> bool:
-    return any(marker in text for marker in _TRACEBACK_MARKERS)
-
-
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    if _looks_like_traceback(text):
-        return "...[head dropped]...\n" + text[-max_chars:]
     half = max_chars // 2
     return (
         text[:half]
@@ -741,6 +730,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -754,6 +750,22 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_notificacoes`) are deliberate signals from the task author about
+    # the code surface that matters. When they pick out a small specific set
+    # of tracked files by path-substring, treat those files as explicit
+    # mentions so they get the same +100 ranking boost as path-mentioned
+    # files. Skipped when the identifier matches too many files (filters out
+    # generic identifiers like `basic.py` or `any2txt`).
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1622,6 +1634,28 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
+# Verb/noun suffixes commonly used in acceptance-criterion English that don't
+# appear in source-code identifiers. The criteria say "clicking", "loads",
+# "selection", "displayed", "correctly"; the corresponding code uses
+# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
+# substring check on the natural-language form misses these matches and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix
+# (with a minimum-stem length to avoid false positives like `action`->`act`
+# matching `react`) bridges the natural-language ↔ identifier gap.
+_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+
+
+def _keyword_in_added(keyword: str, added_lower: str) -> bool:
+    if keyword in added_lower:
+        return True
+    for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
+        if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
+            if keyword[:-len(suffix)] in added_lower:
+                return True
+            break
+    return False
+
+
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -1647,7 +1681,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if not keywords:
             continue
         # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
+        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
@@ -1665,10 +1699,15 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
 _SYMBOL_STOP = {
-    "a", "an", "and", "as", "at", "be", "but", "by", "did", "do", "for",
-    "from", "had", "has", "have", "if", "in", "is", "it", "its", "not",
-    "of", "on", "or", "so", "than", "that", "the", "then", "this", "to",
-    "was", "we", "with",
+    "about", "after", "alert", "argument", "before", "build", "called", "change",
+    "check", "class", "code", "command", "config", "context", "default", "expect",
+    "expected", "fail", "false", "field", "fields", "file", "files", "fix",
+    "fixed", "function", "given", "global", "header", "headers", "import",
+    "issue", "method", "module", "needed", "needs", "object", "params", "parse",
+    "path", "patch", "production", "project", "property", "public", "remove",
+    "reset", "return", "should", "static", "string", "support", "test", "tests",
+    "their", "there", "thing", "this", "true", "type", "types", "update",
+    "using", "value", "values", "when", "with", "will", "without", "write",
 }
 
 
@@ -1868,6 +1907,32 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    # Pre-parsed checklists from the issue. The same heuristics power the
+    # later coverage-nudge and criteria-nudge refinement turns; surfacing
+    # them here on turn 1 lets the model bake them into its plan instead
+    # of needing a second-pass nudge to recover the same gap. The text is
+    # framed as "parsed from the issue" (not authoritative) so the model
+    # is free to reject false positives.
+    criteria = _extract_acceptance_criteria(issue)
+    criteria_block = ""
+    if criteria:
+        bullets = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+        criteria_block = (
+            "\nRequirements parsed from the issue (your patch must satisfy every one — "
+            "missing any is the most common reason patches lose completeness points):\n"
+            f"{bullets}\n"
+        )
+
+    path_mentions = _extract_issue_path_mentions(issue)
+    paths_block = ""
+    if path_mentions:
+        bullets = "\n".join(f"  - {p}" for p in path_mentions[:12])
+        paths_block = (
+            "\nFile paths named in the issue (the most likely edit targets — confirm "
+            "and edit each unless inspection shows it doesn't need a change):\n"
+            f"{bullets}\n"
+        )
+
     return f"""Fix this issue:
 
 {issue}
@@ -1875,16 +1940,18 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{context_section}{criteria_block}{paths_block}
+Before any command, read the ENTIRE issue and walk through every requirement (there may be several). Your patch must satisfy ALL of them — incomplete solutions are scored down hard for completeness.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+In your FIRST response, before any <command> block, emit a short <plan> block that maps each requirement to its target file/function/symbol. Then issue ALL the edit commands needed to satisfy every requirement in the SAME response.
+
+Strategy: the fix is typically in ONE specific function or block per file. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE — not the symptom. Match the surrounding code's exact idioms (variable names, control flow shape, loop vs. unrolled, comment density, brace/quote style) — patches that look like they were written by the same author as the rest of the file score higher.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns. When a source change cascades to a companion test, update the test in the SAME response.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+After patching, run the most targeted real test available (`pytest tests/test_X.py -x -q`, `go test ./...`, `node <test>`, etc.) to verify correctness. A passing functional test is the strongest evidence of correctness; a syntax check alone is not. Then finish with <final>...</final>.
 """
 
 
@@ -2091,28 +2158,6 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test error output."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
-
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -2176,50 +2221,6 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
-def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
-    """Extract the last failing command from attempt logs for the retry memo."""
-    logs_text = result.get("logs", "") or ""
-    last_fail = ""
-    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
-        if "EXIT_CODE:\n" in chunk:
-            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
-            if ec_match and ec_match.group(1) != "0":
-                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
-                if cmd_match:
-                    last_fail = cmd_match.group(1).strip()[:200]
-    return last_fail
-
-
-def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
-    """Summarise attempt 1 so attempt 2 can take a different angle."""
-    patch = result.get("patch", "") or ""
-    return {
-        "attempt1_files_touched": _patch_changed_files(patch),
-        "attempt1_substantive_lines": _multishot_count_substantive(patch),
-        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
-        "attempt1_last_failed_command": _last_failed_commands_summary(result),
-    }
-
-
-def _format_multishot_memo(memo: Dict[str, Any]) -> str:
-    """Render memo as a concise PRIOR ATTEMPT NOTES block for the user prompt."""
-    files = memo.get("attempt1_files_touched") or []
-    lines = memo.get("attempt1_substantive_lines", 0)
-    missing = memo.get("attempt1_unaddressed_paths") or []
-    last_fail = memo.get("attempt1_last_failed_command", "")
-    parts = [
-        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
-        f"  Files touched: {', '.join(files) if files else 'none'}",
-        f"  Substantive lines added: {lines}",
-    ]
-    if missing:
-        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
-    if last_fail:
-        parts.append(f"  Last failing command: {last_fail}")
-    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
-    return "\n".join(parts)
-
-
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2256,12 +2257,7 @@ def solve(
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
-    # Only retry when the patch is empty OR it has too few substantive lines
-    # AND failed to touch any path the issue explicitly mentions. A surgical
-    # 1-2 line fix that covers the required paths is correct — don't discard it.
-    _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
-    if not _should_retry:
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
         _result1["multishot_attempts"] = 1
         return _result1
 
@@ -2272,7 +2268,7 @@ def solve(
         return _result1
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
+    _result2 = _solve_attempt(**_multishot_args)
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
@@ -2300,7 +2296,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-    _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2314,15 +2309,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  
+    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-
-    def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
-
-    def out_of_time() -> bool:
-        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2340,22 +2329,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. coverage-nudge — name issue-mentioned paths still untouched
-            2. criteria-nudge — name issue acceptance bullets not addressed
+            1. polish — drop low-signal hunks the model still emitted
+            2. syntax — quote any parser error back at the model
             3. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. polish — drop low-signal hunks the model still emitted
-            5. syntax — quote any parser error back at the model
+            4. coverage-nudge — name issue-mentioned paths still untouched
+            5. criteria-nudge — name issue acceptance bullets not addressed
             6. self-check — show the diff and ask "did you cover everything?"
-        Judge-half gates (coverage, criteria, companion test) fire before
-        cursor-half gates (polish, syntax) so the two-turn cap is spent on
-        the highest-leverage signals first.
+        Each refinement runs at most once per cycle. Test fires AFTER syntax
+        (we know the patch parses) but BEFORE coverage/criteria/self-check
+        (those are heuristic; test is ground truth from a real runner).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # Hail-mary is exempt from the total-refinement cap: it guards the
-        # only path out of a guaranteed-zero empty-patch result.
+        # v20 edge — close the architectural hole at the empty-patch early
+        # exit. Hail-mary is exempt from the total-refinement cap because
+        # it's the only thing standing between us and a guaranteed-zero
+        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2367,46 +2358,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # Hard-stop when the cap is reached (hail-mary excluded).
+        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
+        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -2432,6 +2387,58 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Companion-test execution gate. The previous king alexlange1 (PR #44)
+        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
+        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
+        # them from solve(). The +1269 line PR #185 rewrite kept the dead
+        # scaffolding without using it. We re-introduce the runtime
+        # correctness signal: if any edited file has a partner test that
+        # actually fails, surface the failure tail to the model as one fix
+        # turn. This is the only refinement step in the chain backed by a
+        # real runner rather than heuristics.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
+        # FILES the issue mentions; criteria gates on the acceptance-criterion
+        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
+        # judge's "missing N of M criteria" complaint is the most common reason
+        # the king loses on multi-bullet issues — surfacing the unaddressed
+        # bullets directly is much cheaper than hoping self-check catches them.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2451,26 +2458,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
-        if _multishot_memo:
-            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _initial_user},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            if out_of_time():
-                logs.append(
-                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
-                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
-                    "exiting loop early to return whatever patch we have."
-                )
-                break
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
@@ -2490,7 +2486,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
+                    if retry_attempt < MAX_STEP_RETRIES:
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2508,7 +2504,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3 or out_of_time():
+                if consecutive_model_errors >= 3:
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
@@ -2599,11 +2595,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                _all_obs_text = observation_text
-                _err_locs = _extract_error_locations(_all_obs_text)
-                if _err_locs and not success:
-                    _loc_lines = "\n".join(f"  - {p}:{ln}" for p, ln in _err_locs)
-                    observation_text += f"\n\nERROR LOCATIONS DETECTED:\n{_loc_lines}\nAddress these on your next response."
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
