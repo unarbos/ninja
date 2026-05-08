@@ -91,9 +91,9 @@ MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_FILES = 8
 MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_COMMANDS_PER_RESPONSE = 16
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,8 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 155.0  # v44 (timeout-safe): cut to 155 to leave ~260s margin per attempt within the 600s validator cap. Production data shows challengers time out 50-56% vs king 18-20%; failing fast and returning whatever patch we have beats burning time and shipping nothing.
+WALL_CLOCK_RESERVE_SECONDS = 25.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -1785,10 +1785,12 @@ def _symbol_grep_hits(
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+1. Cursor similarity: how closely your diff matches the reference in files touched, line regions changed, and tokens added/removed.
+2. LLM judge: scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A correct, complete patch scores high even when similarity is modest.
 
 Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+
+CRITICAL: You have approximately 150 seconds total. Every second counts. Edit fast.
 
 ## Command format
 
@@ -1802,89 +1804,69 @@ Signal completion:
 brief summary of what changed
 </final>
 
-## Workflow
+## Workflow: SPEED IS EVERYTHING
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+Step 1: Decompose the issue mentally. Read the FULL issue. Extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one loses completeness points.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+Step 2: Plan and first edit in ONE response. Emit a short plan block listing each requirement and target file/function. Then IMMEDIATELY issue your edit commands. Do NOT run exploratory greps if the preloaded snippets already show the target code.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+Step 3: Edit surgically. Change ONLY the lines that implement the fix.
+  For one-line fixes: sed -i 's/old/new/' file
+  For small blocks: python3 -c "import pathlib; p=pathlib.Path('file'); t=p.read_text(); p.write_text(t.replace('old block', 'new block'))"
+  For larger edits: a minimal heredoc or Python script
+  NEVER rewrite entire functions when 1-3 lines suffice
+  NEVER use cat to read entire files. Use sed -n 'start,endp' or head/tail instead
 
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+Step 4: Multi-file edits. Emit ALL edit commands for ALL files in ONE response. Never split across turns.
 
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+Step 5: Verify. After patching, run the most targeted test available:
+  Python: python3 -m pytest tests/test_module.py -x -q --tb=short 2>&1 | tail -30
+  Node: npm test 2>&1 | tail -30
+  Go: go test ./... 2>&1 | tail -30
+  If tests fail, fix immediately. Skip ONLY when no runner exists or suite takes over 20s.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+Step 6: Finish. Once correct and complete, emit <final>summary</final>. Do NOT re-read files.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+## Scope discipline: what to change
 
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+Fix the ROOT CAUSE, not just the symptom:
+  "Fix X in function Y" means change only function Y
+  "Add feature Z to class C" means add only what Z requires
+  "Bug when condition Q" means fix the condition, do not restructure
 
-## Scope discipline — what to change
+Use EXACT variable/function/class names from the codebase. Add imports where existing imports are.
 
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
-- "Fix X in function Y" → change only function Y
-- "Add feature Z to class C" → add only what Z requires inside C
-- "Bug when condition Q" → fix the condition that causes it, do not restructure
+## Scope discipline: what NOT to change
 
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+Do not make whitespace-only, comment-only, or blank-line-only edits.
+Do not add imports not needed by your fix.
+Do not add type annotations not already present.
+Do not refactor, rename, or reorder unless the issue asks for it.
+Do not add new helpers unless the issue explicitly requires them.
+Do not add new files unless the issue explicitly requires them.
+Do not touch test files unless required or your change broke them.
+Do not add error handling or logging not directly required.
 
-## Scope discipline — what NOT to change
+## Idiomatic refactors: CRITICAL for judge score
 
-- Whitespace-only, comment-only, or blank-line-only edits
-- Imports not needed by your fix
-- Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
-- Test files unless the issue requires it OR your source change broke an existing test
-- Error handling, logging, or defensive checks not directly required by the fix
+When converting bulk operations to individual ones (e.g. createMany to individual create calls), ALWAYS use a loop. NEVER emit copy-pasted repeated statements.
 
-## Idiomatic refactors — CRITICAL for judge score
+GOOD: for (const data of items) await prisma.X.create({ data })
+BAD: Multiple repeated await prisma.X.create({...}) lines
 
-When converting a bulk operation into individual operations (e.g.
-`createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
-loop. NEVER emit unrolled, copy-pasted statements.
+When 3+ consecutive statements share the same shape, factor into a loop, list comprehension, or map.
 
-GOOD (judge prefers):
-    const items = [{...}, {...}, {...}]
-    for (const data of items) await prisma.X.create({ data })
+## Comment and structure preservation
 
-BAD (judge severely penalizes):
-    await prisma.X.create({ data: {...} })
-    await prisma.X.create({ data: {...} })
-    ... (repeated)
-
-When 3+ consecutive statements share the same shape, factor into a loop, list
-comprehension, or `.map()`.
-
-## Comment + structure preservation
-
-Preserve EVERY comment from the surrounding code unless the task explicitly
-removes it. Section-grouping comments (`// Member 1 availability`) are
-high-signal to the judge. Removing comments while refactoring tanks judge
-score.
+Preserve EVERY comment from surrounding code unless the task explicitly removes it. Section-grouping comments are high-signal to the judge. Removing comments while refactoring tanks judge score.
 
 ## Language-specific completeness rules
 
-**Java:** Write complete method bodies — never use '// similar logic' stubs.
-Cascade all call-site changes when modifying signatures. Include all imports.
-
-**C/C++:** Edit both .h header AND .cpp implementation for each changed
-function. Include full signatures and all required #include changes.
-
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing
-classes, components, and function parameters. Missing one = lower score.
-
-**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
-annotations on modified functions.
-
-**Multi-file tasks:** Complete ALL affected files in the same diff — never
-leave a related file partially edited. When in doubt, include more files.
+Java: Write complete method bodies, never stub. Cascade all call-site changes when modifying signatures. Include all imports.
+C/C++: Edit both .h header AND .cpp implementation. Include full signatures and all required include changes.
+TypeScript/C#: Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one means lower score.
+Go/Rust: Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
+Multi-file tasks: Complete ALL affected files in the same diff. Never leave a related file partially edited. When in doubt, include more files.
 
 ## Style matching
 
@@ -1892,7 +1874,16 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 ## Preloaded snippets
 
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+Preloaded files are your primary edit targets. Edit them DIRECTLY without re-reading. They contain the most likely code to change.
+
+## Anti-patterns that waste your time budget
+
+Do not run cat on entire files (use sed -n or head/tail).
+Do not run broad grep -r across the whole repo (use git grep -l with specific terms).
+Do not read more than 2 files before making your first edit.
+Do not run find to explore directory structure (the repo summary already shows it).
+Do not install packages or run pip/npm install.
+Do not do multiple rounds of reading before editing.
 
 ## Safety
 
@@ -1904,7 +1895,7 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
+Preloaded file snippets (already read, do NOT re-read these files):
 
 {preloaded_context}
 """
@@ -1913,19 +1904,21 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {issue}
 
-Repository summary:
+Repository layout:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+IMPORTANT: Read the ENTIRE issue above. Count every requirement/bullet. Your patch must address ALL of them.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+ACTION PLAN:
+1. The fix is usually in ONE function/block. The preloaded snippets likely contain it.
+2. If the target code is visible above, emit your plan and edit command(s) NOW. No grep needed.
+3. If unclear, run at most ONE focused git grep -n then edit immediately.
+4. Emit ALL edits for ALL files in ONE response. Never split across turns.
+5. After editing, run the most targeted test with output piped to tail -30.
+6. Emit <final>summary</final> when done.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
-
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+Time is extremely limited. Edit first, verify after.
 """
 
 
@@ -1942,11 +1935,17 @@ your command here
 
 
 def build_budget_pressure_prompt(step: int) -> str:
-    if step < 4:
+    if step < 3:
         return (
-            "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "URGENT: No edits yet and time is running out. "
+            "You MUST edit a file NOW using sed or python3 -c based on what you already know. "
+            "Do NOT run any more grep or cat commands. Edit the most likely file IMMEDIATELY."
+        )
+    if step < 5:
+        return (
+            "CRITICAL: Still no patch. You are about to run out of time. "
+            "Issue your edit command RIGHT NOW. Use the preloaded snippets. "
+            "Any edit is better than no edit. A partial fix scores higher than empty."
         )
     return (
         "Hard budget check: still no patch. "
@@ -2243,7 +2242,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
+        _multishot_total_budget = 340.0  # v44: tighter to avoid timeout
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
         _result1 = _solve_attempt(**kwargs)
@@ -2629,7 +2628,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
