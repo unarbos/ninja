@@ -1211,6 +1211,19 @@ _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
 }
 
+# C-style languages where ' is a char-literal delimiter (not a string toggle).
+# A separate parser below (_check_brace_balance_cstyle_one) treats `'X'`,
+# `'\X'`, `'\uXXXX'` etc. as opaque char literals so a stray '}' inside a
+# char literal does not unbalance the count. This catches gross brace
+# imbalances on .cs/.java/.go etc. — the failure mode we saw on king's
+# round 2 of duel #4224 ("Feffusing App.Services;" — sed-mangled C#).
+# Rust is excluded because lifetimes ('a) and raw strings (r"...") need
+# bespoke handling we don't ship; one-off mistakes get caught by the LLM
+# judge instead.
+_CSTYLE_BRACE_BALANCE_SUFFIXES = {
+    ".cs", ".java", ".kt", ".scala", ".c", ".cc", ".cpp", ".h", ".hpp", ".go",
+}
+
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
@@ -1288,12 +1301,247 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`php -l file.php` — lint-only, no execution.
+
+    Addresses king's loss in duel #4224 round 13: invalid PHP method
+    declarations in DashboardIndex went un-caught and the judge rejected
+    the patch. Skips silently when `php` isn't on PATH (we'd rather miss
+    the check than waste timeouts).
+    """
+    if not _has_executable("php"):
+        return None
+    proc_result = run_command(
+        f"php -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code == 0:
+        return None
+    msg = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()[-1] if (proc_result.stderr or proc_result.stdout) else ""
+    return f"{relative_path}: {msg or 'php -l failed'}"
+
+
+def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Brace balance for C-style languages (C#/Java/Kotlin/Go/C/C++/Scala).
+
+    Treats single-quoted char literals as opaque (`'X'`, `'\\n'`, `'\\u00FF'`)
+    so a `'}'` literal does not flip the parser into string mode and produce
+    a phantom imbalance. Falls back to single-char skip when no closing `'`
+    appears within 16 chars (e.g., Go method receivers, stray apostrophe).
+
+    Catches gross structural damage like duel #4224 round 2 ("Feffusing
+    App.Services;" — sed-mangled C# that orphaned a closing brace).
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str = False
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        # Not in string/comment.
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "'":
+            # Char literal: skip ahead to closing ' within a small cap.
+            j = i + 1
+            cap = min(n, i + 16)
+            found = False
+            while j < cap:
+                if source[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if source[j] == "'":
+                    found = True
+                    j += 1
+                    break
+                j += 1
+            if found:
+                i = j
+                continue
+            # Not a balanced char literal — skip just this char.
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
+# Heredoc / shell-prompt markers that must never appear verbatim in source.
+# The LLM judge consistently flags files containing these as "corrupted" and
+# rejects the patch — duel #4224 round 22 lost on this exact failure mode
+# (AmbientBackground file containing shell-script text/EOF markers).
+_CORRUPTION_LINE_RE_LIST: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^EOF\s*$"), "shell heredoc 'EOF' marker leaked into source"),
+    (re.compile(r"^EOM\s*$"), "shell heredoc 'EOM' marker leaked into source"),
+    (re.compile(r"^PYEOF\s*$"), "python heredoc 'PYEOF' marker leaked into source"),
+    (re.compile(r"^\s*cat\s*<<\s*['\"]?[A-Z]+\b"), "shell 'cat <<' command leaked into source"),
+    (re.compile(r"^\s*\$\s+(cat|ls|cd|grep|sed|python|node|git)\b"), "shell prompt leaked into source"),
+)
+
+# File suffixes where heredoc markers can legitimately appear.
+_CORRUPTION_SKIP_SUFFIXES = {".sh", ".bash", ".zsh", ".fish", ".md", ".txt", ".rst"}
+
+
+def _check_corruption_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Detect shell heredoc/prompt markers leaked into source files.
+
+    Catches the failure mode where the agent's own `cat <<EOF ... EOF` heredoc
+    truncated mid-write and left the closing marker embedded in the file, or
+    where shell prompts got pasted into source. Skipped for shell scripts and
+    plain-text files where these tokens are legitimate content.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in _CORRUPTION_SKIP_SUFFIXES:
+        return None
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not source:
+        return None
+    for line_num, line in enumerate(source.splitlines(), 1):
+        for rx, msg in _CORRUPTION_LINE_RE_LIST:
+            if rx.match(line):
+                return f"{relative_path}:{line_num}: {msg}"
+    return None
+
+
+# Critical closing tags whose removal almost always breaks the component.
+# Duel #4224 round 4: king removed </template> closing tag, breaking the Vue
+# component entirely. Round 48: challenger orphaned welcome-screen markup.
+_CRITICAL_TAG_RE = re.compile(
+    r"^\s*</(template|script|style|body|html|head|main|section)>\s*$",
+    re.IGNORECASE,
+)
+
+
+def _check_critical_tag_removals(patch: str) -> List[str]:
+    """Detect removed top-level closing HTML/Vue tags without matching adds.
+
+    Per file: count removed vs added critical closers. If removed > added, the
+    patch is structurally broken. Cheap, high-precision: legitimate refactors
+    almost never delete a `</template>` without immediately re-adding one in
+    the same diff.
+    """
+    if not patch.strip():
+        return []
+    issues: List[str] = []
+    current_file = "?"
+    rmv_counts: Dict[str, int] = {}
+    add_counts: Dict[str, int] = {}
+
+    def flush() -> None:
+        for tag, rmv in rmv_counts.items():
+            add = add_counts.get(tag, 0)
+            if rmv > add:
+                issues.append(
+                    f"{current_file}: removed </{tag}> without matching add "
+                    f"(removed {rmv}, added {add})"
+                )
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            rmv_counts = {}
+            add_counts = {}
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_file = tokens[3][2:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            m = _CRITICAL_TAG_RE.match(line[1:])
+            if m:
+                tag = m.group(1).lower()
+                add_counts[tag] = add_counts.get(tag, 0) + 1
+        elif line.startswith("-") and not line.startswith("---"):
+            m = _CRITICAL_TAG_RE.match(line[1:])
+            if m:
+                tag = m.group(1).lower()
+                rmv_counts[tag] = rmv_counts.get(tag, 0) + 1
+    flush()
+    deduped: List[str] = []
+    seen: set = set()
+    for item in issues:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped[:6]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed
+    through. Includes:
+      - Python ast.parse, JSON loads, `node --check` (.js/.mjs/.cjs)
+      - JS-family + Swift brace balance (' as string delimiter)
+      - C-style brace balance (' as char-literal delimiter): C#/Java/Go/etc.
+      - PHP `php -l` lint when `php` is on PATH
+      - Heredoc-marker corruption check on every touched non-shell file
+      - Patch-level critical-tag-removal check (Vue/HTML structural integrity)
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1310,9 +1558,21 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+        elif suffix in _CSTYLE_BRACE_BALANCE_SUFFIXES:
+            result = _check_brace_balance_cstyle_one(repo, relative_path)
+        elif suffix == ".php":
+            result = _check_php_syntax_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+
+        # Corruption check fires regardless of language (except shells / docs).
+        corruption = _check_corruption_one(repo, relative_path)
+        if corruption:
+            errors.append(corruption)
+
+    # Patch-level structural integrity (Vue/HTML closing tags). Cheap; runs once.
+    errors.extend(_check_critical_tag_removals(patch))
     return errors
 
 
@@ -1938,6 +2198,29 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
 
+## Edit-tool hygiene — DO NOT corrupt files
+
+The LLM judge automatically rejects patches that introduce:
+- **Heredoc markers leaked into source** (a literal `EOF`, `EOM`, or `PYEOF`
+  line embedded in a `.py`/`.ts`/`.cs`/etc. file). When using
+  `cat <<EOF >file ... EOF`, the closing `EOF` MUST be on its own line with
+  no leading whitespace. After any heredoc write, IMMEDIATELY run
+  `tail -n5 file` to confirm no marker leaked.
+- **Removed closing tags** without a matching addition. Never delete
+  `</template>`, `</script>`, `</style>`, `</body>`, `</html>`, or the final
+  `}` of a class/function unless you are also adding a replacement in the
+  same diff. Removing a closing tag breaks the entire component.
+- **Garbled identifiers from sed corruption** (e.g., a global `s/X/Y/`
+  accidentally consumed adjacent characters). When using `sed -i`, prefer
+  unique anchors and use the `c` flag or `python -c "p.write_text(...)"`
+  for multi-line replacements. Run `grep -n` to confirm the change applied
+  correctly and `head` the file to spot corruption.
+- **`await` outside an `async` function** in JS/TS — verify the enclosing
+  function is `async` before adding `await`.
+- **Calling type-specific methods on the wrong type** — e.g., `.plus(...)`
+  on a native number after migrating off `big.js`. After type migration,
+  grep for the old method names to find unmigrated call sites.
+
 ## Safety
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
@@ -2116,13 +2399,35 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
-    """Quote a parser's error output back at the model and demand a minimal repair."""
+    """Quote a parser's error output back at the model and demand a minimal repair.
+
+    Errors may include:
+      - Real syntax/parse errors (Python ast, node --check, php -l, JSON)
+      - Brace imbalance counts on TS/JSX/Swift and C-style languages
+      - Heredoc-marker corruption (a literal `EOF` line embedded in source)
+      - Removed-closing-tag (Vue/HTML) without matching add
+
+    Each of these maps to a different fix recipe, so the prompt walks them
+    explicitly. Most of these failure modes were the deciding factor in
+    rounds the previous king lost in duel #4224.
+    """
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
-        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
-        "Issue the smallest possible fix command(s) to restore parseable code. "
-        "Do NOT introduce new edits, do NOT refactor. Then end with "
-        "<final>summary</final>."
+        f"Structural / syntax check failed on touched file(s):\n  {bullets}\n\n"
+        "Diagnose and repair each item with the SMALLEST possible fix:\n"
+        "  - 'parse failure' / 'SyntaxError' / 'php -l': fix the literal "
+        "syntax error at the reported line.\n"
+        "  - 'brace imbalance': add the missing closer or remove the extra "
+        "one — `tail -n20 <file>` to inspect the end, then sed/python to "
+        "fix.\n"
+        "  - 'heredoc EOF marker leaked': delete the orphan `EOF` / `EOM` / "
+        "`PYEOF` line (`sed -i '/^EOF$/d' <file>`). Then `tail -n5 <file>` "
+        "to confirm clean end-of-file.\n"
+        "  - 'removed </template>' / '</script>' / etc. without matching "
+        "add: re-add the closing tag at the correct position. The file is "
+        "probably missing its component-root closer.\n\n"
+        "Do NOT introduce new edits, do NOT refactor, do NOT touch unrelated "
+        "lines. Then end with <final>summary</final>."
     )
 
 
