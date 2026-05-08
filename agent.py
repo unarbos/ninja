@@ -118,6 +118,7 @@ MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look una
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
+_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -2149,76 +2150,6 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
-def _multishot_should_retry_533(
-    repo: Optional[Path],
-    patch1: str,
-    n1: int,
-    issue_text: str,
-) -> bool:
-    """Merge v533-v44 path-skip with syntax-driven retry (552-style delta)."""
-    if not patch1.strip():
-        return True
-    syntax_errors: List[str] = []
-    if repo is not None:
-        syntax_errors = _check_syntax(repo, patch1)
-    if syntax_errors:
-        return True
-    if n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        return False
-    required = _extract_issue_path_mentions(issue_text)
-    if patch1.strip() and required and _patch_covers_required_paths(patch1, issue_text):
-        return False
-    return True
-
-
-def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
-    logs_text = result.get("logs", "") or ""
-    last_fail = ""
-    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
-        if "EXIT_CODE:\n" in chunk:
-            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
-            if ec_match and ec_match.group(1) != "0":
-                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
-                if cmd_match:
-                    last_fail = cmd_match.group(1).strip()[:200]
-    return last_fail
-
-
-def _build_multishot_memo(result: Dict[str, Any], repo: Path, issue: str) -> Dict[str, Any]:
-    patch = result.get("patch", "") or ""
-    syntax_errors = _check_syntax(repo, patch) if patch.strip() else []
-    return {
-        "attempt1_files_touched": _patch_changed_files(patch),
-        "attempt1_substantive_lines": _multishot_count_substantive(patch),
-        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
-        "attempt1_last_failed_command": _last_failed_commands_summary(result),
-        "attempt1_syntax_errors": syntax_errors,
-    }
-
-
-def _format_multishot_memo(memo: Dict[str, Any]) -> str:
-    files = memo.get("attempt1_files_touched") or []
-    lines = memo.get("attempt1_substantive_lines", 0)
-    missing = memo.get("attempt1_unaddressed_paths") or []
-    last_fail = memo.get("attempt1_last_failed_command", "")
-    parts = [
-        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
-        f"  Files touched: {', '.join(files) if files else 'none'}",
-        f"  Substantive lines added: {lines}",
-    ]
-    if missing:
-        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
-    if last_fail:
-        parts.append(f"  Last failing command: {last_fail}")
-    syntax_errs = memo.get("attempt1_syntax_errors") or []
-    if syntax_errs:
-        parts.append("  Parser/syntax issues on touched files:")
-        for err in syntax_errs[:6]:
-            parts.append(f"    - {err}")
-    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
-    return "\n".join(parts)
-
-
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2279,18 +2210,27 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
-        _issue_text = kwargs.get("issue", "") or ""
 
-        if not _multishot_should_retry_533(_multishot_repo_obj, _patch1, _n1, _issue_text):
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
-            if (
-                _patch1.strip()
-                and _extract_issue_path_mentions(_issue_text)
-                and _patch_covers_required_paths(_patch1, _issue_text)
-            ):
-                _result1["multishot_skipped_retry"] = "covers_issue_paths"
-            elif _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-                _result1["multishot_skipped_retry"] = "substantive_threshold"
+            return _result1
+
+        # v44: keep first attempt if it's non-empty AND the issue named at
+        # least one file path AND the patch covers every named path. The
+        # substantive-line count alone treats a correct surgical fix as a
+        # whiff; the path-coverage guard distinguishes "small and on-target"
+        # from "small and missed the mark". Without any named path we fall
+        # through to the retry as before — the original logic is the safer
+        # default when the issue doesn't anchor to a specific file.
+        _issue_text = kwargs.get("issue", "") or ""
+        _required_paths = _extract_issue_path_mentions(_issue_text)
+        if (
+            _patch1.strip()
+            and _required_paths
+            and _patch_covers_required_paths(_patch1, _issue_text)
+        ):
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "covers_issue_paths"
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
@@ -2301,10 +2241,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _memo_kw: Dict[str, Any] = dict(kwargs)
-        if _multishot_repo_obj is not None:
-            _memo_kw["_multishot_memo"] = _build_multishot_memo(_result1, _multishot_repo_obj, _issue_text)
-        _result2 = _solve_attempt(**_memo_kw)
+        _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2352,7 +2289,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-    _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2521,13 +2457,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
-        if _multishot_memo:
-            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
-
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _initial_user},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
@@ -2725,23 +2657,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
-    """Avoid treating pytest ``0 errors`` / ``0 failed`` summaries as failures."""
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
 
-    failure_patterns = [
-        re.compile(r"\b[1-9]\d*\s+failed\b"),
-        re.compile(r"\bfailures?\s*=\s*[1-9]\d*\b"),
-        re.compile(r"\b[1-9]\d*\s+failure\b"),
-        re.compile(r"\b[1-9]\d*\s+errors?\b"),
-        re.compile(r"\berrors?\s*=\s*[1-9]\d*\b"),
-        re.compile(r"\b[1-9]\d+\s+error\b"),
-        re.compile(r"^---\s*fail:", re.MULTILINE),
-        re.compile(r"\btraceback \(most recent call last\)"),
-        re.compile(r"\bassertionerror\b"),
-        re.compile(r"\bsyntaxerror\b"),
-        re.compile(r"\bexception:\b"),
+    bad_markers = [
+        " failed",
+        " failures",
+        " error",
+        " errors",
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+        "exception",
     ]
 
     good_markers = [
@@ -2754,13 +2682,10 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if exit_code is not None and exit_code != 0:
         return False
 
-    def _has_real_failure(text: str) -> bool:
-        return any(pat.search(text) for pat in failure_patterns)
-
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = _has_real_failure(lower)
-    if stderr_body.strip():
-        has_bad = has_bad or _has_real_failure(stderr_body)
+    has_bad = any(marker in lower for marker in bad_markers)
+    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+        has_bad = True
 
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
