@@ -993,6 +993,7 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
 # frame is almost always the bug locus. We extract those frames in *order*
 # (top of paste first) so callers can boost the deepest frame more than
 # casual mentions, and surface the `in <function>` identifier as a symbol
+# seed for `_symbol_grep_hits`.
 _PY_TRACE_RE = re.compile(
     r'File "([^"]+)", line \d+(?:, in ([\w.<>]+))?',
 )
@@ -1019,7 +1020,7 @@ _TRACE_NODE_INTERNAL_PREFIXES = (
 
 
 def _extract_traceback_paths_and_symbols(
-    issue: str
+    issue: str,
 ) -> Tuple[List[str], List[str]]:
     """Return (ordered paths, function/symbol names) from any tracebacks
     embedded in the issue body. Paths are de-duplicated preserving order
@@ -2704,7 +2705,7 @@ def solve(
     50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
     the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    return _v65_solve_with_safety_net(
         repo_path=repo_path,
         issue=issue,
         model=model,
@@ -2716,82 +2717,23 @@ def solve(
     )
 
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
+# Naming note for reviewers: the `_v65_*` prefix is preserved from the j.py
+# base (chain-king PR486 lineage). The wrapper / inner-driver split is also
+# kept so the safety-net try/except wraps a single function call cleanly,
+# rather than guarding the multi-shot body inline. This is a structural-only
+# preservation — no behavior change vs. inlining the driver — but keeping
+# the names and split makes diffs against j.py and prior forks readable.
+def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """v65 safety-net wrapper. Adapted from chain king PR486."""
     repo_path = kwargs["repo_path"]
-    repo_obj: Optional[Path] = None
+    _multishot_repo_obj: Optional[Path] = None
     try:
-        repo_obj = _repo_path(repo_path)
+        _multishot_repo_obj = _repo_path(repo_path)
     except Exception:
         pass
 
     try:
-        started = time.monotonic()
-        issue = kwargs["issue"]
-        multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
-        initial_head = _multishot_capture_head(repo_obj) if repo_obj else None
-
-        result1 = _solve_attempt(**kwargs)
-        patch1 = result1.get("patch", "") or ""
-        n1 = _multishot_count_substantive(patch1)
-
-        # j.py: retry only when empty OR low-signal AND issue-mentioned paths still uncovered.
-        # A surgical 1–2 line fix that touches every required path is valid — do not discard it.
-        covered_required = bool(patch1.strip()) and not _uncovered_required_paths(patch1, issue)
-        should_retry = (not patch1.strip()) or (
-            n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not covered_required
-        )
-        if not should_retry:
-            result1["multishot_attempts"] = 1
-            return result1
-
-        elapsed = time.monotonic() - started
-
-        # j.py v70: emergency fires on empty attempt 1 (with or without MODEL_ERROR spam).
-        attempt1_logs = result1.get("logs", "") or ""
-        attempt1_was_error_failure = (
-            not patch1.strip() and attempt1_logs.count("MODEL_ERROR") >= 2
-        )
-        attempt1_was_plain_empty = not patch1.strip()
-        should_fire_emergency = attempt1_was_error_failure or attempt1_was_plain_empty
-        if should_fire_emergency and (multishot_total_budget - elapsed) > 60.0 and repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-            result_emergency = _solve_emergency_single_shot(**kwargs)
-            patch_emergency = result_emergency.get("patch", "") or ""
-            if _multishot_count_substantive(patch_emergency) > 0:
-                result_emergency["multishot_attempts"] = 2
-                result_emergency["multishot_winner"] = "emergency"
-                return result_emergency
-            elapsed = time.monotonic() - started
-
-        if (multishot_total_budget - elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            result1["multishot_attempts"] = 1
-            result1["multishot_skipped_retry"] = "insufficient_time"
-            return result1
-
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        result2 = _solve_attempt(
-            **kwargs,
-            _multishot_memo=_build_multishot_memo(result1, issue),
-        )
-        patch2 = result2.get("patch", "") or ""
-        n2 = _multishot_count_substantive(patch2)
-
-        if n2 >= n1:
-            result2["multishot_attempts"] = 2
-            result2["multishot_winner"] = "retry"
-            return result2
-
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        if patch1 and repo_obj is not None:
-            _multishot_apply_patch(repo_obj, patch1)
-        result1["multishot_attempts"] = 2
-        result1["multishot_winner"] = "primary"
-        return result1
-
+        return _v65_multishot_driver(kwargs, _multishot_repo_obj)
     except Exception as exc:
         # v43 safety net: ANY uncaught exception from the multi-shot body
         # should not propagate. Instead, return whatever patch is on disk
@@ -2799,8 +2741,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # do their thing so the validator can clean-kill the process.)
         salvaged = ""
         try:
-            if repo_obj is not None:
-                salvaged = get_patch(repo_obj)
+            if _multishot_repo_obj is not None:
+                salvaged = get_patch(_multishot_repo_obj)
         except Exception:
             salvaged = ""
         return AgentResult(
@@ -2814,6 +2756,89 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             cost=0.0,
             success=bool(salvaged.strip()),
         ).to_dict()
+
+
+def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj: Optional[Path]) -> Dict[str, Any]:
+    """Original UID195 multishot logic, separated so the safety-net try/except
+    wraps it cleanly."""
+    repo_path = kwargs["repo_path"]
+    issue = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+    max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
+    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
+    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
+    _multishot_args = dict(
+        repo_path=repo_path, issue=issue, model=model,
+        api_base=api_base, api_key=api_key,
+        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+    )
+    if _multishot_repo_obj is None:
+        _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
+
+    _result1 = _solve_attempt(**_multishot_args)
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
+
+    # j.py: retry only when empty OR low-signal AND issue-mentioned paths still
+    # uncovered. A surgical 1-2 line fix that touches every required path is
+    # valid — do not discard it.
+    _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
+    _should_retry = (not _patch1.strip()) or (
+        _n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required
+    )
+    if not _should_retry:
+        _result1["multishot_attempts"] = 1
+        return _result1
+
+    _elapsed = time.monotonic() - _multishot_started
+
+    # j.py v70: emergency fires on empty attempt 1 (with or without MODEL_ERROR spam).
+    _attempt1_logs = _result1.get("logs", "") or ""
+    _attempt1_was_error_failure = (
+        not _patch1.strip() and _attempt1_logs.count("MODEL_ERROR") >= 2
+    )
+    _attempt1_was_plain_empty = not _patch1.strip()
+    _should_fire_emergency = _attempt1_was_error_failure or _attempt1_was_plain_empty
+    if _should_fire_emergency and (_multishot_total_budget - _elapsed) > 60.0:
+        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _result_emergency = _solve_emergency_single_shot(**_multishot_args)
+        _patch_emergency = _result_emergency.get("patch", "") or ""
+        if _multishot_count_substantive(_patch_emergency) > 0:
+            _result_emergency["multishot_attempts"] = 2
+            _result_emergency["multishot_winner"] = "emergency"
+            return _result_emergency
+        _elapsed = time.monotonic() - _multishot_started
+
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _result2 = _solve_attempt(
+        **_multishot_args,
+        _multishot_memo=_build_multishot_memo(_result1, issue),
+    )
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
+
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2868,20 +2893,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. lint — ruff/eslint on touched files when tooling exists (j.py v72)
-            4. test — companion test failure tail via build_test_fix_prompt
-            5. coverage-nudge — name issue-mentioned paths still untouched
-            6. criteria-nudge — name issue acceptance bullets not addressed
+            1. coverage-nudge — name issue-mentioned paths still untouched
+            2. criteria-nudge — name issue acceptance bullets not addressed
+            3. test — companion test failure tail via build_test_fix_prompt
+            4. polish — drop low-signal hunks the model still emitted
+            5. syntax — quote any parser error back at the model
+            6. lint — ruff/eslint on touched files when tooling exists
             7. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        and lint (we know the patch parses and is lint-clean when tools exist)
-        but BEFORE coverage/criteria/self-check (those are heuristic; test is
-        ground truth from a real runner).
 
-        Total cap (`MAX_TOTAL_REFINEMENT_TURNS`) gates everything except the
-        hail-mary so chained refinements can't blow the wall-clock budget.
+        v21 base rationale (kept verbatim — no benchmark evidence collected
+        in this fork to overturn it): judge-half gates (coverage, criteria,
+        companion test) fire BEFORE cursor-half gates (polish, syntax, lint)
+        so the two-turn `MAX_TOTAL_REFINEMENT_TURNS` cap is spent on the
+        highest-leverage signals first. A patch that's lint-clean but misses
+        a required path scores worse than a slightly-noisy patch that covers
+        it; conversely, with the cap, time spent on cosmetic polish in turn 1
+        is paid for by losing a coverage/criteria fix in turn 2.
+
+        Hail-mary is the only step exempt from `MAX_TOTAL_REFINEMENT_TURNS`
+        because it's the sole path out of a guaranteed-zero empty patch.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
@@ -2907,6 +2937,57 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
+        # FILES the issue mentions; criteria gates on acceptance checkpoints.
+        # Judge losses on multi-bullet tasks are often "missing N of M"
+        # criteria, so surfacing unaddressed bullets is higher value than
+        # hoping self-check catches them.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # Companion-test execution gate. The previous king alexlange1 (PR #44)
+        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
+        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
+        # them from solve(). The +1269 line PR #185 rewrite kept dead
+        # scaffolding without using it. We restore the runtime correctness
+        # signal: if an edited file has a partner test that fails, surface the
+        # failure tail to the model as one fix turn. This is the only
+        # refinement step in the chain backed by a real runner rather than
+        # heuristics.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -2941,57 +3022,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_lint_fix_prompt(lint_errors),
                     "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
-                )
-                return True
-
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept dead
-        # scaffolding without using it. We restore the runtime correctness
-        # signal: if an edited file has a partner test that fails, surface the
-        # failure tail to the model as one fix turn. This is the only
-        # refinement step in the chain backed by a real runner rather than
-        # heuristics.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on acceptance checkpoints.
-        # Judge losses on multi-bullet tasks are often "missing N of M"
-        # criteria, so surfacing unaddressed bullets is higher value than
-        # hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
