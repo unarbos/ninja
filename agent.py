@@ -1345,10 +1345,93 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+# v74: auto-fix application. Many "lint failures" are mechanical issues that
+# the linter itself can fix in-place (`ruff --fix`, `eslint --fix`). Burning a
+# refinement turn telling the LLM to "rerun ruff with sed" wastes the agent's
+# scarce wall-clock + token budget on work the toolchain can do for free.
+# Strategy: run the fixers FIRST, stage the changes back into the working
+# tree (so subsequent get_patch() includes the formatting fix), then re-check
+# and only escalate to the LLM the errors that survived auto-fix.
+def _file_modified_by(repo: Path, relative_path: str, fn) -> bool:
+    """Run fn (which executes the auto-fixer) and return True if the file
+    on disk actually changed. fn is expected to be a no-arg callable."""
+    target = repo / relative_path
+    try:
+        before = target.read_bytes()
+    except OSError:
+        return False
+    fn()
+    try:
+        after = target.read_bytes()
+    except OSError:
+        return False
+    return before != after
+
+
+def _auto_apply_lint_python(repo: Path, relative_path: str) -> bool:
+    """v74: run `ruff check --fix` on a Python file. Returns whether the file
+    was modified."""
+    if not _has_executable("ruff"):
+        return False
+    def _run() -> None:
+        run_command(
+            f"ruff check --fix --silent {_shell_quote(relative_path)}",
+            repo, timeout=_LINT_TIMEOUT,
+        )
+    return _file_modified_by(repo, relative_path, _run)
+
+
+def _auto_apply_lint_js(repo: Path, relative_path: str) -> bool:
+    """v74: run `eslint --fix` on a JS/TS file when project tooling is available."""
+    has_config = any(
+        (repo / name).exists()
+        for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
+                     ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
+    )
+    if not has_config:
+        return False
+    local_eslint = repo / "node_modules" / ".bin" / "eslint"
+    if local_eslint.exists():
+        cmd = f"./node_modules/.bin/eslint --fix --quiet {_shell_quote(relative_path)}"
+    elif _has_executable("eslint"):
+        cmd = f"eslint --fix --quiet {_shell_quote(relative_path)}"
+    else:
+        return False
+    def _run() -> None:
+        run_command(cmd, repo, timeout=_LINT_TIMEOUT)
+    return _file_modified_by(repo, relative_path, _run)
+
+
+def _stage_modified_files(repo: Path, files: List[str]) -> None:
+    """v74: stage files modified by an auto-fixer so subsequent get_patch()
+    includes the cleaned-up content. We restrict to the explicit list to avoid
+    accidentally staging unrelated dirty files in a noisy working tree."""
+    if not files:
+        return
+    quoted = " ".join(_shell_quote(f) for f in files[:24])
+    run_command(f"git add -- {quoted}", repo, timeout=10)
+
+
 def _check_lint(repo: Path, patch: str) -> List[str]:
-    """v72: lint every touched file with the appropriate tool. Up to 6 errors."""
+    """v72 + v74: lint every touched file. v74 first runs the linter's own
+    auto-fixer (ruff/eslint) and stages the result; only errors the auto-fixer
+    couldn't resolve get escalated to the LLM. Up to 6 errors."""
+    relative_paths = list(_patch_changed_files(patch))
+    # v74: phase 1 — auto-fix what we can.
+    fixed: List[str] = []
+    for relative_path in relative_paths:
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            if _auto_apply_lint_python(repo, relative_path):
+                fixed.append(relative_path)
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            if _auto_apply_lint_js(repo, relative_path):
+                fixed.append(relative_path)
+    if fixed:
+        _stage_modified_files(repo, fixed)
+    # v74: phase 2 — collect residual errors that survived auto-fix.
     errors: List[str] = []
-    for relative_path in _patch_changed_files(patch):
+    for relative_path in relative_paths:
         suffix = Path(relative_path).suffix.lower()
         err: Optional[str] = None
         if suffix == ".py":
@@ -1384,9 +1467,34 @@ def _repo_has_precommit_config(repo: Path) -> bool:
     return (repo / ".pre-commit-config.yaml").is_file() or (repo / ".pre-commit-config.yml").is_file()
 
 
+def _parse_precommit_failures(output: str) -> List[str]:
+    """v73: parse pre-commit's '<hook>........Failed' header + 'exit code: N'
+    body lines into short failure summaries. Returns up to 6."""
+    failed_hooks: List[str] = []
+    current: Optional[str] = None
+    for line in output.splitlines():
+        stripped = line.rstrip()
+        if stripped.endswith("Failed"):
+            current = stripped.split(".")[0].strip()
+            failed_hooks.append(f"{current}: failed")
+            if len(failed_hooks) >= 6:
+                break
+        elif current and stripped.startswith("- exit code:"):
+            failed_hooks[-1] = f"{current}: {stripped.lstrip('- ').strip()}"
+    return failed_hooks
+
+
 def _check_precommit(repo: Path, patch: str) -> List[str]:
-    """v73: run `pre-commit run --files <changed>` when the repo defines hooks
-    AND `pre-commit` is on PATH. Returns up to 6 short failure summaries."""
+    """v73 + v74: run `pre-commit run --files <changed>` when the repo defines
+    hooks AND `pre-commit` is on PATH. Returns up to 6 short failure summaries.
+
+    v74 auto-fix loop: pre-commit hooks like black/isort/prettier auto-modify
+    files, in which case pre-commit exits non-zero on the first run AND on disk
+    the file is now clean. We re-run once: if the second run is green, all
+    failures were auto-fixed (we stage the cleaned files so get_patch picks up
+    the corrected content). Only errors that survive the second run get
+    escalated to the LLM.
+    """
     if not _repo_has_precommit_config(repo):
         return []
     if not _has_executable("pre-commit"):
@@ -1398,27 +1506,43 @@ def _check_precommit(repo: Path, patch: str) -> List[str]:
     if not files:
         return []
     files = files[:12]
-    cmd = "pre-commit run --files " + " ".join(_shell_quote(f) for f in files)
+    quoted = " ".join(_shell_quote(f) for f in files)
+    cmd = f"pre-commit run --files {quoted}"
     res = run_command(cmd, repo, timeout=_PRECOMMIT_TIMEOUT)
     if res.exit_code == 0:
         return []
-    out = (res.stdout + "\n" + res.stderr).strip()
+
+    # v74: detect auto-fix activity. Compare file mtimes/contents — if any
+    # touched file changed between the first and second invocation, the hooks
+    # auto-applied a fix and the second pass is the real signal.
+    pre_hashes = {}
+    for f in files:
+        try:
+            pre_hashes[f] = (repo / f).read_bytes()
+        except OSError:
+            pre_hashes[f] = None
+    res2 = run_command(cmd, repo, timeout=_PRECOMMIT_TIMEOUT)
+    fixed: List[str] = []
+    for f in files:
+        try:
+            current = (repo / f).read_bytes()
+        except OSError:
+            current = None
+        # Note: a hook may have modified the file BEFORE the first run completed
+        # (e.g., black during its own check). The second run's input is the
+        # post-fix content, so if it's now green, fix-and-clean is the story.
+        if pre_hashes[f] is not None and current is not None and pre_hashes[f] != current:
+            fixed.append(f)
+    if fixed:
+        _stage_modified_files(repo, fixed)
+    if res2.exit_code == 0:
+        return []
+
+    out = (res2.stdout + "\n" + res2.stderr).strip()
     if not out:
-        return [f"pre-commit failed (exit {res.exit_code}) with no output"]
-    failed_hooks: List[str] = []
-    current: Optional[str] = None
-    for line in out.splitlines():
-        stripped = line.rstrip()
-        # pre-commit prints "<hook name>...........Failed" then a body block.
-        if stripped.endswith("Failed"):
-            current = stripped.split(".")[0].strip()
-            failed_hooks.append(f"{current}: failed")
-            if len(failed_hooks) >= 6:
-                break
-        elif current and stripped.startswith("- exit code:"):
-            failed_hooks[-1] = f"{current}: {stripped.lstrip('- ').strip()}"
+        return [f"pre-commit failed (exit {res2.exit_code}) with no output"]
+    failed_hooks = _parse_precommit_failures(out)
     if not failed_hooks:
-        # Couldn't parse — give the model the raw tail so it has *something*.
         tail = out[-400:].strip().replace("\n", " | ")
         return [f"pre-commit non-zero: {tail[:400]}"]
     return failed_hooks
