@@ -103,8 +103,6 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
-WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -732,6 +730,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -745,6 +750,22 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_notificacoes`) are deliberate signals from the task author about
+    # the code surface that matters. When they pick out a small specific set
+    # of tracked files by path-substring, treat those files as explicit
+    # mentions so they get the same +100 ranking boost as path-mentioned
+    # files. Skipped when the identifier matches too many files (filters out
+    # generic identifiers like `basic.py` or `any2txt`).
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1613,6 +1634,28 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
+# Verb/noun suffixes commonly used in acceptance-criterion English that don't
+# appear in source-code identifiers. The criteria say "clicking", "loads",
+# "selection", "displayed", "correctly"; the corresponding code uses
+# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
+# substring check on the natural-language form misses these matches and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix
+# (with a minimum-stem length to avoid false positives like `action`->`act`
+# matching `react`) bridges the natural-language ↔ identifier gap.
+_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+
+
+def _keyword_in_added(keyword: str, added_lower: str) -> bool:
+    if keyword in added_lower:
+        return True
+    for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
+        if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
+            if keyword[:-len(suffix)] in added_lower:
+                return True
+            break
+    return False
+
+
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -1638,7 +1681,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if not keywords:
             continue
         # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
+        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
@@ -1864,6 +1907,32 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    # Pre-parsed checklists from the issue. The same heuristics power the
+    # later coverage-nudge and criteria-nudge refinement turns; surfacing
+    # them here on turn 1 lets the model bake them into its plan instead
+    # of needing a second-pass nudge to recover the same gap. The text is
+    # framed as "parsed from the issue" (not authoritative) so the model
+    # is free to reject false positives.
+    criteria = _extract_acceptance_criteria(issue)
+    criteria_block = ""
+    if criteria:
+        bullets = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+        criteria_block = (
+            "\nRequirements parsed from the issue (your patch must satisfy every one — "
+            "missing any is the most common reason patches lose completeness points):\n"
+            f"{bullets}\n"
+        )
+
+    path_mentions = _extract_issue_path_mentions(issue)
+    paths_block = ""
+    if path_mentions:
+        bullets = "\n".join(f"  - {p}" for p in path_mentions[:12])
+        paths_block = (
+            "\nFile paths named in the issue (the most likely edit targets — confirm "
+            "and edit each unless inspection shows it doesn't need a change):\n"
+            f"{bullets}\n"
+        )
+
     return f"""Fix this issue:
 
 {issue}
@@ -1871,16 +1940,18 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{context_section}{criteria_block}{paths_block}
+Before any command, read the ENTIRE issue and walk through every requirement (there may be several). Your patch must satisfy ALL of them — incomplete solutions are scored down hard for completeness.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+In your FIRST response, before any <command> block, emit a short <plan> block that maps each requirement to its target file/function/symbol. Then issue ALL the edit commands needed to satisfy every requirement in the SAME response.
+
+Strategy: the fix is typically in ONE specific function or block per file. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE — not the symptom. Match the surrounding code's exact idioms (variable names, control flow shape, loop vs. unrolled, comment density, brace/quote style) — patches that look like they were written by the same author as the rest of the file score higher.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns. When a source change cascades to a companion test, update the test in the SAME response.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+After patching, run the most targeted real test available (`pytest tests/test_X.py -x -q`, `go test ./...`, `node <test>`, etc.) to verify correctness. A passing functional test is the strongest evidence of correctness; a syntax check alone is not. Then finish with <final>...</final>.
 """
 
 
@@ -2085,7 +2156,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # v43: raised from 90 — never start a retry unless we have at least one full attempt budget (180s) left, so the retry can't push us past the validator's soft cap.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2171,87 +2242,47 @@ def solve(
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
-
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = 580.0
+    _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    _result1 = _solve_attempt(**_multishot_args)
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
-    try:
-        _multishot_repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
-
-    try:
-        _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
-
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
-
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
-
-        _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-
-        if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _result1["multishot_attempts"] = 1
         return _result1
 
-    except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
-        salvaged = ""
-        try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
-        except Exception:
-            salvaged = ""
-        return AgentResult(
-            patch=salvaged or "",
-            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
+    _elapsed = time.monotonic() - _multishot_started
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _result2 = _solve_attempt(**_multishot_args)
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
+
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2281,12 +2312,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-
-    def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
-
-    def out_of_time() -> bool:
-        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2443,14 +2468,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if out_of_time():
-                logs.append(
-                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
-                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
-                    "exiting loop early to return whatever patch we have."
-                )
-                break
-
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2469,7 +2486,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
+                    if retry_attempt < MAX_STEP_RETRIES:
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2487,7 +2504,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3 or out_of_time():
+                if consecutive_model_errors >= 3:
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
