@@ -115,6 +115,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_VISIBLE_SURFACE_NUDGES = 1  # catch visible feature patches that only edit support code
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -536,6 +537,11 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    # v24 (from PR430 taoagentbloom): undo accidental chmod-only churn before
+    # computing the diff, and use `git diff HEAD` so staged + unstaged are
+    # captured. Cursor-similarity is matched_lines / max(model, ref); mode-only
+    # noise inflates model_lines without contributing matched_lines.
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -544,7 +550,7 @@ def get_patch(repo: Path) -> str:
         ":(exclude).git",
     ]
     proc = subprocess.run(
-        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
+        ["git", "diff", "HEAD", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -578,8 +584,70 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
+    # v24 (PR430): defensive strip of any path that should be skipped, in case
+    # --no-index untracked or --binary slipped one through.
+    cleaned = _strip_skipped_path_diffs(diff_output)
+    cleaned = _strip_mode_only_file_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """v24/PR430: undo accidental chmod-only churn while preserving content edits."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    for line in proc.stdout.splitlines():
+        match = re.match(r"\s*mode change (\d+) => (\d+) (.+)$", line)
+        if not match:
+            continue
+        old_mode, _new_mode, relative_path = match.groups()
+        if not relative_path or _should_skip_patch_path(relative_path):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+        try:
+            current = full.stat().st_mode
+            if old_mode.endswith("755"):
+                full.chmod(current | 0o111)
+            else:
+                full.chmod(current & ~0o111)
+        except Exception:
+            continue
+
+
+def _strip_skipped_path_diffs(diff_output: str) -> str:
+    """v24/PR430: drop diff blocks for paths that should be skipped."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        header = block.splitlines()[0] if block.splitlines() else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)$", header)
+        if match and (_should_skip_patch_path(match.group(1)) or _should_skip_patch_path(match.group(2))):
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -781,6 +849,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
+    files = _augment_with_named_scope(repo, files, tracked_set, issue)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
@@ -812,11 +881,45 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files — only treat as
-                              # "mentioned" when an identifier picks out a
-                              # specific small handful in the tracked set.
+def _augment_with_named_scope(repo: Path, files: List[str], tracked_set: set[str], issue: str) -> List[str]:
+    """If an issue names a project/subdir, prioritize files inside that scope."""
+    issue_lower = issue.lower()
+    scope_prefixes: List[str] = []
+
+    for match in re.finditer(r"\bproject\s+([A-Za-z0-9_-]{2,})\b", issue, flags=re.IGNORECASE):
+        name = match.group(1).strip("/")
+        for prefix in (f"projects/{name}/", f"project/{name}/", f"{name}/"):
+            if any(path.startswith(prefix) for path in tracked_set):
+                scope_prefixes.append(prefix)
+
+    for mention in _extract_issue_path_mentions(issue):
+        parts = Path(mention.strip("./")).parts
+        if len(parts) >= 2:
+            prefix = "/".join(parts[:2]) + "/"
+            if any(path.startswith(prefix) for path in tracked_set):
+                scope_prefixes.append(prefix)
+
+    if not scope_prefixes:
+        return files
+
+    scope_prefixes = list(dict.fromkeys(scope_prefixes))
+    terms = set(_issue_terms(issue))
+    scoped: List[str] = []
+    for path in sorted(tracked_set):
+        if not _context_file_allowed(path):
+            continue
+        if not any(path.startswith(prefix) for prefix in scope_prefixes):
+            continue
+        lower = path.lower()
+        name = Path(path).name.lower()
+        if any(term in lower for term in terms) or re.search(r"(app|main|index|draw|editor|code|blob|shader)", name):
+            scoped.append(path)
+
+    ordered: List[str] = []
+    for path in scoped + files:
+        if path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -832,22 +935,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
-
-    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
-    # `email_notificacoes`) are deliberate signals from the task author about
-    # the code surface that matters. When they pick out a small specific set
-    # of tracked files by path-substring, treat those files as explicit
-    # mentions so they get the same +100 ranking boost as path-mentioned
-    # files. Skipped when the identifier matches too many files (filters out
-    # generic identifiers like `basic.py` or `any2txt`).
-    seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
-        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
-        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
-            for m in matches:
-                if m not in seen_mentioned:
-                    mentioned.append(m)
-                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1247,6 +1334,19 @@ _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
 }
 
+# C-style languages where ' is a char-literal delimiter (not a string toggle).
+# A separate parser below (_check_brace_balance_cstyle_one) treats `'X'`,
+# `'\X'`, `'\uXXXX'` etc. as opaque char literals so a stray '}' inside a
+# char literal does not unbalance the count. This catches gross brace
+# imbalances on .cs/.java/.go etc. — the failure mode we saw on king's
+# round 2 of duel #4224 ("Feffusing App.Services;" — sed-mangled C#).
+# Rust is excluded because lifetimes ('a) and raw strings (r"...") need
+# bespoke handling we don't ship; one-off mistakes get caught by the LLM
+# judge instead.
+_CSTYLE_BRACE_BALANCE_SUFFIXES = {
+    ".cs", ".java", ".kt", ".scala", ".c", ".cc", ".cpp", ".h", ".hpp", ".go",
+}
+
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
@@ -1324,12 +1424,313 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`php -l file.php` — lint-only, no execution.
+
+    Addresses king's loss in duel #4224 round 13: invalid PHP method
+    declarations in DashboardIndex went un-caught and the judge rejected
+    the patch. Skips silently when `php` isn't on PATH (we'd rather miss
+    the check than waste timeouts).
+    """
+    if not _has_executable("php"):
+        return None
+    proc_result = run_command(
+        f"php -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code == 0:
+        return None
+    msg = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()[-1] if (proc_result.stderr or proc_result.stdout) else ""
+    return f"{relative_path}: {msg or 'php -l failed'}"
+
+
+def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Brace balance for C-style languages (C#/Java/Kotlin/Go/C/C++/Scala).
+
+    Treats single-quoted char literals as opaque (`'X'`, `'\\n'`, `'\\u00FF'`)
+    so a `'}'` literal does not flip the parser into string mode and produce
+    a phantom imbalance. Falls back to single-char skip when no closing `'`
+    appears within 16 chars (e.g., Go method receivers, stray apostrophe).
+
+    Catches gross structural damage like duel #4224 round 2 ("Feffusing
+    App.Services;" — sed-mangled C# that orphaned a closing brace).
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str = False
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        # Not in string/comment.
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "'":
+            # Char literal: skip ahead to closing ' within a small cap.
+            j = i + 1
+            cap = min(n, i + 16)
+            found = False
+            while j < cap:
+                if source[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if source[j] == "'":
+                    found = True
+                    j += 1
+                    break
+                j += 1
+            if found:
+                i = j
+                continue
+            # Not a balanced char literal — skip just this char.
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
+# Heredoc / shell-prompt markers that must never appear verbatim in source.
+# The LLM judge consistently flags files containing these as "corrupted" and
+# rejects the patch — duel #4224 round 22 lost on this exact failure mode
+# (AmbientBackground file containing shell-script text/EOF markers).
+_CORRUPTION_LINE_RE_LIST: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^EOF\s*$"), "shell heredoc 'EOF' marker leaked into source"),
+    (re.compile(r"^EOM\s*$"), "shell heredoc 'EOM' marker leaked into source"),
+    (re.compile(r"^PYEOF\s*$"), "python heredoc 'PYEOF' marker leaked into source"),
+    (re.compile(r"^\s*cat\s*<<\s*['\"]?[A-Z]+\b"), "shell 'cat <<' command leaked into source"),
+    (re.compile(r"^\s*\$\s+(cat|ls|cd|grep|sed|python|node|git)\b"), "shell prompt leaked into source"),
+)
+
+# File suffixes where heredoc markers can legitimately appear.
+_CORRUPTION_SKIP_SUFFIXES = {".sh", ".bash", ".zsh", ".fish", ".md", ".txt", ".rst"}
+
+
+def _check_corruption_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Detect shell heredoc/prompt markers leaked into source files.
+
+    Catches the failure mode where the agent's own `cat <<EOF ... EOF` heredoc
+    truncated mid-write and left the closing marker embedded in the file, or
+    where shell prompts got pasted into source. Skipped for shell scripts and
+    plain-text files where these tokens are legitimate content.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in _CORRUPTION_SKIP_SUFFIXES:
+        return None
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not source:
+        return None
+    for line_num, line in enumerate(source.splitlines(), 1):
+        for rx, msg in _CORRUPTION_LINE_RE_LIST:
+            if rx.match(line):
+                return f"{relative_path}:{line_num}: {msg}"
+    return None
+
+
+# Critical closing tags whose removal almost always breaks the component.
+# Duel #4224 round 4: king removed </template> closing tag, breaking the Vue
+# component entirely. Round 48: challenger orphaned welcome-screen markup.
+_CRITICAL_TAG_RE = re.compile(
+    r"^\s*</(template|script|style|body|html|head|main|section)>\s*$",
+    re.IGNORECASE,
+)
+
+
+# Duplicate-import detection. Duel #4227 round 6 was lost outright on the
+# rationale "King had fatal duplicate import" — same import line emitted twice
+# after a sed/heredoc mishap. ast.parse and node --check happily accept this
+# (it's syntactically valid), so the existing _check_syntax gate misses it. We
+# scan touched .py / .ts / .tsx / .js / .jsx / .mjs / .cjs files for repeated
+# import statements at line granularity and surface them through the syntax-
+# fix turn so the model can drop the duplicate before <final>.
+_DUP_IMPORT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_PY_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+[\w.]+\s+import\s+.+|import\s+[\w.,\s]+(?:\s+as\s+\w+)?)\s*(?:#.*)?$"
+)
+_JS_IMPORT_RE = re.compile(r"^\s*import\s+.+\s*;?\s*$")
+_JS_REQUIRE_RE = re.compile(
+    r"^\s*(?:const|let|var)\s+[\w{}\s,:.]+\s*=\s*require\([\"'][^\"']+[\"']\)\s*;?\s*$"
+)
+
+
+def _check_duplicate_imports_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag identical import lines repeated in a touched source file.
+
+    Conservative: matches lines verbatim (after whitespace + trailing-`;`
+    normalisation), so re-imports of different symbols from the same module
+    never trip it. Only the first three duplicates are surfaced — that's
+    enough signal for the model to dedupe the whole file in one pass.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in _DUP_IMPORT_SUFFIXES:
+        return None
+    if suffix == ".py":
+        matchers = (_PY_IMPORT_RE,)
+    else:
+        matchers = (_JS_IMPORT_RE, _JS_REQUIRE_RE)
+
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not source:
+        return None
+
+    seen: Dict[str, int] = {}
+    duplicates: List[str] = []
+    for lineno, raw in enumerate(source.splitlines(), 1):
+        if not any(rx.match(raw) for rx in matchers):
+            continue
+        key = " ".join(raw.strip().split())
+        if key.endswith(";"):
+            key = key[:-1].rstrip()
+        if key in seen:
+            duplicates.append(
+                f"line {lineno} duplicates line {seen[key]}: {key[:80]}"
+            )
+        else:
+            seen[key] = lineno
+    if duplicates:
+        return f"{relative_path}: duplicate import(s) — " + "; ".join(duplicates[:3])
+    return None
+
+
+def _check_critical_tag_removals(patch: str) -> List[str]:
+    """Detect removed top-level closing HTML/Vue tags without matching adds.
+
+    Per file: count removed vs added critical closers. If removed > added, the
+    patch is structurally broken. Cheap, high-precision: legitimate refactors
+    almost never delete a `</template>` without immediately re-adding one in
+    the same diff.
+    """
+    if not patch.strip():
+        return []
+    issues: List[str] = []
+    current_file = "?"
+    rmv_counts: Dict[str, int] = {}
+    add_counts: Dict[str, int] = {}
+
+    def flush() -> None:
+        for tag, rmv in rmv_counts.items():
+            add = add_counts.get(tag, 0)
+            if rmv > add:
+                issues.append(
+                    f"{current_file}: removed </{tag}> without matching add "
+                    f"(removed {rmv}, added {add})"
+                )
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            rmv_counts = {}
+            add_counts = {}
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_file = tokens[3][2:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            m = _CRITICAL_TAG_RE.match(line[1:])
+            if m:
+                tag = m.group(1).lower()
+                add_counts[tag] = add_counts.get(tag, 0) + 1
+        elif line.startswith("-") and not line.startswith("---"):
+            m = _CRITICAL_TAG_RE.match(line[1:])
+            if m:
+                tag = m.group(1).lower()
+                rmv_counts[tag] = rmv_counts.get(tag, 0) + 1
+    flush()
+    deduped: List[str] = []
+    seen: set = set()
+    for item in issues:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped[:6]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed
+    through. Includes:
+      - Python ast.parse, JSON loads, `node --check` (.js/.mjs/.cjs)
+      - JS-family + Swift brace balance (' as string delimiter)
+      - C-style brace balance (' as char-literal delimiter): C#/Java/Go/etc.
+      - PHP `php -l` lint when `php` is on PATH
+      - Heredoc-marker corruption check on every touched non-shell file
+      - Patch-level critical-tag-removal check (Vue/HTML structural integrity)
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1346,9 +1747,28 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+        elif suffix in _CSTYLE_BRACE_BALANCE_SUFFIXES:
+            result = _check_brace_balance_cstyle_one(repo, relative_path)
+        elif suffix == ".php":
+            result = _check_php_syntax_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+
+        # Corruption check fires regardless of language (except shells / docs).
+        corruption = _check_corruption_one(repo, relative_path)
+        if corruption:
+            errors.append(corruption)
+
+        # Duplicate-import check — catches the duel #4227 round 6 failure mode
+        # ("King had fatal duplicate import"); ast.parse / node --check accept
+        # it as valid syntax so the per-language gates above miss it.
+        dup_imports = _check_duplicate_imports_one(repo, relative_path)
+        if dup_imports:
+            errors.append(dup_imports)
+
+    # Patch-level structural integrity (Vue/HTML closing tags). Cheap; runs once.
+    errors.extend(_check_critical_tag_removals(patch))
     return errors
 
 
@@ -1775,6 +2195,34 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+def _visible_surface_missing(issue_text: str, patch: str) -> bool:
+    """UI/task asks for rendered behavior but patch only touched support code."""
+    issue_lower = issue_text.lower()
+    if not re.search(
+        r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
+        r"panel|control|slider|simulator|simulation|editor|appointment|booking|"
+        r"workshop|taller|resident|apartment)\b",
+        issue_lower,
+    ):
+        return False
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return False
+    ui_re = re.compile(
+        r"(^|/)(app|main|index)\.(jsx|tsx|js|ts)$|"
+        r"(^|/)(pages?|views?|components?|screens?)/.*\.(jsx|tsx|js|ts)$",
+        re.IGNORECASE,
+    )
+    if any(ui_re.search(path) for path in changed):
+        return False
+    support_only = all(
+        re.search(r"(^|/)(stores?|hooks?|services?|api|lib|types?|models?|utils?)/", path, re.IGNORECASE)
+        or path.endswith((".json", ".sql", ".md", ".css"))
+        for path in changed
+    )
+    return support_only
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -1894,7 +2342,7 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection. Never concatenate many large files with `cat`; use `rg` for names and one focused `sed -n 'start,endp' file` range.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -1972,6 +2420,28 @@ annotations on modified functions.
 **Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
 
+## Integration completeness — wire what you add
+
+A new file or top-level symbol that nothing imports is dead code; the judge
+treats it as incomplete even when the file's own contents are right. In the
+SAME diff:
+- Register new files in the entry point that consumes them (`__init__.py`,
+  `index.ts`, route tables, exports section, `mod.rs`, `main.go`).
+- Import or call new top-level symbols from at least one existing site so
+  the new code is actually reachable.
+- Wire new CLI subcommands / API endpoints into the router or arg parser.
+
+## Reuse existing identifiers — no duplicate imports
+
+When the codebase already has a method, class, or field name for the
+concept you're touching, REUSE it. A one-line `grep -n` finds the existing
+name. Renaming a working identifier while changing its body looks like an
+unrequested refactor and loses correctness + alignment points.
+
+After edits, scan each touched file for repeated `import` / `from ... import`
+/ `import ... from "..."` / `require(...)` lines and remove duplicates —
+the judge treats duplicate imports as a hard correctness defect.
+
 ## Style matching
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
@@ -1979,6 +2449,29 @@ Copy indentation, quote style, brace style, trailing commas, and blank-line patt
 ## Preloaded snippets
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+
+## Edit-tool hygiene — DO NOT corrupt files
+
+The LLM judge automatically rejects patches that introduce:
+- **Heredoc markers leaked into source** (a literal `EOF`, `EOM`, or `PYEOF`
+  line embedded in a `.py`/`.ts`/`.cs`/etc. file). When using
+  `cat <<EOF >file ... EOF`, the closing `EOF` MUST be on its own line with
+  no leading whitespace. After any heredoc write, IMMEDIATELY run
+  `tail -n5 file` to confirm no marker leaked.
+- **Removed closing tags** without a matching addition. Never delete
+  `</template>`, `</script>`, `</style>`, `</body>`, `</html>`, or the final
+  `}` of a class/function unless you are also adding a replacement in the
+  same diff. Removing a closing tag breaks the entire component.
+- **Garbled identifiers from sed corruption** (e.g., a global `s/X/Y/`
+  accidentally consumed adjacent characters). When using `sed -i`, prefer
+  unique anchors and use the `c` flag or `python -c "p.write_text(...)"`
+  for multi-line replacements. Run `grep -n` to confirm the change applied
+  correctly and `head` the file to spot corruption.
+- **`await` outside an `async` function** in JS/TS — verify the enclosing
+  function is `async` before adding `await`.
+- **Calling type-specific methods on the wrong type** — e.g., `.plus(...)`
+  on a native number after migrating off `big.js`. After type migration,
+  grep for the old method names to find unmigrated call sites.
 
 ## Safety
 
@@ -1995,6 +2488,32 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    # Pre-parsed checklists from the issue. The same heuristics power the
+    # later coverage-nudge and criteria-nudge refinement turns; surfacing
+    # them here on turn 1 lets the model bake them into its plan instead
+    # of needing a second-pass nudge to recover the same gap. The text is
+    # framed as "parsed from the issue" (not authoritative) so the model
+    # is free to reject false positives.
+    criteria = _extract_acceptance_criteria(issue)
+    criteria_block = ""
+    if criteria:
+        bullets = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+        criteria_block = (
+            "\nRequirements parsed from the issue (your patch must satisfy every one — "
+            "missing any is the most common reason patches lose completeness points):\n"
+            f"{bullets}\n"
+        )
+
+    path_mentions = _extract_issue_path_mentions(issue)
+    paths_block = ""
+    if path_mentions:
+        bullets = "\n".join(f"  - {p}" for p in path_mentions[:12])
+        paths_block = (
+            "\nFile paths named in the issue (the most likely edit targets — confirm "
+            "and edit each unless inspection shows it doesn't need a change):\n"
+            f"{bullets}\n"
+        )
+
     return f"""Fix this issue:
 
 {issue}
@@ -2002,16 +2521,18 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{context_section}{criteria_block}{paths_block}
+Before any command, read the ENTIRE issue and walk through every requirement (there may be several). Your patch must satisfy ALL of them — incomplete solutions are scored down hard for completeness.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+In your FIRST response, before any <command> block, emit a short <plan> block that maps each requirement to its target file/function/symbol. Then issue ALL the edit commands needed to satisfy every requirement in the SAME response.
+
+Strategy: the fix is typically in ONE specific function or block per file. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE — not the symptom. Match the surrounding code's exact idioms (variable names, control flow shape, loop vs. unrolled, comment density, brace/quote style) — patches that look like they were written by the same author as the rest of the file score higher.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns. When a source change cascades to a companion test, update the test in the SAME response.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+After patching, run the most targeted real test available (`pytest tests/test_X.py -x -q`, `go test ./...`, `node <test>`, etc.) to verify correctness. A passing functional test is the strongest evidence of correctness; a syntax check alone is not. Then finish with <final>...</final>.
 """
 
 
@@ -2040,6 +2561,31 @@ def build_budget_pressure_prompt(step: int) -> str:
         "Do not read files or run tests until after a patch exists. "
         "Use `sed -i` or a python one-liner to make the targeted edit now."
     )
+
+
+def _oversized_context_dump_reason(command: str) -> Optional[str]:
+    """Reject unfocused whole-repo/file dumps before any patch exists."""
+    for raw_line in command.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line or line.startswith("#") or ">" in line or "<<" in line:
+            continue
+        if re.match(r"^cat\s+", lowered):
+            tokens = [
+                token for token in re.split(r"\s+", line)[1:]
+                if token and not token.startswith("-") and not re.search(r"[|;&$()]", token)
+            ]
+            if len(tokens) > 3:
+                return (
+                    "Blocked unfocused context dump. Do not concatenate many files; "
+                    "use one focused rg/sed range or edit from preloaded snippets."
+                )
+        if re.match(r"^grep\s+-n\s+(['\"]{2}|''|\"\")\s+", lowered) and len(re.split(r"\s+", line)) > 5:
+            return (
+                "Blocked whole-file grep dump. Inspect one focused range or edit "
+                "from preloaded snippets."
+            )
+    return None
 
 
 def build_polish_prompt(junk_summary: str) -> str:
@@ -2130,13 +2676,35 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
-    """Quote a parser's error output back at the model and demand a minimal repair."""
+    """Quote a parser's error output back at the model and demand a minimal repair.
+
+    Errors may include:
+      - Real syntax/parse errors (Python ast, node --check, php -l, JSON)
+      - Brace imbalance counts on TS/JSX/Swift and C-style languages
+      - Heredoc-marker corruption (a literal `EOF` line embedded in source)
+      - Removed-closing-tag (Vue/HTML) without matching add
+
+    Each of these maps to a different fix recipe, so the prompt walks them
+    explicitly. Most of these failure modes were the deciding factor in
+    rounds the previous king lost in duel #4224.
+    """
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
-        f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
-        "Issue the smallest possible fix command(s) to restore parseable code. "
-        "Do NOT introduce new edits, do NOT refactor. Then end with "
-        "<final>summary</final>."
+        f"Structural / syntax check failed on touched file(s):\n  {bullets}\n\n"
+        "Diagnose and repair each item with the SMALLEST possible fix:\n"
+        "  - 'parse failure' / 'SyntaxError' / 'php -l': fix the literal "
+        "syntax error at the reported line.\n"
+        "  - 'brace imbalance': add the missing closer or remove the extra "
+        "one — `tail -n20 <file>` to inspect the end, then sed/python to "
+        "fix.\n"
+        "  - 'heredoc EOF marker leaked': delete the orphan `EOF` / `EOM` / "
+        "`PYEOF` line (`sed -i '/^EOF$/d' <file>`). Then `tail -n5 <file>` "
+        "to confirm clean end-of-file.\n"
+        "  - 'removed </template>' / '</script>' / etc. without matching "
+        "add: re-add the closing tag at the correct position. The file is "
+        "probably missing its component-root closer.\n\n"
+        "Do NOT introduce new edits, do NOT refactor, do NOT touch unrelated "
+        "lines. Then end with <final>summary</final>."
     )
 
 
@@ -2161,6 +2729,21 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_visible_surface_nudge_prompt(issue_text: str) -> str:
+    return (
+        "Visible-feature gap — the task asks for rendered controls, a page, "
+        "dashboard, form, simulator, or workflow, but your patch only changes "
+        "supporting state/config/service files.\n\n"
+        "Patch the component/page/view that renders the requested behavior now. "
+        "Use the existing UI architecture and the smallest edit: wire the "
+        "visible control/list/empty-state/submit usage required by the issue. "
+        "Do not rewrite unrelated components.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "Then end with <final>summary</final>."
     )
 
 
@@ -2368,10 +2951,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    visible_surface_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2400,7 +2990,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2499,6 +3089,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
+            visible_surface_nudges_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_visible_surface_nudge_prompt(issue),
+                "VISIBLE_SURFACE_NUDGE_QUEUED",
+            )
+            return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2528,6 +3128,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2546,7 +3154,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES:
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2564,7 +3172,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3:
+                if consecutive_model_errors >= 3 or out_of_time():
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
@@ -2607,7 +3215,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                block_reason = _oversized_context_dump_reason(command) if not get_patch(repo).strip() else None
+                if block_reason:
+                    result = CommandResult(
+                        command=command,
+                        exit_code=1,
+                        stdout="",
+                        stderr=block_reason,
+                        duration_sec=0.0,
+                        blocked=True,
+                    )
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
