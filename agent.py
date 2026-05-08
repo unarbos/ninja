@@ -1871,7 +1871,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-		elif suffix == ".toml":
+        elif suffix == ".toml":
             result = _check_toml_syntax_one(repo, relative_path)
         elif suffix in {".yml", ".yaml"}:
             result = _check_yaml_syntax_one(repo, relative_path)
