@@ -117,10 +117,25 @@ MAX_COVERAGE_NUDGES = 2    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 2    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 3    # three shots at converting an empty patch into a non-zero one
 MAX_INTEGRATION_NUDGES = 2 # cascade-completeness: full-stack tasks need 2 cycles to wire UI<->API<->tests
-MAX_TOTAL_REFINEMENT_TURNS = 6  # raised from 4 — duel #4201 lost ~7 rounds to incomplete integration
-                                # (King 0.34 vs Chal 0.91 on multi-feature notification task; King 0.08 vs
-                                # Chal 0.79 on native-login end-to-end task). Hail-mary and integration-nudge
-                                # are excepted from this cap.
+MAX_TOTAL_REFINEMENT_TURNS = 4  # Capped at 4 against the time budget. Effective working
+                                # window is WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS
+                                # = 270 - 18 = 252s; each refinement turn is ~20s of LLM call
+                                # plus optional commands. With this cap plus the two exempted
+                                # gates (hail-mary up to 3, integration-nudge up to 2), worst-case
+                                # refinement spend is (4 + 2 + 3) * 20s = 180s, leaving ~70s for
+                                # initial exploration/edits — comfortable headroom that a higher
+                                # cap erodes (cap=6 with full exemptions blows past 252s and the
+                                # out_of_time() check truncates mid-chain, leaving the patch in
+                                # an unfinished refinement state). Four turns covers the four
+                                # gates with empirical evidence in duels #4201 and #4210:
+                                # criteria-nudge (~10 hits/26), syntax-fix (~6 hits/24),
+                                # coverage-nudge (~6 hits/26), polish (~3 hits each duel).
+                                # The dropped gates — self-check (low-precision catch-all that
+                                # overlaps criteria/coverage) and test-fix (rare: requires strict
+                                # partner-name + runner + failure) — have low marginal value
+                                # per second. Hail-mary and integration-nudge remain excepted
+                                # because the former defends against guaranteed-zero empties
+                                # and the latter targets the largest single loss pattern.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
