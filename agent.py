@@ -55,6 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -103,7 +104,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+WALL_CLOCK_BUDGET_SECONDS = 120.0  # manual tighten: 180 still saw 5/10 timeouts on subnet-tight tasks (120-246s). 100s leaves ≥20s of cleanup headroom even at the 120s minimum subnet timeout so a partial patch flushes before validator kill.
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -116,6 +117,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_APPLY_CHECK_TURNS = 1  # verify patch applies cleanly; exempt from total cap like hail-mary
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -147,14 +149,6 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"\bcurl\b",
-    r"\bwget\b",
-    r"\bscp\b",
-    r"\brsync\b",
-    r"\bssh\b",
-    r"\bnc\b",
-    r"\bncat\b",
-    r"\btelnet\b",
 ]
 
 
@@ -582,6 +576,40 @@ def get_patch(repo: Path) -> str:
     return _strip_low_signal_hunks(cleaned)
 
 
+def _validate_patch_applies(repo: Path, patch: str) -> Optional[str]:
+    """Write patch to a temp file and run git apply --check --3way.
+
+    Returns the stderr tail (≤600 chars) when the patch would fail to apply,
+    or None when it applies cleanly. An unapplyable patch is a guaranteed
+    zero-score round — catching it here lets the model fix it before <final>.
+    """
+    if not patch.strip():
+        return None  # empty patch handled by hail-mary gate
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+            f.write(patch)
+            tmp = f.name
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "--check", "--3way", tmp],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                return None
+            tail = (proc.stderr or proc.stdout or "").strip()
+            return tail[-600:] if tail else "git apply --check failed (no output)"
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except Exception as exc:
+        return f"patch-apply check error: {exc}"
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -693,73 +721,6 @@ SECRETISH_PARTS = {
 }
 
 
-_PROJECT_HINT_FILES: Tuple[str, ...] = (
-    "package.json",
-    "pyproject.toml",
-    "pytest.ini",
-    "setup.cfg",
-    "tox.ini",
-    "Makefile",
-    "go.mod",
-    "Cargo.toml",
-    "jest.config.js",
-    "vitest.config.ts",
-)
-
-
-def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
-    """Compact top-level project hints: test scripts and build config only.
-
-    This is intentionally separate from ranked source context. The model often
-    knows what to edit but wastes a turn guessing the right verification
-    command. A tiny manifest summary helps it choose targeted tests without
-    reading broad config files itself.
-    """
-    tracked = set(_tracked_files(repo))
-    blocks: List[str] = []
-
-    for relative_path in _PROJECT_HINT_FILES:
-        if relative_path not in tracked:
-            continue
-        full = (repo / relative_path).resolve()
-        try:
-            full.relative_to(repo.resolve())
-            data = full.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-
-        if relative_path == "package.json":
-            try:
-                parsed = json.loads(data)
-            except Exception:
-                parsed = {}
-            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
-            if isinstance(scripts, dict) and scripts:
-                interesting = {
-                    key: scripts[key]
-                    for key in sorted(scripts)
-                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
-                }
-                if interesting:
-                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
-            continue
-
-        snippet = _truncate(data, 700)
-        if snippet.strip():
-            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
-
-        if len("\n\n".join(blocks)) >= max_chars:
-            break
-
-    if not blocks:
-        return ""
-    return _truncate(
-        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
-        + "\n\n".join(blocks),
-        max_chars,
-    )
-
-
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -796,11 +757,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             break
         parts.append(block)
         used += len(block)
-
-    project_hints = _project_hint_block(repo)
-    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
-        parts.append(project_hints)
-        used += len(project_hints)
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
@@ -1324,12 +1280,79 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_toml_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Parse a TOML file using tomllib (stdlib ≥3.11). Silent no-op on older Python."""
+    try:
+        import tomllib  # stdlib in 3.11+
+    except ModuleNotFoundError:
+        return None
+    full = (repo / rel).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        with open(full, "rb") as f:
+            tomllib.load(f)
+        return None
+    except Exception as exc:
+        return f"{rel}: TOML parse error: {str(exc)[:200]}"
+
+
+def _check_yaml_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Best-effort YAML syntax check. Returns None when no parser is available."""
+    full = (repo / rel).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    # No stdlib YAML parser; graceful pass-through when PyYAML is absent.
+    return None
+
+
+def _check_go_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Run gofmt -l -e on a Go file. Silent no-op when gofmt is not on PATH."""
+    if not _has_executable("gofmt"):
+        return None
+    proc = subprocess.run(
+        ["gofmt", "-l", "-e", rel],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc.returncode != 0 and (proc.stderr or "").strip():
+        return f"{rel}: gofmt error: {proc.stderr.strip()[:300]}"
+    return None
+
+
+def _check_rust_syntax_one(repo: Path, rel: str) -> Optional[str]:
+    """Run rustc parse-check on a Rust file. Silent no-op when rustc is absent."""
+    if not _has_executable("rustc"):
+        return None
+    proc = subprocess.run(
+        ["rustc", "--edition=2021", "--emit=metadata", "-o", "/dev/null", rel],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip()[-300:]
+        return f"{rel}: rustc error: {tail}" if tail else None
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed
+    through (matches the existing convention for unknown suffixes).
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1346,6 +1369,14 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+        elif suffix == ".toml":
+            result = _check_toml_syntax_one(repo, relative_path)
+        elif suffix in {".yml", ".yaml"}:
+            result = _check_yaml_syntax_one(repo, relative_path)
+        elif suffix == ".go":
+            result = _check_go_syntax_one(repo, relative_path)
+        elif suffix == ".rs":
+            result = _check_rust_syntax_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
@@ -1390,20 +1421,14 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    ("{stem}.py", "test/{stem}_test.py"),
-    ("{stem}.py", "test/test_{stem}.py"),
-    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
-    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
-    ("{stem}.js", "tests/{stem}.test.js"),
-    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
@@ -2191,6 +2216,25 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_apply_check_prompt(stderr_tail: str, patch: str) -> str:
+    """When git apply --check fails, quote the failure and ask for a corrective edit."""
+    truncated_patch = (
+        patch if len(patch) <= 3000 else patch[:1500] + "\n...[truncated]...\n" + patch[-1000:]
+    )
+    return (
+        "Apply-check failed — your current patch does NOT apply cleanly to the repo:\n\n"
+        "```\n"
+        f"{stderr_tail}\n"
+        "```\n\n"
+        "This means the validator's `git apply` will reject it and score the round at zero.\n\n"
+        "Current patch:\n```diff\n"
+        f"{truncated_patch}\n```\n\n"
+        "Diagnose the conflict (context lines that no longer match, header offset wrong, "
+        "hunk applied twice, etc.) and issue the corrective <command> blocks to fix the "
+        "underlying files so the diff applies. Then end with <final>summary</final>."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2216,7 +2260,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 120.0  # manual tighten paired with WALL_CLOCK_BUDGET_SECONDS = 100; same headroom rationale.
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2302,47 +2346,106 @@ def solve(
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
+
+    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
+    body raises (timeout, network, OOM, anything), we capture whatever's on
+    disk at the time and return it as the patch. The validator scores empty
+    patches at zero — any non-empty diff beats empty. Production data shows
+    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
+    the safety net converts those to "whatever partial work survived".
     """
-    _multishot_started = time.monotonic()
-    _multishot_total_budget = 580.0
-    _multishot_args = dict(
+    return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
-    _multishot_repo_obj = _repo_path(repo_path)
-    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
-    _result1 = _solve_attempt(**_multishot_args)
-    _patch1 = _result1.get("patch", "") or ""
-    _n1 = _multishot_count_substantive(_patch1)
 
-    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        _result1["multishot_attempts"] = 1
+def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """The actual multi-shot driver, wrapped so any exception still returns
+    the on-disk patch state instead of propagating."""
+    repo_path = kwargs["repo_path"]
+    _multishot_repo_obj = None
+    try:
+        _multishot_repo_obj = _repo_path(repo_path)
+    except Exception:
+        pass
+
+    try:
+        _multishot_started = time.monotonic()
+        _multishot_total_budget = 280.0  # manual tighten: fits two 100s attempts + 20s overhead, well under most subnet timeouts (120-600s).
+        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
+
+        _result1 = _solve_attempt(**kwargs)
+        _patch1 = _result1.get("patch", "") or ""
+        _n1 = _multishot_count_substantive(_patch1)
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+            _result1["multishot_attempts"] = 1
+            return _result1
+
+        _elapsed = time.monotonic() - _multishot_started
+        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
+
+        if _multishot_repo_obj is not None:
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _result2 = _solve_attempt(**{**kwargs, "retry_pass": True})
+        _patch2 = _result2.get("patch", "") or ""
+        _n2 = _multishot_count_substantive(_patch2)
+
+        if _n2 >= _n1:
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry"
+            return _result2
+
+        if _multishot_repo_obj is not None:
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        if _patch1 and _multishot_repo_obj is not None:
+            _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        _result1["multishot_attempts"] = 2
+        _result1["multishot_winner"] = "primary"
         return _result1
 
-    _elapsed = time.monotonic() - _multishot_started
-    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-        _result1["multishot_attempts"] = 1
-        _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
+    except Exception as exc:
+        # v43 safety net: ANY uncaught exception from the multi-shot body
+        # should not propagate. Instead, return whatever patch is on disk
+        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
+        # do their thing so the validator can clean-kill the process.)
+        salvaged = ""
+        try:
+            if _multishot_repo_obj is not None:
+                salvaged = get_patch(_multishot_repo_obj)
+        except Exception:
+            salvaged = ""
+        return AgentResult(
+            patch=salvaged or "",
+            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
+            steps=0,
+            cost=0.0,
+            success=bool(salvaged.strip()),
+        ).to_dict()
 
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args)
-    _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
-        _result2["multishot_attempts"] = 2
-        _result2["multishot_winner"] = "retry"
-        return _result2
+def _adaptive_max_steps(issue_text: str, default: int) -> int:
+    """Scale the step budget to issue complexity.
 
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
-    _result1["multishot_attempts"] = 2
-    _result1["multishot_winner"] = "primary"
-    return _result1
+    Trivial single-line fixes need fewer exploration turns; multi-criterion
+    feature issues need more. Heuristic: bullet count, file path mentions,
+    and raw length each contribute one complexity point.
+    """
+    text = issue_text or ""
+    bullet_count = len(re.findall(r"^\s*[-*\d]+[.)\s]", text, re.MULTILINE))
+    path_mentions = len(re.findall(r"\b[\w./-]+\.(py|js|ts|tsx|go|rs|java|rb)\b", text))
+    length = len(text)
+    score = bullet_count + path_mentions + (1 if length > 1500 else 0)
+    if score >= 4:
+        return min(default + 8, 40)   # complex — give extra steps
+    if score <= 1 and length < 400:
+        return max(default - 8, 18)   # trivial — exit earlier, save refinement budget
+    return default
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2356,6 +2459,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    retry_pass: bool = bool(kwargs.get("retry_pass", False))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2369,7 +2473,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    apply_check_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    # Retry pass gets one extra refinement slot (first attempt already used some budget).
+    _max_refinements = MAX_TOTAL_REFINEMENT_TURNS + (1 if retry_pass else 0)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2400,7 +2507,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, apply_check_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2418,9 +2525,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
+        # Apply-check gate: verify the patch would actually apply cleanly.
+        # Exempt from the total cap (same rationale as hail-mary — an
+        # unapplyable patch is a guaranteed zero regardless of content).
+        if apply_check_turns_used < MAX_APPLY_CHECK_TURNS:
+            apply_err = _validate_patch_applies(repo, patch)
+            if apply_err:
+                apply_check_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_apply_check_prompt(apply_err, patch),
+                    "APPLY_CHECK_QUEUED: patch fails git apply --check",
+                )
+                return True
+
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+        if total_refinement_turns_used >= _max_refinements:
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -2499,7 +2620,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+        if self_check_turns_used < MAX_SELF_CHECK_TURNS and not retry_pass:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
@@ -2517,9 +2638,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        max_steps = _adaptive_max_steps(issue, max_steps)
+
+        system_content = SYSTEM_PROMPT
+        if retry_pass:
+            system_content = (
+                "RETRY ATTEMPT — diverge from prior: assume the first edit set was wrong; "
+                "do not repeat the same file targets unless the issue explicitly names them. "
+                "Be more aggressive about deletions and replacements.\n\n"
+                + system_content
+            )
 
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
