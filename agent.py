@@ -59,6 +59,38 @@ Feature blocks (one line each, for reviewers):
       tokens from the issue text.
     - Criteria nudge: when acceptance bullets look unaddressed in added lines,
       list them for a targeted follow-up turn.
+
+Change rationale (reviewable blocks; intentionally cohesive — they share state):
+    A. Time-budget retuning (WALL_CLOCK_BUDGET_SECONDS, WALL_CLOCK_RESERVE_SECONDS,
+       _MULTISHOT_MIN_ATTEMPT_RESERVE, _multishot_total_budget). Motivation is
+       documented inline at each constant: the multi-shot wrapper runs up to two
+       inner attempts under one external per-round timeout, so each inner cap
+       must fit (2 * cap + finalization margin) within the round budget the
+       validator allots. The constants below are derived from those bounds.
+    B. Safety-net wrapper (solve -> _solve_with_safety_net -> _solve_attempt).
+       solve() now delegates to a thin wrapper that catches Exception (not
+       BaseException) and returns whatever unified diff is on disk so a late
+       failure does not discard partial work. The inner loop body is unchanged.
+    C. Refinement chain (polish, syntax, test-fix, coverage-nudge,
+       criteria-nudge, self-check, hail-mary). Each gate fires at most once
+       per cycle, with one shared cap MAX_TOTAL_REFINEMENT_TURNS for
+       heuristic gates; hail-mary is exempt because it is the only path out
+       of an empty working tree.
+    D. Context preloading (build_preloaded_context, _rank_context_files,
+       _symbol_grep_hits, _recent_commit_examples). Ranks tracked files by
+       issue overlap and identifier-shaped grep hits, then concatenates a
+       capped snippet block with optional recent-commit excerpts.
+    E. Multi-language syntax checks (_check_python/_node/_json/_brace_balance).
+       Best-effort per-file parser invocation, used by the syntax-fix
+       refinement gate. Languages without a cheap local check are skipped.
+    F. Companion-test execution (_select_companion_test_failure,
+       _run_companion_test, _TEST_PARTNER_TEMPLATES). Heuristically pairs an
+       edited source file with a likely test path and runs it once when a
+       runner is available, feeding any failure tail into the test-fix gate.
+    G. Prompt text (SYSTEM_PROMPT and build_*_prompt helpers). Describes the
+       expected behaviour (minimal, correct, complete patch) and the
+       refinement turn formats; does not mention the validator's scoring
+       mechanics.
 """
 
 from __future__ import annotations
@@ -116,8 +148,22 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# Inner loop wall clock: shorter budget leaves margin for multi-shot retry and
-# finalization within typical validator per-round limits.
+# Inner-loop wall clock for a single solve attempt.
+#
+# This file's solve() is wrapped by a multi-shot driver that runs the inner
+# loop up to two times under one external per-round timeout. The total budget
+# the wrapper allocates is _multishot_total_budget (see below), so each inner
+# attempt must satisfy:
+#
+#     2 * WALL_CLOCK_BUDGET_SECONDS + finalization_margin <= _multishot_total_budget
+#
+# With _multishot_total_budget = 400s and ~40s reserved for git-diff capture,
+# refinement queueing, and process teardown, an inner cap of 180s leaves the
+# wrapper able to actually run a second attempt rather than starting one and
+# being cut off mid-call. Earlier values around 270s were chosen for a
+# single-shot harness; under a multi-shot wrapper they leave no room for the
+# retry to finish, which converted potential second-attempt wins into hard
+# timeouts.
 WALL_CLOCK_BUDGET_SECONDS = 180.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
@@ -2068,7 +2114,13 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # do not start a retry without a full inner-attempt budget left
+# Minimum time that must remain in _multishot_total_budget before the wrapper
+# is allowed to start a second inner attempt. Set equal to
+# WALL_CLOCK_BUDGET_SECONDS so a retry only starts when it has a full inner
+# attempt to run; smaller reserves (e.g. half the inner cap) let a retry
+# launch and then be killed mid-call, which discards the first attempt's
+# patch without producing a second one.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2181,6 +2233,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         _multishot_started = time.monotonic()
+        # Total budget for both inner attempts plus finalization. Fits two
+        # WALL_CLOCK_BUDGET_SECONDS attempts (2 * 180 = 360s) under a typical
+        # validator per-round soft timeout, leaving ~40s for git-diff capture
+        # and process teardown. See WALL_CLOCK_BUDGET_SECONDS for the full
+        # derivation.
         _multishot_total_budget = 400.0
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
