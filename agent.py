@@ -992,7 +992,6 @@ def _extract_issue_path_mentions(iss: str) -> List[str]:
 # frame is almost always the bug locus. We extract those frames in *order*
 # (top of paste first) so callers can boost the deepest frame more than
 # casual mentions, and surface the `in <function>` identifier as a symbol
-# seed for `_symbol_grep_hits`.
 _PY_TRACE_RE = re.compile(
     r'File "([^"]+)", line \d+(?:, in ([\w.<>]+))?',
 )
