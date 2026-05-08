@@ -105,7 +105,13 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 540.0
+# Timeout-safe inner-attempt budget. Cut from 540s -> 180s because production
+# data shows challengers timing out 50%+ vs king ~20%; the only known cause
+# is exceeding the validator's per-round soft cap. Failing fast and returning
+# whatever patch we have beats burning time and shipping nothing. The
+# multi-shot wrapper around solve() relies on this being well below the
+# validator deadline so we have headroom for a second attempt.
+WALL_CLOCK_BUDGET_SECONDS = 180.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -114,11 +120,14 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-# Companion-test auto-repair turn removed because it was never wired into the
-# solve() refinement loop and only left dead prompt/config surface.
+MAX_TEST_FIX_TURNS = 1     # actually run the companion test if one exists
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+# Total refinement cap across all gates (hail-mary excepted). Chained
+# refinements above 2 burned the wall-clock budget without raising score
+# in the live duels that promoted the current king.
+MAX_TOTAL_REFINEMENT_TURNS = 2
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history.
@@ -1405,6 +1414,141 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+# -----------------------------
+# Companion-test runtime gate
+# -----------------------------
+#
+# Heuristic gates (coverage / criteria / self-check) catch the wrong target.
+# A real test runner is the only refinement signal that's grounded in actual
+# behaviour. When the patch edits `src/foo.py` and the repo has
+# `tests/test_foo.py`, run that test for ~8s and feed the failure tail back
+# to the model. Skip silently when the runner isn't installed, the test
+# isn't found, or the language has no fast static check available.
+
+def _run_companion_test(
+    repo: Path,
+    test_path: str,
+    timeout_seconds: int = 8,
+) -> Optional[str]:
+    """Run a single companion test and return failure tail, or None on pass.
+
+    Returns None when the test passes, the runner is unavailable, or the
+    language isn't supported. Returns a failure-output tail (string) on FAIL
+    so build_test_fix_prompt can quote it back at the model.
+
+    Languages handled:
+      - Python: prefer `pytest -x --tb=short -q --no-header <path>`. Fall
+        back to `python3 -m pytest ...` so a pip-installed pytest without
+        the entry script still works. If both runs report the runner is
+        unimportable (ModuleNotFoundError etc.), treat as unrunnable, not
+        a test failure.
+      - JS/TS: best-effort `node --check <path>`. Real jest/vitest needs
+        project config we can't synthesise in 8s on an unknown repo.
+      - Other languages: skipped (returns None).
+
+    Errors (timeout/runner-missing/exception) intentionally degrade to None
+    so the refinement chain doesn't queue a fix for something the agent
+    can't act on. The whole gate is best-effort.
+    """
+    full = repo / test_path
+    if not full.exists() or not full.is_file():
+        return None
+
+    suffix = Path(test_path).suffix.lower()
+
+    if suffix == ".py":
+        runner_cmds: List[List[str]] = []
+        if _has_executable("pytest"):
+            runner_cmds.append(
+                ["pytest", "-x", "--tb=short", "-q", "--no-header", test_path]
+            )
+        runner_cmds.append(
+            ["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path]
+        )
+
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            unrunnable_markers = (
+                "No module named pytest",
+                "No module named 'pytest'",
+                "command not found",
+                "/usr/bin/env: python3",
+            )
+            if any(marker in output for marker in unrunnable_markers):
+                continue
+            if proc.returncode == 0:
+                return None
+            return output[-2400:] if len(output) > 2400 else output
+
+        return None
+
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        if not _has_executable("node"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["node", "--check", test_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` parse timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    return None
+
+
+def _select_companion_test_failure(
+    repo: Path,
+    patch: str,
+    test_timeout_seconds: int = 8,
+) -> Optional[Tuple[str, str]]:
+    """Find the first companion test that fails for an edited file.
+
+    Returns (test_path, output_tail) on the first non-None failure, else None.
+    Stops at the first failure to keep the refinement budget tight (one fix
+    turn maximum per cycle).
+    """
+    edited = _patch_changed_files(patch)
+    if not edited:
+        return None
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return None
+    for relative_path in edited:
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (partner, output)
+    return None
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """Read recent small-diff commits as style anchors for the model.
 
@@ -1650,77 +1794,210 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are an elite autonomous coding agent in a competitive GitHub issue benchmark.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+Your output is scored in two equal halves:
+1) Cursor similarity (files/regions/tokens close to reference patch)
+2) LLM judge (correctness, completeness, and task alignment)
 
-## Command format
+Optimize BOTH by doing the same thing: identify root cause, make the minimal complete fix, and avoid unrelated edits.
 
-Run a bash command:
+====================================================================
+COMMAND CONTRACT
+====================================================================
+
+To run shell commands:
 <command>
 bash command here
 </command>
 
-Signal completion:
+To finish:
 <final>
-brief summary of what changed
+brief summary of what changed and what verification ran
 </final>
 
-## Workflow
+Optional plan block (first response only):
+<plan>
+- requirement 1
+- requirement 2
+- target files/functions
+- minimal fix strategy
+- intended verification command
+</plan>
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+Never wrap <command>, <plan>, or <final> in markdown code fences.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+====================================================================
+FIRST RESPONSE RULE
+====================================================================
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+Your FIRST response must include:
+1) a concise <plan> that restates ALL explicit requirements and likely hidden criteria
+2) one focused inspection or edit <command> immediately after the plan
 
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+Do not send a plan-only response.
 
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+====================================================================
+ISSUE CONTRACT DISCIPLINE
+====================================================================
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+Before editing, extract every acceptance criterion from the issue.
+Treat each clause with "and", "also", "ensure", "should", "must", "when",
+"unless", "only", "both", "all", "regression", or "edge case" as a distinct requirement.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+Never ignore secondary bullets. Hidden tests usually target missed clauses.
 
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+====================================================================
+INSPECTION STRATEGY (MINIMAL, HIGH-SIGNAL)
+====================================================================
 
-## Scope discipline — what to change
+Prefer:
+1) preloaded snippets
+2) one or two focused grep/rg commands
+3) exact target function/block
+4) nearest companion tests
 
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
-- "Fix X in function Y" → change only function Y
-- "Add feature Z to class C" → add only what Z requires inside C
-- "Bug when condition Q" → fix the condition that causes it, do not restructure
+Avoid repo wandering and repeated broad searches.
+If target is obvious, edit immediately.
 
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+====================================================================
+ROOT CAUSE + PATCH SHAPE
+====================================================================
 
-## Scope discipline — what NOT to change
+Patch the underlying cause, not only the visible symptom.
+Prefer the smallest maintainer-like change in the owning function/module.
 
-- Whitespace-only, comment-only, or blank-line-only edits
-- Imports not needed by your fix
-- Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
-- Test files unless the issue requires it OR your source change broke an existing test
-- Error handling, logging, or defensive checks not directly required by the fix
+If two fixes are both correct, choose the one that:
+- touches fewer files/lines
+- matches surrounding style/patterns
+- preserves public API compatibility
+- introduces fewer imports/helpers
 
-## Style matching
+Do not redesign architecture for a localized bug.
 
-Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
+====================================================================
+SURGICAL EDITING RULES
+====================================================================
 
-## Preloaded snippets
+Change the fewest lines required.
 
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+Preferred edit styles:
+- one-line substitution
+- small guarded block replacement
+- minimal heredoc/python script for narrow region
 
-## Safety
+Avoid:
+- rewriting full files/functions when 1-5 lines suffice
+- variable/function renames unless required
+- import reorder churn
+- formatting-only churn
+- comment-only churn
+- defensive/logging additions not required by issue
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+When 3+ repeated operations share shape, prefer a loop/table-driven pattern
+instead of unrolled copy-paste statements.
+
+====================================================================
+MULTI-FILE CONSISTENCY
+====================================================================
+
+When a change requires cascading updates, complete all affected files in the
+same edit phase:
+- interface/signature changes -> all implementations and call sites
+- type/struct changes -> all constructors/usages/tests
+- C/C++ changes -> declarations + definitions
+
+Do not leave known inconsistencies.
+Do not touch unrelated nearby files.
+
+====================================================================
+TEST + VERIFICATION DISCIPLINE
+====================================================================
+
+After patching, run the most targeted meaningful verification available.
+Prefer focused test file/case over full-suite runs.
+
+Good examples:
+- pytest tests/test_x.py -x -q
+- pytest tests/test_x.py::test_case -q
+- go test ./pkg/foo
+- cargo test test_name
+- npm/pnpm test scoped to changed area
+
+Do not rely only on syntax checks when real tests are available.
+
+If verification fails:
+1) read failure carefully
+2) fix direct root cause
+3) rerun same targeted verification
+
+If verification cannot run (missing deps/env), state that briefly in <final>.
+
+====================================================================
+SCOPE: WHAT NOT TO CHANGE
+====================================================================
+
+Never introduce unrelated changes:
+- whitespace/comment/blank-line-only diffs
+- drive-by refactors or renames
+- unrelated type annotation changes
+- unrelated test rewrites
+- dependency/lockfile changes unless explicitly required
+- generated/vendor/build artifacts unless task explicitly targets them
+
+Preserve surrounding comments and section structure unless they become false.
+If a comment becomes false due to your fix, update it minimally.
+
+====================================================================
+STYLE MATCHING
+====================================================================
+
+Match existing project style exactly:
+- indentation, quotes, braces, commas, semicolons
+- naming conventions and import grouping
+- assertion and test naming style
+- existing helper usage patterns
+
+Consistency with neighboring code beats personal preference.
+
+====================================================================
+LANGUAGE-SPECIFIC COMPLETENESS
+====================================================================
+
+TypeScript/C#/Java:
+- cascade interface/signature/type changes to all implementers/callers
+
+C/C++:
+- update header + implementation together
+
+Go/Rust:
+- update all impacted struct field usages and tests
+
+Python:
+- preserve typing style of surrounding code; avoid broad except blocks
+
+====================================================================
+SAFETY + PROHIBITIONS
+====================================================================
+
+Never:
+- use sudo
+- delete files
+- access host secrets
+- modify hidden tests/evaluator files
+- use network outside validator proxy
+- weaken tests just to pass
+- hardcode outputs for visible examples
+
+====================================================================
+FINISH RULE
+====================================================================
+
+Emit <final> only after a real code patch exists and verification has passed
+or been reasonably attempted.
+
+Keep <final> short:
+"Changed X to fix root cause Y; verified with Z" (or state verification limit).
 """
 
 
@@ -1904,14 +2181,132 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
+def build_test_fix_prompt(test_path: str, output: str) -> str:
+    """When the companion-test gate fails, hand the model the exact failure tail.
+
+    Pairs with `_run_companion_test`. The model gets one fix turn to extend
+    the source patch or update the stale test, then must finalize.
+    """
+    tail = output[-2400:] if len(output) > 2400 else output
+    return (
+        f"Companion test is failing after your patch: `{test_path}`.\n\n"
+        "Test output (tail):\n```\n"
+        f"{tail}\n```\n\n"
+        "Diagnose first: is the source patch incomplete (missing part of the "
+        "fix), or does the test itself need updating to match new correct "
+        "behaviour?\n"
+        "- If the source fix is incomplete, extend it now.\n"
+        "- If the test expectation is stale (the new behaviour IS correct), "
+        "update the test.\n"
+        "Issue the minimal <command> blocks needed, then re-run the test to "
+        "confirm it passes, then end with <final>summary</final>."
+    )
+
+
+# -----------------------------
+# Multi-shot helpers (revert-and-retry around _solve_attempt)
+# -----------------------------
+#
+# Production data on the king-of-the-hill duels: a substantial fraction of
+# losses come from a single inner attempt producing an empty or near-empty
+# patch (model whiff, transient proxy error, runaway exploration). Wrapping
+# solve() in a multi-shot driver that does {attempt -> revert if low-signal
+# -> attempt again} converts those whiffs into a second roll of the dice.
+# Both attempts share the validator's deadline, so the inner-attempt budget
+# (WALL_CLOCK_BUDGET_SECONDS = 180.0) must stay well below the deadline.
+
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3       # +lines of substantive code to "keep" attempt 1
+_MULTISHOT_TOTAL_BUDGET = 400.0           # outer budget across both attempts
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0    # never start a retry without one full inner budget
+
+
+def _multishot_count_substantive(patch: str) -> int:
+    """Count + lines that look like real code (not blank/comment)."""
+    if not patch.strip():
+        return 0
+    n = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if _line_is_comment(body):
+            continue
+        n += 1
+    return n
+
+
+def _multishot_capture_head(repo: Path) -> Optional[str]:
+    """Snapshot HEAD so we can revert the working tree before the retry."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True, timeout=10, check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _multishot_revert(repo: Path, head: Optional[str]) -> None:
+    """Reset the working tree to a known-clean state for the next attempt."""
+    try:
+        if head:
+            subprocess.run(
+                ["git", "reset", "--hard", head],
+                cwd=str(repo), capture_output=True, text=True, timeout=30, check=False,
+            )
+        else:
+            subprocess.run(
+                ["git", "checkout", "."],
+                cwd=str(repo), capture_output=True, text=True, timeout=30, check=False,
+            )
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=str(repo), capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        pass
+
+
+def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
+    """Re-apply a previously captured patch onto a clean working tree."""
+    if not patch_text.strip():
+        return True
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
+        )
+        if proc.returncode != 0:
+            proc2 = subprocess.run(
+                ["git", "apply", "--3way", "--whitespace=nowarn"],
+                cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
+            )
+            return proc2.returncode == 0
+        return True
+    except Exception:
+        return False
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
 
-# MINER-EDITABLE CORE: This orchestration loop is the main place to improve the
-# agent. You may change planning, memory, context collection, repair behavior,
-# test strategy, and stopping criteria. Preserve the solve() signature and
-# returned dict shape so validators can run your submission.
+# MINER-EDITABLE CORE: validator entry point. The public solve() signature is
+# fixed (repo_path, issue, model, api_base, api_key, max_steps,
+# command_timeout, max_tokens). The body is now a multi-shot wrapper around
+# the inner attempt: if attempt 1 produces a low-signal patch and we still
+# have time, revert the working tree and try again. Whichever attempt
+# produced more substantive lines is restored as the final patch.
+#
+# Anything that escapes the wrapper (timeout, OOM, unexpected exception)
+# falls through to a try/except that returns whatever's currently on disk
+# in unified-diff form. Empty patches score zero on every rubric; any
+# non-empty diff has a real chance.
 def solve(
     repo_path: str,
     issue: str,
@@ -1922,9 +2317,104 @@ def solve(
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
+    """Main portable interface for validators (multi-shot, safety-netted)."""
+    return _solve_with_safety_net(
+        repo_path=repo_path,
+        issue=issue,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        max_steps=max_steps,
+        command_timeout=command_timeout,
+        max_tokens=max_tokens,
+    )
+
+
+def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """Multi-shot driver, wrapped so any exception still returns the on-disk
+    patch state instead of propagating an empty result."""
+    repo_path = kwargs["repo_path"]
+    repo_obj: Optional[Path] = None
+    try:
+        repo_obj = _repo_path(repo_path)
+    except Exception:
+        pass
+
+    try:
+        started = time.monotonic()
+        initial_head = _multishot_capture_head(repo_obj) if repo_obj else None
+
+        result1 = _solve_attempt(**kwargs)
+        patch1 = result1.get("patch", "") or ""
+        n1 = _multishot_count_substantive(patch1)
+
+        # Attempt 1 looks good enough — ship it.
+        if n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+            result1["multishot_attempts"] = 1
+            return result1
+
+        elapsed = time.monotonic() - started
+        if (_MULTISHOT_TOTAL_BUDGET - elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            result1["multishot_attempts"] = 1
+            result1["multishot_skipped_retry"] = "insufficient_time"
+            return result1
+
+        # Revert the working tree and try again from scratch.
+        if repo_obj is not None:
+            _multishot_revert(repo_obj, initial_head)
+        result2 = _solve_attempt(**kwargs)
+        patch2 = result2.get("patch", "") or ""
+        n2 = _multishot_count_substantive(patch2)
+
+        if n2 >= n1:
+            result2["multishot_attempts"] = 2
+            result2["multishot_winner"] = "retry"
+            return result2
+
+        # Retry was worse — restore the primary patch onto a clean tree.
+        if repo_obj is not None:
+            _multishot_revert(repo_obj, initial_head)
+        if patch1 and repo_obj is not None:
+            _multishot_apply_patch(repo_obj, patch1)
+        result1["multishot_attempts"] = 2
+        result1["multishot_winner"] = "primary"
+        return result1
+
+    except Exception as exc:
+        # Don't catch BaseException — let SystemExit/KeyboardInterrupt bubble
+        # so the validator can clean-kill the process. Everything else gets
+        # converted into "whatever survived on disk" so we never ship empty.
+        salvaged = ""
+        try:
+            if repo_obj is not None:
+                salvaged = get_patch(repo_obj)
+        except Exception:
+            salvaged = ""
+        return AgentResult(
+            patch=salvaged or "",
+            logs=(
+                "FATAL_SAFETY_NET:\n"
+                f"{type(exc).__name__}: {str(exc)[:500]}\n"
+                f"Returning on-disk patch ({len(salvaged.splitlines())} lines)."
+            ),
+            steps=0,
+            cost=0.0,
+            success=bool(salvaged.strip()),
+        ).to_dict()
+
+
+def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
+    """Inner solve loop. Called once per multi-shot attempt; the multi-shot
+    wrapper handles revert-and-retry around it.
     """
-    Main portable interface for validators.
-    """
+    repo_path = kwargs["repo_path"]
+    issue = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+    max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
+    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
+    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -1934,9 +2424,11 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    total_refinement_turns_used = 0  # cap across all gates (hail-mary excepted)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1964,12 +2456,25 @@ def solve(
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+            3. test — actually run the companion test if one exists; if it
+                      fails, feed the failure tail back via build_test_fix_prompt
+            4. coverage-nudge — name issue-mentioned paths still untouched
+            5. criteria-nudge — name issue acceptance bullets not addressed
+            6. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per cycle. Test fires AFTER syntax
+        (we know the patch parses) but BEFORE coverage/criteria/self-check
+        (those are heuristic; test is ground truth from a real runner).
+
+        Total cap (`MAX_TOTAL_REFINEMENT_TURNS`) gates everything except the
+        hail-mary so chained refinements can't blow the wall-clock budget.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
+        nonlocal test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
+        nonlocal hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
+
+        # Hail-mary is exempt from the total-refinement cap because it's the
+        # only thing standing between us and a guaranteed-zero empty patch.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -1981,10 +2486,15 @@ def solve(
                 return True
             return False
 
+        # Hard-stop chained refinements — they burn budget without raising score.
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_polish_prompt(junk),
@@ -1996,6 +2506,7 @@ def solve(
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
                 syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
@@ -2003,10 +2514,27 @@ def solve(
                 )
                 return True
 
+        # Companion-test execution gate. Only refinement step backed by a
+        # real runner rather than heuristics — a passing test means the
+        # behaviour change is grounded in actual code.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
@@ -2018,6 +2546,7 @@ def solve(
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
@@ -2027,6 +2556,7 @@ def solve(
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
+            total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(patch, issue),
