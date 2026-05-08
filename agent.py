@@ -147,6 +147,14 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\bssh\b",
+    r"\bnc\b",
+    r"\bncat\b",
+    r"\btelnet\b",
 ]
 
 
@@ -752,6 +760,73 @@ SECRETISH_PARTS = {
 }
 
 
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "Makefile",
+    "go.mod",
+    "Cargo.toml",
+    "jest.config.js",
+    "vitest.config.ts",
+)
+
+
+def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
+    """Compact top-level project hints: test scripts and build config only.
+
+    This is intentionally separate from ranked source context. The model often
+    knows what to edit but wastes a turn guessing the right verification
+    command. A tiny manifest summary helps it choose targeted tests without
+    reading broad config files itself.
+    """
+    tracked = set(_tracked_files(repo))
+    blocks: List[str] = []
+
+    for relative_path in _PROJECT_HINT_FILES:
+        if relative_path not in tracked:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            data = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if relative_path == "package.json":
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = {}
+            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+            if isinstance(scripts, dict) and scripts:
+                interesting = {
+                    key: scripts[key]
+                    for key in sorted(scripts)
+                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
+                }
+                if interesting:
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
+            continue
+
+        snippet = _truncate(data, 700)
+        if snippet.strip():
+            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
+
+        if len("\n\n".join(blocks)) >= max_chars:
+            break
+
+    if not blocks:
+        return ""
+    return _truncate(
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
+        + "\n\n".join(blocks),
+        max_chars,
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -788,6 +863,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             break
         parts.append(block)
         used += len(block)
+
+    project_hints = _project_hint_block(repo)
+    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+        parts.append(project_hints)
+        used += len(project_hints)
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
@@ -1614,14 +1694,20 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
+    ("{stem}.py", "test/{stem}_test.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
