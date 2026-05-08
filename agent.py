@@ -128,8 +128,11 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 
-# Recent-commit injection: small in-context style anchors from the staged repo's
-# real history.
+# Recent-commit injection (v21 edge): small style anchors from real git history.
+# We cap insertions and diff size so the model sees "how this repo patches"
+# without drowning preloaded context in huge churn; `--pretty=format:` on
+# `git show` yields raw unified diff only (no commit headers), matching the
+# patch-shaped text validators score against.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
@@ -788,7 +791,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, iss: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -811,7 +814,7 @@ def build_preloaded_context(repo: Path, iss: str) -> str:
     Re-add project hints only if you also raise context budget or tighten hint
     extraction enough to avoid crowding out likely edit targets.
     """
-    files = _rank_context_files(repo, iss)
+    files = _rank_context_files(repo, issue)
     if not files:
         return ""
 
@@ -843,13 +846,13 @@ _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5
 
 
-def _rank_context_files(repo: Path, iss: str) -> List[str]:
+def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
 
-    issue_lower = iss.lower()
-    path_mentions = _extract_issue_path_mentions(iss)
+    issue_lower = issue.lower()
+    path_mentions = _extract_issue_path_mentions(issue)
     mentioned: List[str] = []
     tracked_set = set(tracked)
     for mention in path_mentions:
@@ -858,7 +861,7 @@ def _rank_context_files(repo: Path, iss: str) -> List[str]:
             mentioned.append(normalized)
 
     seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(iss)):
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
         if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
             for m in matches:
@@ -871,7 +874,7 @@ def _rank_context_files(repo: Path, iss: str) -> List[str]:
     # pull traceback function names into the symbol pool. We also prepend
     # traceback paths to `mentioned` so they win the deterministic ordering
     # below for files that tie on score.
-    trace_paths, trace_symbols = _extract_traceback_paths_and_symbols(iss)
+    trace_paths, trace_symbols = _extract_traceback_paths_and_symbols(issue)
     trace_path_score: Dict[str, int] = {}
     if trace_paths:
         # Iterate in reverse so the deepest frame (last in paste order) ends up
@@ -896,7 +899,7 @@ def _rank_context_files(repo: Path, iss: str) -> List[str]:
                     mentioned.insert(0, best_match)
                     seen_mentioned.add(best_match)
 
-    terms = _issue_terms(iss)
+    terms = _issue_terms(issue)
     if trace_symbols:
         # Reuse the issue-terms pool as a cheap conduit into the existing
         # path-substring scoring without touching `_symbol_grep_hits` (which
@@ -906,7 +909,7 @@ def _rank_context_files(repo: Path, iss: str) -> List[str]:
             sym_low = sym.lower()
             if sym_low and sym_low not in terms:
                 terms.append(sym_low)
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, iss)
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -975,13 +978,13 @@ def _context_file_allowed(relative_path: str) -> bool:
     return True
 
 
-def _extract_issue_path_mentions(iss: str) -> List[str]:
+def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(iss):
+    for match in pattern.finditer(issue):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
@@ -992,6 +995,7 @@ def _extract_issue_path_mentions(iss: str) -> List[str]:
 # frame is almost always the bug locus. We extract those frames in *order*
 # (top of paste first) so callers can boost the deepest frame more than
 # casual mentions, and surface the `in <function>` identifier as a symbol
+# seed for `_symbol_grep_hits`.
 _PY_TRACE_RE = re.compile(
     r'File "([^"]+)", line \d+(?:, in ([\w.<>]+))?',
 )
@@ -1018,7 +1022,7 @@ _TRACE_NODE_INTERNAL_PREFIXES = (
 
 
 def _extract_traceback_paths_and_symbols(
-    iss: str,
+    issue: str,
 ) -> Tuple[List[str], List[str]]:
     """Return (ordered paths, function/symbol names) from any tracebacks
     embedded in the issue body. Paths are de-duplicated preserving order
@@ -1055,19 +1059,19 @@ def _extract_traceback_paths_and_symbols(
             seen_symbols.add(s)
             symbols.append(s)
 
-    for match in _PY_TRACE_RE.finditer(iss):
+    for match in _PY_TRACE_RE.finditer(issue):
         _push_path(match.group(1))
         _push_symbol(match.group(2) or "")
-    for match in _JS_TRACE_RE.finditer(iss):
+    for match in _JS_TRACE_RE.finditer(issue):
         _push_symbol(match.group(1) or "")
         _push_path(match.group(2))
-    for match in _GENERIC_TRACE_RE.finditer(iss):
+    for match in _GENERIC_TRACE_RE.finditer(issue):
         _push_path(match.group(1))
 
     return paths, symbols
 
 
-def _issue_terms(iss: str) -> List[str]:
+def _issue_terms(issue: str) -> List[str]:
     stop = {
         "about",
         "after",
@@ -1092,7 +1096,7 @@ def _issue_terms(iss: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", iss.lower()):
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
         if raw in stop or raw in terms:
             continue
         terms.append(raw)
@@ -1293,8 +1297,14 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Keep this set conservative: Rust lifetimes (`'a`) can look like unclosed
-# single-quoted strings to this lightweight parser and cause false positives.
+# Delimiter balance for touched sources uses `_delimiter_balance_error`, which
+# skips // and /* */ comments and treats ", ', and ` strings with \\ escapes.
+# Spot-checked evidence (manual `_delimiter_balance_error` on snippets): Java
+# `char c = '}';`, Go rune literals `x := '}'` and `'\''`, and nested `{}`
+# inside those strings — all return None (no false imbalance). Rust `.rs` is
+# intentionally omitted: lifetime syntax like `'a` is not a rune literal and
+# still confuses the naive single-quote scan (the original reason the set
+# stayed narrow).
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".cs",
@@ -1914,12 +1924,12 @@ _CRITERIA_STOP = frozenset({
 })
 
 
-def _extract_acceptance_criteria(issue_text: str) -> List[str]:
-    if not issue_text:
+def _extract_acceptance_criteria(issue: str) -> List[str]:
+    if not issue:
         return []
     bullets: List[str] = []
     bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
-    for line in issue_text.splitlines():
+    for line in issue.splitlines():
         m = bullet_re.match(line)
         if not m:
             continue
@@ -1935,7 +1945,7 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
         re.IGNORECASE,
     )
-    for raw in re.split(r"(?<=[.!?])\s+", issue_text):
+    for raw in re.split(r"(?<=[.!?])\s+", issue):
         text = raw.strip()
         if not text or len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
             continue
@@ -2638,12 +2648,12 @@ def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
     return last_fail
 
 
-def _build_multishot_memo(result: Dict[str, Any], iss: str) -> Dict[str, Any]:
+def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
     patch = result.get("patch", "") or ""
     return {
         "attempt1_files_touched": _patch_changed_files(patch),
         "attempt1_substantive_lines": _multishot_count_substantive(patch),
-        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, iss),
+        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
         "attempt1_last_failed_command": _last_failed_commands_summary(result),
     }
 
