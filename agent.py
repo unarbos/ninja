@@ -1,51 +1,4 @@
 #!/usr/bin/env python3
-"""
-Portable single-file SWE-style coding agent harness.
-
-Contract:
-    The validator imports this file and calls:
-
-        solve(
-            repo_path="/tmp/task_repo",
-            issue="Fix the bug...",
-            model="validator-managed-model",
-            api_base="http://validator-proxy/v1",
-            api_key="per-run-proxy-token"
-        )
-
-    It returns:
-        {
-            "patch": "... unified git diff ...",
-            "logs": "...",
-            "steps": int,
-            "cost": float | None,
-            "success": bool,
-        }
-
-Design goals:
-    - Single file.
-    - No external Python dependencies.
-    - Validator-provided OpenAI-compatible /v1/chat/completions endpoint.
-    - No direct OpenRouter/OpenAI credentials in miner code.
-    - Bash-only action interface.
-    - Validator owns repo, tests, sandbox, scoring, hidden tasks.
-    - Miners only patch this file.
-
-Miner editing guide:
-    You are expected to improve this file. Good areas to edit include prompting,
-    context gathering, command selection, tool/result parsing, stopping logic,
-    patch generation, safety checks, and how the agent uses its step budget.
-
-    Keep these validator-owned boundaries intact:
-    - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
-      public entry point.
-    - Return a dict with patch, logs, steps, cost, and success.
-    - Use only the validator-provided api_base/api_key for LLM calls.
-    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
-      path, or validator secret.
-    - Do not add third-party package requirements; this file must stay portable.
-    - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
-"""
 
 from __future__ import annotations
 
@@ -103,7 +56,9 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
+# Inner attempt budget: multishot wrapper (below) may run two attempts within ~580s
+# validator wall; keep inner solve lean so a low-signal retry still has time.
+WALL_CLOCK_BUDGET_SECONDS = 270.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -116,9 +71,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
-_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+MAX_TOTAL_REFINEMENT_TURNS = 2  # cap chained refinements across gates (hail-mary excluded); PR#268 insight
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1233,18 +1186,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
-# Languages where ' is unambiguously a string delimiter. The brace-balance
-# parser below treats ' as a string-mode toggle, which produces false
-# positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
-#     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust — `'a` is a lifetime annotation
-#   - Go — `'X'` is a rune literal
-# Net effect of including those: a single `'X'` in any function would yield
-# a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
-# to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
-    ".ts", ".tsx", ".jsx", ".swift",
+    ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
+    ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
 }
 
 
@@ -1390,20 +1334,14 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    ("{stem}.py", "test/{stem}_test.py"),
-    ("{stem}.py", "test/test_{stem}.py"),
-    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
-    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
-    ("{stem}.js", "tests/{stem}.test.js"),
-    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
@@ -1457,42 +1395,17 @@ def _run_companion_test(
 ) -> Optional[str]:
     """Best-effort companion-test execution. Returns failure-output tail on FAIL,
     or None when the test passed, the runner is unavailable, or the language
-    isn't supported.
-
-    Languages handled:
-      - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
-        the failure when output indicates pytest itself isn't importable
-        (ModuleNotFoundError) — that's not a real test failure.
-      - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
-        they require project-level config we can't synthesize in 8s on an
-        unknown repo.
-      - Other languages: skipped (returns None).
-
-    Errors (timeout, runner missing, exception) intentionally degrade to None
-    so the refinement chain doesn't queue a fix for something the agent can't
-    actually act on. The whole gate is best-effort.
-
-    Pairs with build_test_fix_prompt — when this returns a non-None failure
-    tail, that tail is fed back to the model as one extra refinement turn.
-    Companion-test execution was scaffolded by previous king alexlange1 (the
-    constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
-    co-loading templates _TEST_PARTNER_TEMPLATES) but never wired up; the
-    massive PR #185 rewrite preserved the dead scaffolding without using it.
-    This re-introduces the runtime-correctness signal as a refinement gate.
-    """
+    isn't supported."""
     full = repo / test_path
     if not full.exists() or not full.is_file():
         return None
 
     suffix = Path(test_path).suffix.lower()
 
-    # ---- Python ----
     if suffix == ".py":
         runner_cmds: List[List[str]] = []
         if _has_executable("pytest"):
             runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
-        # Always also try `python3 -m pytest`: works when pytest is importable
-        # but no `pytest` binary is on PATH (pip-installed without entry script).
         runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
 
         for cmd in runner_cmds:
@@ -1519,14 +1432,13 @@ def _run_companion_test(
                 "/usr/bin/env: python3",
             )
             if any(marker in output for marker in unrunnable_markers):
-                continue  # try next runner / give up if all fail
+                continue
             if proc.returncode == 0:
-                return None  # test passed
+                return None
             return output[-2400:] if len(output) > 2400 else output
 
-        return None  # no runner produced a usable signal
+        return None
 
-    # ---- JS / TS ----
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
         if not _has_executable("node"):
             return None
@@ -1549,7 +1461,7 @@ def _run_companion_test(
         output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         return output[-2400:] if len(output) > 2400 else output
 
-    return None  # other languages: skip
+    return None
 
 
 def _select_companion_test_failure(
@@ -1557,12 +1469,7 @@ def _select_companion_test_failure(
     patch: str,
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
-    """For files touched by the patch, find the first companion test that fails.
-
-    Returns (test_path, output_tail) on the first non-None failure, else None.
-    Stops at the first failure to keep the refinement budget tight (one fix
-    turn maximum per cycle).
-    """
+    """For files touched by the patch, find the first companion test that fails."""
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -1626,13 +1533,8 @@ def _recent_commit_examples(repo: Path) -> str:
                     break
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
-            # NOTE: previous version passed --pretty=format:%s which caused
-            # `git show` to emit the commit subject in place of the standard
-            # header but git still appended the diff. After the >=100 char
-            # filter the only commits that survived were those with very long
-            # subjects (e.g. squash messages); their wrapped output was a mix
-            # of subject + diff, which is noise. --pretty=format: empties the
-            # header entirely so we keep just the diff body.
+            # --pretty=format: empties the header so we keep just the diff body
+            # (long subjects mixed with diff were noise when using %s).
             diff_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -1738,7 +1640,7 @@ def _keyword_in_added(keyword: str, added_lower: str) -> bool:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
         if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
-            if keyword[:-len(suffix)] in added_lower:
+            if keyword[: -len(suffix)] in added_lower:
                 return True
             break
     return False
@@ -1929,48 +1831,6 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## Idiomatic refactors — CRITICAL for judge score
-
-When converting a bulk operation into individual operations (e.g.
-`createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
-loop. NEVER emit unrolled, copy-pasted statements.
-
-GOOD (judge prefers):
-    const items = [{...}, {...}, {...}]
-    for (const data of items) await prisma.X.create({ data })
-
-BAD (judge severely penalizes):
-    await prisma.X.create({ data: {...} })
-    await prisma.X.create({ data: {...} })
-    ... (repeated)
-
-When 3+ consecutive statements share the same shape, factor into a loop, list
-comprehension, or `.map()`.
-
-## Comment + structure preservation
-
-Preserve EVERY comment from the surrounding code unless the task explicitly
-removes it. Section-grouping comments (`// Member 1 availability`) are
-high-signal to the judge. Removing comments while refactoring tanks judge
-score.
-
-## Language-specific completeness rules
-
-**Java:** Write complete method bodies — never use '// similar logic' stubs.
-Cascade all call-site changes when modifying signatures. Include all imports.
-
-**C/C++:** Edit both .h header AND .cpp implementation for each changed
-function. Include full signatures and all required #include changes.
-
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing
-classes, components, and function parameters. Missing one = lower score.
-
-**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
-annotations on modified functions.
-
-**Multi-file tasks:** Complete ALL affected files in the same diff — never
-leave a related file partially edited. When in doubt, include more files.
 
 ## Style matching
 
@@ -2211,12 +2071,12 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Main agent
 # -----------------------------
 
-# -----------------------------
-# v28 multi-shot helpers
-# -----------------------------
+# MINER-EDITABLE CORE: orchestration lives in _solve_attempt; solve() adds a
+# multi-shot wrapper (revert + retry on low-signal first patch). Preserve the
+# solve() signature and returned dict shape so validators can run your submission.
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2239,7 +2099,11 @@ def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=str(repo), capture_output=True, text=True, timeout=10, check=False,
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         if proc.returncode == 0:
             return proc.stdout.strip()
@@ -2251,13 +2115,31 @@ def _multishot_capture_head(repo: Path) -> Optional[str]:
 def _multishot_revert(repo: Path, head: Optional[str]) -> None:
     try:
         if head:
-            subprocess.run(["git", "reset", "--hard", head],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
+            subprocess.run(
+                ["git", "reset", "--hard", head],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
         else:
-            subprocess.run(["git", "checkout", "."],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-        subprocess.run(["git", "clean", "-fd"],
-                       cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
+            subprocess.run(
+                ["git", "checkout", "."],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
     except Exception:
         pass
 
@@ -2268,12 +2150,22 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     try:
         proc = subprocess.run(
             ["git", "apply", "--whitespace=nowarn"],
-            cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
+            cwd=str(repo),
+            input=patch_text,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         if proc.returncode != 0:
             proc2 = subprocess.run(
                 ["git", "apply", "--3way", "--whitespace=nowarn"],
-                cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
+                cwd=str(repo),
+                input=patch_text,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
             return proc2.returncode == 0
         return True
@@ -2281,15 +2173,6 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
-# -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
-# -----------------------------
-
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
 def solve(
     repo_path: str,
     issue: str,
@@ -2306,14 +2189,20 @@ def solve(
     _multishot_started = time.monotonic()
     _multishot_total_budget = 580.0
     _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        repo_path=repo_path,
+        issue=issue,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        max_steps=max_steps,
+        command_timeout=command_timeout,
+        max_tokens=max_tokens,
     )
     _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
     _result1 = _solve_attempt(**_multishot_args)
+
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
@@ -2346,8 +2235,7 @@ def solve(
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Original solve loop, callable through kwargs to avoid re-stating the
-    validator-protected parameter signature outside of solve()."""
+    """Single agent run (reference prepass + model loop). Called from solve()."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -2369,9 +2257,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2391,22 +2285,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
+            3. test — run companion test when present; feed failure via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
+            5. criteria-nudge — acceptance bullets not clearly reflected in +lines
             6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
+        Each refinement runs at most once per cycle (hail-mary exempt from total cap).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
+        # exit. The original `return False` here silently accepted empty
+        # patches and cost ~10% of rounds in the live duel that promoted
+        # this king. An empty patch has Jaccard = 0 against any non-empty
+        # reference; a guess has Jaccard > 0 with non-zero probability.
+        # Force one final real-edit attempt before the duel scores zero.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2418,8 +2311,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -2447,15 +2338,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -2520,13 +2402,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {
+                "role": "user",
+                "content": build_initial_user_prompt(issue, repo_summary, preloaded_context),
+            },
         ]
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
@@ -2546,7 +2439,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES:
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2564,7 +2457,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3:
+                if consecutive_model_errors >= 3 or out_of_time():
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
