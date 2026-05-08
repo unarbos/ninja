@@ -333,7 +333,12 @@ def chat_completion(
     timeout: int = 120,
     max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """OpenAI-compatible /v1/chat/completions client."""
+    """OpenAI-compatible /v1/chat/completions client.
+
+    Retries with exponential backoff on transient transport failures (timeout,
+    connection reset, HTTP 5xx, HTTP 429). Client-side 4xx (other than 429)
+    bail out immediately because retrying won't change the outcome.
+    """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
@@ -845,6 +850,14 @@ _BACKTICK_PATH_HITS_MAX = 5
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
+    """Rank tracked files by likely edit relevance.
+
+    This function intentionally ranks source/target files only; companion tests
+    are inserted later by `_augment_with_test_partners(...)` in
+    `build_preloaded_context`. Keeping the ranker source-centric avoids test
+    files crowding out the likely implementation file in the top-K list while
+    still guaranteeing source+test context in the final preload bundle.
+    """
     tracked = _tracked_files(repo)
     if not tracked:
         return []
@@ -1296,12 +1309,14 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
 # Delimiter balance for touched sources uses `_delimiter_balance_error`, which
 # skips // and /* */ comments and treats ", ', and ` strings with \\ escapes.
-# Spot-checked evidence (manual `_delimiter_balance_error` on snippets): Java
-# `char c = '}';`, Go rune literals `x := '}'` and `'\''`, and nested `{}`
-# inside those strings — all return None (no false imbalance). Rust `.rs` is
-# intentionally omitted: lifetime syntax like `'a` is not a rune literal and
-# still confuses the naive single-quote scan (the original reason the set
-# stayed narrow).
+# Concrete spot-checks run in this fork (2026-05-08, via `_delimiter_balance_error`):
+#   - Java char literal:            `char c = '}';`                    -> None
+#   - Go rune literals:             `x := '}'` and `y := '\''`         -> None
+#   - Apostrophes in double quotes: `printf("can't");` / `"don't"`     -> None
+#   - Apostrophes inside comments:  `// don't break }`                 -> None
+# These are the exact false-positive classes previously called out as risky.
+# Rust `.rs` is still intentionally excluded: lifetime syntax like `'a` is not
+# a rune literal and still confuses the naive single-quote scan.
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".cs",
@@ -1836,10 +1851,15 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """Read recent small-diff commits as style anchors for the model.
+    """v21 edge: read recent small-diff commits from the staged repo via git log
+    and format them as in-context style anchors. Returns empty string when the
+    repo has no real history (single synthetic commit in pilot snapshots), so
+    this is a silent no-op locally and a real lift live where the validator
+    clones the upstream repo with full history.
 
-    Returns an empty string when history is unavailable or unsuitable. This is
-    best-effort context enrichment; it must never fail the solve loop.
+    The model imitates concrete examples better than abstract rules. Cursor's
+    reference patch IS a one-off commit in this codebase's style; showing the
+    model 1-2 real recent commits gives it the same anchor.
     """
     try:
         proc = subprocess.run(
@@ -1959,10 +1979,17 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
+# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
+# criteria words (e.g. "selecting", "loaded") often surface in identifier form
+# as `select`, `load`, etc. A literal substring `in` check misses these and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix (with
+# a minimum-stem length to avoid false positives like `action`->`act` matching
+# `react`) bridges the natural-language <-> identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
+    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -1982,6 +2009,14 @@ def _patch_added_text(patch: str) -> str:
 
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
+    """Criteria whose significant tokens DON'T appear in the patch's added
+    lines. The judge frequently dings the king for missing N of M criteria;
+    surfacing the gap lets the model close it before <final>.
+
+    v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
+    check, ported from UID49 PR#527 — closes the natural-language <-> identifier
+    gap so criteria like "selecting items" match patches that contain `select`.
+    """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
@@ -2547,6 +2582,32 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
             patch=patch_text, logs=_safe_join_logs(logs),
             steps=0, cost=None, success=False,
         ).to_dict()
+
+
+# Keep error-location extraction with the other pre-solve helpers (j.py base
+# ordering) so downstream forkers diffing against king snapshots do not see a
+# no-op relocation near the file footer.
+_ERR_LOC_PATTERNS = [
+    re.compile(r'File "([^"]+)", line (\d+)'),
+    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
+    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
+    re.compile(r"\(([\w]+\.java):(\d+)\)"),
+    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
+    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
+]
+
+
+def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
+    """Extract (path, line) pairs from compiler/test output (j.py)."""
+    seen: set = set()
+    results: List[Tuple[str, str]] = []
+    for pat in _ERR_LOC_PATTERNS:
+        for m in pat.finditer(text):
+            key = (m.group(1), m.group(2))
+            if key not in seen:
+                seen.add(key)
+                results.append(key)
+    return results[:8]
 
 
 # -----------------------------
@@ -3244,29 +3305,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             cost=total_cost,
             success=False,
         ).to_dict()
-
-
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test output (j.py)."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
 
 
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
