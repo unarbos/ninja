@@ -2739,6 +2739,7 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         return False
 
     has_good = any(re.search(p, lower) for p in good_patterns)
+    
     # Check bad markers only if exit code is zero, to avoid false positives from non-test commands that print "error" or "failed" in their normal output.
     has_bad = any(marker in lower for marker in bad_markers)
 
