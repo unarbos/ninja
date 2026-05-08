@@ -3237,10 +3237,6 @@ def main(argv: List[str]) -> int:
 
     if args.get("json_out"):
         Path(args["json_out"]).write_text(output, encoding="utf-8")
-
-    print(output)
     return 0 if result.get("success") else 1
-
-
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
