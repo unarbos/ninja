@@ -954,7 +954,7 @@ def _augment_with_named_scope(repo: Path, files: List[str], tracked_set: set[str
             continue
         lower = path.lower()
         name = Path(path).name.lower()
-        if any(term in lower for term in terms) or re.search(r"(app|main|index|draw|editor|code|blob|shader)", name):
+        if any(term in lower for term in terms) or re.search(r"(app|main|index)", name):
             scoped.append(path)
 
     ordered: List[str] = []
@@ -1916,8 +1916,8 @@ def _visible_surface_missing(issue_text: str, patch: str) -> bool:
     issue_lower = issue_text.lower()
     if not re.search(
         r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
-        r"panel|control|slider|simulator|simulation|editor|appointment|booking|"
-        r"workshop|taller|resident|apartment)\b",
+        r"panel|control|slider|simulator|simulation|editor|view|layout|"
+        r"sidebar|navbar|menu|modal|dialog)\b",
         issue_lower,
     ):
         return False
@@ -2137,7 +2137,7 @@ annotations on modified functions.
 leave a related file partially edited. When in doubt, include more files.
 If duplicate root and `src/` frontend files exist (`App.jsx` and `src/App.jsx`), edit the active runtime copy imported by the app entry. Do not patch both copies unless the issue explicitly asks to move/delete root files.
 If the issue names a specific project/subdirectory, prefer files inside that scope over similarly named shared/core files unless the task explicitly asks for a global change.
-For shader/vector/color/time control arrays, keep each named index's role exact. If the task says final color is multiplied by RGB controls, compute the base color first, then multiply once by `vec3(T[2], T[3], T[4])`.
+When the issue references named indices into arrays/tuples/structs, preserve each index's documented role rather than reordering them.
 
 ## Style matching
 
@@ -3240,21 +3240,15 @@ def _v14_grounded_score(repo_root: Path, issue_text: str, patch_text: str) -> fl
 # heavy issues, we permit the per-round budget to grow from 180s to 230s. The
 # retry-reserve invariant still holds because the multi-shot driver itself
 # uses _MULTISHOT_MIN_ATTEMPT_RESERVE; this only relaxes the early-exit gate
-# inside _solve_attempt for tasks that genuinely need more steps.
-_LARGE_ISSUE_HEURISTIC_RE = re.compile(
-    r"\b(tests/|test classes|fixture|milestones|catalogue|40\+ rows|version\.php)\b",
-    re.IGNORECASE,
-)
-
-
+# inside _solve_attempt for tasks that genuinely need more steps. Trigger is
+# generic: long issue bodies typically encode multi-criteria tasks that need
+# more refinement turns.
 def _compute_wall_clock_for_issue(issue: str) -> float:
-    """Return per-round wall-clock budget. 180s default, 230s for outsized
-    issues (long bodies or fixture-heavy keywords)."""
+    """Return per-round wall-clock budget. 180s default, 230s for long-body
+    issues that typically encode multi-criteria tasks."""
     if not issue:
         return WALL_CLOCK_BUDGET_SECONDS
     if len(issue) > 5000:
-        return 230.0
-    if _LARGE_ISSUE_HEURISTIC_RE.search(issue):
         return 230.0
     return WALL_CLOCK_BUDGET_SECONDS
 
