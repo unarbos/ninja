@@ -115,6 +115,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_CALLSITE_NUDGES = 1    # v56: tell model which untouched files contain issue-mentioned symbols
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -578,8 +579,36 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
+    # v54: after the block-level mode-only stripper drops files whose ENTIRE
+    # change is a mode change, also strip standalone `old mode / new mode`
+    # metadata lines from any block that has BOTH content edits AND a mode
+    # change. The block-level stripper alone leaves those lines intact; the
+    # LLM judge consistently flags them as "unrelated chmod churn outside
+    # scope" in close-call rounds. Order matters: do block-level first, then
+    # line-level — otherwise a pure mode-only block becomes an orphan
+    # `diff --git` header and slips past the block-level pattern.
     cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+_MODE_METADATA_LINE_RE = re.compile(r"^(?:old|new) mode \d+$")
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Remove top-level `old mode NNNNNN` / `new mode NNNNNN` lines from
+    the diff. These are git metadata, not functional content; `git apply`
+    ignores them. Anchored regex so context lines that happen to contain
+    the text "old mode 100644" inside a hunk are preserved.
+    """
+    if not diff_output:
+        return diff_output
+    out_lines: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        if _MODE_METADATA_LINE_RE.match(line.rstrip("\r\n")):
+            continue
+        out_lines.append(line)
+    return "".join(out_lines)
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1159,6 +1188,66 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+# v56 callsite-coverage gate. The path-coverage gate above only flags files
+# the issue NAMES directly. The dominant LLM-judge complaint in close-call
+# rounds is multi-callsite incompleteness: the king touches every file
+# containing a referenced symbol (function/class/API name), while we touch
+# one. The judge phrases it as "neither updates the OTHER webhook path",
+# "King covers MORE of the requested feature set", "still incomplete because
+# does not update X for full Y consistency". This helper finds files that
+# contain >=2 of the issue's identifier-shaped tokens but aren't touched.
+_CALLSITE_MIN_HITS = 1  # match >=1 issue symbol — typical issues only name 1-2 symbols
+_CALLSITE_MAX_REPORTED = 3  # cap the nudge so the prompt stays tight (false-positive guard)
+_CALLSITE_MIN_TOTAL_FILES = 2  # only nudge when at least 2 files share an issue symbol —
+                                # if there's only one file with the symbol, it's already
+                                # caught by the path-coverage gate
+
+
+def _uncovered_symbol_callsites(
+    patch: str,
+    issue_text: str,
+    repo: Path,
+) -> List[str]:
+    """Files containing >=2 issue-mentioned symbols that the patch does NOT
+    touch. Returns a small, prioritized list (top _CALLSITE_MAX_REPORTED by
+    hit count). Returns [] if the symbol set is empty or every hit is
+    already touched. Used by the callsite-nudge refinement turn.
+    """
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return []
+    if not tracked:
+        return []
+    symbol_hits = _symbol_grep_hits(repo, tracked, issue_text)
+    if not symbol_hits:
+        return []
+    # Skip when only one file contains any issue symbol — that file (if not
+    # touched) is already caught by the path-coverage gate. The callsite
+    # nudge specifically targets the multi-file scenario.
+    if len(symbol_hits) < _CALLSITE_MIN_TOTAL_FILES:
+        return []
+    changed_files = _patch_changed_files(patch)
+    changed_set = set(changed_files)
+    # Some callers list paths as "a/foo.py" or "b/foo.py"; normalize.
+    changed_normalized = set()
+    for c in changed_files:
+        changed_normalized.add(c)
+        if c.startswith(("a/", "b/")):
+            changed_normalized.add(c[2:])
+    missing: List[Tuple[int, str]] = []
+    for path, hit_count in symbol_hits.items():
+        if hit_count < _CALLSITE_MIN_HITS:
+            continue
+        if path in changed_set or path in changed_normalized:
+            continue
+        missing.append((hit_count, path))
+    # Highest hit count first — those files reference the most issue symbols
+    # and are most likely real callsites.
+    missing.sort(key=lambda t: (-t[0], t[1]))
+    return [path for _, path in missing[:_CALLSITE_MAX_REPORTED]]
 
 
 # -----------------------------
@@ -2164,6 +2253,38 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_callsite_nudge_prompt(uncovered: List[str], issue_text: str) -> str:
+    """v56 callsite-nudge: when the issue references symbols (function/class
+    names) that exist in additional untouched files, surface those files as
+    likely-related callsites the same fix should apply to.
+
+    Targets the dominant LLM-judge complaint pattern in close-call rounds:
+    "neither updates the OTHER webhook path", "King covers MORE of the
+    requested feature set", "still incomplete because does not update X for
+    full Y consistency". The judge consistently rewards patches that touch
+    every callsite of a referenced symbol.
+    """
+    bullets = "\n  ".join(f"- {p}" for p in uncovered) or "(none)"
+    return (
+        "Callsite-coverage gap — these untouched files reference multiple "
+        "symbols from the issue (function names, class names, or APIs):\n"
+        f"  {bullets}\n\n"
+        "These are likely related callsites of the same fix. For each one, "
+        "decide:\n"
+        "  (a) it IS a related callsite -> issue <command> blocks to apply "
+        "the same fix there, then end with <final>summary</final>; OR\n"
+        "  (b) it's unrelated (test fixture, docstring, reverse import) -> "
+        "ignore it and end with <final>summary</final>.\n\n"
+        "Important: kings consistently win the LLM judge by addressing ALL "
+        "callsites of a referenced symbol, not just the first one. Missing "
+        "callsites is a top reason challengers lose close-call rounds.\n\n"
+        "Do NOT add scope outside the task. Do NOT rewrite working code. "
+        "Add only what's needed for the new callsites.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1200]}\n"
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2233,6 +2354,33 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_quality(patch: str, issue_text: str) -> int:
+    """v55 quality-weighted score for the multi-shot retry tiebreaker.
+
+    The original tiebreaker (`n2 >= n1`) compares only substantive added
+    lines. A retry can have MORE lines but cover FEWER acceptance
+    criteria — and that worse patch wins the tiebreaker. The quality
+    score adds two on-target signals:
+
+      - +20 if the patch covers every file path the issue named
+      - +5 per acceptance-criterion bullet that looks addressed
+
+    Tuned so a small but on-target patch (covers paths, addresses
+    criteria) beats a larger but off-target patch.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    if _patch_covers_required_paths(patch, issue_text):
+        base += 20
+    criteria = _extract_acceptance_criteria(issue_text)
+    if criteria:
+        missing = _unaddressed_criteria(patch, issue_text)
+        addressed = max(0, len(criteria) - len(missing))
+        base += addressed * 5
+    return base
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2321,6 +2469,23 @@ def solve(
         _result1["multishot_attempts"] = 1
         return _result1
 
+    # v55: keep first attempt if it's non-empty AND the issue named at least
+    # one file path AND the patch covers every named path. The substantive-
+    # line count alone treats a correct surgical fix as a whiff; the path-
+    # coverage guard distinguishes "small and on-target" from "small and
+    # missed the mark". Without any named path we fall through to the retry
+    # as before — the original logic is the safer default when the issue
+    # does not anchor to a specific file.
+    _required_paths = _extract_issue_path_mentions(issue)
+    if (
+        _patch1.strip()
+        and _required_paths
+        and _patch_covers_required_paths(_patch1, issue)
+    ):
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "covers_issue_paths"
+        return _result1
+
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
@@ -2330,11 +2495,17 @@ def solve(
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args)
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    # v55: tiebreak on quality, not just substantive line count. The line
+    # count alone lets a larger but off-target retry beat a smaller but
+    # on-target first attempt — exactly the kind of swap that drives the
+    # primary-passes-but-confirmation-fails variance seen in re-evals.
+    _q1 = _multishot_quality(_patch1, issue)
+    _q2 = _multishot_quality(_patch2, issue)
+    if _q2 >= _q1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_quality"] = (_q1, _q2)
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -2368,6 +2539,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    callsite_nudges_used = 0  # v56
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2395,12 +2567,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
+            6. callsite-nudge — name untouched files containing issue symbols
             6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, callsite_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2496,6 +2669,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # v56 callsite-nudge: fires after path-coverage and criteria-coverage
+        # gates. Path-coverage sees explicitly named files; criteria-coverage
+        # sees acceptance bullets; this gate sees FILES THAT REFERENCE
+        # MULTIPLE ISSUE SYMBOLS and aren't yet touched. The dominant judge
+        # complaint in close-call duels is "neither updates the OTHER X path"
+        # / "King covers MORE of the requested feature set". Surfacing the
+        # untouched callsites lets the model fix all instances in one pass.
+        if callsite_nudges_used < MAX_CALLSITE_NUDGES:
+            uncovered_callsites = _uncovered_symbol_callsites(patch, issue, repo)
+            if uncovered_callsites:
+                callsite_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_callsite_nudge_prompt(uncovered_callsites, issue),
+                    "CALLSITE_NUDGE_QUEUED:\n  " + ", ".join(uncovered_callsites),
                 )
                 return True
 
