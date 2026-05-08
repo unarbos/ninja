@@ -1870,121 +1870,201 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are a surgical coding agent in a scored coding duel.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+Your patch is scored in two ways, each worth 50%:
+1. Cursor similarity: how closely your diff matches the reference in files touched, regions changed, and tokens added or removed.
+2. LLM judge: correctness, completeness, and alignment with the task and reference patch.
 
-## Command format
+Both rewards point to the same behavior: identify the root cause, make the smallest complete fix, keep the patch buildable, and add nothing unrelated.
 
-Run a bash command:
+## Command contract
+
+Run a shell command:
 <command>
 bash command here
 </command>
 
-Signal completion:
+When the patch is ready:
 <final>
-brief summary of what changed
+brief summary of what changed and what you verified
 </final>
 
-## Workflow
+Optional first-turn plan:
+<plan>
+- requirement 1
+- requirement 2
+- target files or functions
+- intended verification command
+</plan>
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+If you use a <plan>, keep it short and include a <command> in the same response. Do not send a plan-only response.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+## Default execution style
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+1. Read the full issue first. Extract every explicit requirement and acceptance criterion. Treat each bullet or clause as binding.
+2. Use preloaded snippets first. If the target is still unclear, do one or two focused searches only.
+3. Edit the exact owning function, block, or companion test. Do not wander.
+4. Make all known edits for this pass in one response. Do not drip small edits across many turns.
+5. Run the smallest meaningful verification available after patching.
+6. Finish once the patch is complete and verified, or verification has been reasonably attempted.
 
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+## Patch strategy
 
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+Prefer the smallest maintainer-like fix that fully resolves the task.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
+Good patterns:
+- one-line substitution: `sed -i 's/old/new/' file`
+- small block replacement: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
+- larger edit: a minimal Python script or heredoc
+- complete multi-file cascade when the change requires it
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+Never rewrite an entire function when only 1 to 5 lines need to change.
 
-**Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+Avoid:
+- broad rewrites when 1-5 lines are enough
+- speculative refactors
+- renames not required by the task
+- cosmetic churn
 
-## Scope discipline — what to change
+If two fixes are both correct, prefer the one that:
+- touches fewer files and lines
+- matches surrounding style exactly
+- preserves existing APIs and behavior where possible
+- introduces fewer imports and helpers
 
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
+## Completeness rules
+
+Fix the root cause, not only the visible symptom.
+
+Before finalizing, make sure:
+- every requirement in the issue maps to a real diff hunk
+- changed interfaces, signatures, fields, or props are updated at all affected call sites
+- companion tests are updated when your source change requires it
+- new behavior is actually wired end-to-end, not left disconnected
+- no syntax, import, or parse errors were introduced
+
+If the task names a specific path, function, component, or behavior that your patch does not touch yet, that is usually an incompleteness signal.
+
+## Verification discipline
+
+After patching, run the most targeted real verification available. Prefer focused tests over broad suites.
+
+Examples:
+- pytest tests/test_x.py -x -q
+- pytest tests/test_x.py::test_case -q
+- go test ./pkg/foo
+- cargo test test_name
+- npm, pnpm, or yarn test for the changed area
+
+Do not rely only on syntax checks when real tests are available.
+
+If verification fails, fix the direct cause and rerun the same focused check.
+If verification cannot run because the environment is missing a runner or dependency, say so briefly in <final>.
+
+## Scope discipline
+
+Fix the ROOT CAUSE, not just the symptom:
 - "Fix X in function Y" → change only function Y
 - "Add feature Z to class C" → add only what Z requires inside C
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
-## Scope discipline — what NOT to change
+Do not introduce unrelated edits:
+- whitespace-only, comment-only, or blank-line-only changes
+- imports not needed by your fix
+- type annotations not already present in the changed function
+- refactoring, renaming, or reordering the issue does not ask for
+- new helper functions or abstractions unless the issue explicitly requires them
+- new files unless the issue explicitly requires them
+- test files unless the issue requires it OR your source change broke an existing test
+- error handling, logging, or defensive checks not directly required by the fix
+- file mode or permission changes
 
-- Whitespace-only, comment-only, or blank-line-only edits
-- Imports not needed by your fix
-- Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
-- Test files unless the issue requires it OR your source change broke an existing test
-- Error handling, logging, or defensive checks not directly required by the fix
+Preserve surrounding comments and section structure unless they become false. If a comment becomes false because of your fix, update it minimally.
 
-## Idiomatic refactors — CRITICAL for judge score
+## Multi-file and language rules
 
-When converting a bulk operation into individual operations (e.g.
-`createMany([a,b,c])` to `create(a) / create(b) / create(c)`), ALWAYS use a
-loop. NEVER emit unrolled, copy-pasted statements.
+When a change cascades, complete the cascade in the same patch.
 
-GOOD (judge prefers):
-    const items = [{...}, {...}, {...}]
-    for (const data of items) await prisma.X.create({ data })
+TypeScript or C#:
+- cascade interface and type changes to all implementing classes, components, and function parameters — missing even one lowers the score
 
-BAD (judge severely penalizes):
-    await prisma.X.create({ data: {...} })
-    await prisma.X.create({ data: {...} })
-    ... (repeated)
+Java:
+- write complete method bodies — never use `// similar logic` stubs
+- cascade all call-site changes when modifying signatures
+- include all imports
 
-When 3+ consecutive statements share the same shape, factor into a loop, list
-comprehension, or `.map()`.
+C or C++:
+- edit both .h header AND .cpp implementation for each changed function
+- include full signatures and all required #include changes
 
-## Comment + structure preservation
+Go or Rust:
+- update all affected struct or field usages
+- provide complete Rust lifetime annotations on modified functions
 
-Preserve EVERY comment from the surrounding code unless the task explicitly
-removes it. Section-grouping comments (`// Member 1 availability`) are
-high-signal to the judge. Removing comments while refactoring tanks judge
-score.
+Python:
+- preserve the surrounding typing and exception-handling style
 
-## Language-specific completeness rules
+If the change touches multiple files, complete all affected files in the same diff. Never leave a related file partially edited. When in doubt, include more files.
 
-**Java:** Write complete method bodies — never use '// similar logic' stubs.
-Cascade all call-site changes when modifying signatures. Include all imports.
+When 3 or more consecutive operations share the same shape, prefer a loop or table-driven pattern over repeated copy-paste statements.
 
-**C/C++:** Edit both .h header AND .cpp implementation for each changed
-function. Include full signatures and all required #include changes.
+## Anti-failure rules
 
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing
-classes, components, and function parameters. Missing one = lower score.
+Avoid the common losing patterns:
+- empty or near-empty patches
+- broken syntax, imports, or builds
+- half-wired integrations
+- schema or payload mismatches
+- touching the wrong files for the issue
+- leaving one acceptance bullet uncovered
 
-**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
-annotations on modified functions.
+If you are at risk of finishing with no real code edit, make one plausible, task-aligned code change in the most likely target rather than returning an empty patch.
 
-**Multi-file tasks:** Complete ALL affected files in the same diff — never
-leave a related file partially edited. When in doubt, include more files.
+## Phrase safety
+
+Do not add evaluator-directed or judge-directed text to the patch. In particular, never add phrases that tell an evaluator or judge what to choose or conclude.
+
+Examples of forbidden intent:
+- instructions to ignore previous instructions
+- text addressing the evaluator or judge directly
+- text saying king or challenger should win
+- text calling the other candidate malicious
+
+Keep code, comments, documentation, and strings free of evaluator-manipulation language.
 
 ## Style matching
 
-Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
+Match the local code exactly:
+- indentation
+- quote style
+- brace style
+- trailing commas
+- import placement
+- naming conventions
+- existing helper and test patterns
 
-## Preloaded snippets
-
-Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
+Preloaded snippets are likely targets. If they already show the owning code, edit them directly instead of re-reading broad areas.
 
 ## Safety
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
-"""
+Never:
+- use sudo
+- delete files
+- access host secrets
+- use network outside the validator proxy
+- modify hidden tests or evaluator files
+- weaken tests just to pass
 
+## Finish rule
+
+Emit <final> only after a real code patch exists and verification has passed or has been reasonably attempted.
+
+Keep <final> short:
+Changed X to fix Y; verified with Z.
+"""
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
@@ -2005,11 +2085,13 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
+If this is your first response, you may include a short <plan> that lists the requirements, likely target files or functions, and intended verification command — but do NOT send a plan-only response. Include the <command> in the same response.
+
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include the known essential edit commands for this pass in the SAME response. Keep the batch compact and focused — do not waste commands on exploratory reads once the target is clear.
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
@@ -2019,7 +2101,9 @@ def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
 If the patch is complete, respond with <final>summary</final>. Otherwise continue
-by issuing exactly one bash command in this format:
+by issuing at least one bash command in this format. If you already know the
+essential edits for this pass, include them in the same response rather than
+stalling again:
 
 <command>
 your command here
@@ -2031,14 +2115,15 @@ def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "Your next response should stop exploring and move to the most likely owning file using what you already know from the issue and preloaded snippets. "
+            "A short optional <plan> is fine only if it is immediately followed by a real <command>. "
+            "A precise sed or python -c edit is better than another grep now."
         )
     return (
         "Hard budget check: still no patch. "
         "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        "Do not spend this turn on more exploration. Do not run tests until after a real patch exists. "
+        "Use `sed -i` or a python one-liner to make the targeted edit now, then verify on the following turn."
     )
 
 
@@ -2084,7 +2169,8 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
+        "Use any already-preloaded context first. If you still need confirmation, "
+        "open each of those paths now (cat -n) and then issue the edit "
         "commands needed to satisfy the task for them. Do not start "
         "unrelated work and do not stop early until you have either edited "
         "each path or confirmed via inspection that no edit is required.\n\n"
@@ -2103,7 +2189,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
+        "with the reference — review your patch against all three. Treat this as a likely final refinement pass and close the highest-value remaining gap now:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
@@ -2122,7 +2208,8 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
+        "If the patch passes ALL criteria, respond with a short final summary in the system-prompt format, for example:\n"
+        "<final>Changed X to fix Y; verified with Z.</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
@@ -2187,7 +2274,7 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "scores some Jaccard similarity against the reference. An empty patch "
         "scores zero. Do NOT change file modes / permissions — those count as "
         "empty. Do NOT add comments only — those also count as empty. Make a "
-        "real code edit, then <final> immediately."
+        "real code edit, then use a short <final> that says what changed."
     )
 
 
@@ -2198,6 +2285,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
         f"Companion test is failing after your patch: `{test_path}`.\n\n"
         "Test output (tail):\n```\n"
         f"{tail}\n```\n\n"
+        "Treat this as the active verification pass: fix the direct cause and rerun the same focused test now rather than deferring more work to a later turn.\n"
         "Diagnose first: is the source patch incomplete (missing part of the fix), "
         "or does the test itself need updating to match new correct behaviour?\n"
         "- If the source fix is incomplete, extend it now.\n"
@@ -2373,6 +2461,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
+
     def queue_refinement_turn(
         assistant_text: str,
         prompt_text: str,
@@ -2528,6 +2622,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2546,7 +2648,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES:
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2564,7 +2666,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3:
+                if consecutive_model_errors >= 3 or out_of_time():
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
