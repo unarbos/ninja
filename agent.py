@@ -2,11 +2,6 @@
 """
 Portable single-file SWE-style coding agent harness.
 
-Variant ``533_variant_01`` — improves on ``agent_533_140_victormorales9493-lab_v_14``:
-multishot retry when attempt-1 has **syntax errors** (keeps v44 path-skip),
-**attempt-2 memo** (552-style) with parser errors in PRIOR ATTEMPT NOTES,
-safer pytest success detection, dead-code cleanup.
-
 Contract:
     The validator imports this file and calls:
 
