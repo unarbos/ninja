@@ -94,9 +94,7 @@ MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
-# Anti-loop and verification-signal gates (hardcoded to satisfy PR Scope Guard
-# env-var allowlist).
-MAX_CONSECUTIVE_IDENTICAL_COMMANDS = 2
+# Hardcoded to satisfy PR Scope Guard env-var allowlist.
 MIN_SUCCESSFUL_VERIFICATIONS = 1
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
@@ -1885,8 +1883,7 @@ bash command here
 
 Signal completion:
 <final>
-brief summary of what changed, plus the verification command you ran and the
-pass/fail line from its output
+brief summary of what changed
 </final>
 
 ## Workflow
@@ -1909,7 +1906,7 @@ pass/fail line from its output
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
-**Finish**: once the patch is correct and complete and you have observed at least one verification command pass (test, py_compile, tsc, go test, cargo check, etc.), emit `<final>` and quote the verification command and the pass/fail line in the summary. Do not re-read files.
+**Finish**: once the patch is correct and complete and you have observed at least one verification command's outcome (test, py_compile, tsc, go test, cargo check, etc.), emit `<final>`. Do not re-read files.
 
 ## Scope discipline — what to change
 
@@ -2028,14 +2025,12 @@ your command here
 
 
 def build_verification_required_prompt() -> str:
-    """Ask the model to actually run the test/check command before declaring done.
+    """Ask the model to actually run a test/check before declaring done.
 
-    A patch that has never been exercised by a test runner or syntax check is a
-    plausibility-argument, not evidence. Two LLM judges scoring the same patch
-    will both penalise an unjustified <final>; running the relevant test once
-    and quoting the pass/fail line in the summary turns a guess into a
-    demonstration. This prompt fires only when no successful verification
-    command has been observed AND the runner appears to be available.
+    A patch that has never been exercised by a test runner or syntax check has
+    not been shown to be correct. This prompt fires only when no successful
+    verification command has been observed AND the runner appears to be
+    available, so it does not pester tasks where no test framework exists.
     """
     return (
         "Before declaring done, actually exercise the change. In your next "
@@ -2044,7 +2039,8 @@ def build_verification_required_prompt() -> str:
         "`python -m py_compile <file>` on the edited file, `npx tsc --noEmit`, "
         "`go test ./...`, `cargo check`, or `make test`). If no test framework "
         "is configured, fall back to a syntax/import check on the edited file. "
-        "Then quote the relevant pass/fail line back in your <final> summary."
+        "Continue iterating if it fails; only emit `<final>` after the runner "
+        "has reported its outcome."
     )
 
 
@@ -2231,11 +2227,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-# Set to WALL_CLOCK_BUDGET_SECONDS so a retry only starts when it has a full
-# inner-attempt budget remaining. With a smaller reserve a retry can launch
-# and then be cut off mid-attempt by the inner wall-clock check, which
-# discards the first attempt's patch without producing a usable second one.
-_MULTISHOT_MIN_ATTEMPT_RESERVE = WALL_CLOCK_BUDGET_SECONDS
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2435,16 +2427,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
-    # Verification gate / loop guard. The gate fires when the model is about to
-    # declare done (via <final> or by going silent on a non-empty patch) but
-    # has not yet produced a clean run of a real test/check command. The guard
-    # blocks the pathological case where the model retries the same command
-    # repeatedly instead of progressing.
+    # Verification gate state. Fires when the model is about to declare done
+    # (via <final> or by going silent on a non-empty patch) but has not yet
+    # produced a clean run of a real test/check command, so the patch has not
+    # been exercised before being submitted.
     successful_verification_signals = 0
     verification_unavailable_signals = 0
     verification_gate_fires_used = 0
-    last_command_signature = ""
-    consecutive_identical_commands = 0
     solve_started_at = time.monotonic()
 
     def queue_refinement_turn(
@@ -2707,36 +2696,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                command_signature = _command_signature(command)
-                if command_signature and command_signature == last_command_signature:
-                    consecutive_identical_commands += 1
-                else:
-                    consecutive_identical_commands = 1
-                    last_command_signature = command_signature
-
-                if consecutive_identical_commands > MAX_CONSECUTIVE_IDENTICAL_COMMANDS:
-                    blocked_msg = (
-                        f"OBSERVATION {command_index}/{len(command_batch)}:\n"
-                        f"Blocked repeated command loop: this command was repeated "
-                        f"more than {MAX_CONSECUTIVE_IDENTICAL_COMMANDS} times in a row "
-                        "without making progress. Try a different approach: edit the "
-                        "most likely file directly, or run a different verification."
-                    )
-                    observations.append(blocked_msg)
-                    logs.append("\n" + blocked_msg)
-                    consecutive_identical_commands = 0
-                    last_command_signature = ""
-                    continue
-
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                # Track whether the model has actually exercised the change with a
-                # real test/check runner. Two LLM judges scoring the same patch
-                # both reward "I ran the test, here is the output" over a bare
-                # plausibility argument.
+                # Track whether the model has actually exercised the change
+                # with a real test/check runner before declaring done. A patch
+                # that has never been run is a guess; a patch the runner has
+                # accepted is a demonstration.
                 patch_after_command = get_patch(repo)
                 if patch_after_command.strip() and _looks_like_verification_command(command):
                     if _looks_like_successful_test_output(observation, command):
@@ -2909,12 +2877,6 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\beslint\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
-
-
-def _command_signature(command: str) -> str:
-    """Normalize a command string so cosmetic spacing differences don't bypass
-    the consecutive-identical-command loop guard."""
-    return re.sub(r"\s+", " ", (command or "").strip().lower())
 
 
 def _looks_like_runner_unavailable(observation: str) -> bool:
