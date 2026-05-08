@@ -2023,7 +2023,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is still empty after other gates.
 
-    Single minimal edit framed by the issue text.
+    Frame a single minimal, issue-motivated code edit.
     """
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
