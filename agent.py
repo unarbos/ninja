@@ -1,4 +1,51 @@
 #!/usr/bin/env python3
+"""
+Portable single-file SWE-style coding agent harness.
+
+Contract:
+    The validator imports this file and calls:
+
+        solve(
+            repo_path="/tmp/task_repo",
+            issue="Fix the bug...",
+            model="validator-managed-model",
+            api_base="http://validator-proxy/v1",
+            api_key="per-run-proxy-token"
+        )
+
+    It returns:
+        {
+            "patch": "... unified git diff ...",
+            "logs": "...",
+            "steps": int,
+            "cost": float | None,
+            "success": bool,
+        }
+
+Design goals:
+    - Single file.
+    - No external Python dependencies.
+    - Validator-provided OpenAI-compatible /v1/chat/completions endpoint.
+    - No direct OpenRouter/OpenAI credentials in miner code.
+    - Bash-only action interface.
+    - Validator owns repo, tests, sandbox, scoring, hidden tasks.
+    - Miners only patch this file.
+
+Miner editing guide:
+    You are expected to improve this file. Good areas to edit include prompting,
+    context gathering, command selection, tool/result parsing, stopping logic,
+    patch generation, safety checks, and how the agent uses its step budget.
+
+    Keep these validator-owned boundaries intact:
+    - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
+      public entry point.
+    - Return a dict with patch, logs, steps, cost, and success.
+    - Use only the validator-provided api_base/api_key for LLM calls.
+    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
+      path, or validator secret.
+    - Do not add third-party package requirements; this file must stay portable.
+    - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
+"""
 
 from __future__ import annotations
 
@@ -598,6 +645,52 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
 
 
+_MAX_PROJECT_HINT_TOTAL_CHARS = 6000
+
+
+def _project_hint_block(repo: Path) -> str:
+    """Bounded excerpts from common project manifests (scripts, build hooks).
+
+    Gives the model concrete npm/Makefile/pyproject cues for verification.
+    Omits paths outside the task repo; failures are silent per file.
+    """
+    candidates: List[Tuple[str, int]] = [
+        ("package.json", 3500),
+        ("pyproject.toml", 2800),
+        ("setup.cfg", 1800),
+        ("Makefile", 2600),
+        ("CMakeLists.txt", 2200),
+    ]
+    chunks: List[str] = []
+    used = 0
+    root = repo.resolve()
+    for relative_path, budget in candidates:
+        if used >= _MAX_PROJECT_HINT_TOTAL_CHARS:
+            break
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        cap = min(budget, max(0, _MAX_PROJECT_HINT_TOTAL_CHARS - used))
+        if cap <= 0:
+            break
+        excerpt = _truncate(raw, cap) if len(raw) > cap else raw
+        header = f"### Project manifest excerpt: {relative_path}\n"
+        block = header + f"```\n{excerpt}\n```"
+        chunks.append(block)
+        used += len(block)
+    if not chunks:
+        return ""
+    return "Project hints (read-only excerpts):\n\n" + "\n\n".join(chunks)
+
+
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
@@ -610,7 +703,11 @@ def get_repo_summary(repo: Path) -> str:
         res = run_command(cmd, repo, timeout=10)
         parts.append(format_observation(res))
 
-    return "\n\n".join(parts)
+    base = "\n\n".join(parts)
+    manifest_hints = _project_hint_block(repo)
+    if manifest_hints.strip():
+        return base + "\n\n" + manifest_hints
+    return base
 
 
 TEXT_FILE_EXTENSIONS = {
@@ -2017,22 +2114,25 @@ def _detect_multi_file_task(issue_text: str) -> bool:
     return False
 
 
-def _estimate_target_patch_size(issue_text: str, multi_file: bool) -> Tuple[int, int]:
-    """Return (target_added_lines, target_files) scaled from issue signals."""
-    if not issue_text:
-        return (90, 3)
-    paths = _extract_issue_path_mentions(issue_text)
-    n_paths = len(set(paths))
-    criteria = _extract_acceptance_criteria(issue_text)
-    n_crit = len(criteria)
+def _build_scope_hint_block(multi_file: bool) -> str:
+    """Qualitative scope guidance for the first user turn.
+
+    Intentionally avoids numeric line-count or "match the reference diff size"
+    targets so the model optimizes for correctness and requirement coverage,
+    not patch bulk.
+    """
     if multi_file:
-        files = max(4, min(8, max(n_paths, (n_crit + 2) // 2)))
-        per_file = 50 + 8 * n_crit
-        return (min(500, files * per_file), files)
-    if n_paths >= 2 or n_crit >= 4:
-        files = max(2, min(4, n_paths or 2))
-        return (min(250, 50 + 30 * n_crit + 20 * n_paths), files)
-    return (max(20, min(120, 20 + 18 * max(1, n_crit))), max(1, n_paths or 1))
+        return (
+            "\nScope: this issue likely spans multiple files or coordinated "
+            "changes. Plan all affected areas, edit together in one response when "
+            "possible, and cascade signatures/types across callers — still avoid "
+            "unrelated churn.\n"
+        )
+    return (
+        "\nScope: implement exactly what the issue requires — prefer the smallest "
+        "complete fix; expand only when requirements clearly demand more behavior "
+        "or files.\n"
+    )
 
 
 def _detect_target_languages(repo: Path) -> List[str]:
@@ -2055,19 +2155,6 @@ def _detect_target_languages(repo: Path) -> List[str]:
     ranked = sorted(counts.items(), key=lambda x: -x[1])
     top = [ext for ext, _ in ranked[:4]]
     return top
-
-
-def _build_size_target_block(target_lines: int, target_files: int, multi_file: bool) -> str:
-    if multi_file:
-        return (
-            f"\nScope hint: this task is MULTI-FILE. Target ~{target_lines} added lines across "
-            f"~{target_files} files. Bloating past 3x this target loses; hitting "
-            f"under-target also loses. Aim for the working scale.\n"
-        )
-    return (
-        f"\nScope hint: target ~{target_lines} added lines across ~{target_files} file(s). "
-        f"Match the reference scale; don't pad and don't undershoot.\n"
-    )
 
 
 def _build_language_idiom_block(target_languages: List[str]) -> str:
@@ -2100,8 +2187,7 @@ def _build_v32_initial_user_message(repo: Path, issue_text: str, repo_summary: s
     """
     base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
     multi_file = _detect_multi_file_task(issue_text)
-    target_lines, target_files = _estimate_target_patch_size(issue_text, multi_file)
-    size_block = _build_size_target_block(target_lines, target_files, multi_file)
+    scope_block = _build_scope_hint_block(multi_file)
     lang_block = ""
     try:
         lang_block = _build_language_idiom_block(_detect_target_languages(repo))
@@ -2124,7 +2210,7 @@ def _build_v32_initial_user_message(repo: Path, issue_text: str, repo_summary: s
             "through props lose to working implementations."
         )
 
-    return base + size_block + lang_block + "\n" + strategy + "\n"
+    return base + scope_block + lang_block + "\n" + strategy + "\n"
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
