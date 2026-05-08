@@ -1,51 +1,4 @@
 #!/usr/bin/env python3
-"""
-Portable single-file SWE-style coding agent harness.
-
-Contract:
-    The validator imports this file and calls:
-
-        solve(
-            repo_path="/tmp/task_repo",
-            issue="Fix the bug...",
-            model="validator-managed-model",
-            api_base="http://validator-proxy/v1",
-            api_key="per-run-proxy-token"
-        )
-
-    It returns:
-        {
-            "patch": "... unified git diff ...",
-            "logs": "...",
-            "steps": int,
-            "cost": float | None,
-            "success": bool,
-        }
-
-Design goals:
-    - Single file.
-    - No external Python dependencies.
-    - Validator-provided OpenAI-compatible /v1/chat/completions endpoint.
-    - No direct OpenRouter/OpenAI credentials in miner code.
-    - Bash-only action interface.
-    - Validator owns repo, tests, sandbox, scoring, hidden tasks.
-    - Miners only patch this file.
-
-Miner editing guide:
-    You are expected to improve this file. Good areas to edit include prompting,
-    context gathering, command selection, tool/result parsing, stopping logic,
-    patch generation, safety checks, and how the agent uses its step budget.
-
-    Keep these validator-owned boundaries intact:
-    - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
-      public entry point.
-    - Return a dict with patch, logs, steps, cost, and success.
-    - Use only the validator-provided api_base/api_key for LLM calls.
-    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
-      path, or validator secret.
-    - Do not add third-party package requirements; this file must stay portable.
-    - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
-"""
 
 from __future__ import annotations
 
@@ -64,16 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# -----------------------------
-# Config
-# -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
-# validator wiring. During real validation the validator passes model, api_base,
-# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -95,44 +42,28 @@ MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
-# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
-# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 180.0  # v43 (timeout-safe): cut from 270 to 180 so we leave 120s margin per attempt. Production data shows our challengers time out 50-56% vs king's 18-20%; the only known cause is exceeding the validator's per-round soft cap. Failing fast and returning whatever patch we have beats burning time and shipping nothing.
+WALL_CLOCK_BUDGET_SECONDS = 270.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
-MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
-_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
-# Recent-commit injection: small in-context style anchors from the staged repo's
-# real history. The validator clones the real repo with full git history; the
-# pilot stages snapshots with one synthetic commit so this is a no-op locally
-# but high-leverage live. Cursor's reference patches ARE recent commits in this
-# codebase's style — showing the model 1-2 actual examples teaches the codebase's
-# idioms (variable conventions, hunk shape, test-touch patterns) far better than
-# any abstract prompt rule.
+MAX_POLISH_TURNS = 1       
+MAX_SELF_CHECK_TURNS = 1   
+MAX_SYNTAX_FIX_TURNS = 1   
+MAX_TEST_FIX_TURNS = 1     
+MAX_COVERAGE_NUDGES = 1    
+MAX_CRITERIA_NUDGES = 1    
+MAX_HAIL_MARY_TURNS = 1    
+MAX_PLAN_COVERAGE_NUDGES = 1 
+MAX_TOTAL_REFINEMENT_TURNS = 2 
+_STYLE_HINT_BUDGET = 600   
+
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
 
-# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
-# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -149,10 +80,6 @@ DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\s+777\s+/",
 ]
 
-
-# -----------------------------
-# Data structures
-# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -182,10 +109,6 @@ class AgentResult:
             "success": self.success,
         }
 
-
-# -----------------------------
-# Utility
-# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -284,14 +207,6 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
-# -----------------------------
-# OpenAI-compatible client
-# -----------------------------
-
-# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
-# behavior, response parsing, or model-message strategy here. Keep all requests
-# pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -368,14 +283,6 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
-# Shell execution
-# -----------------------------
-
-# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
-# repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -482,10 +389,6 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
-
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -505,10 +408,6 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
-
-# -----------------------------
-# Git helpers
-# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -686,21 +585,6 @@ SECRETISH_PARTS = {
 
 
 def build_preloaded_context(repo: Path, issue: str) -> str:
-    """Preload the highest-ranked tracked files plus their companion tests.
-
-    Two improvements over a vanilla rank-and-read loop:
-
-      1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
-         X_test.go for X.go, etc.) are slotted in right after their source
-         partner. Real GitHub-derived tasks almost always need source+test
-         changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
-
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
-    """
     files = _rank_context_files(repo, issue)
     if not files:
         return ""
@@ -722,9 +606,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -767,7 +648,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
         if score > 0:
@@ -1056,6 +936,77 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+
+#
+# The path-coverage gate (above) checks paths the ISSUE TEXT mentions. The
+# plan-coverage gate checks paths the AGENT ITSELF named in its `<plan>`
+# block. Often the model's plan is more concrete than the issue (e.g. issue
+# says "fix the bug" but the plan correctly identifies foo.py + tests/
+# test_foo.py as targets). Surfacing planned-but-untouched files makes the
+# inner agent finish what it announced it would do. 
+
+
+def _extract_planned_target_paths(repo: Path, assistant_text: str) -> List[str]:
+    """Resolve concrete files named in the model's <plan> to tracked paths.
+
+    Task-agnostic: if the model says a repo file/function is a planned
+    target, the final diff should usually touch that file. Catches
+    incomplete multi-file edits without keyword playbooks.
+    """
+    plan_match = re.search(r"<plan>(.*?)</plan>", assistant_text, flags=re.IGNORECASE | re.DOTALL)
+    if not plan_match:
+        return []
+    plan = plan_match.group(1)
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    tracked = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    tracked_set = set(tracked)
+    stem_to_paths: Dict[str, List[str]] = {}
+    for path in tracked:
+        if not _context_file_allowed(path):
+            continue
+        stem_to_paths.setdefault(Path(path).stem, []).append(path)
+
+    out: List[str] = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        if path not in seen and path in tracked_set and _context_file_allowed(path):
+            seen.add(path)
+            out.append(path)
+
+    for token in re.findall(r"[A-Za-z0-9_./@+-]+\.[A-Za-z0-9_+-]+", plan):
+        normalized = token.strip("`'\"(),;:[]{}")
+        if normalized in tracked_set:
+            add(normalized)
+
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", plan):
+        paths = stem_to_paths.get(token)
+        if paths and len(paths) == 1:
+            add(paths[0])
+
+    return out[:8]
+
+
+def _uncovered_planned_paths(repo: Path, assistant_text: str, patch: str) -> List[str]:
+    planned = _extract_planned_target_paths(repo, assistant_text)
+    if not planned:
+        return []
+    changed = set(_patch_changed_files(patch))
+    return [path for path in planned if path not in changed]
 
 
 # -----------------------------
@@ -1963,6 +1914,21 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
+def build_plan_coverage_nudge_prompt(missing_paths: List[str]) -> str:
+    """Surface planned target files (from the agent's own <plan>) that the
+    patch hasn't touched. """
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    return (
+        "Plan-coverage gap — your own <plan> named these repo files as edit "
+        "targets, but the current patch does NOT touch them:\n"
+        f"  {bullets}\n\n"
+        "If a listed file truly needs no edit, say why in <final>. Otherwise "
+        "edit the missing planned file(s) now with the smallest change needed "
+        "to complete the issue. Do not add unrelated files or broaden scope. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -2085,7 +2051,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0  # v43: raised from 90 — never start a retry unless we have at least one full attempt budget (180s) left, so the retry can't push us past the validator's soft cap.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2171,87 +2137,47 @@ def solve(
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
-
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = 580.0
+    _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    _result1 = _solve_attempt(**_multishot_args)
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
-    try:
-        _multishot_repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
-
-    try:
-        _multishot_started = time.monotonic()
-        _multishot_total_budget = 400.0  # v43
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
-
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
-
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
-
-        _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-
-        if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _result1["multishot_attempts"] = 1
         return _result1
 
-    except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
-        salvaged = ""
-        try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
-        except Exception:
-            salvaged = ""
-        return AgentResult(
-            patch=salvaged or "",
-            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
+    _elapsed = time.monotonic() - _multishot_started
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _result2 = _solve_attempt(**_multishot_args)
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
+
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2277,8 +2203,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    plan_coverage_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0  
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2315,7 +2242,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, plan_coverage_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2333,8 +2260,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -2393,6 +2318,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # <plan> block named as targets but the patch hasn't touched yet.
+        # Independent of whether the issue text named them; sometimes the
+        # plan is more accurate than the bare issue (e.g. issue says "fix
+        # the bug" and the plan correctly identifies foo.py + the
+        # companion test as targets).
+        if plan_coverage_nudges_used < MAX_PLAN_COVERAGE_NUDGES:
+            missing_planned = _uncovered_planned_paths(repo, assistant_text, patch)
+            if missing_planned:
+                plan_coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_plan_coverage_nudge_prompt(missing_planned),
+                    "PLAN_COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing_planned),
                 )
                 return True
 
@@ -2600,6 +2542,49 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # Post-loop empty-patch fallback. The main for-loop can exit with
+        # no patch when the model issued only inspection commands (cat /
+        # grep / ls / find / sed-no-match) and never reached `<final>` or
+        # the early-exit branches that travel through
+        # `maybe_queue_refinement` — leaving `hail_mary_turns_used == 0`
+        # despite the patch being empty. Fire one final hail-mary turn
+        # manually so the round doesn't return a guaranteed-zero result.
+        # Multi-shot's revert+retry path (see solve()) already handles
+        # the "first attempt produced low-signal" case, but it triggers
+        # AFTER `_solve_attempt` returns; this saves the FIRST attempt
+        # before multi-shot has to spend budget on a second.
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and not out_of_time()
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={time_remaining():.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if out_of_time():
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
