@@ -114,6 +114,10 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
+MAX_PRECOMMIT_TURNS = 1    # v73: project-defined pre-commit hooks (formatting, import-sort)
+_PRECOMMIT_TIMEOUT = 25    # v73: per-file pre-commit budget (slower than ruff alone)
+MAX_TYPE_CHECK_TURNS = 1   # v73: mypy/pyright/tsc — type errors look like incomplete code to the judge
+_TYPE_CHECK_TIMEOUT = 30   # v73: per-file type checker budget
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -622,11 +626,33 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+_GENERATED_BASENAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "Cargo.lock", "Pipfile.lock", "composer.lock", "Gemfile.lock",
+})
+_GENERATED_DIR_PARTS = frozenset({
+    "__pycache__", ".pytest_cache", "node_modules", ".git",
+    "dist", "build", ".next", ".nuxt", "coverage", "__snapshots__",
+    ".tox", ".mypy_cache", ".ruff_cache",
+})
+_GENERATED_SUFFIXES = frozenset({".pyc", ".pyo", ".min.js", ".min.css", ".map"})
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
+    """v73: shield generated/lock/cache files from validation gates.
+
+    Any patch hunk that lands in node_modules/dist/lock files etc. cannot be
+    meaningfully linted/type-checked and almost always reflects an accidental
+    edit (or stale lockfile diff from a dependency bump). Skipping early
+    prevents the lint/precommit/type gates from burning a refinement turn on
+    tooling errors against generated code.
+    """
     path = Path(relative_path)
-    if path.suffix == ".pyc":
+    if path.suffix in _GENERATED_SUFFIXES:
         return True
-    return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+    if path.name in _GENERATED_BASENAMES:
+        return True
+    return any(part in _GENERATED_DIR_PARTS for part in path.parts)
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1345,6 +1371,197 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
         "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
         "confirm with <final>lint clean</final>."
+    )
+
+
+# v73: pre-commit hook gate. Many real-world repos define a `.pre-commit-config.yaml`
+# (formatters, import sorters, custom checks) that maintainers run on every commit.
+# A patch that ignores those hooks reads to the judge as "didn't follow project
+# conventions"; running them in-process and surfacing failures lets the model patch
+# the patch before submission. Lint covers ruff/eslint; pre-commit covers everything
+# else the project has wired up (black, isort, prettier, markdownlint, etc.).
+def _repo_has_precommit_config(repo: Path) -> bool:
+    return (repo / ".pre-commit-config.yaml").is_file() or (repo / ".pre-commit-config.yml").is_file()
+
+
+def _check_precommit(repo: Path, patch: str) -> List[str]:
+    """v73: run `pre-commit run --files <changed>` when the repo defines hooks
+    AND `pre-commit` is on PATH. Returns up to 6 short failure summaries."""
+    if not _repo_has_precommit_config(repo):
+        return []
+    if not _has_executable("pre-commit"):
+        return []
+    files = [
+        rel for rel in _patch_changed_files(patch)
+        if not _should_skip_patch_path(rel)
+    ]
+    if not files:
+        return []
+    files = files[:12]
+    cmd = "pre-commit run --files " + " ".join(_shell_quote(f) for f in files)
+    res = run_command(cmd, repo, timeout=_PRECOMMIT_TIMEOUT)
+    if res.exit_code == 0:
+        return []
+    out = (res.stdout + "\n" + res.stderr).strip()
+    if not out:
+        return [f"pre-commit failed (exit {res.exit_code}) with no output"]
+    failed_hooks: List[str] = []
+    current: Optional[str] = None
+    for line in out.splitlines():
+        stripped = line.rstrip()
+        # pre-commit prints "<hook name>...........Failed" then a body block.
+        if stripped.endswith("Failed"):
+            current = stripped.split(".")[0].strip()
+            failed_hooks.append(f"{current}: failed")
+            if len(failed_hooks) >= 6:
+                break
+        elif current and stripped.startswith("- exit code:"):
+            failed_hooks[-1] = f"{current}: {stripped.lstrip('- ').strip()}"
+    if not failed_hooks:
+        # Couldn't parse — give the model the raw tail so it has *something*.
+        tail = out[-400:].strip().replace("\n", " | ")
+        return [f"pre-commit non-zero: {tail[:400]}"]
+    return failed_hooks
+
+
+def build_precommit_fix_prompt(errors: List[str]) -> str:
+    """v73: ask the model to satisfy the project's pre-commit hooks. Same
+    scope-preserving guidance as the lint gate."""
+    body = "\n".join(f"  - {e}" for e in errors[:6])
+    return (
+        "The repository defines pre-commit hooks (formatting/import-sort/etc.) "
+        "that fail on your patch. Maintainers run these on every commit:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes these formatting/style issues only. "
+        "Do NOT change the patch's logic. Prefer running the auto-fixer "
+        "(`pre-commit run --files <files>` or the underlying tool with `--fix`/"
+        "`--write`). Then end with <final>pre-commit clean</final>."
+    )
+
+
+# v73: type-check gate. Ships TWO observable wins: (a) catches type regressions
+# the model wouldn't notice (renamed Optional, missing return type), (b) makes
+# the diff read as "production-ready" to the judge (no red squiggles a maintainer
+# would call out in code review). Detection is config-driven so we never run a
+# checker on a project that doesn't already use one — avoids false positives
+# from third-party type errors a vanilla mypy run would surface.
+_PYRIGHT_CONFIG_NAMES = ("pyrightconfig.json", "pyrightconfig.toml")
+_TYPE_FAIL_PATTERN = re.compile(
+    r"(?:error|Error):\s*(.+?)(?:\s*\[(?P<code>[\w\-]+)\])?$"
+)
+
+
+def _has_mypy_config(repo: Path) -> bool:
+    if (repo / "mypy.ini").is_file() or (repo / ".mypy.ini").is_file():
+        return True
+    pyproject = repo / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            text = pyproject.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        return "[tool.mypy]" in text
+    return False
+
+
+def _has_pyright_config(repo: Path) -> bool:
+    return any((repo / name).is_file() for name in _PYRIGHT_CONFIG_NAMES)
+
+
+def _has_tsconfig(repo: Path) -> bool:
+    return (repo / "tsconfig.json").is_file()
+
+
+def _check_type_python(repo: Path, files: List[str]) -> List[str]:
+    """v73: prefer mypy when configured, else pyright. Both are strict-by-config
+    so we run them on the project's terms, not stdlib defaults."""
+    py_files = [f for f in files if f.endswith(".py")]
+    if not py_files:
+        return []
+    py_files = py_files[:8]
+    if _has_mypy_config(repo) and _has_executable("mypy"):
+        cmd = "mypy --no-error-summary --no-color-output " + " ".join(_shell_quote(f) for f in py_files)
+    elif _has_pyright_config(repo) and _has_executable("pyright"):
+        cmd = "pyright --outputjson " + " ".join(_shell_quote(f) for f in py_files)
+    else:
+        return []
+    res = run_command(cmd, repo, timeout=_TYPE_CHECK_TIMEOUT)
+    if res.exit_code == 0:
+        return []
+    out = (res.stdout + "\n" + res.stderr)
+    errors: List[str] = []
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped or "found 0 errors" in stripped.lower():
+            continue
+        m = _TYPE_FAIL_PATTERN.search(stripped)
+        if m:
+            errors.append(stripped[:200])
+        if len(errors) >= 6:
+            break
+    if not errors and res.exit_code != 0:
+        tail = out.strip()[-400:].replace("\n", " | ")
+        errors.append(f"type checker non-zero: {tail[:400]}")
+    return errors
+
+
+def _check_type_ts(repo: Path, files: List[str]) -> List[str]:
+    """v73: tsc --noEmit on the project. Only runs when tsconfig.json exists
+    AND tsc is on PATH (likely via local node_modules/.bin via pnpm/npm exec)."""
+    ts_files = [f for f in files if f.endswith((".ts", ".tsx"))]
+    if not ts_files or not _has_tsconfig(repo):
+        return []
+    if _has_executable("tsc"):
+        runner = "tsc"
+    elif _has_executable("npx"):
+        runner = "npx --no-install tsc"
+    else:
+        return []
+    cmd = f"{runner} --noEmit --pretty false"
+    res = run_command(cmd, repo, timeout=_TYPE_CHECK_TIMEOUT)
+    if res.exit_code == 0:
+        return []
+    touched = {f for f in ts_files}
+    errors: List[str] = []
+    for line in (res.stdout + "\n" + res.stderr).splitlines():
+        stripped = line.strip()
+        # tsc format: "src/foo.ts(12,5): error TS2304: Cannot find name 'X'."
+        if "error TS" not in stripped:
+            continue
+        head = stripped.split("(", 1)[0]
+        if not any(head.endswith(t) or head == t for t in touched):
+            continue
+        errors.append(stripped[:200])
+        if len(errors) >= 6:
+            break
+    return errors
+
+
+def _check_types(repo: Path, patch: str) -> List[str]:
+    """v73: run any configured type checker on touched source files."""
+    files = [
+        rel for rel in _patch_changed_files(patch)
+        if not _should_skip_patch_path(rel)
+    ]
+    if not files:
+        return []
+    errors = _check_type_python(repo, files)
+    if len(errors) < 6:
+        errors.extend(_check_type_ts(repo, files)[: 6 - len(errors)])
+    return errors[:6]
+
+
+def build_type_fix_prompt(errors: List[str]) -> str:
+    """v73: prompt the model to fix type errors. Type errors flagged in the
+    project's checker output, scoped to files this patch touched."""
+    body = "\n".join(f"  - {e}" for e in errors[:6])
+    return (
+        "Type checker errors in your patch (mypy/pyright/tsc, project-configured):\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes these type errors only. Examples: "
+        "tighten an annotation, add a missing import, narrow an Optional with an "
+        "explicit None check, or correct a wrong return type. Do NOT broaden a "
+        "real type to silence a real bug. Then end with <final>types clean</final>."
     )
 
 
@@ -2180,13 +2397,91 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+# v73: surgical test-failure extraction. The previous 2400-char tail dragged
+# in unrelated stdout/teardown noise that crowded the model's context budget
+# and pushed the actual assertion line out of focus. This helper finds the
+# pytest "FAILED" markers + the corresponding assertion/error block per
+# failure so the model sees the exact failing assertion + ~12 lines of
+# surrounding traceback context per failure, capped at 3 failures.
+_PYTEST_FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?::\S+?)(?:\s|-|$)")
+_PYTEST_ASSERT_RE = re.compile(r"^E\s+(?:assert|AssertionError|TypeError|ValueError|RuntimeError|KeyError|AttributeError|NameError|ImportError|ModuleNotFoundError)")
+
+
+def _extract_test_failure_pinpoint(output: str, max_failures: int = 3) -> str:
+    """v73: extract surgical failure context from pytest output.
+
+    Strategy:
+    1. Find the pytest "short summary" footer ("=== FAILED tests/x.py::test_y ===")
+    2. For each failure, scan the body section for the matching `____ test_y ____`
+       block and its `E   assert ...` lines.
+    3. Return at most `max_failures` blocks, capped at ~600 chars each.
+    Falls back to last-1200-chars tail when the output isn't pytest-shaped.
+    """
+    if not output or not output.strip():
+        return ""
+    lines = output.splitlines()
+    failures: List[str] = []
+    for line in lines:
+        m = _PYTEST_FAILED_RE.match(line.strip())
+        if m:
+            failures.append(m.group(1))
+            if len(failures) >= max_failures:
+                break
+    if not failures:
+        return output[-1200:] if len(output) > 1200 else output
+
+    def _block_for(test_id: str) -> str:
+        # Test name is the part after the last `::`. Pytest body delim looks like
+        # "______ test_name ______" (one or more underscores either side).
+        leaf = test_id.split("::")[-1].split("[", 1)[0]
+        delim_pat = re.compile(rf"^_+\s*{re.escape(leaf)}\s*_+\s*$")
+        body: List[str] = []
+        capturing = False
+        for line in lines:
+            if delim_pat.match(line.strip()):
+                if capturing:
+                    break
+                capturing = True
+                body.append(line)
+                continue
+            if not capturing:
+                continue
+            body.append(line)
+            # Stop at the next delimiter-like marker or summary footer.
+            if line.startswith("=") and ("FAILED" in line or "passed" in line or "error" in line):
+                break
+        if not body:
+            return ""
+        # Prefer the assertion subblock — find first `E   assert/Error` line and
+        # take ~6 lines on each side.
+        idx = next((i for i, ln in enumerate(body) if _PYTEST_ASSERT_RE.match(ln)), None)
+        if idx is not None:
+            start = max(0, idx - 6)
+            end = min(len(body), idx + 7)
+            block = "\n".join(body[start:end])
+        else:
+            block = "\n".join(body[: 18])
+        return block[-600:] if len(block) > 600 else block
+
+    parts: List[str] = []
+    for tid in failures:
+        block = _block_for(tid)
+        if not block:
+            continue
+        parts.append(f"--- {tid} ---\n{block}")
+    if not parts:
+        return output[-1200:] if len(output) > 1200 else output
+    return "\n\n".join(parts)
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """When the companion-test gate fails, hand the model the exact failure tail."""
-    tail = output[-2400:] if len(output) > 2400 else output
+    """When the companion-test gate fails, hand the model the surgical failure
+    context (assertion + nearby traceback per failure) instead of a blind tail."""
+    pinpoint = _extract_test_failure_pinpoint(output)
     return (
         f"Companion test is failing after your patch: `{test_path}`.\n\n"
-        "Test output (tail):\n```\n"
-        f"{tail}\n```\n\n"
+        "Failure pinpoint (assertion + nearby traceback):\n```\n"
+        f"{pinpoint}\n```\n\n"
         "Diagnose first: is the source patch incomplete (missing part of the fix), "
         "or does the test itself need updating to match new correct behaviour?\n"
         "- If the source fix is incomplete, extend it now.\n"
@@ -2630,6 +2925,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     lint_turns_used = 0  # v72
+    precommit_turns_used = 0  # v73: project-defined hooks
+    type_check_turns_used = 0  # v73: mypy/pyright/tsc when configured
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -2671,7 +2968,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, precommit_turns_used, type_check_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2764,6 +3061,40 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_lint_fix_prompt(lint_errors),
                     "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                )
+                return True
+
+        # v73: pre-commit pass — runs the project's own .pre-commit-config.yaml
+        # hooks on touched files. Different axis from lint: covers black/isort/
+        # prettier/markdownlint/custom maintainer hooks the project pinned. A
+        # patch that satisfies project-pinned hooks reads as "follows project
+        # conventions" to the judge.
+        if precommit_turns_used < MAX_PRECOMMIT_TURNS:
+            precommit_errors = _check_precommit(repo, patch)
+            if precommit_errors:
+                precommit_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_precommit_fix_prompt(precommit_errors),
+                    "PRECOMMIT_QUEUED:\n  " + "\n  ".join(precommit_errors),
+                )
+                return True
+
+        # v73: type-check pass — mypy/pyright/tsc when the project ships a
+        # config. Type errors flagged in a project-configured checker read as
+        # "incomplete code" to the judge and would block any real maintainer
+        # merge. Skipped silently when no config is present (avoids spurious
+        # third-party errors from running a vanilla checker).
+        if type_check_turns_used < MAX_TYPE_CHECK_TURNS:
+            type_errors = _check_types(repo, patch)
+            if type_errors:
+                type_check_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_type_fix_prompt(type_errors),
+                    "TYPE_CHECK_QUEUED:\n  " + "\n  ".join(type_errors),
                 )
                 return True
 
