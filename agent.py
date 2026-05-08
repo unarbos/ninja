@@ -149,6 +149,14 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\bssh\b",
+    r"\bnc\b",
+    r"\bncat\b",
+    r"\btelnet\b",
 ]
 
 
