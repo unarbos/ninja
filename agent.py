@@ -788,7 +788,7 @@ SECRETISH_PARTS = {
 }
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, iss: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Two improvements over a vanilla rank-and-read loop:
@@ -811,7 +811,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     Re-add project hints only if you also raise context budget or tighten hint
     extraction enough to avoid crowding out likely edit targets.
     """
-    files = _rank_context_files(repo, issue)
+    files = _rank_context_files(repo, iss)
     if not files:
         return ""
 
@@ -843,13 +843,13 @@ _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, iss: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
         return []
 
-    issue_lower = issue.lower()
-    path_mentions = _extract_issue_path_mentions(issue)
+    issue_lower = iss.lower()
+    path_mentions = _extract_issue_path_mentions(iss)
     mentioned: List[str] = []
     tracked_set = set(tracked)
     for mention in path_mentions:
@@ -858,7 +858,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             mentioned.append(normalized)
 
     seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+    for ident in set(_BACKTICK_IDENT_RE.findall(iss)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
         if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
             for m in matches:
@@ -871,7 +871,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
     # pull traceback function names into the symbol pool. We also prepend
     # traceback paths to `mentioned` so they win the deterministic ordering
     # below for files that tie on score.
-    trace_paths, trace_symbols = _extract_traceback_paths_and_symbols(issue)
+    trace_paths, trace_symbols = _extract_traceback_paths_and_symbols(iss)
     trace_path_score: Dict[str, int] = {}
     if trace_paths:
         # Iterate in reverse so the deepest frame (last in paste order) ends up
@@ -896,7 +896,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
                     mentioned.insert(0, best_match)
                     seen_mentioned.add(best_match)
 
-    terms = _issue_terms(issue)
+    terms = _issue_terms(iss)
     if trace_symbols:
         # Reuse the issue-terms pool as a cheap conduit into the existing
         # path-substring scoring without touching `_symbol_grep_hits` (which
@@ -906,7 +906,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             sym_low = sym.lower()
             if sym_low and sym_low not in terms:
                 terms.append(sym_low)
-    symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    symbol_hits = _symbol_grep_hits(repo, tracked_set, iss)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -975,13 +975,13 @@ def _context_file_allowed(relative_path: str) -> bool:
     return True
 
 
-def _extract_issue_path_mentions(issue: str) -> List[str]:
+def _extract_issue_path_mentions(iss: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(issue):
+    for match in pattern.finditer(iss):
         value = match.group(1).strip("`'\"()[]{}:,;")
         if value and value not in mentions:
             mentions.append(value)
@@ -1019,7 +1019,7 @@ _TRACE_NODE_INTERNAL_PREFIXES = (
 
 
 def _extract_traceback_paths_and_symbols(
-    issue: str,
+    iss: str,
 ) -> Tuple[List[str], List[str]]:
     """Return (ordered paths, function/symbol names) from any tracebacks
     embedded in the issue body. Paths are de-duplicated preserving order
@@ -1056,19 +1056,19 @@ def _extract_traceback_paths_and_symbols(
             seen_symbols.add(s)
             symbols.append(s)
 
-    for match in _PY_TRACE_RE.finditer(issue):
+    for match in _PY_TRACE_RE.finditer(iss):
         _push_path(match.group(1))
         _push_symbol(match.group(2) or "")
-    for match in _JS_TRACE_RE.finditer(issue):
+    for match in _JS_TRACE_RE.finditer(iss):
         _push_symbol(match.group(1) or "")
         _push_path(match.group(2))
-    for match in _GENERIC_TRACE_RE.finditer(issue):
+    for match in _GENERIC_TRACE_RE.finditer(iss):
         _push_path(match.group(1))
 
     return paths, symbols
 
 
-def _issue_terms(issue: str) -> List[str]:
+def _issue_terms(iss: str) -> List[str]:
     stop = {
         "about",
         "after",
@@ -1093,7 +1093,7 @@ def _issue_terms(issue: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", iss.lower()):
         if raw in stop or raw in terms:
             continue
         terms.append(raw)
@@ -2639,12 +2639,12 @@ def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
     return last_fail
 
 
-def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
+def _build_multishot_memo(result: Dict[str, Any], iss: str) -> Dict[str, Any]:
     patch = result.get("patch", "") or ""
     return {
         "attempt1_files_touched": _patch_changed_files(patch),
         "attempt1_substantive_lines": _multishot_count_substantive(patch),
-        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
+        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, iss),
         "attempt1_last_failed_command": _last_failed_commands_summary(result),
     }
 
