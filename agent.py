@@ -2798,7 +2798,5 @@ def main(argv: List[str]) -> int:
 
     print(output)
     return 0 if result.get("success") else 1
-
-
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
