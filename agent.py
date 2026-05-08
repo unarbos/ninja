@@ -1912,6 +1912,14 @@ brief summary of what changed
 
 ## Scope discipline — what to change
 
+## Root cause analysis (do before any edit)
+
+Before writing any edits, state:
+ROOT CAUSE: [origin of the bug, not the symptom]
+FILES TO CHANGE: [all files that need edits]
+CALL SITES: [callers of any function you will modify]
+Then implement edits covering all required files and call sites.
+
 Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Fix X in function Y" → change only function Y
 - "Add feature Z to class C" → add only what Z requires inside C
