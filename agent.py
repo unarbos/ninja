@@ -105,13 +105,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# Timeout-safe inner-attempt budget. Cut from 540s -> 180s because production
-# data shows challengers timing out 50%+ vs king ~20%; the only known cause
-# is exceeding the validator's per-round soft cap. Failing fast and returning
-# whatever patch we have beats burning time and shipping nothing. The
-# multi-shot wrapper around solve() relies on this being well below the
-# validator deadline so we have headroom for a second attempt.
-WALL_CLOCK_BUDGET_SECONDS = 180.0
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -151,12 +145,14 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
-    r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\bssh\b",
+    r"\bnc\b",
+    r"\bncat\b",
+    r"\btelnet\b",
 ]
 
 
@@ -720,6 +716,73 @@ SECRETISH_PARTS = {
 }
 
 
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "Makefile",
+    "go.mod",
+    "Cargo.toml",
+    "jest.config.js",
+    "vitest.config.ts",
+)
+
+
+def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
+    """Compact top-level project hints: test scripts and build config only.
+
+    This is intentionally separate from ranked source context. The model often
+    knows what to edit but wastes a turn guessing the right verification
+    command. A tiny manifest summary helps it choose targeted tests without
+    reading broad config files itself.
+    """
+    tracked = set(_tracked_files(repo))
+    blocks: List[str] = []
+
+    for relative_path in _PROJECT_HINT_FILES:
+        if relative_path not in tracked:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            data = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if relative_path == "package.json":
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = {}
+            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+            if isinstance(scripts, dict) and scripts:
+                interesting = {
+                    key: scripts[key]
+                    for key in sorted(scripts)
+                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
+                }
+                if interesting:
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
+            continue
+
+        snippet = _truncate(data, 700)
+        if snippet.strip():
+            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
+
+        if len("\n\n".join(blocks)) >= max_chars:
+            break
+
+    if not blocks:
+        return ""
+    return _truncate(
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
+        + "\n\n".join(blocks),
+        max_chars,
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -757,6 +820,14 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    project_hints = _project_hint_block(repo)
+    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+        parts.append(project_hints)
+        used += len(project_hints)
+
+    # v21 edge: append recent-commit examples as concrete style anchors. Silent
+    # no-op when the repo has no real history (pilot snapshots have one
+    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1373,14 +1444,20 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
+    ("{stem}.py", "test/{stem}_test.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
@@ -2242,9 +2319,8 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Both attempts share the validator's deadline, so the inner-attempt budget
 # (WALL_CLOCK_BUDGET_SECONDS = 180.0) must stay well below the deadline.
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3       # +lines of substantive code to "keep" attempt 1
-_MULTISHOT_TOTAL_BUDGET = 400.0           # outer budget across both attempts
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 180.0    # never start a retry without one full inner budget
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2344,90 +2420,49 @@ def solve(
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
-    """Main portable interface for validators (multi-shot, safety-netted)."""
-    return _solve_with_safety_net(
-        repo_path=repo_path,
-        issue=issue,
-        model=model,
-        api_base=api_base,
-        api_key=api_key,
-        max_steps=max_steps,
-        command_timeout=command_timeout,
-        max_tokens=max_tokens,
+    """
+    Main portable interface for validators.
+    """
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = 580.0
+    _multishot_args = dict(
+        repo_path=repo_path, issue=issue, model=model,
+        api_base=api_base, api_key=api_key,
+        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    _result1 = _solve_attempt(**_multishot_args)
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """Multi-shot driver, wrapped so any exception still returns the on-disk
-    patch state instead of propagating an empty result."""
-    repo_path = kwargs["repo_path"]
-    repo_obj: Optional[Path] = None
-    try:
-        repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _result1["multishot_attempts"] = 1
+        return _result1
 
-    try:
-        started = time.monotonic()
-        initial_head = _multishot_capture_head(repo_obj) if repo_obj else None
+    _elapsed = time.monotonic() - _multishot_started
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
 
-        result1 = _solve_attempt(**kwargs)
-        patch1 = result1.get("patch", "") or ""
-        n1 = _multishot_count_substantive(patch1)
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _result2 = _solve_attempt(**_multishot_args)
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
 
-        # Attempt 1 looks good enough — ship it.
-        if n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            result1["multishot_attempts"] = 1
-            return result1
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
 
-        elapsed = time.monotonic() - started
-        if (_MULTISHOT_TOTAL_BUDGET - elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            result1["multishot_attempts"] = 1
-            result1["multishot_skipped_retry"] = "insufficient_time"
-            return result1
-
-        # Revert the working tree and try again from scratch.
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        result2 = _solve_attempt(**kwargs)
-        patch2 = result2.get("patch", "") or ""
-        n2 = _multishot_count_substantive(patch2)
-
-        if n2 >= n1:
-            result2["multishot_attempts"] = 2
-            result2["multishot_winner"] = "retry"
-            return result2
-
-        # Retry was worse — restore the primary patch onto a clean tree.
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        if patch1 and repo_obj is not None:
-            _multishot_apply_patch(repo_obj, patch1)
-        result1["multishot_attempts"] = 2
-        result1["multishot_winner"] = "primary"
-        return result1
-
-    except Exception as exc:
-        # Don't catch BaseException — let SystemExit/KeyboardInterrupt bubble
-        # so the validator can clean-kill the process. Everything else gets
-        # converted into "whatever survived on disk" so we never ship empty.
-        salvaged = ""
-        try:
-            if repo_obj is not None:
-                salvaged = get_patch(repo_obj)
-        except Exception:
-            salvaged = ""
-        return AgentResult(
-            patch=salvaged or "",
-            logs=(
-                "FATAL_SAFETY_NET:\n"
-                f"{type(exc).__name__}: {str(exc)[:500]}\n"
-                f"Returning on-disk patch ({len(salvaged.splitlines())} lines)."
-            ),
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
