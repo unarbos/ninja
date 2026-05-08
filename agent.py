@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -693,11 +693,10 @@ SECRETISH_PARTS = {
 }
 
 
-_PROJECT_HINT_FILES = (
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
     "package.json",
     "pyproject.toml",
-    "requirements.txt",
-    "requirements-dev.txt",
+    "pytest.ini",
     "setup.cfg",
     "tox.ini",
     "Makefile",
@@ -709,12 +708,12 @@ _PROJECT_HINT_FILES = (
 
 
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
-    """Compact top-level verification hints: test scripts and build config.
+    """Compact top-level project hints: test scripts and build config only.
 
     This is intentionally separate from ranked source context. The model often
     knows what to edit but wastes a turn guessing the right verification
-    command. A small manifest summary helps it pick targeted tests without
-    broad config-file exploration.
+    command. A tiny manifest summary helps it choose targeted tests without
+    reading broad config files itself.
     """
     tracked = set(_tracked_files(repo))
     blocks: List[str] = []
@@ -742,11 +741,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
                     if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
                 }
                 if interesting:
-                    blocks.append(
-                        "### package.json scripts\n```json\n"
-                        + json.dumps(interesting, indent=2)[:900]
-                        + "\n```"
-                    )
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
             continue
 
         snippet = _truncate(data, 700)
@@ -802,7 +797,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
+    project_hints = _project_hint_block(repo)
     if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
         parts.append(project_hints)
         used += len(project_hints)
@@ -1395,14 +1390,20 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
+    ("{stem}.py", "test/{stem}_test.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
@@ -2859,8 +2860,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2946,87 +2946,47 @@ def solve(
 ) -> Dict[str, Any]:
     """
     Main portable interface for validators.
-
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
     """
-    return _solve_with_safety_net(
+    _multishot_started = time.monotonic()
+    _multishot_total_budget = 580.0
+    _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _multishot_repo_obj = _repo_path(repo_path)
+    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    _result1 = _solve_attempt(**_multishot_args)
+    _patch1 = _result1.get("patch", "") or ""
+    _n1 = _multishot_count_substantive(_patch1)
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
-    try:
-        _multishot_repo_obj = _repo_path(repo_path)
-    except Exception:
-        pass
-
-    try:
-        _multishot_started = time.monotonic()
-        _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
-
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
-
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
-
-        _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-
-        if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
+    if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _result1["multishot_attempts"] = 1
         return _result1
 
-    except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
-        salvaged = ""
-        try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
-        except Exception:
-            salvaged = ""
-        return AgentResult(
-            patch=salvaged or "",
-            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
+    _elapsed = time.monotonic() - _multishot_started
+    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "insufficient_time"
+        return _result1
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    _result2 = _solve_attempt(**_multishot_args)
+    _patch2 = _result2.get("patch", "") or ""
+    _n2 = _multishot_count_substantive(_patch2)
+
+    if _n2 >= _n1:
+        _result2["multishot_attempts"] = 2
+        _result2["multishot_winner"] = "retry"
+        return _result2
+
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    if _patch1:
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    _result1["multishot_attempts"] = 2
+    _result1["multishot_winner"] = "primary"
+    return _result1
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
