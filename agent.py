@@ -798,6 +798,38 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+def _files_to_create_hint(repo: Path, issue: str, tracked_set: set) -> str:
+    """Surface backticked path-shaped identifiers that don't match any
+    existing tracked file. Most often these are files the task wants us
+    to create (e.g. `PodHistoryButton.svelte`, `validate-gpkg.test-helpers.js`).
+
+    Without this hint, the existing backtick discovery silently drops them
+    (the 1<=hits<=N check excludes the 0-hit case), and the agent ends up
+    modifying existing files instead of creating the new ones the issue
+    actually requires.
+    """
+    candidates = []
+    seen = set()
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue):
+        if ident in seen:
+            continue
+        seen.add(ident)
+        # Skip when an EXISTING file matches — already handled by the
+        # standard backtick path-mention boost upstream.
+        if any(ident in p for p in tracked_set):
+            continue
+        candidates.append(ident)
+        if len(candidates) >= 12:
+            break
+    if not candidates:
+        return ""
+    return (
+        "FILES TO CREATE (path-shaped identifiers in backticks that don't exist yet — "
+        "the issue is likely asking you to create these):\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -845,6 +877,15 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(readme)
         used += len(readme)
 
+    # Files-to-create hint: backticked path-shaped identifiers in the issue
+    # that match NO existing tracked file are almost certainly files the
+    # task wants us to create. Surface them so the agent doesn't miss
+    # creating new components/modules the issue named explicitly.
+    create_hint = _files_to_create_hint(repo, issue, tracked_set)
+    if create_hint and used + len(create_hint) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+        parts.append(create_hint)
+        used += len(create_hint)
+
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -856,10 +897,25 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+_BACKTICK_PATH_HITS_MAX = 10  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+# Regex for backticked identifiers that LOOK like file paths but match no
+# existing tracked file. These are most likely files the issue is asking
+# us to CREATE (e.g. `PodHistoryButton.svelte`, `validate-gpkg.test-helpers.js`).
+# Heuristic: must contain a path separator '/' OR a recognizable code/file
+# extension. Lock-files / metadata are excluded by the standard
+# _context_file_allowed gate downstream.
+_BACKTICK_PATHLIKE_RE = re.compile(
+    r"`([A-Za-z][\w./_-]{2,80}"
+    r"(?:/[A-Za-z][\w./_-]{1,80}"
+    r"|\.(?:py|js|jsx|ts|tsx|svelte|vue|go|rs|java|kt|rb|php|cs|cpp|c|h|hpp|"
+    r"swift|dart|ex|exs|md|rst|txt|json|yaml|yml|toml|sql|sh|bash|zsh|html|css|scss)"
+    r"))`",
+    re.IGNORECASE,
+)
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1954,6 +2010,10 @@ brief summary of what changed
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+**Issue-vocabulary fidelity**: when the issue text specifies a field, function, error code, file name, or identifier with specific casing or wording, reproduce that EXACT spelling in your code. If the issue says `timestamp`, use `timestamp` not `timeStamp`. If it says `getCoOccurrenceMatrix`, that's the function name verbatim. If it says `GPKG_HABITATS_NO_GEOMETRY_COLUMN`, that's the constant. The issue's wording is the spec — don't translate to "idiomatic" alternatives that match nearby existing code, because the reference patch the judge compares against will use the issue's wording.
+
+**New components and their callers**: if you create a new file (component, module, helper), find the parent file(s) that should import or use it and update them in the SAME response. Issues frequently say "accessible via a button in the X page" or "expose this in the public API" — implying the parent must be updated too. If a FILES TO CREATE block appears in your preloaded context, treat each entry as a required new file unless the issue text contradicts it.
 
 **Pre-final completeness check**: before emitting `<final>`, mentally verify each acceptance criterion in the issue maps to a hunk in your current diff. If the issue names a specific function, file path, component, or behavior that you haven't touched, fix it now — don't ship the gap. Most judge "missing N of M criteria" complaints come from skipping one or two bullets in a multi-bullet issue.
 
