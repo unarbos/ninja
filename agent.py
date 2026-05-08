@@ -995,7 +995,6 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
 # frame is almost always the bug locus. We extract those frames in *order*
 # (top of paste first) so callers can boost the deepest frame more than
 # casual mentions, and surface the `in <function>` identifier as a symbol
-# seed for `_symbol_grep_hits`.
 _PY_TRACE_RE = re.compile(
     r'File "([^"]+)", line \d+(?:, in ([\w.<>]+))?',
 )
@@ -1022,7 +1021,7 @@ _TRACE_NODE_INTERNAL_PREFIXES = (
 
 
 def _extract_traceback_paths_and_symbols(
-    issue: str,
+    issue: str
 ) -> Tuple[List[str], List[str]]:
     """Return (ordered paths, function/symbol names) from any tracebacks
     embedded in the issue body. Paths are de-duplicated preserving order
