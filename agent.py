@@ -871,8 +871,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
+        # Files that DEFINE an issue symbol get a much larger boost than files
+        # that merely mention it — the definition file is almost always the
+        # edit target. Caps prevent a single mass-importer from dominating.
         if relative_path in symbol_hits:
-            score += 60 + min(40, 8 * symbol_hits[relative_path])
+            mentions, definitions = symbol_hits[relative_path]
+            score += 60 + min(40, 8 * mentions) + min(80, 30 * definitions)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1825,12 +1829,43 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
+# Definition-shape patterns we re-grep against files that already mention an
+# issue symbol. A file that DEFINES the symbol is a much stronger edit-target
+# signal than one that merely mentions it. SYMBOL is replaced with the
+# regex-escaped symbol at use-time. Each pattern is anchored at line start so
+# we ignore in-comment / in-string usages that just happen to look like a
+# definition.
+_DEFINITION_PATTERNS: Tuple[str, ...] = (
+    # Python
+    r"^[ \t]*(?:async[ \t]+)?def[ \t]+SYMBOL\b",
+    r"^[ \t]*class[ \t]+SYMBOL\b",
+    # JavaScript / TypeScript
+    r"^[ \t]*(?:export[ \t]+)?(?:async[ \t]+)?function[ \t]+SYMBOL\b",
+    r"^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?class[ \t]+SYMBOL\b",
+    r"^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+SYMBOL[ \t]*=",
+    r"^[ \t]*(?:export[ \t]+)?(?:type|interface|enum)[ \t]+SYMBOL\b",
+    # Go
+    r"^func[ \t]+(?:\([^)]*\)[ \t]+)?SYMBOL\b",
+    r"^type[ \t]+SYMBOL\b",
+    # Rust
+    r"^[ \t]*(?:pub[ \t]+)?(?:async[ \t]+)?fn[ \t]+SYMBOL\b",
+    r"^[ \t]*(?:pub[ \t]+)?(?:struct|enum|trait|impl)[ \t]+SYMBOL\b",
+)
+
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
     issue_text: str,
-) -> Dict[str, int]:
-    """Count how many extracted symbols each tracked file references.
+) -> Dict[str, Tuple[int, int]]:
+    """For each tracked file, return (mentions, definitions) of issue symbols.
+
+    A *definition* hit is a much stronger ranking signal than a usage hit — the
+    file that defines `parse_config` is far more likely the edit target than a
+    file that imports it. We grep twice: once with `-l -F` for any literal
+    mention (cheap), then once per symbol with `-l -E` against language-aware
+    definition patterns, restricted to files we already proved contain the
+    literal.
 
     Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
     to ranking, never the only signal.
@@ -1839,6 +1874,7 @@ def _symbol_grep_hits(
     if not symbols:
         return {}
     hits: Dict[str, int] = {}
+    defs: Dict[str, int] = {}
     for symbol in symbols:
         try:
             proc = subprocess.run(
@@ -1853,6 +1889,7 @@ def _symbol_grep_hits(
             continue
         if proc.returncode not in (0, 1):
             continue
+        files_with_symbol: List[str] = []
         for line in proc.stdout.splitlines():
             relative_path = line.strip()
             if not relative_path or relative_path not in tracked_set:
@@ -1860,7 +1897,35 @@ def _symbol_grep_hits(
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
-    return hits
+            files_with_symbol.append(relative_path)
+        if not files_with_symbol:
+            continue
+        # Only re-grep definitions when the symbol is a plain identifier — keeps
+        # us from interpolating regex specials into the alternation pattern.
+        if not symbol.replace("_", "").isalnum():
+            continue
+        symbol_re = re.escape(symbol)
+        alt_pattern = "|".join(p.replace("SYMBOL", symbol_re) for p in _DEFINITION_PATTERNS)
+        try:
+            def_proc = subprocess.run(
+                ["git", "grep", "-l", "-E", "--", alt_pattern, "--"] + files_with_symbol,
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if def_proc.returncode not in (0, 1):
+            continue
+        for line in def_proc.stdout.splitlines():
+            rel = line.strip()
+            if rel and rel in tracked_set and _context_file_allowed(rel):
+                defs[rel] = defs.get(rel, 0) + 1
+    if not hits:
+        return {}
+    return {path: (hits[path], defs.get(path, 0)) for path in hits}
 
 
 # -----------------------------
@@ -1892,7 +1957,7 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. When the issue names a path, symbol, setting, CLI flag, error string, error message, stack trace, or log line, copy that exact substring into the plan verbatim and use it to anchor your first search/edit. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
@@ -2677,6 +2742,50 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+
+        # Post-loop empty-patch hail-mary. The main for-loop can exit with no
+        # patch when the model issued only inspection commands (cat/grep/ls/
+        # find/sed-no-match) and never reached `<final>` or the early-exit
+        # branches that route through `maybe_queue_refinement` — leaving
+        # `hail_mary_turns_used == 0` despite the patch being empty. Fire one
+        # final hail-mary turn manually so the round doesn't return a
+        # guaranteed-zero patch. Multi-shot's revert+retry handles the
+        # "low-signal first attempt" case AFTER `_solve_attempt` returns; this
+        # rescues the FIRST attempt before multi-shot has to spend time on a
+        # second. Wrapped in a defensive try so any failure here just falls
+        # through to the normal patch-return path.
+        _hm_remaining = WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - _wall_start)
+        if (
+            not get_patch(repo).strip()
+            and hail_mary_turns_used < MAX_HAIL_MARY_TURNS
+            and _hm_remaining > WALL_CLOCK_RESERVE_SECONDS
+        ):
+            try:
+                hail_mary_turns_used += 1
+                logs.append(
+                    f"\nPOST_LOOP_HAIL_MARY: empty patch after {step} steps; "
+                    f"forcing one final attempt (remaining={_hm_remaining:.1f}s)."
+                )
+                messages.append({"role": "assistant", "content": "(no commands issued)"})
+                messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
+                resp_text, hm_cost, _hm_raw = chat_completion(
+                    messages=_messages_for_request(messages),
+                    model=model_name,
+                    api_base=api_base,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                if hm_cost is not None and total_cost is not None:
+                    total_cost += hm_cost
+                logs.append("HAIL_MARY_RESPONSE:\n" + resp_text)
+                hm_commands = extract_commands(resp_text)[:MAX_COMMANDS_PER_RESPONSE]
+                for cmd in hm_commands:
+                    if (time.monotonic() - _wall_start) > (WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS):
+                        break
+                    cr = run_command(cmd, repo, timeout=command_timeout)
+                    logs.append(f"\nHM_OBSERVATION:\n{format_observation(cr)}")
+            except Exception:
+                logs.append("HAIL_MARY_ERROR:\n" + traceback.format_exc())
 
         patch = get_patch(repo)
         if patch.strip() and not success:
