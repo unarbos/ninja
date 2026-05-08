@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -156,6 +157,26 @@ DANGEROUS_PATTERNS = [
     r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?telnet(?:\s|$))",
     r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
+
+_SHELL_COMMAND_PAYLOAD_FLAGS = {"-c", "--command"}
+_XARGS_FLAGS_WITH_VALUE = {
+    "-E",
+    "-I",
+    "-L",
+    "-P",
+    "-S",
+    "-d",
+    "-n",
+    "-s",
+    "--delimiter",
+    "--eof",
+    "--max-args",
+    "--max-chars",
+    "--max-lines",
+    "--max-procs",
+    "--process-slot-var",
+    "--replace",
+}
 
 
 # -----------------------------
@@ -275,10 +296,64 @@ def _resolve_inference_config(
     return model_name, _normalize_api_base(base), key
 
 
+def _dangerous_command_scan_targets(command: str) -> List[str]:
+    """Build command slices that may actually execute in shell contexts.
+
+    We scan:
+    - the raw command
+    - payloads passed to `sh/bash -c ...`
+    - command templates executed by `xargs ... <cmd> ...`
+    This keeps network filters effective in quoted/nested execution paths
+    without widening the base regexes into noisy text matches.
+    """
+    raw = command.strip()
+    if not raw:
+        return []
+    targets = [raw]
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except Exception:
+        return targets
+
+    for idx, token in enumerate(tokens[:-1]):
+        if token in _SHELL_COMMAND_PAYLOAD_FLAGS:
+            payload = tokens[idx + 1].strip()
+            if payload:
+                targets.append(payload)
+
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx] != "xargs":
+            idx += 1
+            continue
+        j = idx + 1
+        while j < len(tokens):
+            tok = tokens[j]
+            if tok == "--":
+                j += 1
+                break
+            if tok in _XARGS_FLAGS_WITH_VALUE:
+                j += 2
+                continue
+            if tok.startswith("-"):
+                j += 1
+                continue
+            break
+        if j < len(tokens):
+            tail = " ".join(tokens[j:]).strip()
+            if tail:
+                targets.append(tail)
+        idx = max(j, idx + 1)
+
+    return targets
+
+
 def _is_dangerous_command(command: str) -> Optional[str]:
-    lowered = command.strip()
+    targets = _dangerous_command_scan_targets(command)
+    if not targets:
+        return None
     for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, lowered):
+        if any(re.search(pattern, target) for target in targets):
             return pattern
     return None
 
@@ -1105,6 +1180,8 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
 # Keep this set conservative: Rust lifetimes (`'a`) can look like unclosed
 # single-quoted strings to this lightweight parser and cause false positives.
+# We intentionally scope this brace check to C-family/Java/Go/Kotlin/Scala files
+# where delimiter mismatch catches real regressions with low noise.
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".cs",
@@ -1352,7 +1429,12 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Cross-platform executable presence check."""
+    """Cross-platform executable presence check.
+
+    Keep `shutil.which` here instead of shelling out to `command -v`: validators
+    run non-interactive shells where builtins and PATH init differ. `which` is
+    stable across Python runtimes and avoids extra subprocess overhead.
+    """
     return shutil.which(name) is not None
 
 
@@ -1572,6 +1654,8 @@ def _recent_commit_examples(repo: Path) -> str:
 
     Returns an empty string when history is unavailable or unsuitable. This is
     best-effort context enrichment; it must never fail the solve loop.
+    We use `--pretty=format:` (empty) so only diff content is injected; commit
+    subject lines can bias the model toward unrelated wording.
     """
     try:
         proc = subprocess.run(
@@ -2400,6 +2484,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
+        This ordering is load-bearing: v20 protects against empty-patch exits
+        early, and v21 keeps criteria nudges after path coverage so the model
+        does not burn turns on wording before touching required files.
 
         Total cap (`MAX_TOTAL_REFINEMENT_TURNS`) gates everything except the
         hail-mary so chained refinements can't blow the wall-clock budget.
