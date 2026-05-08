@@ -103,8 +103,6 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
-WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -116,8 +114,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -716,6 +713,38 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
 )
 
 
+_README_FILES: Tuple[str, ...] = (
+    "README.md", "README.rst", "README.txt", "README",
+    "readme.md", "Readme.md",
+)
+
+
+def _readme_block(repo: Path, max_chars: int = 1200) -> str:
+    """Top of repo README as architectural-context preload.
+
+    Most multi-file tasks reference modules or systems described in the
+    repo's README. Without it preloaded the agent either guesses the
+    architecture or wastes a discovery turn reading the file. The top
+    ~1200 chars typically contain the module map / quickstart, which is
+    the highest-signal portion for orientation.
+    """
+    tracked = set(_tracked_files(repo))
+    for name in _README_FILES:
+        if name not in tracked:
+            continue
+        full = (repo / name).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet = _truncate(text, max_chars)
+        if not snippet.strip():
+            continue
+        return f"REPO README ({name}, top {max_chars} chars — architectural context):\n\n{snippet}"
+    return ""
+
+
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     """Compact top-level project hints: test scripts and build config only.
 
@@ -810,6 +839,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
         parts.append(project_hints)
         used += len(project_hints)
+
+    readme = _readme_block(repo)
+    if readme and used + len(readme) <= MAX_PRELOADED_CONTEXT_CHARS + 1500:
+        parts.append(readme)
+        used += len(readme)
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
@@ -1739,7 +1773,11 @@ def _criterion_keywords(criterion: str) -> List[str]:
 # inflates the criteria-nudge false-positive rate. Stripping the suffix
 # (with a minimum-stem length to avoid false positives like `action`->`act`
 # matching `react`) bridges the natural-language ↔ identifier gap.
-_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+_KEYWORD_SUFFIX_STRIPS = (
+    ("tion", 4), ("ment", 4), ("ness", 4), ("able", 4), ("ible", 4),
+    ("ing", 4), ("est", 4), ("ity", 4), ("ful", 4), ("ion", 4),
+    ("ed", 4), ("es", 4), ("ly", 4), ("er", 4), ("s", 4),
+)
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
@@ -2382,7 +2420,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
-    solve_started_at = time.monotonic()
 
     def queue_refinement_turn(
         assistant_text: str,
