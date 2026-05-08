@@ -1761,49 +1761,23 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix (small patch). 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
-
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Edit surgically when small, completely when large**:
-- Single-line substitutions: `sed -i 's/old/new/' file`
+**Edit surgically**: change only the lines that implement the fix.
+- One-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits or new files: a Python heredoc or `cat > file <<'EOF'` block
-- Multi-file edits: emit ALL files in ONE response
+- Larger edits: a minimal Python script or heredoc
+- Never rewrite an entire function when only 1–3 lines need changing
 
-**Multi-file is common**: edit-set sizes follow the reference patch distribution — about 35% of references touch 4+ files, ~10% touch 8+. Do not artificially constrain to one file when the issue spans multiple concerns.
+**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
-**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it. Note: tests are present in only ~11% of reference patches — do NOT add tests on tasks that don't already touch them.
+**Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
-
-## Patch size — MATCH the reference scale
-
-Reference patches in this codebase typically run ~110 lines across 4 files (median). Empirical scoring data shows winners emit ~1.5× the reference size; both undersized AND oversized lose. Hard rules:
-
-- Tiny task (mention of 1 file, 1-2 line change requested): target ~10-30 lines total
-- Small task (1-2 files mentioned, single feature): target ~50-100 lines
-- Medium task (3-5 files, single coherent feature): target ~150-300 lines
-- Large task / multi-file refactor / new component with deps: target ~300-600 lines
-- Hard CAP: 3× the implied reference. Past that, the judge cites "unfocused" / "unrelated changes" / "scope creep".
-
-Aim for ~1.5× the implied reference. Bloat is the dominant losing failure mode; minimalism is second.
-
-## Functional completeness — DEFEAT THE STUB CRITIQUE
-
-The judge consistently downscores patches with phrasings like "stub", "static", "placeholder", "no state management", "no working", "no functional behavior". A patch with WORKING behavior beats a patch with better structural similarity by an average of +0.23 LLM-score. To avoid stub critique:
-
-- UI/component tasks: add `useState` + event handlers + wired data flow. NEVER emit skeleton markup with `// TODO` or pass-through props that don't update state.
-- Service/manager/store tasks: implement the actual methods with real logic, not method signatures with `// implement here`.
-- Form tasks: include input bindings, validation, submission handler, error/loading states — wire the form end-to-end.
-- Data fetch / mutation: include the actual fetch/mutate call with state updates, NOT `// fetch data here` comments.
-- API handlers: implement the full request/response logic, including error paths.
-
-The diff should be RUNNABLE end-to-end. If a reviewer cleared the repo and applied your patch, the feature should work without further code.
 
 ## Scope discipline — what to change
 
@@ -1814,24 +1788,15 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
-## New files — create them when the task implies new functionality
-
-About 31% of reference patches CREATE new files (`new file mode 100644`). When the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist, create the file confidently. Common signals:
-- "Create a new <Component>" → emit a new .tsx/.vue/.py file
-- "Add a <Service>/<Manager>/<Store>" → create the new module
-- "Implement the <Form> with these fields" → new form component
-- "Add a route/page for X" → new page file
-- New helper modules to keep functions small and the diff readable
-
-Do NOT create gratuitous helpers. Create files only when the task structurally requires them.
-
 ## Scope discipline — what NOT to change
 
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- Test files unless the issue requires it OR your source change broke an existing test (most references do not include tests)
+- New helper functions or abstractions unless the issue explicitly requires them
+- New files unless the issue explicitly requires them
+- Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
 ## Idiomatic refactors — CRITICAL for judge score
@@ -1880,19 +1845,6 @@ leave a related file partially edited. When in doubt, include more files.
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
 
-## TypeScript / TSX / JSX-specific idioms
-
-When editing .ts/.tsx/.jsx files (about 35% of tasks), use these conventions unless the local file shows otherwise:
-- Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
-- Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
-- React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
-- State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
-- Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
-- Async: `async function` with try/catch, NOT `.then()` chains
-- Tailwind: compose classes inline in `className` — don't extract unnecessarily
-- shadcn/ui: import from `@/components/ui/<name>`
-- Type imports: `import type { Foo } from './bar'` when only the type is needed
-
 ## Preloaded snippets
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
@@ -1901,127 +1853,6 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
-
-
-_MULTI_FILE_KEYWORDS = (
-    "refactor",
-    "delegate",
-    "split into",
-    "split up",
-    "extract",
-    "migrate",
-    "cascade",
-    "across multiple",
-    "multiple files",
-    "across the",
-    "all of the",
-    "every",
-)
-
-
-def _detect_multi_file_task(issue_text: str) -> bool:
-    """Detect tasks that empirically need 4+ file edits.
-
-    Triggers: issue text mentions >=3 distinct file paths, OR has >=6
-    acceptance-criteria bullets, OR contains multi-file keyword.
-    Targets the stub-critique loss mode where mak edits 1 file x 64 lines
-    while challengers edit 4 files x 157 lines and win.
-    """
-    if not issue_text:
-        return False
-    paths = _extract_issue_path_mentions(issue_text)
-    if len(set(paths)) >= 3:
-        return True
-    criteria = _extract_acceptance_criteria(issue_text)
-    if len(criteria) >= 6:
-        return True
-    lower = issue_text.lower()
-    if any(kw in lower for kw in _MULTI_FILE_KEYWORDS):
-        return True
-    return False
-
-
-def _estimate_target_patch_size(issue_text: str, multi_file: bool) -> Tuple[int, int]:
-    """Return (target_added_lines, target_files) sized to the empirical
-    reference distribution: median 110 lines / 4 files; winners hit ~1.5x.
-    """
-    if not issue_text:
-        return (90, 3)
-    paths = _extract_issue_path_mentions(issue_text)
-    n_paths = len(set(paths))
-    criteria = _extract_acceptance_criteria(issue_text)
-    n_crit = len(criteria)
-    # Heuristic: scale by mentioned paths and criteria count, then 1.5x.
-    if multi_file:
-        files = max(4, min(8, max(n_paths, (n_crit + 2) // 2)))
-        per_file = 50 + 8 * n_crit
-        return (min(500, files * per_file), files)
-    if n_paths >= 2 or n_crit >= 4:
-        files = max(2, min(4, n_paths or 2))
-        return (min(250, 50 + 30 * n_crit + 20 * n_paths), files)
-    return (max(20, min(120, 20 + 18 * max(1, n_crit))), max(1, n_paths or 1))
-
-
-def _detect_target_languages(repo: Path) -> List[str]:
-    """Return the dominant file extensions in the repo (excluding common noise).
-
-    Used to decide whether to inject TypeScript / Python / Go-specific guidance
-    into the initial prompt. Only checks tracked files for stability across the
-    pilot vs live (which differ in untracked content).
-    """
-    try:
-        tracked = _tracked_files(repo)
-    except Exception:
-        return []
-    counts: Dict[str, int] = {}
-    skip_exts = {".md", ".lock", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}
-    for path in tracked:
-        ext = Path(path).suffix.lower()
-        if not ext or ext in skip_exts:
-            continue
-        if ext == ".lock":
-            continue
-        counts[ext] = counts.get(ext, 0) + 1
-    if not counts:
-        return []
-    ranked = sorted(counts.items(), key=lambda x: -x[1])
-    top = [ext for ext, _ in ranked[:4]]
-    return top
-
-
-def _build_size_target_block(target_lines: int, target_files: int, multi_file: bool) -> str:
-    if multi_file:
-        return (
-            f"\nScope hint: this task is MULTI-FILE. Target ~{target_lines} added lines across "
-            f"~{target_files} files. Bloating past 3x this target loses; hitting "
-            f"under-target also loses. Aim for the working scale.\n"
-        )
-    return (
-        f"\nScope hint: target ~{target_lines} added lines across ~{target_files} file(s). "
-        f"Match the reference scale; don't pad and don't undershoot.\n"
-    )
-
-
-def _build_language_idiom_block(target_languages: List[str]) -> str:
-    if not target_languages:
-        return ""
-    ts_like = {".ts", ".tsx", ".jsx"}
-    py_like = {".py"}
-    if any(ext in ts_like for ext in target_languages):
-        return (
-            "\nLanguage hint (TypeScript / TSX detected): use existing imports and aliases "
-            "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
-            "elements with onClick/onChange, useState with explicit types. Named function "
-            "exports preferred. Tailwind classes inline in className. shadcn/ui imports from "
-            "`@/components/ui/...`.\n"
-        )
-    if any(ext in py_like for ext in target_languages):
-        return (
-            "\nLanguage hint (Python detected): use type hints, `from __future__ import annotations` "
-            "if file already does, dataclasses for records, async/await over callbacks, and "
-            "stdlib over deps unless the codebase already imports otherwise.\n"
-        )
-    return ""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
@@ -2051,41 +1882,6 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
-
-
-def _build_v32_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """v32 user message: wraps build_initial_user_prompt with size/lang/strategy hints.
-
-    Kept as a separate wrapper so build_initial_user_prompt's signature (which
-    contains validator-protected substrings) is preserved untouched.
-    """
-    base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
-    multi_file = _detect_multi_file_task(issue_text)
-    target_lines, target_files = _estimate_target_patch_size(issue_text, multi_file)
-    size_block = _build_size_target_block(target_lines, target_files, multi_file)
-    lang_block = ""
-    try:
-        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
-    except Exception:
-        lang_block = ""
-
-    if multi_file:
-        strategy = (
-            "Strategy override: this task spans MULTIPLE files. Identify all affected files, then "
-            "emit ALL edit commands for ALL files in ONE response. Coordinate cross-file consistency "
-            "— when you change a function signature, type, or interface, cascade the change to every "
-            "caller. Skeleton/stub edits lose to working multi-file implementations even when smaller."
-        )
-    else:
-        strategy = (
-            "Strategy override: identify the ROOT CAUSE precisely, then make the minimal edit that "
-            "fixes it. If the task describes new functionality (a component, form, service, page) "
-            "not already in the codebase, create the new file. Wire functional behavior end-to-end "
-            "— state hooks, event handlers, real logic. Skeleton patches with `// TODO` or pass-"
-            "through props lose to working implementations."
-        )
-
-    return base + size_block + lang_block + "\n" + strategy + "\n"
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2382,6 +2178,12 @@ def solve(
     patches at zero — any non-empty diff beats empty. Production data shows
     50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
     the safety net converts those to "whatever partial work survived".
+
+    v44: smart-skip the multi-shot retry when the first attempt already
+    covers every file path the issue explicitly mentions. Counting only
+    substantive added lines (threshold=3) treats a correct 1-2 line surgical
+    fix the same as a whiff and burns a 180s retry on a patch that was
+    already on-target. The path-coverage guard lets these through.
     """
     return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
@@ -2411,6 +2213,24 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
+            return _result1
+
+        # v44: keep first attempt if it's non-empty AND the issue named at
+        # least one file path AND the patch covers every named path. The
+        # substantive-line count alone treats a correct surgical fix as a
+        # whiff; the path-coverage guard distinguishes "small and on-target"
+        # from "small and missed the mark". Without any named path we fall
+        # through to the retry as before — the original logic is the safer
+        # default when the issue doesn't anchor to a specific file.
+        _issue_text = kwargs.get("issue", "") or ""
+        _required_paths = _extract_issue_path_mentions(_issue_text)
+        if (
+            _patch1.strip()
+            and _required_paths
+            and _patch_covers_required_paths(_patch1, _issue_text)
+        ):
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "covers_issue_paths"
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
@@ -2639,15 +2459,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_v32_initial_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
-        # Track whether we've forced an emergency-emit prompt under TLE pressure.
-        # Closes the failure mode where the agent's first patch arrives after the
-        # 300s docker kill (mak goes empty 42/42 on a stable set of hard tasks).
-        emergency_injected = False
-        _TLE_EMERGENCY_THRESHOLD = 240.0
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -2659,33 +2474,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
-
-            elapsed = time.monotonic() - _wall_start
-            if (
-                elapsed >= _TLE_EMERGENCY_THRESHOLD
-                and not emergency_injected
-                and not get_patch(repo).strip()
-            ):
-                emergency_injected = True
-                logs.append(
-                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s, patch still empty -- "
-                    "forcing minimal emit prompt before docker kill at 300s."
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "EMERGENCY — less than 60 seconds remain before timeout and your "
-                        "draft diff is still empty. An empty patch scores ZERO. A minimal, "
-                        "imperfect edit to the most plausible file from the issue scores "
-                        "non-zero and often wins (since the opponent may also TLE).\n\n"
-                        "In your NEXT response: pick ONE file and ONE edit that addresses "
-                        "the most central requirement in the issue. Use a single `sed -i` or "
-                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
-                        "not run grep. Do not list files. After the edit command, end your "
-                        "response with `<final>emergency edit</final>`. Do this in ONE "
-                        "response."
-                    ),
-                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
