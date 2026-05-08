@@ -296,6 +296,15 @@ def _resolve_inference_config(
     return model_name, _normalize_api_base(base), key
 
 
+def _is_dangerous_command(command: str) -> Optional[str]:
+    targets = _dangerous_command_scan_targets(command)
+    if not targets:
+        return None
+    for pattern in DANGEROUS_PATTERNS:
+        if any(re.search(pattern, target) for target in targets):
+            return pattern
+    return None
+
 def _dangerous_command_scan_targets(command: str) -> List[str]:
     """Build command slices that may actually execute in shell contexts.
 
@@ -346,17 +355,6 @@ def _dangerous_command_scan_targets(command: str) -> List[str]:
         idx = max(j, idx + 1)
 
     return targets
-
-
-def _is_dangerous_command(command: str) -> Optional[str]:
-    targets = _dangerous_command_scan_targets(command)
-    if not targets:
-        return None
-    for pattern in DANGEROUS_PATTERNS:
-        if any(re.search(pattern, target) for target in targets):
-            return pattern
-    return None
-
 
 def _repo_path(path: str | Path) -> Path:
     p = Path(path).resolve()
