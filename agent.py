@@ -57,8 +57,13 @@ Feature blocks (one line each, for reviewers):
       as in-repo style examples (no-op on single-commit snapshots).
     - Symbol-grep ranking: boost context files that contain identifier-shaped
       tokens from the issue text.
+    - Backtick-identifier ranking boost: treat backtick-quoted issue tokens as
+      explicit file mentions when they pick out a small set of tracked files.
+    - Project-hint preload: a compact summary of top-level test/build manifests
+      so the model picks a targeted verification command on the first try.
     - Criteria nudge: when acceptance bullets look unaddressed in added lines,
-      list them for a targeted follow-up turn.
+      list them for a targeted follow-up turn (with morphology-aware matching
+      so common verb/noun suffixes don't inflate false positives).
 
 Change rationale (reviewable blocks; intentionally cohesive — they share state):
     A. Time-budget retuning (WALL_CLOCK_BUDGET_SECONDS, WALL_CLOCK_RESERVE_SECONDS,
@@ -68,7 +73,7 @@ Change rationale (reviewable blocks; intentionally cohesive — they share state
        must fit (2 * cap + finalization margin) within the round budget the
        validator allots. The constants below are derived from those bounds.
     B. Safety-net wrapper (solve -> _solve_with_safety_net -> _solve_attempt).
-       solve() now delegates to a thin wrapper that catches Exception (not
+       solve() delegates to a thin wrapper that catches Exception (not
        BaseException) and returns whatever unified diff is on disk so a late
        failure does not discard partial work. The inner loop body is unchanged.
     C. Refinement chain (polish, syntax, test-fix, coverage-nudge,
@@ -77,9 +82,11 @@ Change rationale (reviewable blocks; intentionally cohesive — they share state
        heuristic gates; hail-mary is exempt because it is the only path out
        of an empty working tree.
     D. Context preloading (build_preloaded_context, _rank_context_files,
-       _symbol_grep_hits, _recent_commit_examples). Ranks tracked files by
-       issue overlap and identifier-shaped grep hits, then concatenates a
-       capped snippet block with optional recent-commit excerpts.
+       _symbol_grep_hits, _recent_commit_examples, _project_hint_block,
+       _BACKTICK_IDENT_RE). Ranks tracked files by issue overlap, backtick
+       identifiers, and identifier-shaped grep hits, then concatenates a
+       capped snippet block plus a manifest summary and optional
+       recent-commit excerpts.
     E. Multi-language syntax checks (_check_python/_node/_json/_brace_balance).
        Best-effort per-file parser invocation, used by the syntax-fix
        refinement gate. Languages without a cheap local check are skipped.
@@ -87,10 +94,14 @@ Change rationale (reviewable blocks; intentionally cohesive — they share state
        _run_companion_test, _TEST_PARTNER_TEMPLATES). Heuristically pairs an
        edited source file with a likely test path and runs it once when a
        runner is available, feeding any failure tail into the test-fix gate.
-    G. Prompt text (SYSTEM_PROMPT and build_*_prompt helpers). Describes the
+    G. Criteria matching (_unaddressed_criteria, _keyword_in_added,
+       _KEYWORD_SUFFIX_STRIPS). Compares acceptance-criterion keywords
+       against added patch lines using a short suffix-stripping pass so
+       English morphology (clicking/click, loads/load, selection/select) does
+       not produce spurious nudge prompts.
+    H. Prompt text (SYSTEM_PROMPT and build_*_prompt helpers). Describes the
        expected behaviour (minimal, correct, complete patch) and the
-       refinement turn formats; does not mention the validator's scoring
-       mechanics.
+       refinement turn formats.
 """
 
 from __future__ import annotations
@@ -744,6 +755,73 @@ SECRETISH_PARTS = {
 }
 
 
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "Makefile",
+    "go.mod",
+    "Cargo.toml",
+    "jest.config.js",
+    "vitest.config.ts",
+)
+
+
+def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
+    """Compact top-level project hints: test scripts and build config only.
+
+    Separate from ranked source context. The model often knows what to edit but
+    wastes a turn guessing the right verification command. A tiny manifest
+    summary helps it choose targeted tests without reading broad config files
+    itself.
+    """
+    tracked = set(_tracked_files(repo))
+    blocks: List[str] = []
+
+    for relative_path in _PROJECT_HINT_FILES:
+        if relative_path not in tracked:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            data = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if relative_path == "package.json":
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = {}
+            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+            if isinstance(scripts, dict) and scripts:
+                interesting = {
+                    key: scripts[key]
+                    for key in sorted(scripts)
+                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
+                }
+                if interesting:
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
+            continue
+
+        snippet = _truncate(data, 700)
+        if snippet.strip():
+            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
+
+        if len("\n\n".join(blocks)) >= max_chars:
+            break
+
+    if not blocks:
+        return ""
+    return _truncate(
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
+        + "\n\n".join(blocks),
+        max_chars,
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -781,6 +859,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    # Project-level test / build hints: a short manifest summary so the model
+    # can pick a targeted verification command without reading config files.
+    project_hints = _project_hint_block(repo)
+    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+        parts.append(project_hints)
+        used += len(project_hints)
+
     # Append recent-commit examples as style anchors when history exists; no-op
     # on single-commit pilot snapshots.
     recent_examples = _recent_commit_examples(repo)
@@ -788,6 +873,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -803,6 +895,22 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_handler`) are deliberate signals from the task author about the
+    # code surface that matters. When they pick out a small specific set of
+    # tracked files by path-substring, treat those files as explicit mentions
+    # so they get the same +100 ranking boost as path-mentioned files.
+    # Skipped when the identifier matches too many files (filters out generic
+    # identifiers like `basic.py` or `util`).
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1343,14 +1451,20 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
+    ("{stem}.py", "test/{stem}_test.py"),
+    ("{stem}.py", "test/test_{stem}.py"),
+    ("{stem}.py", "{dir}/{stem}_test.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
+    ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
@@ -1661,6 +1775,28 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
+# Verb/noun suffixes commonly used in acceptance-criterion English that don't
+# appear in source-code identifiers. The criteria say "clicking", "loads",
+# "selection", "displayed", "correctly"; the corresponding code uses
+# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
+# substring check on the natural-language form misses these matches and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix
+# (with a minimum-stem length to avoid false positives like `action` -> `act`
+# matching `react`) bridges the natural-language <-> identifier gap.
+_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+
+
+def _keyword_in_added(keyword: str, added_lower: str) -> bool:
+    if keyword in added_lower:
+        return True
+    for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
+        if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
+            if keyword[:-len(suffix)] in added_lower:
+                return True
+            break
+    return False
+
+
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -1685,7 +1821,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if not keywords:
             continue
         # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if kw in added_lower)
+        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
