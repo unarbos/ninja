@@ -798,7 +798,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def _files_to_create_hint(repo: Path, issue: str, tracked_set: set) -> str:
+def _files_to_create_hint(repo: Path, issue_text: str, tracked_set: set) -> str:
     """Surface backticked path-shaped identifiers that don't match any
     existing tracked file. Most often these are files the task wants us
     to create (e.g. `PodHistoryButton.svelte`, `validate-gpkg.test-helpers.js`).
@@ -810,7 +810,7 @@ def _files_to_create_hint(repo: Path, issue: str, tracked_set: set) -> str:
     """
     candidates = []
     seen = set()
-    for ident in _BACKTICK_PATHLIKE_RE.findall(issue):
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue_text):
         if ident in seen:
             continue
         seen.add(ident)
