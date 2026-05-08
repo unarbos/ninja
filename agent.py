@@ -106,6 +106,80 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 270.0  # halved from 540 — multi-shot wrapper needs room for 1 retry within validator's ~600s budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
+# v32 (ported from v31): stall-prevention machinery. NO new LLM calls,
+# NO prompt expansion, NO max_tokens change. Adapts each call's timeout
+# to remaining budget, scales retries, wraps deadline+fallback when
+# budget is tight, tracks recent latencies.
+LLM_TIMEOUT_MIN = 30
+LLM_TIMEOUT_MAX = 120
+LLM_TIMEOUT_FALLBACK = 60
+DEADLINE_FALLBACK_MIN_REMAINING_S = 120.0
+
+_LLM_CALL_LATENCIES: List[float] = []
+_LLM_LATENCY_HISTORY = 3
+
+
+def _record_llm_latency(seconds: float) -> None:
+    _LLM_CALL_LATENCIES.append(seconds)
+    if len(_LLM_CALL_LATENCIES) > _LLM_LATENCY_HISTORY:
+        del _LLM_CALL_LATENCIES[0]
+
+
+def _reset_llm_latency_history() -> None:
+    _LLM_CALL_LATENCIES.clear()
+
+
+def _expected_next_llm_latency() -> float:
+    if not _LLM_CALL_LATENCIES:
+        return float(LLM_TIMEOUT_MIN)
+    return max(float(LLM_TIMEOUT_MIN), max(_LLM_CALL_LATENCIES))
+
+
+def _adaptive_llm_timeout(seconds_remaining: Optional[float]) -> int:
+    if seconds_remaining is None:
+        return LLM_TIMEOUT_FALLBACK
+    usable = seconds_remaining - WALL_CLOCK_RESERVE_SECONDS
+    if usable <= 0:
+        return LLM_TIMEOUT_MIN
+    return max(LLM_TIMEOUT_MIN, min(LLM_TIMEOUT_MAX, int(usable)))
+
+
+def _adaptive_llm_max_retries(socket_timeout: int) -> int:
+    if socket_timeout < 60:
+        return 0
+    if socket_timeout < 90:
+        return 1
+    if socket_timeout < 120:
+        return 2
+    return HTTP_MAX_RETRIES
+
+
+def chat_completion_with_deadline(
+    deadline_seconds: float,
+    **chat_kwargs: Any,
+) -> Tuple[str, Optional[float], Dict[str, Any]]:
+    """Worker-thread deadline guardrail. On TimeoutError records the
+    deadline as a latency sample and re-raises so the caller's existing
+    model-error path handles the honest failure."""
+    import concurrent.futures
+
+    if deadline_seconds <= 0:
+        raise TimeoutError("no remaining budget for chat_completion")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(chat_completion, **chat_kwargs)
+    call_start = time.monotonic()
+    try:
+        result = future.result(timeout=float(deadline_seconds))
+        _record_llm_latency(time.monotonic() - call_start)
+        return result
+    except concurrent.futures.TimeoutError as exc:
+        _record_llm_latency(float(deadline_seconds))
+        raise TimeoutError(f"chat_completion deadline of {deadline_seconds:.1f}s exceeded") from exc
+    finally:
+        executor.shutdown(wait=False)
+
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -2313,21 +2387,44 @@ def solve(
     _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
+    def _finalize(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Restricted to consolidating a genuinely-produced patch.
+
+        Normalises the result dict so downstream callers can rely on the
+        `patch` and `logs` fields being strings. Does NOT mutate any repo
+        files, does NOT re-run the patch capture, does NOT override the
+        `success` flag the inner loop set. When the loop produced zero
+        substantive added lines we return the result as-is — empty stays
+        empty, honestly.
+        """
+        try:
+            if not isinstance(result.get("patch"), str):
+                result["patch"] = result.get("patch") or ""
+            if not isinstance(result.get("logs"), str):
+                result["logs"] = result.get("logs") or ""
+        except Exception:
+            pass
+        return result
+
+    # v32: reset latency history before attempt 1.
+    _reset_llm_latency_history()
     _result1 = _solve_attempt(**_multishot_args)
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
     if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
         _result1["multishot_attempts"] = 1
-        return _result1
+        return _finalize(_result1)
 
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
         _result1["multishot_attempts"] = 1
         _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
+        return _finalize(_result1)
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+    # v32: reset latency history before attempt 2.
+    _reset_llm_latency_history()
     _result2 = _solve_attempt(**_multishot_args)
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
@@ -2335,14 +2432,14 @@ def solve(
     if _n2 >= _n1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
-        return _result2
+        return _finalize(_result2)
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     if _patch1:
         _multishot_apply_patch(_multishot_repo_obj, _patch1)
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
-    return _result1
+    return _finalize(_result1)
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2372,6 +2469,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+    # v32: scoped time-remaining helper. ONLY feeds adaptive timeouts;
+    # does NOT gate step entry (the new king deliberately removed
+    # step-level out_of_time checks).
+    def _time_remaining_inner() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2530,21 +2632,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
+                # v32: per-call adaptive socket timeout + retry count.
+                # Threshold guard: only deadline-wrap when remaining is
+                # tight; otherwise let chat_completion run its standard
+                # HTTP retry logic (capped at adaptive timeout).
+                _remaining = _time_remaining_inner()
+                _socket_to = _adaptive_llm_timeout(_remaining)
+                _adaptive_retries = _adaptive_llm_max_retries(_socket_to)
+                _use_deadline_wrap = _remaining < DEADLINE_FALLBACK_MIN_REMAINING_S
                 try:
-                    response_text, cost, _raw = chat_completion(
-                        messages=_messages_for_request(messages),
-                        model=model_name,
-                        api_base=api_base,
-                        api_key=api_key,
-                        max_tokens=max_tokens,
-                    )
+                    if _use_deadline_wrap:
+                        response_text, cost, _raw = chat_completion_with_deadline(
+                            deadline_seconds=float(_socket_to),
+                            messages=_messages_for_request(messages),
+                            model=model_name,
+                            api_base=api_base,
+                            api_key=api_key,
+                            max_tokens=max_tokens,
+                            timeout=_socket_to,
+                            max_retries=_adaptive_retries,
+                        )
+                    else:
+                        response_text, cost, _raw = chat_completion(
+                            messages=_messages_for_request(messages),
+                            model=model_name,
+                            api_base=api_base,
+                            api_key=api_key,
+                            max_tokens=max_tokens,
+                            timeout=_socket_to,
+                            max_retries=_adaptive_retries,
+                        )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
                     break
                 except Exception as exc:
                     logs.append(
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
-                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
+                        f"{MAX_STEP_RETRIES + 1}, wrap={_use_deadline_wrap}):\n{exc}"
                     )
                     if retry_attempt < MAX_STEP_RETRIES:
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
