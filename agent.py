@@ -151,11 +151,18 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?curl(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?wget(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?netcat(?:\s|$))",
-    r"(?:(?:^|[;&|`(]\s*)(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?ssh(?:\s|$))",
+    # Outbound network / bulk copy: word boundaries catch leading whitespace and
+    # mid-pipeline uses; `nc` uses a prefix class so extensions like foo.nc.ts do
+    # not false-positive on path segments like foo.nc.ts.
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bssh\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\bncat\b",
+    r"\btelnet\b",
+    r"\bnetcat\b",
+    r"(?:^|[\s;&|`()])\s*(?:sudo\s+)?(?:env\s+\w+=\S+\s+)*(?:command\s+)?nc(?:\s|$)",
     r"(?:[<>]\s*/dev/tcp/|\bexec\s+\d+[<>]/dev/tcp/)",
 ]
 
@@ -512,21 +519,12 @@ FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_commands(model_text: str) -> List[str]:
-    tagged = [
+    """Only `<command>...</command>` blocks are executed — no fenced-code fallback."""
+    return [
         match.group(1).strip()
         for match in ACTION_RE.finditer(model_text)
         if match.group(1).strip()
     ]
-    if tagged:
-        return tagged
-
-    fence = re.search(r"```(?:bash|sh)?\s*(.*?)```", model_text, flags=re.IGNORECASE | re.DOTALL)
-    if not fence:
-        return []
-    inner = fence.group(1).strip()
-    if not inner or len(inner) > 2000:
-        return []
-    return [inner]
 
 
 def extract_command(model_text: str) -> Optional[str]:
@@ -2332,18 +2330,16 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort instruction when all refinement turns still yielded no patch."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "EMERGENCY: after all refinement attempts your patch is still empty. "
-        "An empty patch scores 0% on the validator's similarity AND on the LLM "
-        "judge — both rubrics expect actual code edits.\n\n"
+        "Last attempt: the working tree still has no substantive fix for this "
+        "issue. The harness cannot verify behavior without at least one concrete "
+        "code change tied to the requirements.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
-        "Make ONE plausible code edit consistent with the issue. Pick the most "
-        "likely target file from the preloaded snippets (or one focused grep). "
-        "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
-        "TARGETED CODE CHANGE in that file. Even a partially-wrong guess "
-        "scores some similarity against the reference. An empty patch "
-        "scores zero. Do NOT change file modes / permissions. Do NOT add "
-        "comments only. Make a real code edit, then <final> immediately."
+        "Make ONE plausible code edit that addresses the clearest requirement: "
+        "pick the most likely target file from the preloaded snippets (or one "
+        "focused grep). Use sed -i, a python -c one-liner, or a heredoc for a "
+        "single targeted change. Prefer correctness over breadth; avoid "
+        "permission/mode churn and comment-only edits. Then end with <final>."
     )
 
 
@@ -2686,7 +2682,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap because it's the
-        # only thing standing between us and a guaranteed-zero empty patch.
+        # last chance to produce a substantive edit before returning.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2822,10 +2818,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({
                     "role": "user",
                     "content": (
-                        "EMERGENCY — less than 60 seconds remain before timeout and your "
-                        "draft diff is still empty. An empty patch scores ZERO. A minimal, "
-                        "imperfect edit to the most plausible file from the issue scores "
-                        "non-zero and often wins (since the opponent may also TLE).\n\n"
+                        "Time pressure: wall-clock is tight and no code changes are "
+                        "staged yet. Apply one minimal, requirement-aligned edit so the "
+                        "task has a concrete implementation to evaluate.\n\n"
                         "In your NEXT response: pick ONE file and ONE edit that addresses "
                         "the most central requirement in the issue. Use a single `sed -i` or "
                         "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
