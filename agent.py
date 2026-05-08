@@ -116,8 +116,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 4  # raised: with 7 ordered gates and a cap of 2 the last 5 are
+                                # functionally dead whenever polish+syntax both fire; 4 lets the
+                                # coverage/criteria/self-check gates run without blowing wall-clock
+                                # (the existing per-gate caps of 1 still bound each pass)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -287,6 +289,17 @@ def _repo_path(path: str | Path) -> Path:
 # -----------------------------
 # OpenAI-compatible client
 # -----------------------------
+
+def _request_timeout(deadline_monotonic: float) -> int:
+    """Return a safe HTTP request timeout that won't overrun the wall-clock budget.
+
+    Shrinks as the deadline approaches so a single hung call can't consume all
+    remaining time. Clamped to [30, 120] so we never cut short a fast request
+    nor block indefinitely near the end of the budget.
+    """
+    remaining = deadline_monotonic - time.monotonic() - WALL_CLOCK_RESERVE_SECONDS
+    return max(30, min(120, int(remaining)))
+
 
 # MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
 # behavior, response parsing, or model-message strategy here. Keep all requests
@@ -685,6 +698,102 @@ SECRETISH_PARTS = {
 }
 
 
+def _detect_repo_style_hints(repo: Path) -> str:
+    """Sample tracked source files to infer indent style and quote convention.
+
+    Returns a compact block (≤ _STYLE_HINT_BUDGET chars) injected into the
+    preloaded context so the model adopts the repo's conventions on the first
+    turn. Implements the dead _STYLE_HINT_BUDGET constant that has been defined
+    since PR#250 but never wired to any code path.
+    """
+    try:
+        tracked = _tracked_files(repo)
+        if not tracked:
+            return ""
+        _ext_counts: Dict[str, int] = {}
+        for _f in tracked:
+            _suf = Path(_f).suffix.lower()
+            if _suf in TEXT_FILE_EXTENSIONS:
+                _ext_counts[_suf] = _ext_counts.get(_suf, 0) + 1
+        if not _ext_counts:
+            return ""
+        _dominant = max(_ext_counts, key=lambda k: _ext_counts[k])
+        _candidates = [
+            _f for _f in tracked
+            if Path(_f).suffix.lower() == _dominant and _context_file_allowed(_f)
+        ][:8]
+        if not _candidates:
+            return ""
+        _tab_lines = 0
+        _space_lines = 0
+        _single_q = 0
+        _double_q = 0
+        for _rel in _candidates:
+            try:
+                _text = (repo / _rel).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for _line in _text.splitlines()[:200]:
+                if _line.startswith("\t"):
+                    _tab_lines += 1
+                elif _line.startswith("    "):
+                    _space_lines += 1
+                _single_q += _line.count("'")
+                _double_q += _line.count('"')
+        _indent = "tabs" if _tab_lines > _space_lines else "4 spaces"
+        _quotes = "single-quoted" if _single_q > _double_q else "double-quoted"
+        _lang_map = {
+            ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+            ".tsx": "TSX", ".jsx": "JSX", ".go": "Go", ".rs": "Rust",
+            ".rb": "Ruby", ".java": "Java", ".cs": "C#", ".cpp": "C++",
+            ".c": "C", ".swift": "Swift", ".kt": "Kotlin",
+        }
+        _lang = _lang_map.get(_dominant, _dominant.lstrip(".").upper())
+        _hint = f"Repo style:\n- Language: {_lang}\n- Indent: {_indent}\n- Strings: {_quotes}"
+        return _hint[:_STYLE_HINT_BUDGET]
+    except Exception:
+        return ""
+
+
+def _detect_project_type(repo: Path) -> Dict[str, str]:
+    """Return project ecosystem metadata based on manifest file detection.
+
+    Checks common manifest files in priority order and returns a dict with
+    keys: kind, runner, test_cmd. Used to inject a concise "Project:" block
+    into the initial user prompt so the model immediately knows the test runner
+    and build tool without spending a step discovering them.
+    """
+    _manifests = [
+        ("pyproject.toml", "python", "pytest", "pytest -x -q"),
+        ("setup.py", "python", "pytest", "pytest -x -q"),
+        ("requirements.txt", "python", "pytest", "pytest -x -q"),
+        ("go.mod", "go", "go test", "go test ./..."),
+        ("Cargo.toml", "rust", "cargo test", "cargo test --quiet"),
+        ("Gemfile", "ruby", "rspec", "bundle exec rspec"),
+        ("pom.xml", "java", "junit", "mvn -q test"),
+    ]
+    for _manifest, _kind, _runner, _test_cmd in _manifests:
+        if (repo / _manifest).exists():
+            return {"kind": _kind, "runner": _runner, "test_cmd": _test_cmd}
+    for _gf in ("build.gradle", "build.gradle.kts"):
+        if (repo / _gf).exists():
+            return {"kind": "java", "runner": "gradle", "test_cmd": "gradle -q test"}
+    if (repo / "package.json").exists():
+        _runner = "jest"
+        _test_cmd = "npx jest --no-coverage"
+        try:
+            _pkg = json.loads((repo / "package.json").read_text(encoding="utf-8", errors="replace"))
+            _deps = {**_pkg.get("dependencies", {}), **_pkg.get("devDependencies", {})}
+            if "vitest" in _deps:
+                _runner, _test_cmd = "vitest", "npx vitest run"
+            elif "jest" not in _deps:
+                _test_cmd = "npm test"
+        except Exception:
+            pass
+        return {"kind": "node", "runner": _runner, "test_cmd": _test_cmd}
+    return {}
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -710,6 +819,14 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     parts: List[str] = []
     used = 0
+
+    # Prepend detected style hints as the first block so the model sees the
+    # repo's indent/quote conventions before any file content.
+    _style = _detect_repo_style_hints(repo)
+    if _style:
+        parts.append(_style)
+        used += len(_style)
+
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
@@ -732,13 +849,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     return "\n\n".join(parts)
 
 
-_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files — only treat as
-                              # "mentioned" when an identifier picks out a
-                              # specific small handful in the tracked set.
-
-
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -752,22 +862,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
-
-    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
-    # `email_notificacoes`) are deliberate signals from the task author about
-    # the code surface that matters. When they pick out a small specific set
-    # of tracked files by path-substring, treat those files as explicit
-    # mentions so they get the same +100 ranking boost as path-mentioned
-    # files. Skipped when the identifier matches too many files (filters out
-    # generic identifiers like `basic.py` or `any2txt`).
-    seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
-        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
-        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
-            for m in matches:
-                if m not in seen_mentioned:
-                    mentioned.append(m)
-                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1636,28 +1730,6 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# Verb/noun suffixes commonly used in acceptance-criterion English that don't
-# appear in source-code identifiers. The criteria say "clicking", "loads",
-# "selection", "displayed", "correctly"; the corresponding code uses
-# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
-# substring check on the natural-language form misses these matches and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix
-# (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ↔ identifier gap.
-_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
-
-
-def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    if keyword in added_lower:
-        return True
-    for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
-        if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
-            if keyword[:-len(suffix)] in added_lower:
-                return True
-            break
-    return False
-
-
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -1683,7 +1755,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if not keywords:
             continue
         # criterion is "addressed" if at least HALF its keywords appear
-        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
+        hits = sum(1 for kw in keywords if kw in added_lower)
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
@@ -1746,34 +1818,57 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
-    to ranking, never the only signal.
+    Uses a single batched git grep call (one -e per symbol) to find the union
+    of matching files, then attributes per-symbol hits in memory. This bounds
+    the pre-loop blocking I/O to one subprocess instead of up to 12 serial
+    calls, which at 4s each could consume up to 48s on a slow repo.
     """
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    # Single batched call: list every file matching any symbol.
+    args = ["git", "grep", "-l", "-F", "-e", symbols[0]]
+    for sym in symbols[1:]:
+        args.extend(["-e", sym])
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=6,
+            check=False,
+        )
+    except Exception:
+        return {}
+    if proc.returncode not in (0, 1):
+        return {}
+
+    union_files = [
+        line.strip()
+        for line in proc.stdout.splitlines()
+        if line.strip() and line.strip() in tracked_set and _context_file_allowed(line.strip())
+    ]
+    if not union_files:
+        return {}
+
+    # Per-symbol attribution: read each union file once, then count in memory.
+    file_texts: Dict[str, str] = {}
+    for relative_path in union_files:
         try:
-            proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", symbol],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=4,
+            file_texts[relative_path] = (repo / relative_path).read_text(
+                encoding="utf-8", errors="replace"
             )
         except Exception:
-            continue
-        if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            pass
+
+    hits: Dict[str, int] = {}
+    for symbol in symbols:
+        for relative_path, text in file_texts.items():
+            if symbol in text:
+                hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
 
 
@@ -2176,6 +2271,72 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
         pass
 
 
+def _attempt2_diversification_addendum(prev_patch: str, issue_text: str, repo: Path) -> str:
+    """Build a retry hint appended to the issue text for the second multi-shot attempt.
+
+    The first attempt produced low-signal output (few substantive added lines).
+    This addendum nudges the second attempt to be more ambitious: it names how
+    many lines were produced, which files were touched, and which issue-mentioned
+    paths remain untouched.
+    """
+    n_lines = _multishot_count_substantive(prev_patch)
+    touched = _patch_changed_files(prev_patch) if prev_patch.strip() else []
+    required = _extract_issue_path_mentions(issue_text)
+    untouched = [
+        p for p in required
+        if not any(p == c or c.endswith("/" + p) for c in touched)
+    ]
+    parts: List[str] = [
+        f"\n\nNOTE: A previous attempt produced only {n_lines} substantive added lines and was discarded."
+    ]
+    if touched:
+        parts.append(f"Touched files: {', '.join(touched[:6])}.")
+    if untouched:
+        parts.append(
+            f"Untouched required paths from the issue: {', '.join(untouched[:6])}."
+        )
+    parts.append(
+        "This retry should be more ambitious — touch every required path, "
+        "update companion tests, and finish with <final> only after running a real test."
+    )
+    return " ".join(parts)
+
+
+def _validate_patch_applies_cleanly(repo: Path, patch: str) -> bool:
+    """Dry-run git apply --check on an isolated worktree clone of HEAD.
+
+    Uses `git worktree add --detach` to create a clean checkout, then verifies
+    the patch would apply without conflicts. Fails open (returns True) when
+    worktree setup fails so we never discard a patch we can't verify.
+    """
+    if not patch.strip():
+        return True
+    import tempfile as _tempfile
+    try:
+        with _tempfile.TemporaryDirectory() as _tmpdir:
+            _wt = _tmpdir + "/wt"
+            _add = subprocess.run(
+                ["git", "worktree", "add", "--detach", _wt],
+                cwd=str(repo), capture_output=True, text=True, timeout=15, check=False,
+            )
+            if _add.returncode != 0:
+                return True  # worktree unavailable; fail open
+            try:
+                _chk = subprocess.run(
+                    ["git", "apply", "--check", "-p1", "--whitespace=nowarn"],
+                    cwd=_wt, input=patch,
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                return _chk.returncode == 0
+            finally:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", _wt],
+                    cwd=str(repo), capture_output=True, text=True, timeout=10, check=False,
+                )
+    except Exception:
+        return True
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
@@ -2251,8 +2412,13 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _n1 = _multishot_count_substantive(_patch1)
 
         if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
+            # Validate before committing to this patch as the final answer.
+            # If the patch is structurally broken, fall through to attempt 2
+            # rather than returning a patch the validator's git apply will reject.
+            if _multishot_repo_obj is None or _validate_patch_applies_cleanly(_multishot_repo_obj, _patch1):
+                _result1["multishot_attempts"] = 1
+                return _result1
+            # patch1 failed validation; revert and try again
 
         _elapsed = time.monotonic() - _multishot_started
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
@@ -2262,14 +2428,30 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+
+        # Diversify attempt 2: append a hint describing what the first attempt
+        # missed so the second shot is less likely to make the same first move.
+        _kwargs2 = dict(kwargs)
+        _kwargs2["issue"] = kwargs.get("issue", "") + _attempt2_diversification_addendum(
+            _patch1, kwargs.get("issue", ""), _multishot_repo_obj or Path(".")
+        )
+        _result2 = _solve_attempt(**_kwargs2)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
         if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
+            if _multishot_repo_obj is None or _validate_patch_applies_cleanly(_multishot_repo_obj, _patch2):
+                _result2["multishot_attempts"] = 2
+                _result2["multishot_winner"] = "retry"
+                return _result2
+            # patch2 is higher-signal but broken; fall through to patch1
+            if _multishot_repo_obj is not None:
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            if _patch1 and _multishot_repo_obj is not None:
+                _multishot_apply_patch(_multishot_repo_obj, _patch1)
+            _result1["multishot_attempts"] = 2
+            _result1["multishot_winner"] = "primary_validation_fallback"
+            return _result1
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -2326,6 +2508,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
+    _solve_deadline = solve_started_at + WALL_CLOCK_BUDGET_SECONDS
+
+    def time_remaining() -> float:
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+
+    def out_of_time() -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2472,6 +2661,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
+        # Prepend project-type metadata to preloaded context so the model
+        # knows the test runner before reading any file content.
+        _proj = _detect_project_type(repo)
+        if _proj:
+            _proj_line = (
+                f"Project: {_proj['kind']} | test runner: {_proj['runner']}"
+                f" | command: {_proj['test_cmd']}"
+            )
+            preloaded_context = _proj_line + ("\n\n" + preloaded_context if preloaded_context else "")
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
@@ -2482,6 +2681,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
+
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
@@ -2491,6 +2698,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=_request_timeout(_solve_deadline),
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -2500,7 +2708,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES:
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
                         continue
                     break
@@ -2518,7 +2726,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3:
+                if consecutive_model_errors >= 3 or out_of_time():
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
@@ -2568,7 +2776,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
-                    if patch.strip() and _looks_like_successful_test_output(observation, command):
+                    if (patch.strip()
+                            and _looks_like_successful_test_output(observation, command)
+                            and _patch_covers_required_paths(patch, issue)):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
@@ -2679,17 +2889,15 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "exception",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
-
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = (
+        " passed" in lower
+        or " all passed" in lower
+        or "success" in lower
+        or re.search(r"\bok\b", lower) is not None
+    )
     has_bad = any(marker in lower for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
