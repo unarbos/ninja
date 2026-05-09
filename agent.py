@@ -816,7 +816,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
-    files = _augment_with_named_scope(repo, issue, files, tracked_set)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
@@ -910,44 +909,6 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-
-
-def _augment_with_named_scope(repo: Path, issue: str, ranked: List[str], tracked_set: set[str]) -> List[str]:
-    """Prefer files inside a project/subdir explicitly named by the task.
-
-    Real tasks often say "in the named project" or "for foo/bar". The
-    filename terms alone can rank a shared helper above the active app. This
-    moves a small number of same-scope files to the front without hardcoding any
-    project names.
-    """
-    issue_lower = issue.lower()
-    prefixes: List[str] = []
-    for path in tracked_set:
-        parts = Path(path).parts
-        for depth in (1, 2):
-            if len(parts) <= depth:
-                continue
-            prefix = "/".join(parts[:depth])
-            name = parts[depth - 1].lower()
-            if len(name) >= 4 and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", issue_lower):
-                if prefix not in prefixes:
-                    prefixes.append(prefix)
-        if len(prefixes) >= 3:
-            break
-    if not prefixes:
-        return ranked
-
-    scoped: List[str] = []
-    for prefix in prefixes:
-        scoped.extend(
-            path for path in ranked
-            if path.startswith(prefix + "/") and path not in scoped
-        )
-        if len(scoped) >= 6:
-            break
-    if not scoped:
-        return ranked
-    return scoped + [path for path in ranked if path not in scoped]
 
 
 def _context_file_allowed(relative_path: str) -> bool:
