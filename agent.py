@@ -727,7 +727,7 @@ SECRETISH_PARTS = {
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Two improvements over a vanilla rank-and-read loop:
+    Three improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -739,6 +739,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+      3. Files that define issue-mentioned symbols use focused slices around
+         those definitions, so long files reveal the likely edit region.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -747,12 +750,34 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
+    definer_files = _find_identifier_definers(repo, tracked_set, issue)
+    anchor_map: Dict[str, List[Tuple[int, int]]] = {}
+    region_anchors: List[Tuple[str, int, int]] = []
+    if definer_files:
+        region_anchors = _extract_region_anchors(repo, definer_files)
+        for anchor_path, anchor_start, anchor_end in region_anchors:
+            anchor_map.setdefault(anchor_path, []).append((anchor_start, anchor_end))
+
     parts: List[str] = []
     used = 0
+
+    if region_anchors:
+        focus_lines = [f"  {path}:{start}-{end}" for path, start, end in region_anchors[:6]]
+        focus_block = (
+            "FOCUS REGIONS (the issue mentions these symbols; their definitions "
+            "are included below, so concentrate inspection there):\n"
+            + "\n".join(focus_lines)
+        )
+        parts.append(focus_block)
+        used += len(focus_block)
+
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        if relative_path in anchor_map:
+            snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
+        else:
+            snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -787,6 +812,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    definer_files = _find_identifier_definers(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -806,9 +832,10 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Boost files whose contents reference identifiers from the issue.
-        if relative_path in symbol_hits:
-            score += 60 + min(40, 8 * symbol_hits[relative_path])
+        if relative_path in definer_files:
+            score += 200
+        elif relative_path in symbol_hits:
+            score += 30
         if score > 0:
             scored.append((score, relative_path))
 
@@ -912,6 +939,57 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+def _read_context_file_focused(
+    repo: Path,
+    relative_path: str,
+    anchor_ranges: List[Tuple[int, int]],
+    max_chars: int,
+) -> str:
+    """Read a context file around definition anchors instead of only the head."""
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return ""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    if not anchor_ranges or total == 0:
+        return _truncate(text, max_chars)
+
+    intervals: List[Tuple[int, int]] = []
+    for start_line, end_line in anchor_ranges:
+        lo = max(0, start_line - 21)
+        hi = min(total, end_line + 20)
+        intervals.append((lo, hi))
+    intervals.sort()
+
+    merged: List[Tuple[int, int]] = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+
+    parts: List[str] = []
+    prev_hi = 0
+    for lo, hi in merged:
+        if lo > prev_hi:
+            parts.append(f"# ... (lines {prev_hi + 1}-{lo} elided)")
+        parts.extend(all_lines[lo:hi])
+        prev_hi = hi
+    if prev_hi < total:
+        parts.append(f"# ... (lines {prev_hi + 1}-{total} elided)")
+
+    return _truncate("\n".join(parts), max_chars)
 
 
 # -----------------------------
@@ -2099,6 +2177,20 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
+_DEFINER_PATTERNS = [
+    r"^[[:space:]]*(def|class|async[[:space:]]+def)[[:space:]]+{sym}[[:space:]\(:]",
+    r"^[[:space:]]*(export[[:space:]]+)?(default[[:space:]]+)?(async[[:space:]]+)?function[[:space:]]+{sym}[[:space:]\(]",
+    r"^[[:space:]]*(export[[:space:]]+)?(default[[:space:]]+)?class[[:space:]]+{sym}[[:space:]\{(]",
+    r"^[[:space:]]*(export[[:space:]]+)?(const|let|var)[[:space:]]+{sym}[[:space:]]*=[[:space:]]*(async[[:space:]]+)?\(",
+    r"^[[:space:]]*(export[[:space:]]+)?interface[[:space:]]+{sym}[[:space:]\{]",
+    r"^[[:space:]]*(export[[:space:]]+)?type[[:space:]]+{sym}[[:space:]]*=",
+    r"^[[:space:]]*func[[:space:]]+(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]+\*?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)[[:space:]]+)?{sym}[[:space:]\(]",
+    r"^[[:space:]]*type[[:space:]]+{sym}[[:space:]]+(struct|interface)[[:space:]\{]",
+    r"^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+{sym}[[:space:]\(]",
+    r"^[[:space:]]*(pub[[:space:]]+)?(struct|enum|trait|impl)[[:space:]]+{sym}[[:space:]\{(]",
+    r"^[[:space:]]*(public|private|protected|static|final|abstract)[[:space:]]+[A-Za-z_][A-Za-z0-9_<>\[\]]*[[:space:]]+{sym}[[:space:]]*\(",
+    r"^[[:space:]]*class[[:space:]]+{sym}[[:space:]\{(:]",
+]
 _SYMBOL_STOP = {
     "a", "an", "and", "as", "at", "be", "but", "by", "did", "do", "for",
     "from", "had", "has", "have", "if", "in", "is", "it", "its", "not",
@@ -2169,6 +2261,78 @@ def _symbol_grep_hits(
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
+
+
+def _find_identifier_definers(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Dict[str, List[Tuple[str, int]]]:
+    """Locate files that define issue-derived symbols, not just reference them."""
+    symbols = _extract_issue_symbols(issue_text)
+    if not symbols:
+        return {}
+    definers: Dict[str, List[Tuple[str, int]]] = {}
+    for symbol in symbols:
+        patterns = [pattern.replace("{sym}", re.escape(symbol)) for pattern in _DEFINER_PATTERNS]
+        combined = "|".join(f"({pattern})" for pattern in patterns)
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-nE", "--", combined],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 2:
+                continue
+            relative_path = parts[0].strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            try:
+                lineno = int(parts[1])
+            except (ValueError, IndexError):
+                lineno = 0
+            definers.setdefault(relative_path, []).append((symbol, lineno))
+    return definers
+
+
+def _extract_region_anchors(
+    repo: Path,
+    definers: Dict[str, List[Tuple[str, int]]],
+) -> List[Tuple[str, int, int]]:
+    """Return bounded line ranges around definition matches."""
+    top_level_re = re.compile(
+        r"^(def |class |async def |func |fn |impl |type |function |interface )",
+    )
+    anchors: List[Tuple[str, int, int]] = []
+    for relative_path, hits in definers.items():
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            file_lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for _symbol, start_line in hits:
+            if start_line < 1:
+                continue
+            start_idx = start_line - 1
+            end_idx = min(start_idx + 80, len(file_lines))
+            for idx in range(start_idx + 1, end_idx):
+                if top_level_re.match(file_lines[idx]):
+                    end_idx = idx
+                    break
+            anchors.append((relative_path, start_line, end_idx))
+    return anchors
 
 
 # -----------------------------
