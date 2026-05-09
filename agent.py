@@ -118,8 +118,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -590,7 +589,44 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_mode_lines_from_blocks(cleaned)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _strip_mode_lines_from_blocks(diff_output: str) -> str:
+    """Strip `old mode`/`new mode` header lines from blocks that ALSO contain
+    real content. `_strip_mode_only_file_diffs` removes blocks that are JUST
+    a mode flip; this handles the mixed case where the file has both real
+    edits and a mode flip. Production loss rationales repeatedly cite
+    "unrelated file mode churn" / "include unrelated chmod churn" on these
+    mixed blocks. The system prompt asks the model to avoid mode flips, but
+    a deterministic pass that removes the cosmetic header lines (while
+    preserving every hunk and the file path/index) is safer and cheaper
+    than relying on the model to self-police every diff.
+    """
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if "\nold mode " not in block and "\nnew mode " not in block:
+            kept.append(block)
+            continue
+        new_lines = []
+        for line in block.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+                continue
+            new_lines.append(line)
+        kept.append("\n".join(new_lines))
+
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -704,6 +740,79 @@ SECRETISH_PARTS = {
 }
 
 
+_README_FILES: Tuple[str, ...] = (
+    "README.md", "README.rst", "README.txt", "README",
+    "readme.md", "Readme.md",
+)
+
+
+def _readme_block(repo: Path, max_chars: int = 1200) -> str:
+    """Top of repo README as architectural-context preload.
+
+    Multi-file tasks frequently reference modules or systems described in
+    the repo's README. Without it preloaded the agent either guesses the
+    architecture or wastes a discovery turn reading the file. The top
+    portion typically contains the module map / quickstart, which is the
+    highest-signal section for orientation.
+    """
+    tracked = set(_tracked_files(repo))
+    for name in _README_FILES:
+        if name not in tracked:
+            continue
+        full = (repo / name).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet = _truncate(text, max_chars)
+        if not snippet.strip():
+            continue
+        return f"REPO README ({name}, top {max_chars} chars — architectural context):\n\n{snippet}"
+    return ""
+
+
+# Backticked path-shaped identifiers in the issue that match no existing
+# tracked file are almost certainly files the task wants us to create.
+# The standard backtick boost only fires on `1<=hits<=N` (matching existing
+# files), so new-file creation cues are silently dropped without this hint.
+# Heuristic: must contain a path separator '/' OR a recognized code/file
+# extension. The system prompt already encourages new-file creation, but a
+# concrete enumerated list of suspected new files removes the model's need
+# to derive them from prose.
+_BACKTICK_PATHLIKE_RE = re.compile(
+    r"`([A-Za-z][\w./_-]{2,80}"
+    r"(?:/[A-Za-z][\w./_-]{1,80}"
+    r"|\.(?:py|js|jsx|ts|tsx|svelte|vue|go|rs|java|kt|rb|php|cs|cpp|c|h|hpp|"
+    r"swift|dart|ex|exs|md|rst|txt|json|yaml|yml|toml|sql|sh|bash|zsh|html|css|scss)"
+    r"))`",
+    re.IGNORECASE,
+)
+
+
+def _files_to_create_hint(repo: Path, issue_text: str, tracked_set: set) -> str:
+    """Surface backticked path-shaped identifiers that don't match any
+    existing tracked file as a `FILES TO CREATE` block."""
+    candidates = []
+    seen = set()
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue_text):
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if any(ident in p for p in tracked_set):
+            continue
+        candidates.append(ident)
+        if len(candidates) >= 12:
+            break
+    if not candidates:
+        return ""
+    return (
+        "FILES TO CREATE (path-shaped identifiers in backticks that don't exist yet — "
+        "the issue is likely asking you to create these):\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -744,6 +853,16 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
+    tracked_set_for_hints = set(_tracked_files(repo))
+    readme = _readme_block(repo)
+    if readme and used + len(readme) <= MAX_PRELOADED_CONTEXT_CHARS + 1500:
+        parts.append(readme)
+        used += len(readme)
+    create_hint = _files_to_create_hint(repo, issue, tracked_set_for_hints)
+    if create_hint and used + len(create_hint) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+        parts.append(create_hint)
+        used += len(create_hint)
+
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1718,7 +1837,11 @@ def _criterion_keywords(criterion: str) -> List[str]:
 # inflates the criteria-nudge false-positive rate. Stripping the suffix (with
 # a minimum-stem length to avoid false positives like `action`->`act` matching
 # `react`) bridges the natural-language ↔ identifier gap.
-_KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
+_KEYWORD_SUFFIX_STRIPS = (
+    ("tion", 4), ("ment", 4), ("ness", 4), ("able", 4), ("ible", 4),
+    ("ing", 4), ("est", 4), ("ity", 4), ("ful", 4), ("ion", 4),
+    ("ed", 4), ("es", 4), ("ly", 4), ("er", 4), ("s", 4),
+)
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
@@ -1898,6 +2021,8 @@ brief summary of what changed
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+**Issue-vocabulary fidelity**: when the issue specifies a field, function, error code, file name, or identifier with specific casing or wording, reproduce that EXACT spelling. If the issue says `timestamp`, use `timestamp` not `timeStamp`. If it says `getCoOccurrenceMatrix`, that's the function name verbatim. If it says `GPKG_HABITATS_NO_GEOMETRY_COLUMN`, that's the constant. The issue's wording is the spec — don't translate to "idiomatic" alternatives that match nearby existing code, because the reference patch the judge compares against will use the issue's wording.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
