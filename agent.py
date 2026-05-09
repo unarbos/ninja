@@ -1881,23 +1881,37 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
+
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Edit surgically**: change only the lines that implement the fix.
-- One-line substitutions: `sed -i 's/old/new/' file`
+**Edit comprehensively when the task needs it, surgically when it doesn't**:
+- Single-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits: a minimal Python script or heredoc
-- Never rewrite an entire function when only 1–3 lines need changing
+- Larger edits or new files: a Python heredoc or `cat > file <<'EOF'` block
+- Multi-file edits: emit ALL files in ONE response
 
-**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+**Multi-file is common**: many reference patches touch multiple files. Do not artificially constrain to one file when the issue spans multiple concerns.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+
+## Functional completeness
+
+A patch that fully implements the requested behavior is generally rated higher than a partially-implemented one of similar size. To avoid leaving features half-done:
+
+- UI/component tasks: add `useState` + event handlers + wired data flow. Avoid skeleton markup with `// TODO` or pass-through props that don't update state.
+- Service/manager/store tasks: implement the actual methods with real logic, not method signatures with `// implement here`.
+- Form tasks: include input bindings, validation, submission handler, error/loading states — wire the form end-to-end.
+- Data fetch / mutation: include the actual fetch/mutate call with state updates, not `// fetch data here` comments.
+- API handlers: implement the full request/response logic, including error paths.
+
+The diff should be RUNNABLE end-to-end. If a reviewer cleared the repo and applied your patch, the feature should work without further code.
 
 ## Scope discipline — what to change
 
@@ -1908,16 +1922,55 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
+## New files — create them when the task implies new functionality
+
+When the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist, create the file confidently using `new file mode 100644`. Common signals:
+- "Create a new <Component>" → emit a new .tsx/.vue/.py file
+- "Add a <Service>/<Manager>/<Store>" → create the new module
+- "Implement the <Form> with these fields" → new form component
+- "Add a route/page for X" → new page file
+- New helper modules to keep functions small and the diff readable
+
+Do NOT create gratuitous helpers. Create files only when the task structurally requires them.
+
 ## Scope discipline — what NOT to change
 
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless the issue explicitly requires them
-- New files unless the issue explicitly requires them
-- Test files unless the issue requires it OR your source change broke an existing test
+- **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
+- Test files unless the issue requires it OR your source change broke an existing test (most references do not include tests)
 - Error handling, logging, or defensive checks not directly required by the fix
+
+## Match the task's scope
+
+A patch that closely matches the requested behavior is rated higher than one that diverges. What this means concretely:
+
+- **Cover every explicit requirement in the issue.** Issues often have multiple bullets or numbered criteria. Read the issue twice, list the requirements, implement each. Missing one of the requested behaviors is a common reason patches are rated as incomplete.
+
+- **Don't add features the issue doesn't ask for.** Drive-by refactors, type-annotation backfills, comment rewrites, mode-only flips, and imports-you-don't-need are typically cited as "unrelated changes". Stay inside the issue's scope.
+
+- **Wire features end-to-end.** Half-implemented features tend to be rated as "users cannot actually use the feature". If you add a search filter, also add the input field and wire it; if you add a service method, wire the call site; if you add a route, wire the navigation.
+
+## Self-check before final
+
+Before emitting `<final>`, ask yourself:
+1. Did I implement EVERY numbered/bulleted requirement from the issue?
+2. Are there any chmod-only or file-mode changes in my diff? (Remove them.)
+3. Did I add anything the issue doesn't ask for? (Remove it.)
+4. Does any UI feature I added have its event handlers and state wired up?
+5. Does the patch compile/parse? Concretely:
+   - Every imported symbol is actually defined or imported elsewhere
+   - Every function called exists with matching signature
+   - Brace/paren/bracket counts balance
+   - No duplicate function/class/method definitions in the same file
+   - No mismatched types (e.g., calling string method on number)
+   - For TypeScript/Java/Go/C#: type annotations align with actual values
+6. Are there any duplicate hunks or near-duplicate code blocks that should consolidate?
+
+If yes to (2) or (3): clean up before finalizing.
+If issues with (5) or (6): fix them — broken/non-compiling code and duplicate definitions hurt the LLM-judge score significantly.
 
 ## Idiomatic refactors — CRITICAL for judge score
 
@@ -1965,6 +2018,19 @@ leave a related file partially edited. When in doubt, include more files.
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
 
+## TypeScript / TSX / JSX-specific idioms
+
+When editing .ts/.tsx/.jsx files, use these conventions unless the local file shows otherwise:
+- Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
+- Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
+- React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
+- State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
+- Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
+- Async: `async function` with try/catch, NOT `.then()` chains
+- Tailwind: compose classes inline in `className` — don't extract unnecessarily
+- shadcn/ui: import from `@/components/ui/<name>`
+- Type imports: `import type { Foo } from './bar'` when only the type is needed
+
 ## Preloaded snippets
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
@@ -1973,6 +2039,85 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
+
+
+_MULTI_FILE_KEYWORDS = (
+    "refactor",
+    "delegate",
+    "split into",
+    "split up",
+    "extract",
+    "migrate",
+    "cascade",
+    "across multiple",
+    "multiple files",
+    "across the",
+    "all of the",
+    "every",
+)
+
+
+def _detect_multi_file_task(issue_text: str) -> bool:
+    """Detect tasks that empirically need 4+ file edits.
+
+    Triggers: issue text mentions >=3 distinct file paths, OR has >=6
+    acceptance-criteria bullets, OR contains multi-file keyword.
+    Targets the stub-critique loss mode where mak edits 1 file x 64 lines
+    while challengers edit 4 files x 157 lines and win.
+    """
+    if not issue_text:
+        return False
+    paths = _extract_issue_path_mentions(issue_text)
+    if len(set(paths)) >= 3:
+        return True
+    criteria = _extract_acceptance_criteria(issue_text)
+    if len(criteria) >= 6:
+        return True
+    lower = issue_text.lower()
+    if any(kw in lower for kw in _MULTI_FILE_KEYWORDS):
+        return True
+    return False
+
+
+def _detect_target_languages(repo: Path) -> List[str]:
+    """Return the dominant file extensions in the repo (excluding common noise)."""
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return []
+    counts: Dict[str, int] = {}
+    skip_exts = {".md", ".lock", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}
+    for path in tracked:
+        ext = Path(path).suffix.lower()
+        if not ext or ext in skip_exts:
+            continue
+        counts[ext] = counts.get(ext, 0) + 1
+    if not counts:
+        return []
+    ranked = sorted(counts.items(), key=lambda x: -x[1])
+    return [ext for ext, _ in ranked[:4]]
+
+
+def _build_language_idiom_block(target_languages: List[str]) -> str:
+    if not target_languages:
+        return ""
+    ts_like = {".ts", ".tsx", ".jsx"}
+    py_like = {".py"}
+    if any(ext in ts_like for ext in target_languages):
+        return (
+            "\nLanguage hint (TypeScript / TSX detected): use existing imports and aliases "
+            "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
+            "elements with onClick/onChange, useState with explicit types. Named function "
+            "exports preferred. Tailwind classes inline in className. shadcn/ui imports from "
+            "`@/components/ui/...`.\n"
+        )
+    if any(ext in py_like for ext in target_languages):
+        return (
+            "\nLanguage hint (Python detected): use type hints, `from __future__ import annotations` "
+            "if file already does, dataclasses for records, async/await over callbacks, and "
+            "stdlib over deps unless the codebase already imports otherwise.\n"
+        )
+    return ""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
@@ -2002,6 +2147,41 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
+    """v33 user message: wraps build_initial_user_prompt with multi-file/lang strategy hints.
+
+    No size targeter — empirical live data shows winners emit 5-15x baseline,
+    not 1.5x; explicit numeric guidance was inert in v32. Functional-completeness
+    language in SYSTEM_PROMPT is the live-validated wedge instead.
+    """
+    base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
+    multi_file = _detect_multi_file_task(issue_text)
+    lang_block = ""
+    try:
+        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
+    except Exception:
+        lang_block = ""
+
+    if multi_file:
+        strategy = (
+            "Strategy override: this task spans MULTIPLE files. Identify all affected files, then "
+            "emit ALL edit commands for ALL files in ONE response. Coordinate cross-file consistency "
+            "— when you change a function signature, type, or interface, cascade the change to every "
+            "caller. Skeleton/stub edits lose to working multi-file implementations even when smaller. "
+            "Comprehensive working implementations beat minimal patches in this codebase."
+        )
+    else:
+        strategy = (
+            "Strategy override: identify the ROOT CAUSE precisely, then implement the fix completely. "
+            "If the task describes new functionality (a component, form, service, page) not already "
+            "in the codebase, create the new file. Wire functional behavior end-to-end — state hooks, "
+            "event handlers, real logic. Skeleton patches with `// TODO` or pass-through props lose "
+            "to working implementations. Comprehensive working implementations beat minimal patches."
+        )
+
+    return base + lang_block + "\n" + strategy + "\n"
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2791,10 +2971,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _initial_user},
+            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
+        # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
+        # v32 hardcoded 240s and became dead code under tighter king budgets,
+        # which cost us 4 empty rounds and the duel. This adapts to whatever
+        # budget the king sets — fires 60s before out_of_time().
+        emergency_injected = False
+        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -2806,6 +2992,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            elapsed = time.monotonic() - _wall_start
+            if (
+                elapsed >= _tle_emergency_threshold
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                emergency_injected = True
+                logs.append(
+                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_emergency_threshold:.1f}s "
+                    "patch still empty -- forcing minimal emit prompt before docker kill."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EMERGENCY — less than 60 seconds remain before timeout and your "
+                        "draft diff is still empty. An empty patch scores ZERO. A minimal, "
+                        "imperfect edit to the most plausible file from the issue scores "
+                        "non-zero and often wins (since the opponent may also TLE).\n\n"
+                        "In your NEXT response: pick ONE file and ONE edit that addresses "
+                        "the most central requirement in the issue. Use a single `sed -i` or "
+                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
+                        "not run grep. Do not list files. After the edit command, end your "
+                        "response with `<final>emergency edit</final>`. Do this in ONE "
+                        "response."
+                    ),
+                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
