@@ -114,6 +114,7 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
+MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check run
 MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
@@ -1442,7 +1443,7 @@ def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     )
     if proc.exit_code == 0:
         return None
-    output = (proc.stdout or "").strip()
+    output = (proc.stdout or proc.stderr or "").strip()
     if not output:
         return None
     first_line = output.splitlines()[0].strip()[:200]
@@ -1455,7 +1456,8 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
     has_config = any(
         (repo / name).exists()
         for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
-                     ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
+                     ".eslintrc.yaml", ".eslintrc.yml", "eslint.config.js",
+                     "eslint.config.mjs", "eslint.config.cjs")
     )
     if not has_config:
         return None
@@ -1504,6 +1506,61 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
         "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
         "confirm with <final>lint clean</final>."
+    )
+
+
+_EMPTY_ARG_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    (
+        "object-literal field with empty value",
+        re.compile(r"^\+(?!\+\+).*[A-Za-z_][\w$]*\s*:\s*,", re.MULTILINE),
+    ),
+    (
+        "method call with no arguments where args were intended",
+        re.compile(
+            r"^\+(?!\+\+).*\b(?:push|emit|send|append|write|add|set|"
+            r"console\.(?:log|error|warn|info|debug)|res\.send|res\.json"
+            r")\(\s*\)\s*[;,]?\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "thrown error with no message",
+        re.compile(
+            r"^\+(?!\+\+).*\b(?:throw\s+new\s+\w+\(\s*\)|new\s+Error\(\s*\))",
+            re.MULTILINE,
+        ),
+    ),
+)
+
+
+def _check_empty_args(patch: str) -> List[str]:
+    findings: List[str] = []
+    if not patch.strip():
+        return findings
+    seen: set[Tuple[str, str]] = set()
+    for label, pattern in _EMPTY_ARG_PATTERNS:
+        for match in pattern.finditer(patch):
+            line = match.group(0).strip()
+            key = (label, line[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {line[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_empty_args_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains expressions that look syntactically valid but "
+        "unfinished:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes ONLY these specific lines: pass the "
+        "intended argument(s), supply a descriptive error message, or remove "
+        "the call entirely if it served no purpose. Do NOT add new behavior "
+        "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
     )
 
 
@@ -3027,6 +3084,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     lint_turns_used = 0  # v72
+    empty_arg_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
     patch_safety_turns_used = 0
@@ -3071,10 +3129,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             5. failed-verification — repair the latest concrete failed check
             6. integration/artifact/dependency — close common missing pieces
-            7. polish/syntax/lint — remove churn and parser/tool errors
+            7. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
             8. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3218,6 +3276,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
+            empty_arg_findings = _check_empty_args(patch)
+            if empty_arg_findings:
+                empty_arg_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_empty_args_fix_prompt(empty_arg_findings),
+                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
                 )
                 return True
 
