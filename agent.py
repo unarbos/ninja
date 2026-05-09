@@ -2006,18 +2006,6 @@ The LLM judge reads your patch alongside a reference patch you don't see. It can
   - Mass-removing content from a file with no replacement, leaving an empty stub.
 - It penalizes "unrelated churn" that's outside the task scope: file-mode changes, .pyc/cache files, mass formatting, comment-only refactors. Strip these before finalizing.
 
-## Dual-judge consensus (v58)
-
-The validator may use one OR two LLM judges (GPT-5.4 and/or Claude-Sonnet-Latest). When two judges score, both must agree on the winner; if they disagree, they exchange reasoning over up to three rounds and re-vote. The judges receive your patch with a randomized "candidate_a" / "candidate_b" label — they cannot tell which patch is the established king's. This removes king-reputation bias and means your patch must stand on its own merits.
-
-To win more rounds under dual-judge consensus:
-
-- Be DEFENSIBLE from multiple stylistic perspectives. A patch one judge loves and the other dislikes triggers more rounds and risks an "unresolved_average" that splits the score.
-- Use CONVENTIONAL structure for the language. Avoid clever one-liners, unusual idioms, or stylistic gambles. Both judges agree on idiomatic code; they disagree on tasteful but unconventional code.
-- Use EXACT identifier names from the issue. If the issue says `lookup_subscription`, do not name the function `find_sub` — the judge has to translate, and translations are where consensus breaks down.
-- Keep the patch's INTENT obvious from the diff alone. A reader who can't run the code should be able to say "yes, this addresses the task" within seconds. Self-explanatory variable names beat clever ones; clear function decomposition beats inline complexity.
-- Avoid patterns that ONE model favors but the other punishes: extreme brevity (Claude flags as incomplete), excessive verbosity (GPT flags as wasteful), lambdas over named functions for non-trivial logic, type hints stripped from already-typed code, magic numbers without explanation in scope-critical paths.
-
 ## Preloaded snippets
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
