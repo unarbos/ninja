@@ -118,6 +118,8 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v34: revert ruff/eslint diagnostics — recent rounds dock unlinted patches as "style"
 MAX_EMPTY_ARG_TURNS = 1    # v34: re-prompt when patch contains malformed `: ,`, `.push()`, `new Error()` patterns
+MAX_CONTRACT_TURNS = 1     # v35: re-prompt when a patch removes an exported symbol that other files still reference
+MAX_SETTER_TURNS = 1       # v35: re-prompt when `const [x, setX] = useState(...)` is added but `setX(...)` is never called
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -125,10 +127,34 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_TOTAL_REFINEMENT_TURNS = 3  # v34: 2 -> 3. The new lint and empty-arg gates address frequent loss
                                 # patterns from recent rounds (lint: 114 hits, malformed args: 9 hits in
                                 # the 18 v33 losses); pre-v34 cap left them stranded behind earlier gates.
+                                # v35 keeps the cap at 3 — the contract-preservation and setter-wired gates
+                                # only fire on tasks where they're load-bearing, so they push out lower-
+                                # leverage gates only when needed.
 
 # v34: lint integration knobs.
 _LINT_TIMEOUT_SECONDS = 10
 _LINT_MAX_ERRORS_REPORTED = 6
+
+# v35: contract-preservation gate knobs.
+# Cross-file usage check is grep-based and shouldn't take more than a couple
+# of seconds even on a large repo, but we cap individually to be safe.
+_CONTRACT_GREP_TIMEOUT_SECONDS = 8
+_CONTRACT_MAX_FINDINGS = 5
+# Names that look like removed exports but are noise (tests, locals, common
+# builder-style identifiers we don't want to chase).
+_CONTRACT_NAME_DENYLIST = {
+    "default",
+    "main",
+    "index",
+    "module",
+    "exports",
+    "describe",
+    "test",
+    "it",
+    "expect",
+    "beforeEach",
+    "afterEach",
+}
 
 # v34: emergency single-shot fallback. Fires when the main solve loop returns
 # an empty patch. Deliberately tight — one small file, one model call, one
@@ -1558,6 +1584,214 @@ def build_v34_empty_args_fix_prompt(findings: List[str]) -> str:
     )
 
 
+# v35: contract-preservation gate.
+#
+# When v33 lost rounds in duel #4288, ~5 of those losses traced to the same
+# pattern: the patch removed (or fully rewrote) a public symbol that other
+# files in the repo still imported / called. Examples cited by the dual
+# judge:
+#   - skill-vocabulary.ts is completely rewritten and removes HUMANOID_SKILLS,
+#     HumanoidSkill type, and skillById/skillByName helpers referenced by
+#     other files
+#   - imports `DatasetMeta` from `dataset-browser.tsx`, but that module no
+#     longer exports it
+#   - Function rename (mqtt_task() to mqtt_app_main()) could break existing
+#     callers
+#
+# This gate scans the patch for removed export-like declarations and uses
+# `git grep` to verify each removed name is no longer referenced outside the
+# file it was removed from. If references survive, we surface them so the
+# refinement turn can re-add the export, restore the rename, or update the
+# call sites.
+
+# Patterns for "this line removes a declaration that other files might use"
+# (matches `-` lines in the patch only).
+_V35_REMOVED_EXPORT_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    # JS / TS: `export const X`, `export function X`, `export class X`,
+    # `export type X`, `export interface X`, `export enum X`, `export let X`,
+    # `export var X`. The name capture is intentionally narrow.
+    re.compile(
+        r"^-(?!--)\s*export\s+(?:default\s+)?"
+        r"(?:async\s+)?(?:const|let|var|function|class|type|interface|enum)"
+        r"\s+([A-Za-z_$][\w$]*)\b"
+    ),
+    # JS / TS named re-export: `export { X, Y as Z }`
+    re.compile(r"^-(?!--).*\bexport\s*\{\s*([^}]+?)\s*\}"),
+    # CommonJS: `module.exports.X = ...` or `exports.X = ...`
+    re.compile(r"^-(?!--).*\b(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*="),
+    # Python: `def NAME(` or `class NAME` removed at module level (4-space
+    # indent or no indent — best effort, ignores nested defs).
+    re.compile(r"^-(?!--)(?:    )?(?:def|class)\s+([A-Za-z_][\w]*)\s*[(:]"),
+    # Python: `NAME = ...` removed at module level (no leading whitespace).
+    re.compile(r"^-(?!--)([A-Z_][A-Z0-9_]{2,})\s*="),
+)
+
+
+def _v35_extract_removed_export_names(patch: str) -> List[str]:
+    """Return distinct candidate symbol names removed by this patch."""
+    seen: set = set()
+    out: List[str] = []
+    for line in patch.splitlines():
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        for pattern in _V35_REMOVED_EXPORT_PATTERNS:
+            m = pattern.match(line)
+            if not m:
+                continue
+            captured = m.group(1)
+            if captured is None:
+                continue
+            # Named-re-export pattern can capture a comma-separated list.
+            for name in re.split(r"[\s,]+", captured):
+                name = name.strip().split(" as ")[0].strip()
+                if not name or name in _CONTRACT_NAME_DENYLIST:
+                    continue
+                if not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def _v35_check_contract_preservation(repo: Path, patch: str) -> List[str]:
+    """For each removed export name, search the rest of the repo for usages.
+
+    Returns up to `_CONTRACT_MAX_FINDINGS` strings of the form
+    "<name>: still used in <file1>, <file2>" so the refinement turn can
+    name-and-shame each broken reference back to the model.
+    """
+    if not patch.strip():
+        return []
+    names = _v35_extract_removed_export_names(patch)
+    if not names:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[str] = []
+    for name in names:
+        try:
+            proc = subprocess.run(
+                [
+                    "git", "grep", "--name-only",
+                    "--word-regexp", "-F",
+                    "--", name,
+                ],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CONTRACT_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        survivors: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            survivors.append(relative_path)
+            if len(survivors) >= 4:
+                break
+        if survivors:
+            preview = ", ".join(survivors[:4])
+            findings.append(f"{name}: still used in {preview}")
+            if len(findings) >= _CONTRACT_MAX_FINDINGS:
+                break
+    return findings
+
+
+def build_v35_contract_preservation_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch removes (or fully rewrites) symbols that other files in "
+        "the repo still reference. Recent dual-judge rounds penalise this "
+        "pattern as 'breaks existing exports / breaks callers' — about 1 in "
+        "4 multi-file losing patches loses on this exact issue.\n\n"
+        f"{body}\n\n"
+        "Pick ONE of these resolutions and emit a SINGLE bash command:\n"
+        "  (a) Re-add the removed export(s) so existing call sites keep "
+        "working;\n"
+        "  (b) Update every surviving call site (in the files listed above) "
+        "to use the new name / API.\n\n"
+        "Do NOT introduce new behaviour beyond restoring the contract. After "
+        "the command, end with `<final>contract restored</final>`."
+    )
+
+
+# v35: useState-without-setter gate.
+#
+# Recent loss critique: "Adds an isImporting state but never updates it,
+# leaving dead code and making the disabled-import UI logic ineffective."
+# When the patch declares `[x, setX] = useState(...)` but never calls
+# `setX(`, the state can't change and the feature is half-implemented.
+#
+# We restrict to React-style patterns since those are the dominant context
+# where this loss mode appears in the data.
+
+_V35_USE_STATE_DECL_RE = re.compile(
+    r"^\+(?!\+\+).*const\s*\[\s*([A-Za-z_$][\w$]*)\s*,\s*"
+    r"(set[A-Za-z_$][\w$]*)\s*\]\s*=\s*useState\b"
+)
+
+
+def _v35_check_setter_wired(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    declarations: List[Tuple[str, str]] = []
+    for line in patch.splitlines():
+        m = _V35_USE_STATE_DECL_RE.match(line)
+        if m:
+            declarations.append((m.group(1), m.group(2)))
+    if not declarations:
+        return []
+
+    # Pull all + lines as a single haystack of *added* code.
+    added_lines = [
+        line[1:]
+        for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    haystack = "\n".join(added_lines)
+
+    findings: List[str] = []
+    for state_name, setter in declarations:
+        # A "real" setter call is `setX(` where it's not the destructuring
+        # line itself. Count occurrences across the added code minus the
+        # declaration line(s) that named it.
+        decl_re = re.compile(
+            rf"\b{re.escape(setter)}\s*\]"  # appears in the [_, setX] form
+        )
+        call_re = re.compile(rf"\b{re.escape(setter)}\s*\(")
+        decl_count = len(decl_re.findall(haystack))
+        call_count = len(call_re.findall(haystack))
+        # If we see the destructure but no call, flag it.
+        if call_count == 0:
+            findings.append(
+                f"useState `{state_name}` declared with setter `{setter}` "
+                f"but `{setter}(...)` is never called in the patch"
+            )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+def build_v35_setter_wired_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch adds React state hooks whose setters are never called. "
+        "An unupdated `useState` reads as half-implemented to the judge:\n\n"
+        f"{body}\n\n"
+        "Either wire the setter in the appropriate event/effect handler in "
+        "the same patch, or — if the state turned out to be unnecessary — "
+        "remove the `useState` declaration entirely. Emit ONE bash command "
+        "to make the change, then `<final>state wired</final>`."
+    )
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2247,8 +2481,65 @@ often than any other quality signal. Concretely:
 - **Imports without call sites** — adding `import { foo } from '...'`
   without invoking `foo()` somewhere in the same patch reads as a half-done
   wiring. Either add the call or remove the import.
+- **Calls to undefined symbols** — `+hasInputPatterns(text)` without a
+  matching `import { hasInputPatterns }` in the same patch causes runtime
+  failure. When you call a function, always confirm its definition is
+  visible in the current file (existing import, existing definition, or a
+  new import you add in the same patch).
 - **chmod-only / mode-only file diffs** — never let `mode 100755` flips
   appear in your diff; revert the mode and keep the substantive edits.
+- **Variable used before declaration (TDZ)** — placing a `useEffect` /
+  computation that depends on `width` / `height` BEFORE the
+  `useElementSize()` (or analogous) destructuring causes a `ReferenceError`
+  at render. Always declare hooks/destructured values BEFORE the lines that
+  read them.
+
+## Contract preservation — do not break callers
+
+When the issue does not explicitly ask for it, do NOT remove or rename:
+- `export` statements (named or default)
+- `module.exports.X` keys
+- Function, class, const, type, or interface declarations that are public
+  (i.e. used by other files in the repo)
+- `useState` / store keys whose names are read elsewhere
+
+If a rename or removal IS asked for, you MUST update every call site in
+the SAME patch. The judge gives a hard penalty for "breaks existing
+exports / breaks callers" — recent dual-judge data flags this in roughly
+1 of every 4 multi-file losing patches.
+
+## State wiring — useState without a setter is half-done
+
+When you add `const [x, setX] = useState(initial)`, you MUST also add a
+`setX(...)` call in the appropriate handler within the same patch. A
+declared-but-never-set state variable reads as scaffolded-but-not-finished
+to the judge. The same applies to `useReducer`, Zustand `set()`, or
+language analogues.
+
+## File placement — match the codebase's existing layout
+
+When the task introduces NEW files, place them where the existing
+codebase puts files of the same kind:
+- React components → wherever the codebase keeps components
+  (`src/components/...`, `app/components/...`, `packages/ui/...`, etc.)
+- React hooks → `hooks/` directory if one exists
+- Utilities / helpers → `utils/`, `lib/`, or `helpers/` if one exists
+- Service-layer code → `services/`, `api/`, or `domain/` if present
+- Types / interfaces → wherever the codebase already defines its public
+  types
+
+The judge consistently rewards "file placement matches the reference"
+over "file placement is anywhere reasonable."
+
+## Test files — context-dependent
+
+Most reference patches do NOT include tests, so default to NOT adding
+tests. Add tests only when ALL of these are true:
+1. The codebase has existing tests for similar functionality (e.g., a
+   sibling `__tests__/` directory with relevant cases).
+2. Your source change touches behavior covered by an existing test that
+   would otherwise break.
+3. The task explicitly asks for tests.
 
 ## Language-specific completeness rules
 
@@ -3033,6 +3324,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0          # v34
     empty_arg_turns_used = 0     # v34
+    contract_turns_used = 0      # v35: removed-export-still-used detector
+    setter_turns_used = 0        # v35: useState-without-setter detector
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3074,7 +3367,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, setter_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3096,6 +3389,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
+
+        # v35: contract-preservation gate. Highest-leverage gate by recent
+        # dual-judge data — about 1 of every 4 multi-file losses traces to
+        # "patch removes / rewrites a public symbol still imported by other
+        # files." We fire it FIRST among correctness gates (after hail-mary)
+        # so the gate budget goes to broken-callers issues before anything
+        # else.
+        if contract_turns_used < MAX_CONTRACT_TURNS:
+            contract_findings = _v35_check_contract_preservation(repo, patch)
+            if contract_findings:
+                contract_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v35_contract_preservation_fix_prompt(contract_findings),
+                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
+                )
+                return True
 
         # v34: empty-arg/value gate. Malformed-but-syntax-valid expressions
         # ('description: ,', 'lines.push()', 'new Error()') were directly
@@ -3150,6 +3461,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_v34_lint_fix_prompt(lint_findings),
                     "LINT_FIX_QUEUED:\n  " + "\n  ".join(lint_findings),
+                )
+                return True
+
+        # v35: useState-without-setter gate. React-specific, lower frequency
+        # than contract preservation (cited in ~1 of v33's 18 losses), but
+        # cheap to detect and the fix is mechanical. Fires after lint so the
+        # earlier slots prioritise universally applicable issues.
+        if setter_turns_used < MAX_SETTER_TURNS:
+            setter_findings = _v35_check_setter_wired(patch)
+            if setter_findings:
+                setter_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v35_setter_wired_fix_prompt(setter_findings),
+                    "SETTER_FIX_QUEUED:\n  " + "\n  ".join(setter_findings),
                 )
                 return True
 
