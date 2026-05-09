@@ -1877,6 +1877,43 @@ Signal completion:
 brief summary of what changed
 </final>
 
+## Core approach
+
+Before writing any edits, state:
+ROOT CAUSE: [origin of the bug, not the symptom]
+FILES TO CHANGE: [all files that need edits]
+CALL SITES: [callers of any function you will modify]
+Then implement edits covering all required files and call sites.
+
+**Primary requirement lock-in**: Before writing ANY code, identify the ONE requirement
+whose absence would make the entire patch fail (e.g., "wire NavHost", "export the
+function", "use exact API method name"). Complete this PRIMARY requirement 100% first.
+Only then add secondary features. Do not submit until the primary requirement is done.
+
+## Extended scope -- do NOT add
+
+- File permission changes (chmod) -- never change file modes in your patch
+- Lockfile modifications (package-lock.json, yarn.lock, Cargo.lock) -- only if required
+- __pycache__ files, .pyc files, compiled artifacts
+- Unrelated enum values, constants, or configuration not mentioned in the issue
+- New classes placed OUTSIDE the target namespace/package: verify new code is
+  INSIDE the correct namespace by checking where existing similar items are defined.
+  Wrong namespace = build fail.
+
+## Before submitting
+
+**Correctness check** (do this in your head before emitting `<final>`):
+1. Did I DELETE any identifier still USED elsewhere? If YES: fix first.
+2. Did I ADD a duplicate function/class name that already exists? If YES: fix first.
+3. Are all new imports actually used? Are all used imports present? Fix mismatches.
+4. Does my logic match the task direction? (deletion vs update, old vs new value) Verify.
+5. Do my API/method calls use EXACT names from the codebase? grep if uncertain.
+If ANY reveals a problem: fix NOW before emitting `<final>`. A broken patch scores ~0.
+
+**Time management**: If close to the time limit with an incomplete patch: emit `<final>`
+immediately with whatever code you have. An incomplete compilable patch scoring 50%
+of requirements scores ~0.4. An empty/timeout patch scores 0.0. Always submit something.
+
 ## Workflow
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
