@@ -1920,7 +1920,7 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Add feature Z to class C" → add only what Z requires inside C
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
 
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file. When you must introduce a new identifier, copy the case style (snake_case vs camelCase), abbreviation pattern, and prefix conventions from existing names in the same file — never switch naming styles for new symbols.
 
 ## New files — create them when the task implies new functionality
 
