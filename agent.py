@@ -115,6 +115,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
+MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check run
 MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
@@ -127,6 +128,21 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+_CONTRACT_GREP_TIMEOUT_SECONDS = 8
+_CONTRACT_MAX_FINDINGS = 4
+_CONTRACT_NAME_DENYLIST = {
+    "default",
+    "main",
+    "index",
+    "module",
+    "exports",
+    "describe",
+    "test",
+    "it",
+    "expect",
+    "beforeEach",
+    "afterEach",
+}
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1561,6 +1577,97 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
         "intended argument(s), supply a descriptive error message, or remove "
         "the call entirely if it served no purpose. Do NOT add new behavior "
         "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
+    )
+
+
+_REMOVED_PUBLIC_SYMBOL_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^-(?!--)\s*export\s+(?:default\s+)?"
+        r"(?:async\s+)?(?:const|let|var|function|class|type|interface|enum)"
+        r"\s+([A-Za-z_$][\w$]*)\b"
+    ),
+    re.compile(r"^-(?!--).*\bexport\s*\{\s*([^}]+?)\s*\}"),
+    re.compile(r"^-(?!--).*\b(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*="),
+    re.compile(r"^-(?!--)(?:    )?(?:def|class)\s+([A-Za-z_][\w]*)\s*[(:]"),
+    re.compile(r"^-(?!--)([A-Z_][A-Z0-9_]{2,})\s*="),
+)
+
+
+def _extract_removed_public_symbol_names(patch: str) -> List[str]:
+    seen: set[str] = set()
+    names: List[str] = []
+    for line in patch.splitlines():
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        for pattern in _REMOVED_PUBLIC_SYMBOL_PATTERNS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            captured = match.group(1)
+            for raw_name in re.split(r"[\s,]+", captured or ""):
+                name = raw_name.strip().split(" as ")[0].strip()
+                if not name or name in _CONTRACT_NAME_DENYLIST:
+                    continue
+                if not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
+    """Find removed public symbols still referenced by untouched files."""
+    if not patch.strip():
+        return []
+    names = _extract_removed_public_symbol_names(patch)
+    if not names:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[str] = []
+    for name in names:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "--word-regexp", "-F", "--", name],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CONTRACT_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        survivors: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            survivors.append(relative_path)
+            if len(survivors) >= 4:
+                break
+        if survivors:
+            findings.append(f"{name}: still referenced in {', '.join(survivors[:4])}")
+            if len(findings) >= _CONTRACT_MAX_FINDINGS:
+                break
+    return findings
+
+
+def build_contract_preservation_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Contract check: your patch removes public/exported symbols that other "
+        "files still reference:\n\n"
+        f"{body}\n\n"
+        "Choose the smallest safe fix: either restore the removed symbol as a "
+        "compatibility wrapper/export, or update every listed call site to the "
+        "new name/API. Do not introduce unrelated behavior. Emit the minimal "
+        "<command> block(s), then end with <final>contract preserved</final>."
     )
 
 
@@ -3085,6 +3192,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0  # v72
     empty_arg_turns_used = 0
+    contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
     patch_safety_turns_used = 0
@@ -3128,11 +3236,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
             5. failed-verification — repair the latest concrete failed check
-            6. integration/artifact/dependency — close common missing pieces
-            7. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            8. self-check — show the diff and ask "did you cover everything?"
+            6. contract — preserve public symbols still referenced by callers
+            7. integration/artifact/dependency — close common missing pieces
+            8. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
+            9. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3218,6 +3327,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
             )
             return True
+
+        if contract_turns_used < MAX_CONTRACT_TURNS:
+            contract_findings = _contract_preservation_gap_summary(repo, patch)
+            if contract_findings:
+                contract_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_contract_preservation_prompt(contract_findings),
+                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
+                )
+                return True
 
         if integration_nudges_used < MAX_INTEGRATION_NUDGES:
             integration = _integration_gap_summary(patch, issue)
