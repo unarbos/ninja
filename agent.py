@@ -114,7 +114,6 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
-_FORMAT_TIMEOUT = 8        # best-effort formatter timeout before lint
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
@@ -1608,59 +1607,6 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 # v72: lint integration ported from PR559 (UID 154). Clean ruff/eslint output
 # helps keep the patch production-looking while warnings make it look unfinished.
-
-def _organize_imports_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort import organization before linting a touched Python file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff check --select I --fix --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code in (0, 1)
-
-
-def _autoformat_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort Python formatting before linting a touched file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff format --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code == 0
-
-
-def _autoformat_js(repo: Path, relative_path: str) -> bool:
-    """Best-effort JS/TS formatting when prettier is available."""
-    local_prettier = repo / "node_modules" / ".bin" / "prettier"
-    if local_prettier.exists():
-        cmd = f"./node_modules/.bin/prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    elif _has_executable("prettier"):
-        cmd = f"prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    else:
-        return False
-    proc = run_command(cmd, repo, timeout=_FORMAT_TIMEOUT)
-    return proc.exit_code == 0
-
-
-def _autoformat_touched(repo: Path, patch: str) -> int:
-    """Run semantic-neutral cleanup on touched Python/JS files before lint."""
-    formatted = 0
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        ok = False
-        if suffix == ".py":
-            ok = _organize_imports_python(repo, relative_path) or ok
-            ok = _autoformat_python(repo, relative_path) or ok
-        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-            ok = _autoformat_js(repo, relative_path)
-        if ok:
-            formatted += 1
-    return formatted
-
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     """v72: run `ruff check` on a Python file. Returns the first issue or None."""
@@ -3716,11 +3662,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
         if lint_turns_used < MAX_LINT_TURNS:
-            try:
-                _autoformat_touched(repo, patch)
-                patch = get_patch(repo) or patch
-            except Exception:
-                pass
             lint_errors = _check_lint(repo, patch)
             if lint_errors:
                 lint_turns_used += 1
