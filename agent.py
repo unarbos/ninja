@@ -741,14 +741,46 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
+    create_hint = _files_to_create_hint(repo, issue, tracked_set)
+    if create_hint and used + len(create_hint) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+        parts.append(create_hint)
+        used += len(create_hint)
+
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+_BACKTICK_PATHLIKE_RE = re.compile(
+    r"`([A-Za-z][\w./_-]{2,80}"
+    r"(?:/[A-Za-z][\w./_-]{1,80}"
+    r"|\.(?:py|js|jsx|ts|tsx|svelte|vue|go|rs|java|kt|rb|php|cs|cpp|c|h|hpp|"
+    r"swift|dart|ex|exs|md|rst|txt|json|yaml|yml|toml|sql|sh|bash|zsh|html|css|scss)"
+    r"))`",
+    re.IGNORECASE,
+)
+
+
+def _files_to_create_hint(repo: Path, issue_text: str, tracked_set: set) -> str:
+    candidates = []
+    seen = set()
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue_text):
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if any(ident in p for p in tracked_set):
+            continue
+        candidates.append(ident)
+        if len(candidates) >= 12:
+            break
+    if not candidates:
+        return ""
+    return (
+        "FILES TO CREATE (path-shaped identifiers in backticks that don't exist yet):\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+    )
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
