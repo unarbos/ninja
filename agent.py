@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # Alex/md merge: +30s inner loop; multi-shot wrapper still fits ~600s validator budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,8 +112,6 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
-_LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -197,18 +195,9 @@ class AgentResult:
 # Utility
 # -----------------------------
 
-_TRACEBACK_MARKERS = ("Traceback (most recent", "panic:", "FAIL\t", "error TS", "error[E", "  at ", "FAILED\n", "FAILED ")
-
-
-def _looks_like_traceback(text: str) -> bool:
-    return any(marker in text for marker in _TRACEBACK_MARKERS)
-
-
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    if _looks_like_traceback(text):
-        return "...[head dropped]...\n" + text[-max_chars:]
     half = max_chars // 2
     return (
         text[:half]
@@ -704,6 +693,71 @@ SECRETISH_PARTS = {
 }
 
 
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "Makefile",
+    "go.mod",
+    "Cargo.toml",
+    "jest.config.js",
+    "vitest.config.ts",
+)
+
+
+def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
+    """Compact top-level project hints: test scripts and build config only.
+
+    Separate from ranked source context — helps pick verification commands
+    without extra exploration (see md/agent-alex-vs-ricichez12345.md).
+    """
+    tracked = set(_tracked_files(repo))
+    blocks: List[str] = []
+
+    for relative_path in _PROJECT_HINT_FILES:
+        if relative_path not in tracked:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            data = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if relative_path == "package.json":
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = {}
+            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+            if isinstance(scripts, dict) and scripts:
+                interesting = {
+                    key: scripts[key]
+                    for key in sorted(scripts)
+                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
+                }
+                if interesting:
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
+            continue
+
+        snippet = _truncate(data, 700)
+        if snippet.strip():
+            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
+
+        if len("\n\n".join(blocks)) >= max_chars:
+            break
+
+    if not blocks:
+        return ""
+    return _truncate(
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
+        + "\n\n".join(blocks),
+        max_chars,
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -741,6 +795,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    project_hints = _project_hint_block(repo)
+    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+        parts.append(project_hints)
+        used += len(project_hints)
+
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -749,6 +808,10 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5  # skip generic ids that match many files
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -764,6 +827,15 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for m in matches:
+                if m not in seen_mentioned:
+                    mentioned.append(m)
+                    seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1266,86 +1338,6 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
-
-
-# v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
-# matters to the LLM judge — clean ruff/eslint output reads as "production code"
-# while warnings make the patch look unfinished.
-
-def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `ruff check` on a Python file. Returns the first issue or None."""
-    if not _has_executable("ruff"):
-        return None
-    proc = run_command(
-        f"ruff check --no-fix --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_LINT_TIMEOUT,
-    )
-    if proc.exit_code == 0:
-        return None
-    output = (proc.stdout or "").strip()
-    if not output:
-        return None
-    first_line = output.splitlines()[0].strip()[:200]
-    return f"{relative_path}: {first_line}"
-
-
-def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `eslint` on a JS/TS file. Returns first issue or None.
-    Skips when no eslint config or no local install is present."""
-    has_config = any(
-        (repo / name).exists()
-        for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
-                     ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
-    )
-    if not has_config:
-        return None
-    has_eslint = (repo / "node_modules" / ".bin" / "eslint").exists() or _has_executable("eslint")
-    if not has_eslint:
-        return None
-    if (repo / "node_modules" / ".bin" / "eslint").exists():
-        cmd = f"./node_modules/.bin/eslint --no-color --format compact {_shell_quote(relative_path)}"
-    else:
-        cmd = f"eslint --no-color --format compact {_shell_quote(relative_path)}"
-    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT)
-    if proc.exit_code == 0:
-        return None
-    output = (proc.stdout or "").strip()
-    if not output:
-        return None
-    for line in output.splitlines():
-        if "Error" in line or "Warning" in line:
-            return f"{relative_path}: {line.strip()[:240]}"
-    return None
-
-
-def _check_lint(repo: Path, patch: str) -> List[str]:
-    """v72: lint every touched file with the appropriate tool. Up to 6 errors."""
-    errors: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        err: Optional[str] = None
-        if suffix == ".py":
-            err = _check_lint_python(repo, relative_path)
-        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-            err = _check_lint_js(repo, relative_path)
-        if err:
-            errors.append(err)
-            if len(errors) >= 6:
-                break
-    return errors
-
-
-def build_lint_fix_prompt(errors: List[str]) -> str:
-    """v72: prompt the model to fix lint issues."""
-    body = "\n".join(f"  - {e}" for e in errors[:6])
-    return (
-        "Lint issues were found in your patch. The judge prefers lint-clean code:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that fixes these specific issues only. Do NOT change "
-        "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
-        "confirm with <final>lint clean</final>."
-    )
 
 
 def _has_executable(name: str) -> bool:
@@ -1969,6 +1961,19 @@ Keep existing comments unless the issue tells you to remove them. Section header
 
 Mirror neighboring code: indentation width, quote style, semicolons, trailing commas, brace placement, blank lines between sections.
 
+## TypeScript / TSX / JSX-specific idioms
+
+When editing .ts/.tsx/.jsx files, use these conventions unless the local file shows otherwise:
+- Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
+- Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
+- React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
+- State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
+- Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
+- Async: `async function` with try/catch, NOT `.then()` chains
+- Tailwind: compose classes inline in `className` — don't extract unnecessarily
+- shadcn/ui: import from `@/components/ui/<name>`
+- Type imports: `import type { Foo } from './bar'` when only the type is needed
+
 ## Preloaded snippets
 
 Files preloaded in the user message are **prime suspects** for edits. Use their paths and content directly; avoid redundant `cat` of the same material unless you must confirm line numbers for a surgical edit.
@@ -1977,6 +1982,79 @@ Files preloaded in the user message are **prime suspects** for edits. Use their 
 
 Commands run in an automated sandbox. Do **not**: use `sudo`; delete or wipe paths recklessly; fetch from the network (no `curl`/`wget`/package installs unless the task repo clearly expects it and the harness allows—when unsure, avoid); exfiltrate secrets; or edit evaluator-only or hidden infrastructure files. Prefer git-friendly edits that produce a clean `git diff`.
 """
+
+
+_MULTI_FILE_KEYWORDS = (
+    "refactor",
+    "delegate",
+    "split into",
+    "split up",
+    "extract",
+    "migrate",
+    "cascade",
+    "across multiple",
+    "multiple files",
+    "across the",
+    "all of the",
+    "every",
+)
+
+
+def _detect_multi_file_task(issue_text: str) -> bool:
+    """Heuristic: tasks that often need coordinated multi-file edits."""
+    if not issue_text:
+        return False
+    paths = _extract_issue_path_mentions(issue_text)
+    if len(set(paths)) >= 3:
+        return True
+    criteria = _extract_acceptance_criteria(issue_text)
+    if len(criteria) >= 6:
+        return True
+    lower = issue_text.lower()
+    if any(kw in lower for kw in _MULTI_FILE_KEYWORDS):
+        return True
+    return False
+
+
+def _detect_target_languages(repo: Path) -> List[str]:
+    """Dominant source extensions (excluding config-ish types)."""
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return []
+    counts: Dict[str, int] = {}
+    skip_exts = {".md", ".lock", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}
+    for path in tracked:
+        ext = Path(path).suffix.lower()
+        if not ext or ext in skip_exts:
+            continue
+        counts[ext] = counts.get(ext, 0) + 1
+    if not counts:
+        return []
+    ranked = sorted(counts.items(), key=lambda x: -x[1])
+    return [ext for ext, _ in ranked[:4]]
+
+
+def _build_language_idiom_block(target_languages: List[str]) -> str:
+    if not target_languages:
+        return ""
+    ts_like = {".ts", ".tsx", ".jsx"}
+    py_like = {".py"}
+    if any(ext in ts_like for ext in target_languages):
+        return (
+            "\nLanguage hint (TypeScript / TSX detected): use existing imports and aliases "
+            "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
+            "elements with onClick/onChange, useState with explicit types. Named function "
+            "exports preferred. Tailwind classes inline in className. shadcn/ui imports from "
+            "`@/components/ui/...`.\n"
+        )
+    if any(ext in py_like for ext in target_languages):
+        return (
+            "\nLanguage hint (Python detected): use type hints, `from __future__ import annotations` "
+            "if file already does, dataclasses for records, async/await over callbacks, and "
+            "stdlib over deps unless the codebase already imports otherwise.\n"
+        )
+    return ""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
@@ -2006,6 +2084,36 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
+    """Wraps build_initial_user_prompt with multi-file / language strategy hints (Alex merge)."""
+    base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
+    multi_file = _detect_multi_file_task(issue_text)
+    lang_block = ""
+    try:
+        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
+    except Exception:
+        lang_block = ""
+
+    if multi_file:
+        strategy = (
+            "Strategy override: this task spans MULTIPLE files. Identify all affected files, then "
+            "emit ALL edit commands for ALL files in ONE response. Coordinate cross-file consistency "
+            "— when you change a function signature, type, or interface, cascade the change to every "
+            "caller. Skeleton/stub edits lose to working multi-file implementations even when smaller. "
+            "Comprehensive working implementations beat minimal patches in this codebase."
+        )
+    else:
+        strategy = (
+            "Strategy override: identify the ROOT CAUSE precisely, then implement the fix completely. "
+            "If the task describes new functionality (a component, form, service, page) not already "
+            "in the codebase, create the new file. Wire functional behavior end-to-end — state hooks, "
+            "event handlers, real logic. Skeleton patches with `// TODO` or pass-through props lose "
+            "to working implementations. Comprehensive working implementations beat minimal patches."
+        )
+
+    return base + lang_block + "\n" + strategy + "\n"
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2540,7 +2648,7 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
 
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 540.0  # v69: 580->540, reserves 60s headroom for safety net before docker kill at 600s
+    _multishot_total_budget = 580.0  # Alex/md merge: outer budget headroom for retries (~600s validator wall)
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -2633,7 +2741,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    lint_turns_used = 0  # v72
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -2661,21 +2768,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            0. hail-mary — patch empty after everything: force one real edit
-            1. coverage-nudge — name issue-mentioned paths still untouched
-            2. criteria-nudge — name issue acceptance bullets not addressed
-            3. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
-            4. polish — drop low-signal hunks the model still emitted
-            5. syntax — quote any parser error back at the model
-            6. self-check — show the diff and ask "did you cover everything?"
-        Judge-half gates (coverage, criteria, companion test) fire before
-        cursor-half gates (polish, syntax) so the two-turn cap is spent on
-        the highest-leverage signals first.
+        Alex/md merge order (lint removed): polish → syntax → companion test →
+        coverage → criteria → self-check. Test runs after parse checks; coverage/
+        criteria are heuristic follow-ups (see md/agent-alex-vs-ricichez12345.md).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2694,43 +2791,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Hard-stop when the cap is reached (hail-mary excluded).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -2756,18 +2816,40 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v72: lint pass — runs ruff/eslint when project tooling is available.
-        # Different axis from syntax (which proves the file parses); lint
-        # catches style issues the LLM judge dings as "unfinished code".
-        if lint_turns_used < MAX_LINT_TURNS:
-            lint_errors = _check_lint(repo, patch)
-            if lint_errors:
-                lint_turns_used += 1
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_lint_fix_prompt(lint_errors),
-                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -2790,7 +2872,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        _initial_user = _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)
         if _multishot_memo:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
@@ -2799,6 +2881,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
 
         _wall_start = time.monotonic()
+        emergency_injected = False
+        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -2810,6 +2894,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            elapsed = time.monotonic() - _wall_start
+            if (
+                elapsed >= _tle_emergency_threshold
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                emergency_injected = True
+                logs.append(
+                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_emergency_threshold:.1f}s "
+                    "patch still empty -- forcing minimal emit prompt before docker kill."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EMERGENCY — less than 60 seconds remain before timeout and your "
+                        "draft diff is still empty. An empty patch scores ZERO. A minimal, "
+                        "imperfect edit to the most plausible file from the issue scores "
+                        "non-zero and often wins (since the opponent may also TLE).\n\n"
+                        "In your NEXT response: pick ONE file and ONE edit that addresses "
+                        "the most central requirement in the issue. Use a single `sed -i` or "
+                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
+                        "not run grep. Do not list files. After the edit command, end your "
+                        "response with `<final>emergency edit</final>`. Do this in ONE "
+                        "response."
+                    ),
+                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
