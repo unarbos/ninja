@@ -49,12 +49,14 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -105,6 +107,7 @@ HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_HARD_DEADLINE_SECONDS = 470.0  # hard return ceiling; validator SIGKILL is 600s, reserve 130s for cleanup
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -301,6 +304,28 @@ def _repo_path(path: str | Path) -> Path:
     if not p.is_dir():
         raise NotADirectoryError(f"repo_path is not a directory: {p}")
     return p
+
+
+def _bounded_chat_timeout(remaining_seconds: float, default: int = 120) -> int:
+    """Cap chat_completion's per-call timeout so a single hung call cannot
+    consume more than 60% of the caller's remaining budget. Floor 25s,
+    ceiling = default."""
+    if remaining_seconds <= 0:
+        return 25
+    return int(max(25, min(default, 0.6 * remaining_seconds)))
+
+
+def _bounded_chat_retries(remaining_seconds: float) -> int:
+    """Cap max_retries so the cumulative worst-case (timeout * (retries+1) +
+    backoff sum) stays under remaining_seconds * 0.9. Falls back to 0 (no
+    retry) when the budget is tight, 3 (default) only when budget is ample."""
+    if remaining_seconds < 60:
+        return 0
+    if remaining_seconds < 150:
+        return 1
+    if remaining_seconds < 300:
+        return 2
+    return 3
 
 
 # -----------------------------
@@ -1667,6 +1692,62 @@ _CRITERIA_STOP = frozenset({
 })
 
 
+_BUGFIX_KEYWORDS = re.compile(
+    r"\b(fix|bug|broken|crash|error|fail|incorrect|wrong|regression|"
+    r"raise[ds]|throw[ns]|exception|traceback|stack ?trace)\b", re.I)
+_FEATURE_KEYWORDS = re.compile(
+    r"\b(add|implement|create|introduce|new |support |allow |"
+    r"enable|expose|extend(?:s|ed|ing)? .* (?:to|with|by))\b", re.I)
+_REFACTOR_KEYWORDS = re.compile(
+    r"\b(refactor|rename|extract|simplify|cleanup|reorganize|"
+    r"consolidate|deduplicate|inline|move .* (?:to|into|from))\b", re.I)
+_TEST_KEYWORDS = re.compile(
+    r"\b(add (?:a |another )?test|write (?:a |unit |integration )?test|"
+    r"missing test|cover|coverage|assert|fixture)\b", re.I)
+
+
+def _classify_task_type(issue: str) -> str:
+    """Return one of: 'bugfix', 'feature', 'refactor', 'test', 'unknown'.
+    Heuristic regex over the issue text. Used only to pick a per-type
+    addendum to the user prompt; if 'unknown', no addendum is added.
+    Mutually exclusive: priority is bugfix > test > feature > refactor."""
+    text = issue or ""
+    if _BUGFIX_KEYWORDS.search(text): return "bugfix"
+    if _TEST_KEYWORDS.search(text):   return "test"
+    if _FEATURE_KEYWORDS.search(text): return "feature"
+    if _REFACTOR_KEYWORDS.search(text): return "refactor"
+    return "unknown"
+
+
+_TASK_TYPE_ADDENDA = {
+    "bugfix": (
+        "TASK TYPE: BUG FIX. Reference patches for bug fixes are typically "
+        "1-5 lines and touch one file. Locate the failing branch, change "
+        "only what's wrong, do not rewrite surrounding logic. If a "
+        "traceback is shown, the failing line is usually the right edit "
+        "site."
+    ),
+    "feature": (
+        "TASK TYPE: FEATURE ADD. Reference patches for feature adds touch "
+        "1-3 files and may add new functions or class methods. Match the "
+        "surrounding module's naming and import conventions. Do not "
+        "modify unrelated APIs."
+    ),
+    "refactor": (
+        "TASK TYPE: REFACTOR. Reference patches for refactors preserve "
+        "external behavior. Run no test discovery; the existing tests "
+        "should still pass without modification. Prefer minimal-diff "
+        "rename/extract over rewrite."
+    ),
+    "test": (
+        "TASK TYPE: TEST ADD. Reference patches for test-add tasks touch "
+        "only test files. Match the existing test framework, fixture style, "
+        "and assertion idiom in the same directory. Do not modify "
+        "production code unless the issue explicitly requests it."
+    ),
+}
+
+
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     """Pull acceptance-criterion checkpoints from the issue text.
 
@@ -1984,9 +2065,14 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
+    _ttype = _classify_task_type(issue)
+    _type_addendum = ""
+    if _ttype in _TASK_TYPE_ADDENDA:
+        _type_addendum = _TASK_TYPE_ADDENDA[_ttype] + "\n\n"
+
     return f"""Fix this issue:
 
-{issue}
+{_type_addendum}{issue}
 
 Repository summary:
 
@@ -2400,9 +2486,93 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
         pass
 
 
+_CHECKPOINT_PATCH_FILENAME = ".ninja_checkpoint.patch"
+
+
+class _DeadlineExceeded(Exception):
+    """Raised from the watchdog thread via PyThreadState_SetAsyncExc."""
+
+
+def _write_patch_checkpoint(repo: Optional[Path]) -> None:
+    """Atomic write of the current on-disk patch to a sibling file. Used by
+    the watchdog and at every successful _multishot_apply_patch return."""
+    if repo is None:
+        return
+    try:
+        patch = get_patch(repo)
+    except Exception:
+        return
+    if not patch.strip():
+        return
+    target = repo.parent / _CHECKPOINT_PATCH_FILENAME
+    tmp = target.with_suffix(".tmp")
+    try:
+        tmp.write_text(patch, encoding="utf-8")
+        tmp.replace(target)
+    except Exception:
+        pass
+
+
+def _read_patch_checkpoint(repo: Optional[Path]) -> str:
+    if repo is None:
+        return ""
+    target = repo.parent / _CHECKPOINT_PATCH_FILENAME
+    try:
+        return target.read_text(encoding="utf-8") if target.is_file() else ""
+    except Exception:
+        return ""
+
+
+def _arm_watchdog(repo: Optional[Path], deadline_seconds: float) -> threading.Event:
+    """Start a daemon thread that raises _DeadlineExceeded in the main thread
+    after deadline_seconds. The Event lets us cancel cleanly on normal return.
+    Also writes a periodic on-disk patch checkpoint every 15s."""
+    cancelled = threading.Event()
+    main_tid = threading.get_ident()
+
+    def _run() -> None:
+        start = time.monotonic()
+        while not cancelled.wait(timeout=15.0):
+            elapsed = time.monotonic() - start
+            try:
+                _write_patch_checkpoint(repo)
+            except Exception:
+                pass
+            if elapsed >= deadline_seconds:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_long(main_tid),
+                    ctypes.py_object(_DeadlineExceeded),
+                )
+                return
+
+    threading.Thread(target=_run, daemon=True).start()
+    return cancelled
+
+
+def _validate_patch_applies(repo: Optional[Path], patch: str) -> bool:
+    """Dry-run `git apply --check` against the patch text. Returns True iff
+    the patch would apply cleanly. Surfaces the exact reject reason in logs
+    on failure (otherwise silent)."""
+    if not (patch or "").strip() or repo is None:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check", "--whitespace=nowarn", "-"],
+            input=patch, text=True, capture_output=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            print(f"PATCH_APPLY_REJECTED: {(proc.stderr or '').strip()[:300]}", file=sys.stderr)
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
+    if not _validate_patch_applies(repo, patch_text):
+        return False
     try:
         proc = subprocess.run(
             ["git", "apply", "--whitespace=nowarn"],
@@ -2413,7 +2583,9 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
                 ["git", "apply", "--3way", "--whitespace=nowarn"],
                 cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
             )
-            return proc2.returncode == 0
+            if proc2.returncode != 0:
+                return False
+        _write_patch_checkpoint(repo)
         return True
     except Exception:
         return False
@@ -2498,7 +2670,9 @@ def solve(
 
 
 def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """v65 safety-net wrapper. Adapted from chain king PR486."""
+    """v65 safety-net wrapper. Adapted from chain king PR486.
+    v74: adds threading watchdog that enforces _HARD_DEADLINE_SECONDS and
+    checkpoints the on-disk patch periodically so SIGKILL leaves a non-empty diff."""
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -2506,8 +2680,20 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     except Exception:
         pass
 
+    cancelled = _arm_watchdog(_multishot_repo_obj, _HARD_DEADLINE_SECONDS)
     try:
         return _v65_multishot_driver(kwargs, _multishot_repo_obj)
+    except _DeadlineExceeded:
+        salvaged = ""
+        try:
+            salvaged = get_patch(_multishot_repo_obj) or _read_patch_checkpoint(_multishot_repo_obj)
+        except Exception:
+            salvaged = _read_patch_checkpoint(_multishot_repo_obj)
+        return AgentResult(
+            patch=salvaged or "",
+            logs=f"WATCHDOG_DEADLINE: returned at {_HARD_DEADLINE_SECONDS}s with {len(salvaged.splitlines())} lines",
+            steps=0, cost=0.0, success=bool(salvaged.strip()),
+        ).to_dict()
     except Exception as exc:
         salvaged = ""
         try:
@@ -2522,6 +2708,8 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             cost=0.0,
             success=bool(salvaged.strip()),
         ).to_dict()
+    finally:
+        cancelled.set()
 
 
 def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
@@ -2550,13 +2738,19 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
-    # Only retry when the patch is empty OR it has too few substantive lines
-    # AND failed to touch any path the issue explicitly mentions. A surgical
-    # 1-2 line fix that covers the required paths is correct — don't discard it.
+    # v74: only retry when attempt 1 produced no patch at all, OR produced a
+    # trivial patch (<2 lines) that touches NO file the issue mentioned. A 1-line
+    # fix that hits an issue-named path is the validator's most common reference
+    # shape — keep it.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+    _patch1_stripped = _patch1.strip()
+    _should_retry = (
+        not _patch1_stripped
+        or (_n1 < 2 and not _covered_required)
+    )
     if not _should_retry:
         _result1["multishot_attempts"] = 1
+        _result1["multishot_skipped_retry"] = "v74_kept_a1_low_signal_covered"
         return _result1
 
     _elapsed = time.monotonic() - _multishot_started
@@ -2598,6 +2792,12 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     if _n2 >= _n1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        return _result2
+
+    if _patch1 and not _validate_patch_applies(_multishot_repo_obj, _patch1):
+        # Attempt 1 patch can no longer apply cleanly after attempt 2 modified
+        # the tree — keep attempt 2's state rather than reverting blind.
+        _result2["multishot_winner"] = "primary_apply_rejected_kept_a2"
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -2810,12 +3010,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
+                    _remaining = time_remaining()
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=_bounded_chat_timeout(_remaining),
+                        max_retries=_bounded_chat_retries(_remaining),
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
