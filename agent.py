@@ -1759,7 +1759,7 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. When the issue quotes a path, symbol, flag, or error substring, treat it as a required anchor for search and edits. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
