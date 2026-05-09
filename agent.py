@@ -704,6 +704,38 @@ SECRETISH_PARTS = {
 }
 
 
+
+
+_BACKTICK_PATHLIKE_RE = re.compile(
+    r"`([A-Za-z][\w./_-]{2,80}"
+    r"(?:/[A-Za-z][\w./_-]{1,80}"
+    r"|\.(?:py|js|jsx|ts|tsx|svelte|vue|go|rs|java|kt|rb|php|cs|cpp|c|h|hpp|"
+    r"swift|dart|ex|exs|md|rst|txt|json|yaml|yml|toml|sql|sh|bash|zsh|html|css|scss)"
+    r"))`",
+    re.IGNORECASE,
+)
+
+
+def _files_to_create_hint(repo, issue_text, tracked_set):
+    candidates = []
+    seen = set()
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue_text):
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if any(ident in p for p in tracked_set):
+            continue
+        candidates.append(ident)
+        if len(candidates) >= 12:
+            break
+    if not candidates:
+        return ""
+    return (
+        "FILES TO CREATE (path-shaped identifiers in backticks that don't exist yet):\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -748,6 +780,14 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
+
+    try:
+        _v_tracked_set = set(_tracked_files(repo))
+        _v_create_hint = _files_to_create_hint(repo, issue, _v_tracked_set)
+        if _v_create_hint:
+            parts.append(_v_create_hint)
+    except Exception:
+        pass
     return "\n\n".join(parts)
 
 
