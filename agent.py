@@ -117,8 +117,9 @@ _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_VISIBLE_SURFACE_NUDGES = 1  # frontend/UI issues often need visible text/style hooks, not only logic
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -547,6 +548,7 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    _restore_mode_only_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -589,8 +591,56 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _filter_inactive_duplicate_root_diffs(repo, _strip_mode_only_file_diffs(diff_output))
     return _strip_low_signal_hunks(cleaned)
+
+
+def _restore_mode_only_changes(repo: Path) -> None:
+    """Undo chmod-only churn before final diff capture.
+
+    The returned patch filters mode-only blocks, but the working tree can still
+    carry those permission flips into later git/status reasoning. Restore only
+    files whose content is unchanged.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--summary", "--", "."],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return
+    mode_only: List[str] = []
+    for line in proc.stdout.splitlines():
+        match = re.search(r"mode change \d+ => \d+ (.+)$", line.strip())
+        if match:
+            mode_only.append(match.group(1))
+    for relative_path in mode_only[:20]:
+        if _should_skip_patch_path(relative_path):
+            continue
+        content_diff = subprocess.run(
+            ["git", "diff", "--numstat", "--", relative_path],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if content_diff.returncode == 0 and content_diff.stdout.strip():
+            continue
+        subprocess.run(
+            ["git", "checkout", "--", relative_path],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -616,6 +666,47 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
             continue
         kept.append(block)
 
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _filter_inactive_duplicate_root_diffs(repo: Path, diff_output: str) -> str:
+    """Drop root-level duplicate frontend files when src/ twin also changed.
+
+    Several app templates contain stale root App.jsx/App.css/etc. plus the
+    active src/ copy. Models sometimes edit both; the judge prefers only the
+    active copy. Keep deletions/new files, but drop non-delete root twins when
+    src/<same-name> is also in the patch.
+    """
+    if not diff_output.strip():
+        return diff_output
+    changed_src_names: set[str] = set()
+    for match in re.finditer(r"^diff --git a/(src/[^ \n]+) b/(src/[^ \n]+)$", diff_output, flags=re.MULTILINE):
+        changed_src_names.add(Path(match.group(2)).name)
+    if not changed_src_names:
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        header = re.match(r"^diff --git a/([^ \n]+) b/([^ \n]+)", block)
+        if not header:
+            kept.append(block)
+            continue
+        old_path, new_path = header.group(1), header.group(2)
+        old_parts, new_parts = Path(old_path).parts, Path(new_path).parts
+        root_twin = (
+            len(old_parts) == 1
+            and len(new_parts) == 1
+            and Path(new_path).name in changed_src_names
+            and Path(new_path).suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"}
+        )
+        if root_twin and "\ndeleted file mode " not in block and (repo / "src" / Path(new_path).name).exists():
+            continue
+        kept.append(block)
     result = "".join(kept)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
@@ -725,6 +816,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
+    files = _augment_with_named_scope(repo, issue, files, tracked_set)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
@@ -818,6 +910,44 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _augment_with_named_scope(repo: Path, issue: str, ranked: List[str], tracked_set: set[str]) -> List[str]:
+    """Prefer files inside a project/subdir explicitly named by the task.
+
+    Real tasks often say "in the named project" or "for foo/bar". The
+    filename terms alone can rank a shared helper above the active app. This
+    moves a small number of same-scope files to the front without hardcoding any
+    project names.
+    """
+    issue_lower = issue.lower()
+    prefixes: List[str] = []
+    for path in tracked_set:
+        parts = Path(path).parts
+        for depth in (1, 2):
+            if len(parts) <= depth:
+                continue
+            prefix = "/".join(parts[:depth])
+            name = parts[depth - 1].lower()
+            if len(name) >= 4 and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", issue_lower):
+                if prefix not in prefixes:
+                    prefixes.append(prefix)
+        if len(prefixes) >= 3:
+            break
+    if not prefixes:
+        return ranked
+
+    scoped: List[str] = []
+    for prefix in prefixes:
+        scoped.extend(
+            path for path in ranked
+            if path.startswith(prefix + "/") and path not in scoped
+        )
+        if len(scoped) >= 6:
+            break
+    if not scoped:
+        return ranked
+    return scoped + [path for path in ranked if path not in scoped]
 
 
 def _context_file_allowed(relative_path: str) -> bool:
@@ -1240,6 +1370,183 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_ts_structure_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch cheap TS/JS structural breakage without a compiler.
+
+    The brace counter misses invalid-but-balanced output such as prepending a
+    full replacement implementation while leaving the old imports/exported
+    function below it. Those patches look plausible in diff form but fail to
+    build.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    source = "\n".join(lines)
+
+    dangling = re.search(r"(?:\$\{[^}\n]*(?:\|\||&&|\?\?|[?:+\-*/%])\s*\}|(?:\|\||&&|\?\?|[?:+\-*/%])\s*[,;)\]}])", source)
+    if dangling:
+        line_no = source[:dangling.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: dangling JavaScript expression `{dangling.group(0)[:80]}`"
+
+    empty_jsx = re.search(r"\b(?:className|style|value|onClick|onChange|disabled|checked|href|src)\s*=\s*\{\s*\}", source)
+    if empty_jsx:
+        line_no = source[:empty_jsx.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: empty JSX expression `{empty_jsx.group(0)}`"
+
+    exported_functions: Dict[str, int] = {}
+    for idx, line in enumerate(lines, 1):
+        match = re.match(r"\s*export\s+function\s+([A-Za-z_$][\w$]*)\s*\(", line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in exported_functions:
+            return f"{relative_path}:{idx}: duplicate exported function `{name}`"
+        exported_functions[name] = idx
+
+    block_names: Dict[str, int] = {}
+    for idx, line in enumerate(lines, 1):
+        match = re.match(r"\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in block_names:
+            return f"{relative_path}:{idx}: duplicate declaration `{name}`"
+        block_names[name] = idx
+
+    for match in re.finditer(r"^\s*import\s+(?:.+?\s+from\s+)?['\"](\.{1,2}/[^'\"]+)['\"]", source, flags=re.MULTILINE):
+        spec = match.group(1)
+        if _relative_import_exists(full.parent, spec):
+            continue
+        line_no = source[:match.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: unresolved relative import `{spec}`"
+
+    return None
+
+
+def _relative_import_exists(base_dir: Path, spec: str) -> bool:
+    target = (base_dir / spec).resolve()
+    suffixes = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css", ".scss", "/index.ts", "/index.tsx", "/index.js", "/index.jsx")
+    candidates = [target]
+    if target.suffix == ".js":
+        candidates.extend([target.with_suffix(".ts"), target.with_suffix(".tsx")])
+    elif target.suffix == ".jsx":
+        candidates.append(target.with_suffix(".tsx"))
+    elif target.suffix == ".mjs":
+        candidates.append(target.with_suffix(".mts"))
+    try:
+        target.relative_to(base_dir.parent.parent.parent if len(base_dir.parts) > 3 else base_dir.anchor)
+    except Exception:
+        pass
+    for base in candidates:
+        for suffix in suffixes:
+            candidate = Path(str(base) + suffix)
+            if candidate.exists():
+                return True
+    return False
+
+
+def _check_added_semantic_tripwires(repo: Path, relative_path: str, patch: str) -> List[str]:
+    """Cheap checks for plausible-looking but judge-fatal generated code."""
+    errors: List[str] = []
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in {".js", ".jsx", ".ts", ".tsx", ".py", ".json", ".sql", ".md", ".txt"}:
+        return errors
+
+    added_for_file: List[str] = []
+    in_file = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            in_file = line.endswith(f" b/{relative_path}")
+            continue
+        if in_file and line.startswith("+") and not line.startswith("+++"):
+            added_for_file.append(line[1:])
+    if not added_for_file:
+        return errors
+
+    added_text = "\n".join(added_for_file)
+    lowered = added_text.lower()
+    placeholder_markers = (
+        "placeholder", "replace_with", "todo:", "fixme", "example.com",
+        "your_", "demo_user_uuid",
+    )
+    if any(marker in lowered for marker in placeholder_markers):
+        errors.append(f"{relative_path}: added placeholder/example value")
+
+    if suffix in {".js", ".jsx", ".ts", ".tsx"}:
+        if re.search(r"useState\s*\(\s*\(\)\s*=>\s*[^)\n]*cache[^)\n]*(?:!==|!=)\s*null", added_text, re.IGNORECASE):
+            errors.append(f"{relative_path}: loading/cache initializer looks inverted; cached data should usually make loading false")
+        if re.search(r"\bsave[A-Za-z0-9_]*\s*\(\s*[A-Za-z_$][\w$]*\s*\(\s*\[\s*\]\s*\)\s*\)", added_text):
+            errors.append(f"{relative_path}: cache save calls an updater with [] and will persist an empty list")
+
+        try:
+            full_text = (repo / relative_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            full_text = ""
+        for const_name in re.findall(r"\bconst\s+\{\s*data\s*:\s*([A-Za-z_$][\w$]*)\s*\}", full_text):
+            if re.search(rf"\b{re.escape(const_name)}\s*=", full_text):
+                errors.append(f"{relative_path}: assigns to const binding `{const_name}`")
+                break
+        setter_names = sorted(set(re.findall(r"\bset[A-Z][A-Za-z0-9_]*\b", added_text)))
+        for name in setter_names[:20]:
+            state_name = name[3:4].lower() + name[4:]
+            declared = (
+                re.search(rf"\bconst\s+\[\s*{re.escape(state_name)}\s*,\s*{re.escape(name)}\s*\]\s*=", full_text)
+                or re.search(rf"\bfunction\s+{re.escape(name)}\s*\(", full_text)
+                or re.search(rf"\bconst\s+{re.escape(name)}\s*=", full_text)
+                or re.search(rf"\blet\s+{re.escape(name)}\s*=", full_text)
+            )
+            if not declared:
+                errors.append(f"{relative_path}: added `{name}` without declaring matching state/function")
+                if len(errors) >= 6:
+                    break
+    return errors
+
+
+def _check_patch_semantic_tripwires(repo: Path, patch: str) -> List[str]:
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        errors.extend(_check_added_semantic_tripwires(repo, relative_path, patch))
+        if len(errors) >= 10:
+            break
+    errors.extend(_scope_churn_errors(patch))
+    return errors[:12]
+
+
+def _scope_churn_errors(patch: str) -> List[str]:
+    errors: List[str] = []
+    current_file = ""
+    added = 0
+    removed = 0
+
+    def flush() -> None:
+        nonlocal added, removed, current_file
+        if current_file and removed > 300 and added > 80:
+            errors.append(f"{current_file}: looks like a large rewrite ({added} added, {removed} removed); keep the existing file and patch only requested sections")
+        added = 0
+        removed = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            parts = line.split()
+            current_file = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else ""
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    flush()
+    return errors
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1260,8 +1567,10 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
-        elif suffix in _BRACE_BALANCE_SUFFIXES:
-            result = _check_brace_balance_one(repo, relative_path)
+        elif suffix in _BRACE_BALANCE_SUFFIXES or suffix in {".jsx"}:
+            result = _check_ts_structure_one(repo, relative_path)
+            if result is None:
+                result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
@@ -1769,6 +2078,140 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+def _artifact_coverage_missing(issue_text: str, patch: str) -> List[str]:
+    """Spot explicit artifact/UI/process requirements that a keyword scan misses."""
+    issue_lower = issue_text.lower()
+    changed = set(_patch_changed_files(patch))
+    added = _patch_added_text(patch)
+    missing: List[str] = []
+
+    explicit_paths = _extract_issue_path_mentions(issue_text)
+    for path in explicit_paths:
+        normalized = path.strip("./")
+        if normalized and not any(c == normalized or c.endswith("/" + normalized) for c in changed):
+            missing.append(f"touch required path `{normalized}`")
+
+    artifact_rules = [
+        (("demo", "data"), lambda: any(("demo" in Path(c).name.lower() or "data" in Path(c).name.lower()) and Path(c).suffix.lower() == ".sql" for c in changed), "create the requested demo-data SQL/script"),
+        (("review", "notes"), lambda: any("review" in c.lower() and "note" in c.lower() for c in changed), "create/update the requested review notes artifact"),
+        (("requirements", "cleanup"), lambda: any("requirements" in Path(c).name.lower() for c in changed), "update the requested requirements/dependency cleanup"),
+        (("test mode",), lambda: "test" in added and ("window" in added or "filter" in added or "mode" in added), "implement the requested test-mode behavior, not just adjacent scheduling"),
+        (("datalist",), lambda: "datalist" in added or "<option" in added, "add the requested datalist/options UI"),
+        (("bulk", "create"), lambda: "bulk" in added and ("button" in added or "modal" in added or "input" in added or "form" in added), "wire a visible bulk-create UI, not only helper state"),
+        (("column",), lambda: "<th" in added or "<td" in added or "table" in added or "column" in added, "add the requested visible table/list column"),
+    ]
+    for terms, predicate, note in artifact_rules:
+        if all(term in issue_lower for term in terms) and not predicate():
+            missing.append(note)
+
+    deduped: List[str] = []
+    for note in missing:
+        if note not in deduped:
+            deduped.append(note)
+    return deduped[:8]
+
+
+def build_artifact_coverage_prompt(missing: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {m}" for m in missing[:8]) or "(none)"
+    return (
+        "Explicit artifact/UI requirement gap — the task asks for concrete "
+        "files, config entries, UI controls, cleanup, or process behavior that "
+        "your current patch does not clearly implement:\n"
+        f"  {bullets}\n\n"
+        "Add only the missing required artifacts/controls/cleanup now. Do not "
+        "rewrite unrelated flows, do not invent placeholder values, and do not satisfy these by comments alone. "
+        "If creating a file, use `mkdir -p` plus a heredoc or a focused Python "
+        "write. Then end with <final>summary</final>."
+        "\n\nTask:\n"
+        f"{issue_text[:1600]}\n"
+    )
+
+
+def _visible_surface_missing(issue_text: str, patch: str) -> bool:
+    """Frontend-visible tasks need at least one visible UI/style delta.
+
+    A recurring loss pattern is a correct-looking state/helper edit that never
+    changes rendered text, styles, markup, or event wiring. This lightweight
+    gate asks for one more pass only when the issue is visibly UI-facing and
+    the patch has no obvious UI-surface additions.
+    """
+    issue_lower = issue_text.lower()
+    ui_terms = {
+        "button", "screen", "page", "modal", "card", "form", "dropdown",
+        "select", "input", "label", "sidebar", "menu", "layout", "style",
+        "color", "theme", "animation", "hover", "responsive", "mobile",
+        "desktop", "visible", "display", "show", "hide", "render", "text",
+        "copy", "appointment", "booking", "workshop", "resident", "apartment",
+    }
+    if not any(term in issue_lower for term in ui_terms):
+        return False
+    changed = _patch_changed_files(patch)
+    if not any(Path(path).suffix.lower() in {".css", ".scss", ".html", ".jsx", ".tsx", ".vue", ".svelte", ".js", ".ts"} for path in changed):
+        return False
+    added = _patch_added_text(patch)
+    surface_terms = (
+        "class", "classname", "style", "aria", "role", "placeholder", "label",
+        "button", "input", "select", "option", "onchange", "onclick",
+        "href", "src", "data-", "px", "rem", "grid", "flex", "color",
+        "background", "display", "visibility", "render", "return (",
+    )
+    return not any(term in added for term in surface_terms)
+
+
+_STORE_SELECTOR_RE = re.compile(
+    r"use[A-Za-z0-9_]*Store\s*\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*\1\.([A-Za-z_$][\w$]*)"
+)
+
+
+def _external_state_api_errors(repo: Path, patch: str) -> List[str]:
+    """Detect newly used store selectors that are absent from store modules.
+
+    If a patch reads `useAppStore((s) => s.newThing)` but does not update a
+    store/provider module, it often compiles poorly or fails at runtime. This
+    check is intentionally narrow: only selector properties added by the patch.
+    """
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    props = []
+    for _state_name, prop in _STORE_SELECTOR_RE.findall(added):
+        if prop not in props:
+            props.append(prop)
+    if not props:
+        return []
+
+    changed = _patch_changed_files(patch)
+    changed_store = any("store" in Path(path).name.lower() or "/store/" in path.lower() for path in changed)
+    if changed_store:
+        return []
+
+    store_baseline = ""
+    for path in _tracked_files(repo):
+        lower = path.lower()
+        if "store" not in lower or Path(path).suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "show", f"HEAD:{path}"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            store_baseline += "\n" + (proc.stdout or "")
+
+    errors: List[str] = []
+    for prop in props[:8]:
+        if not re.search(rf"\b{re.escape(prop)}\b", store_baseline):
+            errors.append(f"store selector `{prop}` is used but no changed store module defines it")
+    return errors
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -1883,7 +2326,7 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection. Never concatenate many large files with cat; use `rg` and one focused `sed -n` range.
 
 **Edit surgically**: change only the lines that implement the fix.
 - One-line substitutions: `sed -i 's/old/new/' file`
@@ -1892,6 +2335,15 @@ brief summary of what changed
 - Never rewrite an entire function when only 1–3 lines need changing
 
 **Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
+
+**Explicit artifacts**: if the issue asks for a file, migration, demo-data script,
+review notes, requirements cleanup, config entry, UI control, column, or test
+mode, implement that artifact directly. Do not satisfy it only by adding a
+comment or mentioning it in another file.
+
+If an app has both root-level App/Style files and a `src/` copy with the same
+name, prefer the `src/` copy unless the issue explicitly names the root file.
+Do not edit both duplicate copies.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
@@ -1907,6 +2359,9 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
+Preserve public APIs unless the issue explicitly asks to change them: exported
+function names, return object keys, route action names, JSON response shape,
+store selectors/actions, and existing imports used by other files.
 
 ## Scope discipline — what NOT to change
 
@@ -1918,6 +2373,15 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
+- Changing quote style, semicolons, indentation style, or compacting multi-line
+  code into one-liners while making a logic change
+- Rewriting authentication, registration, delete, share, or unrelated CRUD flows
+  when the issue only asks for a small adjacent feature
+- Placeholder values (`placeholder`, `example.com`, fake UUIDs/emails/URLs) in
+  required artifacts or configs. If the repo already has a concrete value,
+  reuse that value; otherwise omit the optional field rather than inventing it.
+- Comment-only interval/config changes. If a task asks for a cadence, test mode,
+  feature flag, or constant change, update the actual expression/query too.
 
 ## Idiomatic refactors — CRITICAL for judge score
 
@@ -1971,7 +2435,7 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 ## Safety
 
-No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
+No sudo. Repository file deletion is allowed only when the issue asks for removal, cleanup, or moving files; otherwise preserve files. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
 
 
@@ -2007,6 +2471,9 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
+If a long command was cut off, replace it with a much smaller focused edit.
+Do not resend a giant whole-file replacement script.
+
 If the patch is complete, respond with <final>summary</final>. Otherwise continue
 by issuing exactly one bash command in this format:
 
@@ -2029,6 +2496,33 @@ def build_budget_pressure_prompt(step: int) -> str:
         "Do not read files or run tests until after a patch exists. "
         "Use `sed -i` or a python one-liner to make the targeted edit now."
     )
+
+
+def _oversized_context_dump_reason(command: str) -> Optional[str]:
+    """Block first-turn commands that dump broad file contents.
+
+    Long `cat $(find ...)` style commands burn the context window and time
+    without moving toward a patch. Once a patch exists we allow normal review
+    commands, but before that force focused `rg`/`sed -n`.
+    """
+    lowered = command.lower()
+    redirected_cat = bool(re.search(r"\bcat\s*(?:-[A-Za-z]+\s+)*(?:>|<<)", command))
+    if "cat " not in lowered and "sed -n" not in lowered:
+        return None
+    broad_markers = ("git ls-files", "find .", "find *", " xargs cat", "$(find", "$(git ls-files", "`find", "`git ls-files")
+    if any(marker in lowered for marker in broad_markers):
+        return (
+            "Blocked broad context dump before any patch exists. Use `rg` for symbols "
+            "or one focused `sed -n 'start,endp' file` command, then edit."
+        )
+    if redirected_cat:
+        return None
+    cat_targets = re.findall(r"\bcat\s+(?:-[A-Za-z]+\s+)*([^;&|`$]+)", command)
+    for target_text in cat_targets:
+        targets = [part for part in re.split(r"\s+", target_text.strip()) if part and not part.startswith("-")]
+        if len(targets) > 3:
+            return "Blocked cat of many files before any patch exists. Inspect one focused file/range instead."
+    return None
 
 
 def build_polish_prompt(junk_summary: str) -> str:
@@ -2129,6 +2623,19 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
+def build_semantic_fix_prompt(errors: List[str]) -> str:
+    bullets = "\n  ".join(f"- {e}" for e in errors[:10]) or "(none)"
+    return (
+        "Semantic safety check failed. These are likely runtime/build/scope "
+        "regressions even if the diff looks plausible:\n"
+        f"  {bullets}\n\n"
+        "Fix them with the smallest correction. Preserve existing file structure "
+        "and public APIs. If you rewrote a large file, revert the rewrite and "
+        "re-apply only the required small sections. Do not add placeholder values. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
@@ -2150,6 +2657,37 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_visible_surface_nudge_prompt(issue_text: str) -> str:
+    return (
+        "Visible-surface gap — this appears to be a UI/user-visible task, but "
+        "your current patch does not clearly change rendered text, markup, "
+        "classes, styles, or event wiring.\n\n"
+        "Inspect the active component/style file (prefer `src/` over duplicate "
+        "root files) and make the smallest visible change needed for the task. "
+        "Do not add decorative redesigns or unrelated refactors.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "After the edit, run the most targeted check available and end with "
+        "<final>summary</final>."
+    )
+
+
+def build_dependency_fix_prompt(errors: List[str]) -> str:
+    bullets = "\n  ".join(f"- {e}" for e in errors[:8]) or "(none)"
+    return (
+        "Dependency-consistency gap — your patch added calls to application "
+        "state/store API that is not present in the existing store/provider "
+        "modules:\n"
+        f"  {bullets}\n\n"
+        "Fix this before finalizing. Prefer using existing store fields/actions "
+        "already present in the repo. If a new store API is truly required, edit "
+        "the owning store/provider in the same patch and update its type shape. "
+        "Do not leave selectors/actions that resolve to undefined at runtime.\n\n"
+        "After the minimal correction, run the targeted syntax/type/test check "
+        "available and end with <final>summary</final>."
     )
 
 
@@ -2373,6 +2911,63 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+def _patch_quality_report(repo: Path, patch: str, issue: str) -> Dict[str, Any]:
+    """Score a candidate patch by deployability/completeness, not size.
+
+    Older multishot logic selected the retry when it had at least as many
+    substantive added lines. That rewards broad rewrites and can prefer broken
+    patches. This score is intentionally conservative: complete coverage and
+    parseable code beat volume.
+    """
+    substantive = _multishot_count_substantive(patch)
+    changed = _patch_changed_files(patch)
+    missing_paths = _uncovered_required_paths(patch, issue)
+    syntax_errors = _check_syntax(repo, patch) if patch.strip() else []
+    semantic_errors = _check_patch_semantic_tripwires(repo, patch) if patch.strip() else []
+    artifact_gaps = _artifact_coverage_missing(issue, patch) if patch.strip() else []
+    churn_errors = _scope_churn_errors(patch) if patch.strip() else []
+
+    score = 0
+    if patch.strip():
+        score += 20
+    score += min(25, substantive)
+    score += min(15, len(changed) * 3)
+    score -= len(missing_paths) * 12
+    score -= len(artifact_gaps) * 8
+    score -= len(syntax_errors) * 25
+    score -= len(semantic_errors) * 12
+    score -= len(churn_errors) * 10
+
+    # Tiny patches can be correct, but only when they cover explicit paths and
+    # have no structural defects. Avoid penalizing a surgical fix solely by size.
+    if substantive < 3 and (missing_paths or syntax_errors or semantic_errors):
+        score -= 15
+
+    return {
+        "score": score,
+        "substantive": substantive,
+        "changed_files": changed,
+        "missing_paths": missing_paths,
+        "artifact_gaps": artifact_gaps,
+        "syntax_errors": syntax_errors,
+        "semantic_errors": semantic_errors,
+        "churn_errors": churn_errors,
+    }
+
+
+def _patch_quality_summary(report: Dict[str, Any]) -> str:
+    parts = [
+        f"score={report.get('score')}",
+        f"substantive={report.get('substantive')}",
+        f"files={len(report.get('changed_files') or [])}",
+    ]
+    for key in ("missing_paths", "artifact_gaps", "syntax_errors", "semantic_errors", "churn_errors"):
+        items = report.get(key) or []
+        if items:
+            parts.append(f"{key}={len(items)}")
+    return "; ".join(parts)
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -2549,14 +3144,26 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _result1 = _solve_attempt(**_multishot_args)
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
+    _report1 = _patch_quality_report(_multishot_repo_obj, _patch1, issue)
 
-    # Only retry when the patch is empty OR it has too few substantive lines
-    # AND failed to touch any path the issue explicitly mentions. A surgical
-    # 1-2 line fix that covers the required paths is correct — don't discard it.
+    # Retry when the patch is empty, very low signal, or structurally suspect.
+    # A surgical 1-2 line fix that covers required paths and parses is correct;
+    # do not discard it just for being small.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+    _severe_quality_issues = bool(
+        _report1.get("syntax_errors")
+        or _report1.get("semantic_errors")
+        or _report1.get("missing_paths")
+        or _report1.get("artifact_gaps")
+    )
+    _should_retry = (
+        (not _patch1.strip())
+        or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+        or (_severe_quality_issues and (_report1.get("score", 0) < 25))
+    )
     if not _should_retry:
         _result1["multishot_attempts"] = 1
+        _result1["multishot_quality"] = _patch_quality_summary(_report1)
         return _result1
 
     _elapsed = time.monotonic() - _multishot_started
@@ -2594,10 +3201,12 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
+    _report2 = _patch_quality_report(_multishot_repo_obj, _patch2, issue)
 
-    if _n2 >= _n1:
+    if _report2.get("score", -10**9) >= _report1.get("score", -10**9):
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_quality"] = _patch_quality_summary(_report2)
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -2605,6 +3214,7 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
         _multishot_apply_patch(_multishot_repo_obj, _patch1)
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
+    _result1["multishot_quality"] = _patch_quality_summary(_report1)
     return _result1
 
 
@@ -2633,6 +3243,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    visible_surface_nudges_used = 0
+    artifact_nudges_used = 0
+    semantic_fix_turns_used = 0
+    dependency_fix_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2671,7 +3285,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, artifact_nudges_used, semantic_fix_turns_used, dependency_fix_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2703,6 +3317,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
@@ -2712,6 +3338,52 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if semantic_fix_turns_used < 1:
+            semantic_errors = _check_patch_semantic_tripwires(repo, patch)
+            if semantic_errors:
+                semantic_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_semantic_fix_prompt(semantic_errors),
+                    "SEMANTIC_FIX_QUEUED:\n  " + "\n  ".join(semantic_errors),
+                )
+                return True
+
+        if artifact_nudges_used < 1:
+            missing_artifacts = _artifact_coverage_missing(issue, patch)
+            if missing_artifacts:
+                artifact_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_artifact_coverage_prompt(missing_artifacts, issue),
+                    "ARTIFACT_COVERAGE_QUEUED:\n  " + "\n  ".join(missing_artifacts),
+                )
+                return True
+
+        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
+            visible_surface_nudges_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_visible_surface_nudge_prompt(issue),
+                "VISIBLE_SURFACE_NUDGE_QUEUED",
+            )
+            return True
+
+        if dependency_fix_turns_used < 1:
+            dependency_errors = _external_state_api_errors(repo, patch)
+            if dependency_errors:
+                dependency_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dependency_fix_prompt(dependency_errors),
+                    "DEPENDENCY_FIX_QUEUED:\n  " + "\n  ".join(dependency_errors),
                 )
                 return True
 
@@ -2737,18 +3409,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_polish_prompt(junk),
                     f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -2886,7 +3546,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                block_reason = _oversized_context_dump_reason(command) if not get_patch(repo).strip() else None
+                if block_reason:
+                    result = CommandResult(
+                        command=command,
+                        exit_code=1,
+                        stdout="",
+                        stderr=block_reason,
+                        duration_sec=0.0,
+                        blocked=True,
+                    )
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
@@ -2996,6 +3667,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
+    stdout_body = _extract_observation_section(lower, "stdout")
     stderr_body = _extract_observation_section(lower, "stderr")
 
     bad_markers = [
@@ -3007,20 +3679,30 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "assertionerror",
         "syntaxerror",
         "exception",
+        "block not found",
+        "not found",
+        "0 replacements",
+        "no replacement",
+        "no changes",
+        "not modified",
+        "nothing to commit",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
+    good_patterns = [
+        r"(?m)\b\d+\s+passed\b",
+        r"(?m)\ball\s+passed\b",
+        r"(?m)^ok\b",
+        r"(?m)\bsuccess(?:ful|fully)?\b",
+        r"(?m)\bbuild\s+completed\b",
+        r"(?m)\bcompiled\s+successfully\b",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
+    check_text = "\n".join(part for part in (stdout_body, stderr_body) if part)
+    has_good = any(re.search(pattern, check_text) for pattern in good_patterns)
+    has_bad = any(marker in check_text for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
