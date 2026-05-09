@@ -767,6 +767,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    _pinned = set(_extract_issue_paths(issue, Path(repo)))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -775,6 +776,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         name_lower = Path(relative_path).name.lower()
         stem_lower = Path(relative_path).stem.lower()
         score = 0
+        if relative_path in _pinned:
+            score += 500
         if relative_path in mentioned:
             score += 100
         if path_lower in issue_lower:
@@ -831,6 +834,22 @@ def _context_file_allowed(relative_path: str) -> bool:
     if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
         return False
     return True
+
+
+_PATH_LIKE_RE = re.compile(
+    r"\b((?:[a-zA-Z0-9_][\w./-]*?/)+[a-zA-Z0-9_][\w-]{0,60}"
+    r"\.(?:py|pyi|js|jsx|ts|tsx|go|rs|java|kt|rb|c|h|cc|cpp|cs|php|sh|toml|yaml|yml|json|md))\b"
+)
+
+
+def _extract_issue_paths(issue_text: str, repo_root: Path) -> List[str]:
+    """Extract literal repo-relative paths from the issue text that exist on disk."""
+    candidates = set(_PATH_LIKE_RE.findall(issue_text or ""))
+    real: List[str] = []
+    for p in candidates:
+        if (repo_root / p).is_file():
+            real.append(p)
+    return real
 
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
@@ -2004,6 +2023,17 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
+def _build_target_files_prefix(pinned_paths: List[str]) -> str:
+    """Format a TARGET FILES block to prepend to the user prompt."""
+    if not pinned_paths:
+        return ""
+    path_list = "\n".join(f"  {p}" for p in pinned_paths[:8])
+    return (
+        "TARGET FILES (mentioned by path in the issue — concentrate edits in these unless strictly impossible):\n"
+        f"{path_list}\n\n"
+    )
+
+
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
@@ -2207,11 +2237,109 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
+
+def _attempt_time_budget(
+    elapsed_total: float,
+    multishot_total: float,
+    attempts_remaining: int,
+    reserve_for_other_layers: float,
+) -> float:
+    """Compute the wall-clock budget this _solve_attempt is allowed to burn.
+
+    Returns a value clamped to [90.0, WALL_CLOCK_BUDGET_SECONDS]. 90.0 is the
+    floor below which an attempt cannot meaningfully complete a chat call.
+    """
+    remaining = max(0.0, multishot_total - elapsed_total - reserve_for_other_layers)
+    even_share = remaining / max(1, attempts_remaining)
+    return max(90.0, min(WALL_CLOCK_BUDGET_SECONDS, even_share))
+
+
+def _chat_timeout_for(remaining_attempt_budget: float) -> int:
+    """Cap chat_completion timeout so a single call can't burn more than 60%
+    of an attempt's remaining wall-clock. Floor at 25s, ceiling at 120s.
+    """
+    return int(max(25, min(120, 0.6 * remaining_attempt_budget)))
+
+
+# Scout patch: guaranteed disk floor before docker kill.
+_SCOUT_TIMEOUT_SECONDS = 30
+_SCOUT_MAX_TOKENS = 1024
+
+_SCOUT_SYSTEM = (
+    "You are a minimal patch generator. Output ONLY a unified diff and nothing else.\n"
+    "Format: a valid `git diff` or `diff -u` block. No explanation, no markdown fences,\n"
+    "no commands. The patch must apply cleanly with `git apply`.\n"
+    "Make the smallest plausible code change consistent with the task description.\n"
+    "If uncertain, change ONE line in the most relevant file."
+)
+
 # v66: emergency single-shot constants (adapted from PR518)
 _EMERGENCY_MAX_TOKENS = 1024
 _EMERGENCY_TIMEOUT_SECONDS = 45
 _EMERGENCY_COMMAND_TIMEOUT = 30
 _EMERGENCY_PROMPT_TARGET_CHARS = 2000
+
+
+def _compute_scout_patch(scout_rpath, scout_issue, ranked_paths, scout_model, scout_api_base, scout_api_key) -> str:
+    """Single-call minimal-patch generator. Hard 30s budget, 1024 tokens.
+
+    Result is the absolute floor for the multishot driver — it is captured
+    BEFORE attempt 1 starts so that any subsequent hang/timeout still leaves
+    a non-empty diff in the result dict.
+    """
+    try:
+        repo = _repo_path(scout_rpath)
+        model_name, base, key = _resolve_inference_config(scout_model or "", scout_api_base, scout_api_key)
+        file_snippets: List[str] = []
+        budget_chars = 3000
+        for rp in ranked_paths[:2]:
+            snippet = _read_context_file(repo, rp, min(2000, budget_chars))
+            if snippet.strip():
+                file_snippets.append(f"### {rp}\n```\n{snippet}\n```")
+                budget_chars -= len(snippet)
+            if budget_chars <= 0:
+                break
+        context_block = "\n\n".join(file_snippets)
+        user_msg = (
+            f"TASK:\n{issue[:1200]}\n\n"
+            f"MOST RELEVANT FILES:\n{context_block}\n\n"
+            "Output a unified diff patch only. No prose."
+        )
+        msgs = [
+            {"role": "system", "content": _SCOUT_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ]
+        content, _, _ = chat_completion(
+            msgs,
+            model=model_name,
+            api_base=base,
+            api_key=key,
+            max_tokens=_SCOUT_MAX_TOKENS,
+            timeout=_SCOUT_TIMEOUT_SECONDS,
+            max_retries=1,
+        )
+        return _extract_unified_diff(content)
+    except Exception:
+        return ""
+
+
+def _extract_unified_diff(text: str) -> str:
+    """Extract a unified diff block from model output (handles fenced or raw)."""
+    if not text:
+        return ""
+    text = text.strip()
+    fence_match = re.search(r"```(?:diff)?\n(.*?)```", text, re.DOTALL)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+        if candidate.startswith("diff ") or candidate.startswith("--- "):
+            return candidate
+    if text.startswith("diff ") or text.startswith("--- "):
+        return text
+    for line in text.splitlines():
+        if line.startswith("diff ") or line.startswith("--- "):
+            idx = text.find(line)
+            return text[idx:]
+    return ""
 
 
 def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
@@ -2400,9 +2528,25 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
         pass
 
 
+def _validate_patch_applies(repo: Path, patch: str) -> bool:
+    """Dry-run git apply --check. Returns True iff the patch would apply cleanly."""
+    if not (patch or "").strip():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check", "--whitespace=nowarn", "-"],
+            input=patch, text=True, capture_output=True, timeout=10,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
+    if not _validate_patch_applies(repo, patch_text):
+        return False
     try:
         proc = subprocess.run(
             ["git", "apply", "--whitespace=nowarn"],
@@ -2546,7 +2690,42 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
         _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
-    _result1 = _solve_attempt(**_multishot_args)
+    # Item A: compute a scout patch in the first ~30s as a disk floor.
+    # Any subsequent SIGKILL at 600s returns a non-empty diff instead of zero.
+    _scout_patch = ""
+    try:
+        _scout_ranked = _rank_context_files(_multishot_repo_obj, issue)
+        _scout_patch = _compute_scout_patch(
+            repo_path, issue, _scout_ranked, model or "", api_base, api_key
+        )
+        if _scout_patch.strip() and _validate_patch_applies(_multishot_repo_obj, _scout_patch):
+            _multishot_apply_patch(_multishot_repo_obj, _scout_patch)
+    except Exception:
+        _scout_patch = ""
+    # Revert before attempt 1 so the model edits a clean tree.
+    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+
+    def _maybe_return_scout(result: Dict[str, Any]) -> Dict[str, Any]:
+        """If the final patch is empty and scout is non-empty, apply and return scout."""
+        final_patch = result.get("patch", "") or ""
+        if not final_patch.strip() and _scout_patch.strip():
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            if _validate_patch_applies(_multishot_repo_obj, _scout_patch):
+                _multishot_apply_patch(_multishot_repo_obj, _scout_patch)
+            return AgentResult(
+                patch=_scout_patch, logs="scout_floor",
+                steps=0, cost=0.0, success=True,
+            ).to_dict()
+        return result
+
+    # Item B: compute adaptive per-attempt budget.
+    _a1_budget = _attempt_time_budget(
+        elapsed_total=time.monotonic() - _multishot_started,
+        multishot_total=_multishot_total_budget,
+        attempts_remaining=2,
+        reserve_for_other_layers=45.0 + _SCOUT_TIMEOUT_SECONDS,
+    )
+    _result1 = _solve_attempt(**_multishot_args, wall_clock_budget=_a1_budget)
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
@@ -2558,6 +2737,16 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     if not _should_retry:
         _result1["multishot_attempts"] = 1
         return _result1
+
+    # Item E: skip retry when attempt 1 covers required paths and budget is tight.
+    _elapsed_e = time.monotonic() - _multishot_started
+    if _should_retry and _patch1.strip():
+        _covered_all = not _uncovered_required_paths(_patch1, issue)
+        _remaining_e = _multishot_total_budget - _elapsed_e
+        if _covered_all and _n1 >= 1 and _remaining_e < 1.5 * WALL_CLOCK_BUDGET_SECONDS:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "covered_required_and_tight_budget"
+            return _result1
 
     _elapsed = time.monotonic() - _multishot_started
 
@@ -2586,26 +2775,32 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
         _elapsed = time.monotonic() - _multishot_started
 
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-        _result1["multishot_attempts"] = 1
-        _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
+        return _maybe_return_scout(_result1 | {"multishot_attempts": 1, "multishot_skipped_retry": "insufficient_time"})
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
+    _a2_budget = _attempt_time_budget(
+        elapsed_total=time.monotonic() - _multishot_started,
+        multishot_total=_multishot_total_budget,
+        attempts_remaining=1,
+        reserve_for_other_layers=15.0,
+    )
+    _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue), wall_clock_budget=_a2_budget)
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
     if _n2 >= _n1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
-        return _result2
+        return _maybe_return_scout(_result2)
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    if _patch1:
+    if _patch1 and _validate_patch_applies(_multishot_repo_obj, _patch1):
+        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+    elif _patch1:
         _multishot_apply_patch(_multishot_repo_obj, _patch1)
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
-    return _result1
+    return _maybe_return_scout(_result1)
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -2620,6 +2815,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
     _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
+    _wall_clock_budget: float = float(kwargs.get("wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2639,7 +2835,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return _wall_clock_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2785,8 +2981,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        _pinned_paths = _extract_issue_paths(issue, repo)
 
         _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if _pinned_paths:
+            _initial_user = _build_target_files_prefix(_pinned_paths) + _initial_user
         if _multishot_memo:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
@@ -2816,6 +3015,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=_chat_timeout_for(time_remaining()),
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
