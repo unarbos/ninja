@@ -2204,7 +2204,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 1
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
 # v66: emergency single-shot constants (adapted from PR518)
