@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
+WALL_CLOCK_BUDGET_SECONDS = 210.0  # v5 tuning: 210s (was 240)
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -1901,7 +1901,7 @@ brief summary of what changed
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
-## Functional completeness
+## Functional completeness (FEATURE_BUILD/new functionality only)
 
 A patch that fully implements the requested behavior is generally rated higher than a partially-implemented one of similar size. To avoid leaving features half-done:
 
@@ -2170,7 +2170,7 @@ def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: s
             "emit ALL edit commands for ALL files in ONE response. Coordinate cross-file consistency "
             "— when you change a function signature, type, or interface, cascade the change to every "
             "caller. Skeleton/stub edits lose to working multi-file implementations even when smaller. "
-            "Comprehensive working implementations beat minimal patches in this codebase."
+            "Coordinate all required files precisely — include every file the task explicitly requires, no more."
         )
     else:
         strategy = (
@@ -2178,7 +2178,7 @@ def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: s
             "If the task describes new functionality (a component, form, service, page) not already "
             "in the codebase, create the new file. Wire functional behavior end-to-end — state hooks, "
             "event handlers, real logic. Skeleton patches with `// TODO` or pass-through props lose "
-            "to working implementations. Comprehensive working implementations beat minimal patches."
+            "to working implementations. Implement exactly what the task requires — no extra scope."
         )
 
     return base + lang_block + "\n" + strategy + "\n"
@@ -2980,7 +2980,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # which cost us 4 empty rounds and the duel. This adapts to whatever
         # budget the king sets — fires 60s before out_of_time().
         emergency_injected = False
-        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 35.0, 65.0)  # 35s margin for v5
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
