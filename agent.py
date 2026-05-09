@@ -2342,6 +2342,20 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
+
+
+def _detect_new_file_task(issue_text, repo):
+    lower = issue_text.lower()
+    signals = ['create', 'add new', 'implement new', 'new file', 'new module',
+               'new component', 'build a new', 'introduce', 'write a new', 'scaffold']
+    has_keyword = any(k in lower for k in signals)
+    import re as _re
+    tracked = set(_tracked_files(repo))
+    paths = _re.findall(r'[\w/.-]+\.(?:ts|tsx|js|jsx|py|go|java|cs|rb|vue|svelte)', issue_text)
+    new_paths = [p for p in paths if not any(p in tp for tp in tracked)]
+    return (has_keyword and len(new_paths) >= 1) or len(new_paths) >= 2
+
+
 def solve(
     repo_path: str,
     issue: str,
@@ -2646,10 +2660,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
+        _nf_task = _detect_new_file_task(issue, repo)
+        _nf_hint = " [NEW FILE CREATION TASK: produce a COMPLETE new file, not a surgical edit]" if _nf_task else ""
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue + _nf_hint, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
