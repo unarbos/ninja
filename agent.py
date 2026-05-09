@@ -547,10 +547,66 @@ def ensure_git_repo(repo: Path) -> None:
 
 def get_patch(repo: Path) -> str:
     exclude_pathspecs = [
+        # Compiled artifacts
         ":(exclude,glob)**/*.pyc",
+        ":(exclude,glob)**/*.pyo",
+        ":(exclude,glob)**/*.class",
+        ":(exclude,glob)**/*.o",
+        ":(exclude,glob)**/*.so",
+        ":(exclude,glob)**/*.tsbuildinfo",
+        ":(exclude,glob)**/*.min.js",
+        ":(exclude,glob)**/*.min.css",
+        ":(exclude,glob)**/*.map",
+        # Generated/cache directories
         ":(exclude,glob)**/__pycache__/**",
         ":(exclude,glob)**/.pytest_cache/**",
+        ":(exclude,glob)**/.mypy_cache/**",
+        ":(exclude,glob)**/.ruff_cache/**",
         ":(exclude,glob)**/node_modules/**",
+        ":(exclude,glob)**/dist/**",
+        ":(exclude,glob)**/build/**",
+        ":(exclude,glob)**/.next/**",
+        ":(exclude,glob)**/.nuxt/**",
+        ":(exclude,glob)**/.output/**",
+        ":(exclude,glob)**/.svelte-kit/**",
+        ":(exclude,glob)**/.turbo/**",
+        ":(exclude,glob)**/.cache/**",
+        ":(exclude,glob)**/coverage/**",
+        ":(exclude,glob)**/.coverage",
+        ":(exclude,glob)**/.nyc_output/**",
+        ":(exclude,glob)**/target/**",
+        ":(exclude,glob)**/out/**",
+        ":(exclude,glob)**/.gradle/**",
+        ":(exclude,glob)**/vendor/**",
+        # Lock files (production-grade dependency pins; reference patches almost
+        # never edit these, but agents frequently run installers that touch
+        # them, polluting the diff with unrelated churn).
+        ":(exclude,glob)**/package-lock.json",
+        ":(exclude,glob)**/yarn.lock",
+        ":(exclude,glob)**/pnpm-lock.yaml",
+        ":(exclude,glob)**/bun.lockb",
+        ":(exclude,glob)**/Cargo.lock",
+        ":(exclude,glob)**/go.sum",
+        ":(exclude,glob)**/composer.lock",
+        ":(exclude,glob)**/Gemfile.lock",
+        ":(exclude,glob)**/Pipfile.lock",
+        ":(exclude,glob)**/poetry.lock",
+        ":(exclude,glob)**/flake.lock",
+        ":(exclude,glob)**/mix.lock",
+        # Real env files (never commit credentials). `.env.example` is left
+        # alone — it's a legitimate template that some issues ask to update.
+        ":(exclude,glob)**/.env",
+        ":(exclude,glob)**/.env.local",
+        ":(exclude,glob)**/.env.development",
+        ":(exclude,glob)**/.env.production",
+        ":(exclude,glob)**/.env.test",
+        # OS noise
+        ":(exclude,glob)**/.DS_Store",
+        ":(exclude,glob)**/Thumbs.db",
+        # Logs
+        ":(exclude,glob)**/*.log",
+        ":(exclude,glob)**/npm-debug.log*",
+        # Repo internals
         ":(exclude).git",
     ]
     proc = subprocess.run(
@@ -658,11 +714,46 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+_SKIP_PATCH_FILENAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "Cargo.lock", "go.sum", "composer.lock", "Gemfile.lock",
+    "Pipfile.lock", "poetry.lock", "flake.lock", "mix.lock",
+    ".env", ".env.local", ".env.development", ".env.production", ".env.test",
+    ".DS_Store", "Thumbs.db",
+})
+
+_SKIP_PATCH_SUFFIXES = frozenset({
+    ".pyc", ".pyo", ".class", ".o", ".so", ".tsbuildinfo",
+    ".min.js", ".min.css", ".map", ".log",
+})
+
+_SKIP_PATCH_DIRS = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "node_modules", "dist", "build", ".next", ".nuxt", ".output",
+    ".svelte-kit", ".turbo", ".cache", "coverage", ".nyc_output",
+    "target", "out", ".gradle", "vendor", ".git",
+})
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
+    """Filter for untracked-file patch inclusion.
+
+    Mirrors the exclude list in `get_patch`'s pathspecs so untracked
+    new files coming through `git ls-files --others` get the same
+    treatment as tracked changes. Without this, the agent could create
+    e.g. a fresh `package-lock.json` (via `npm install` in a tool call)
+    that would slip into the diff as a new file even though tracked
+    changes to it are excluded.
+    """
     path = Path(relative_path)
-    if path.suffix == ".pyc":
+    if path.name in _SKIP_PATCH_FILENAMES:
         return True
-    return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+    # Multi-suffix check (handles `.min.js`, `.min.css`)
+    name_lower = path.name.lower()
+    for suffix in _SKIP_PATCH_SUFFIXES:
+        if name_lower.endswith(suffix):
+            return True
+    return any(part in _SKIP_PATCH_DIRS for part in path.parts)
 
 
 def get_repo_summary(repo: Path) -> str:
