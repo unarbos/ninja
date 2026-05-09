@@ -103,8 +103,54 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+# v34: real validator envelope is 300s docker hard-kill (validate.py
+# _POOL_SOLVE_TIMEOUT_SECONDS=300 + docker_solver.py _DOCKER_SOLVER_HARD_TIMEOUT
+# also clamps to 300). Both king and challenger get this same fixed timeout —
+# verified: validate.py:_duel_agent_timeout returns task.agent_timeout_seconds,
+# which is hardcoded to 300 at pool-fill time and never adjusted by king's
+# actual elapsed time. The previous king's 240s loop + 540s multishot wrapper
+# assumed a 600s envelope; that wrapper's second attempt and emergency retry
+# never fire inside 300s. v34 drops the multishot wrapper entirely, raises the
+# loop budget near the 300s floor for one focused attempt, and inlines an emergency single
+# shot at the late-loop level so it actually fits the real envelope.
+# Score = LLM-judge only (validate.py:_combined_round_score returns clamp01(llm)
+# — cursor similarity is logged but does NOT decide rounds).
+#
+# Adaptive timeout strategy: the king used a static chat_completion(timeout=120)
+# inside the loop. A call started near the end could overshoot the 300s docker
+# hard-kill (e.g. start at 240s + hang 120s = 360s — past kill). The agent
+# would not return cleanly; only the on-disk diff would survive via docker's
+# salvage path. v34 keeps the docker safety net but ALSO self-aborts:
+#   - WALL_CLOCK_BUDGET_SECONDS = 270s and WALL_CLOCK_RESERVE_SECONDS = 30s,
+#     so out_of_time() fires around elapsed >= 240s and leaves about 60s to
+#     collect and return the prepared patch before Docker's hard kill.
+#   - Every chat_completion / run_command inside the loop uses
+#     _adaptive_llm_timeout / _adaptive_command_timeout, which clamp the call's
+#     own timeout to (remaining_budget - reserve - headroom). A call started
+#     near the end gets a short socket timeout and fails fast instead of
+#     hanging until docker kills the container.
+#   - Net: agent self-aborts at ~290s, returns prepared work by ~296s,
+#     never touches the 300s docker enforcement.
+WALL_CLOCK_BUDGET_SECONDS = 300.0
+WALL_CLOCK_RESERVE_SECONDS = 10.0
+_LLM_HEADROOM_SECONDS = 5.0           # extra slack subtracted when sizing chat_completion timeout
+_LLM_TIMEOUT_FLOOR = 5                # late calls should fail fast instead of crossing the 290s self-stop
+_LLM_TIMEOUT_CEILING = 120            # never above the king's 120s default
+_CMD_HEADROOM_SECONDS = 2.0           # extra slack subtracted when sizing run_command timeout
+_CMD_TIMEOUT_FLOOR = 3                # late commands should fail fast before the 10s reserve
+
+# v34: inline emergency single-shot trigger. If the loop hasn't produced any
+# patch by EMERGENCY_INLINE_TRIGGER_SECONDS AND the budget left is at least
+# EMERGENCY_INLINE_MIN_REMAINING, fire one focused single-shot LLM call to
+# force a non-empty patch. This is the late-loop equivalent of the king's v66
+# emergency_single_shot, but at a level that actually fits the 300s docker
+# hard-kill (the king's wrapper-level emergency was unreachable).
+EMERGENCY_INLINE_TRIGGER_SECONDS = 200.0
+EMERGENCY_INLINE_MIN_REMAINING = 60.0
+_EMERGENCY_MAX_TOKENS = 1024
+_EMERGENCY_TIMEOUT_SECONDS = 45
+_EMERGENCY_COMMAND_TIMEOUT = 30
+_EMERGENCY_PROMPT_TARGET_CHARS = 2000
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -112,15 +158,57 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
-_LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+# v35: the fundamental bimodal failure-mode in v34 was that the model emitted
+# <final> too early on multi-file tasks (062141 finished in 117.9s while king
+# took 225s on the same task; v34 score 0.16, king 0.58). The keyword-based
+# coverage/criteria gates were fooled by stub edits that mentioned the right
+# tokens. The completeness gate fires when the patch touches FEWER distinct
+# files than the issue mentions paths — a coarser, harder-to-fool signal that
+# catches "1.5K-line patch on a multi-file task" directly.
+MAX_COMPLETENESS_NUDGES = 1
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+# v35: room for the new completeness gate alongside coverage/criteria; the
+# 290s self-stop + adaptive timeouts still keep us inside the docker envelope
+# even when all 3 high-leverage gates fire (each adds ~1 LLM turn ≤ 30s).
+MAX_TOTAL_REFINEMENT_TURNS = 3
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+
+# v34: project-hint block (compact test/build manifest summary). Lets the
+# model pick the right verification command on its first turn instead of
+# burning a turn on `cat package.json | head`. Ported from v32.
+_PROJECT_HINT_BLOCK_BUDGET = 2600
+_PROJECT_HINT_PER_FILE_BUDGET = 700
+_PROJECT_HINT_SCRIPT_KEYWORDS = ("test", "check", "lint", "type", "build")
+
+
+def _remaining_wall_clock(started_at: float) -> float:
+    """Seconds left in the agent's WALL_CLOCK_BUDGET_SECONDS envelope."""
+    return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - started_at)
+
+
+def _adaptive_llm_timeout(started_at: float, default: int = _LLM_TIMEOUT_CEILING) -> int:
+    """Pick a chat_completion socket timeout that won't outlive the wall-clock budget.
+
+    Returns at least _LLM_TIMEOUT_FLOOR (so we never call with a useless 1s
+    timeout) but never more than (remaining - reserve - headroom). When the
+    budget is nearly exhausted, this clamps low so the call fails fast instead
+    of hanging until docker hard-kills the container.
+    """
+    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _LLM_HEADROOM_SECONDS
+    return max(_LLM_TIMEOUT_FLOOR, min(default, int(remaining)))
+
+
+def _adaptive_command_timeout(started_at: float, default: int) -> int:
+    """Pick a run_command timeout that fits inside the remaining budget.
+
+    Per-command timeouts are usually small (15s default), so this only kicks
+    in when a command would have spilled past the reserve.
+    """
+    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _CMD_HEADROOM_SECONDS
+    return max(_CMD_TIMEOUT_FLOOR, min(default, int(remaining)))
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -741,6 +829,15 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    # v34: project-hint block — surfaces test/build manifest scripts so the
+    # model picks the right verification command first turn. Cheap (~300-2600
+    # chars) and lets us reclaim a turn we'd otherwise lose to `cat
+    # package.json | head` exploration. Ported from v32.
+    project_hint = _project_hint_block(repo)
+    if project_hint and used + len(project_hint) <= MAX_PRELOADED_CONTEXT_CHARS + _PROJECT_HINT_BLOCK_BUDGET:
+        parts.append(project_hint)
+        used += len(project_hint)
+
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -749,6 +846,64 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+def _project_hint_block(repo: Path) -> str:
+    """v34: compact test/build manifest summary.
+
+    For package.json: only `scripts` keys whose name matches one of
+    {test, check, lint, type, build}. For other manifests: a 700-char snippet.
+    Whole block capped at _PROJECT_HINT_BLOCK_BUDGET (2600). Returns empty
+    string when no relevant manifests are tracked, so it's a silent no-op
+    on repos that don't ship build config.
+    """
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return ""
+
+    sections: List[str] = []
+    used = 0
+    for name in (
+        "package.json", "pyproject.toml", "pytest.ini", "setup.cfg",
+        "tox.ini", "Makefile", "go.mod", "Cargo.toml",
+        "jest.config.js", "vitest.config.ts",
+    ):
+        if name not in tracked:
+            continue
+        try:
+            raw = (repo / name).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet = ""
+        if name == "package.json":
+            try:
+                payload = json.loads(raw)
+                scripts = payload.get("scripts") if isinstance(payload, dict) else None
+                if isinstance(scripts, dict):
+                    keep = {
+                        k: v for k, v in scripts.items()
+                        if isinstance(k, str) and any(kw in k.lower() for kw in _PROJECT_HINT_SCRIPT_KEYWORDS)
+                    }
+                    if keep:
+                        snippet = json.dumps({"scripts": keep}, indent=2)
+            except Exception:
+                snippet = ""
+        if not snippet:
+            snippet = raw[:_PROJECT_HINT_PER_FILE_BUDGET].rstrip()
+        if not snippet.strip():
+            continue
+        block = f"### {name}\n```\n{snippet}\n```"
+        if used + len(block) > _PROJECT_HINT_BLOCK_BUDGET:
+            break
+        sections.append(block)
+        used += len(block)
+
+    if not sections:
+        return ""
+    return (
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real "
+        "verification command):\n\n" + "\n\n".join(sections)
+    )
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1077,6 +1232,70 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+# v35: completeness gate. The keyword-based coverage/criteria gates are fooled
+# by stub edits that mention the right tokens; the LLM-judge then docks the
+# patch as "missing core work". This gate counts distinct files touched vs
+# distinct paths the issue mentions; if the patch covers fewer than half
+# the mentioned paths AND the issue mentions ≥3 paths (signal of a real
+# multi-file task), it fires a refinement turn that names the gap directly.
+# More aggressive than coverage-nudge because it triggers even when the
+# *exact* path strings don't quite match (e.g., "user.service.ts" mentioned
+# but patch touches "src/services/user.service.ts" — coverage-nudge accepts
+# this; completeness-nudge still flags it if total file count is too low).
+def _completeness_shortfall(patch: str, issue_text: str) -> Optional[Tuple[int, int, List[str]]]:
+    """Return (touched_count, mentioned_count, suggested_paths_to_add) if the
+    patch is significantly under-covered, else None.
+
+    Triggers when:
+      - issue mentions ≥ 3 distinct paths AND
+      - patch touches < ceil(mentioned_count / 2) distinct files
+    The suggested_paths list is the still-uncovered subset of mentions.
+    """
+    mentions = _extract_issue_path_mentions(issue_text)
+    if len(mentions) < 3:
+        return None
+    touched = _patch_changed_files(patch)
+    if not touched:
+        return None  # hail-mary covers this case
+    # Count distinct mentions that are NOT yet in the patch.
+    changed = set(touched)
+    uncovered: List[str] = []
+    for m in mentions:
+        if not any(m == c or c.endswith("/" + m) or c.endswith(m) for c in changed):
+            uncovered.append(m)
+    needed = max(2, (len(mentions) + 1) // 2)
+    if len(touched) >= needed:
+        return None  # coverage is acceptable
+    return (len(touched), len(mentions), uncovered[:8])
+
+
+def build_completeness_nudge_prompt(touched: int, mentioned: int, uncovered: List[str], issue_text: str) -> str:
+    """v35: tell the model its patch covers fewer files than the issue mentions.
+
+    Differs from coverage-nudge: that gate names *exact* paths the patch
+    skipped. This gate addresses the broader "1.5K-line patch on a 9-file
+    task" failure where coverage-by-name happened to pass but the patch is
+    obviously under-implemented vs the task scope.
+    """
+    bullets = "\n  ".join(f"- {p}" for p in uncovered[:8]) or "(none — but file count is still low)"
+    return (
+        f"Completeness gap — your patch touches only {touched} file(s) but the task "
+        f"mentions {mentioned} distinct path(s). Most multi-file tasks need every "
+        f"mentioned path edited, plus any companion tests.\n\n"
+        f"Paths the task mentions that you have NOT yet edited:\n  {bullets}\n\n"
+        "For EACH uncovered path, decide:\n"
+        "  (a) it really needs an edit → open the file and emit the edit "
+        "command(s) now, OR\n"
+        "  (b) you can prove via inspection it does not need editing → say so "
+        "explicitly in your <final> summary.\n\n"
+        "Stub edits (mentioning a keyword in a comment, importing a name, "
+        "adding a TODO) do NOT count — the LLM judge reads the full diff and "
+        "penalises incomplete work as 'missing core functionality'.\n\n"
+        f"Task (for reference):\n{issue_text[:1500]}\n\n"
+        "After your edits, end with <final>summary</final>."
+    )
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -1268,84 +1487,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
-# matters to the LLM judge — clean ruff/eslint output reads as "production code"
-# while warnings make the patch look unfinished.
-
-def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `ruff check` on a Python file. Returns the first issue or None."""
-    if not _has_executable("ruff"):
-        return None
-    proc = run_command(
-        f"ruff check --no-fix --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_LINT_TIMEOUT,
-    )
-    if proc.exit_code == 0:
-        return None
-    output = (proc.stdout or "").strip()
-    if not output:
-        return None
-    first_line = output.splitlines()[0].strip()[:200]
-    return f"{relative_path}: {first_line}"
-
-
-def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `eslint` on a JS/TS file. Returns first issue or None.
-    Skips when no eslint config or no local install is present."""
-    has_config = any(
-        (repo / name).exists()
-        for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
-                     ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
-    )
-    if not has_config:
-        return None
-    has_eslint = (repo / "node_modules" / ".bin" / "eslint").exists() or _has_executable("eslint")
-    if not has_eslint:
-        return None
-    if (repo / "node_modules" / ".bin" / "eslint").exists():
-        cmd = f"./node_modules/.bin/eslint --no-color --format compact {_shell_quote(relative_path)}"
-    else:
-        cmd = f"eslint --no-color --format compact {_shell_quote(relative_path)}"
-    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT)
-    if proc.exit_code == 0:
-        return None
-    output = (proc.stdout or "").strip()
-    if not output:
-        return None
-    for line in output.splitlines():
-        if "Error" in line or "Warning" in line:
-            return f"{relative_path}: {line.strip()[:240]}"
-    return None
-
-
-def _check_lint(repo: Path, patch: str) -> List[str]:
-    """v72: lint every touched file with the appropriate tool. Up to 6 errors."""
-    errors: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        err: Optional[str] = None
-        if suffix == ".py":
-            err = _check_lint_python(repo, relative_path)
-        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-            err = _check_lint_js(repo, relative_path)
-        if err:
-            errors.append(err)
-            if len(errors) >= 6:
-                break
-    return errors
-
-
-def build_lint_fix_prompt(errors: List[str]) -> str:
-    """v72: prompt the model to fix lint issues."""
-    body = "\n".join(f"  - {e}" for e in errors[:6])
-    return (
-        "Lint issues were found in your patch. The judge prefers lint-clean code:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that fixes these specific issues only. Do NOT change "
-        "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
-        "confirm with <final>lint clean</final>."
-    )
+# v34: lint-fix gate removed. King's v72 lint pass cost 10-30s per turn on
+# real validator tasks (ruff per-file timeout was 10s, eslint per-file 10s,
+# capped at 6 issues — so up to 60s in the worst case). Inside a 300s
+# docker hard-kill envelope that's too expensive for the marginal LLM-judge
+# lift; saved budget goes to the inline emergency single-shot instead.
 
 
 def _has_executable(name: str) -> bool:
@@ -1859,11 +2005,15 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is judged by expert LLM diff judges against the issue and a hidden reference intent.
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+The judges reward:
+1. Correctness — the root cause is fixed, not papered over.
+2. Completeness — every issue requirement and acceptance bullet is handled.
+3. Alignment — changed files, APIs, tests, and behavior match the codebase's existing design.
+4. Low churn — no unrelated refactors, formatting, file mode changes, or cosmetic edits.
+
+Optimize for a complete, reviewable, production-quality patch quickly. A small correct patch beats a broad partial one. A patch that misses one bullet often loses even if the touched code looks good.
 
 ## Command format
 
@@ -1879,9 +2029,9 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses the LLM judge.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row before issuing commands. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
@@ -1895,9 +2045,17 @@ brief summary of what changed
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check when a real fast test exists. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing targeted test is strong evidence for the LLM judge. If the right test would clearly take >30 s or tooling is unavailable, run a cheap syntax/build check and finalize.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
+
+## LLM judge completeness checklist
+
+Before finalizing, silently verify:
+- Every named file, route, function, CLI flag, setting, UI state, and edge case in the issue is covered.
+- Signature/type/interface changes are cascaded to all call sites and implementors.
+- If behavior changed, existing companion tests are updated only where required.
+- The diff has no unrelated cleanup that a reviewer would call scope creep.
 
 ## Scope discipline — what to change
 
@@ -1961,6 +2119,25 @@ annotations on modified functions.
 **Multi-file tasks:** Complete ALL affected files in the same diff — never
 leave a related file partially edited. When in doubt, include more files.
 
+## Anti-early-final discipline (v35 — CRITICAL)
+
+The judge consistently scores **partial patches very poorly**, even when the
+edited code is correct, because incomplete work reads as "missing core
+functionality". Concrete rules:
+
+- If the issue mentions **3+ distinct files/paths**, you typically need at
+  least that many edits before <final>. A patch that touches 1-2 files when
+  the issue named 5 will lose by a wide margin.
+- Do NOT emit <final> until you have actually EDITED every file the issue
+  identifies. Mentioning a file's name in a comment, importing its symbol,
+  or adding a TODO does NOT count.
+- On a non-trivial multi-file task, you typically need **5+ turns** of
+  alternating edit/verify before finalizing. Two-turn solutions to large
+  tasks almost always score below 0.3.
+- Quote each acceptance criterion in your final summary and state which file/
+  function in your patch addresses it. If you can't, the criterion is not
+  yet covered.
+
 ## Style matching
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
@@ -1976,6 +2153,27 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+    # v34: front-load acceptance criteria as a numbered checklist at the very
+    # top of the prompt. King only surfaces these in a refinement-nudge AFTER
+    # the patch exists — too late, since the patch is already shaped. This
+    # keeps the model thinking about "address every bullet" from turn 1.
+    # v35: append explicit anti-early-final language. The v34 mini-duel showed
+    # that the model sometimes claims completeness after a 1-2 turn stub edit;
+    # this calls that out directly.
+    criteria = _extract_acceptance_criteria(issue)
+    criteria_section = ""
+    if criteria:
+        bullets = "\n".join(f"  {idx}. {c}" for idx, c in enumerate(criteria, 1))
+        criteria_section = (
+            "ACCEPTANCE CRITERIA — every patch is judged against ALL of these. "
+            "Address each one explicitly:\n"
+            f"{bullets}\n\n"
+            "Do NOT emit <final> until you have actually EDITED the files needed "
+            "to satisfy each criterion above. Mentioning a criterion's keywords "
+            "in a comment, adding a TODO, or importing a symbol does NOT count "
+            "as addressing it — the LLM judge reads the full diff.\n\n"
+        )
+
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -1984,7 +2182,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 """
 
-    return f"""Fix this issue:
+    return f"""{criteria_section}Fix this issue:
 
 {issue}
 
@@ -2200,22 +2398,16 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Main agent
 # -----------------------------
 
-# -----------------------------
-# v28 multi-shot helpers
-# -----------------------------
-
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
-
-# v66: emergency single-shot constants (adapted from PR518)
-_EMERGENCY_MAX_TOKENS = 1024
-_EMERGENCY_TIMEOUT_SECONDS = 45
-_EMERGENCY_COMMAND_TIMEOUT = 30
-_EMERGENCY_PROMPT_TARGET_CHARS = 2000
+# v34: emergency single-shot helpers retained — now invoked inline inside the
+# main loop (not from a multishot wrapper). Goal is the same as the king's
+# v66 emergency: when the planning loop hasn't produced any patch by the
+# late-loop checkpoint, fire ONE focused LLM call that names a target file
+# and asks for the smallest substantive edit. Costs ~30-45s and stays inside
+# the 300s docker hard-kill envelope.
 
 
 def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """v66: pick the single most-likely-to-need-editing tracked file."""
+    """Pick the single most-likely-to-need-editing tracked file."""
     mentioned_paths = _extract_issue_path_mentions(task_text)
     tracked = set(_tracked_files(repo))
     for mention in mentioned_paths:
@@ -2233,7 +2425,7 @@ def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
 
 
 def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """v66: stripped-down single-shot prompt: one command, one final, nothing else."""
+    """Stripped-down single-shot prompt: one command, one final, nothing else."""
     task_view = task_text[:1500]
     return (
         "You are a one-shot patch generator. Time and tokens are extremely "
@@ -2247,91 +2439,6 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
         "Format:\n<command>\nyour single command here\n</command>\n"
         "<final>emergency edit</final>"
     )
-
-
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """v66: single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-
-    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
-    repo: Optional[Path] = None
-    try:
-        repo = _repo_path(repo_path_value)
-        ensure_git_repo(repo)
-        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-
-        target = _emergency_pick_target(repo, task_text)
-        if target is None:
-            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict()
-
-        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-        prompt = _emergency_build_prompt(target, snippet, task_text)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response_text, _, _ = chat_completion(
-                messages=messages,
-                model=model_name,
-                api_base=base,
-                api_key=key,
-                max_tokens=_EMERGENCY_MAX_TOKENS,
-                timeout=_EMERGENCY_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-        except Exception as exc:
-            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
-            patch_text = get_patch(repo) if repo is not None else ""
-            return AgentResult(
-                patch=patch_text, logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=bool(patch_text.strip()),
-            ).to_dict()
-
-        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
-        commands = extract_commands(response_text)
-        if not commands:
-            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
-        for cmd in commands[:2]:
-            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
-            logs.append(format_observation(result))
-
-        patch_text = get_patch(repo)
-        return AgentResult(
-            patch=patch_text,
-            logs=_safe_join_logs(logs),
-            steps=1,
-            cost=0.0,
-            success=bool(patch_text.strip()),
-        ).to_dict()
-    except Exception:
-        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
-        patch_text = ""
-        if repo is not None:
-            try:
-                patch_text = get_patch(repo)
-            except Exception:
-                pass
-        return AgentResult(
-            patch=patch_text, logs=_safe_join_logs(logs),
-            steps=0, cost=None, success=False,
-        ).to_dict()
 
 
 _ERR_LOC_PATTERNS = [
@@ -2357,121 +2464,17 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
     return results[:8]
 
 
-def _multishot_count_substantive(patch: str) -> int:
-    if not patch.strip():
-        return 0
-    n = 0
-    for line in patch.splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-        body = line[1:].strip()
-        if not body:
-            continue
-        if _line_is_comment(body):
-            continue
-        n += 1
-    return n
-
-
-def _multishot_capture_head(repo: Path) -> Optional[str]:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo), capture_output=True, text=True, timeout=10, check=False,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.strip()
-    except Exception:
-        pass
-    return None
-
-
-def _multishot_revert(repo: Path, head: Optional[str]) -> None:
-    try:
-        if head:
-            subprocess.run(["git", "reset", "--hard", head],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-        else:
-            subprocess.run(["git", "checkout", "."],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-        subprocess.run(["git", "clean", "-fd"],
-                       cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-    except Exception:
-        pass
-
-
-def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
-    if not patch_text.strip():
-        return True
-    try:
-        proc = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn"],
-            cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
-        )
-        if proc.returncode != 0:
-            proc2 = subprocess.run(
-                ["git", "apply", "--3way", "--whitespace=nowarn"],
-                cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
-            )
-            return proc2.returncode == 0
-        return True
-    except Exception:
-        return False
-
-
-def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
-    """Extract the last failing command from attempt logs for the retry memo."""
-    logs_text = result.get("logs", "") or ""
-    last_fail = ""
-    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
-        if "EXIT_CODE:\n" in chunk:
-            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
-            if ec_match and ec_match.group(1) != "0":
-                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
-                if cmd_match:
-                    last_fail = cmd_match.group(1).strip()[:200]
-    return last_fail
-
-
-def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
-    """Summarise attempt 1 so attempt 2 can take a different angle."""
-    patch = result.get("patch", "") or ""
-    return {
-        "attempt1_files_touched": _patch_changed_files(patch),
-        "attempt1_substantive_lines": _multishot_count_substantive(patch),
-        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
-        "attempt1_last_failed_command": _last_failed_commands_summary(result),
-    }
-
-
-def _format_multishot_memo(memo: Dict[str, Any]) -> str:
-    """Render memo as a concise PRIOR ATTEMPT NOTES block for the user prompt."""
-    files = memo.get("attempt1_files_touched") or []
-    lines = memo.get("attempt1_substantive_lines", 0)
-    missing = memo.get("attempt1_unaddressed_paths") or []
-    last_fail = memo.get("attempt1_last_failed_command", "")
-    parts = [
-        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
-        f"  Files touched: {', '.join(files) if files else 'none'}",
-        f"  Substantive lines added: {lines}",
-    ]
-    if missing:
-        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
-    if last_fail:
-        parts.append(f"  Last failing command: {last_fail}")
-    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
-    return "\n".join(parts)
-
-
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (v34 — single-attempt with inline emergency, sized for 300s docker)
 # -----------------------------
 
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
+
+# MINER-EDITABLE: validator entry point. v34 dropped the multishot wrapper
+# (king's _v65_multishot_driver assumed a 600s envelope; the 300s docker
+# hard-kill at validate.py:_POOL_SOLVE_TIMEOUT_SECONDS made attempt-2 / wrapper-
+# emergency unreachable). v34 runs ONE focused attempt with a 290s self-stop
+# target inside the 300s Docker envelope and inlines the emergency single-shot
+# into the loop itself.
 def solve(
     repo_path: str,
     issue: str,
@@ -2485,34 +2488,28 @@ def solve(
     """
     Main portable interface for validators.
 
-    v65: wrapped in patch-preserve safety net (from chain king PR486).
-    Any uncaught exception in the multishot body returns the on-disk patch
-    state instead of propagating. The validator scores empty patches at
-    zero — any non-empty diff beats empty.
+    Wraps the inner _solve_attempt in a patch-preserve safety net: any uncaught
+    exception returns the on-disk diff so the validator never sees an empty
+    patch on internal harness errors. Empty patches score 0; any non-empty
+    diff has a chance with the LLM judge.
     """
-    return _v65_solve_with_safety_net(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
-
-
-def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """v65 safety-net wrapper. Adapted from chain king PR486."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
+    repo: Optional[Path] = None
     try:
-        _multishot_repo_obj = _repo_path(repo_path)
+        repo = _repo_path(repo_path)
     except Exception:
         pass
 
     try:
-        return _v65_multishot_driver(kwargs, _multishot_repo_obj)
+        return _solve_attempt(
+            repo_path=repo_path, issue=issue, model=model,
+            api_base=api_base, api_key=api_key,
+            max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        )
     except Exception as exc:
         salvaged = ""
         try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
+            if repo is not None:
+                salvaged = get_patch(repo)
         except Exception:
             salvaged = ""
         return AgentResult(
@@ -2524,93 +2521,8 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
-def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
-    """The original UID195 multishot logic, separated so the safety-net try/except wraps it cleanly."""
-    repo_path = kwargs["repo_path"]
-    issue = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-    max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
-    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
-    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-
-    _multishot_started = time.monotonic()
-    _multishot_total_budget = 540.0  # v69: 580->540, reserves 60s headroom for safety net before docker kill at 600s
-    _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
-    if _multishot_repo_obj is None:
-        _multishot_repo_obj = _repo_path(repo_path)
-    _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
-
-    _result1 = _solve_attempt(**_multishot_args)
-    _patch1 = _result1.get("patch", "") or ""
-    _n1 = _multishot_count_substantive(_patch1)
-
-    # Only retry when the patch is empty OR it has too few substantive lines
-    # AND failed to touch any path the issue explicitly mentions. A surgical
-    # 1-2 line fix that covers the required paths is correct — don't discard it.
-    _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
-    if not _should_retry:
-        _result1["multishot_attempts"] = 1
-        return _result1
-
-    _elapsed = time.monotonic() - _multishot_started
-
-    # v70: broadened emergency trigger. Originally (v66/v69) only fired when
-    # attempt 1 returned empty AND had >=2 MODEL_ERROR markers. v70 also fires
-    # on ANY empty attempt 1 (not just transport failures) — sometimes the
-    # planning loop just exits cleanly with no patch, and we still want a
-    # cheap single-shot fallback rather than burning the retry budget on the
-    # same chain that produced nothing.
-    _attempt1_logs = _result1.get("logs", "") or ""
-    _attempt1_was_error_failure = (
-        not _patch1.strip()
-        and _attempt1_logs.count("MODEL_ERROR") >= 2
-    )
-    # v70: also fire on plain empty attempt (no error markers required).
-    _attempt1_was_plain_empty = not _patch1.strip()
-    _should_fire_emergency = _attempt1_was_error_failure or _attempt1_was_plain_empty
-    if _should_fire_emergency and (_multishot_total_budget - _elapsed) > 60.0:
-        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result_emergency = _solve_emergency_single_shot(**_multishot_args)
-        _patch_emergency = _result_emergency.get("patch", "") or ""
-        if _multishot_count_substantive(_patch_emergency) > 0:
-            _result_emergency["multishot_attempts"] = 2
-            _result_emergency["multishot_winner"] = "emergency"
-            return _result_emergency
-        _elapsed = time.monotonic() - _multishot_started
-
-    if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-        _result1["multishot_attempts"] = 1
-        _result1["multishot_skipped_retry"] = "insufficient_time"
-        return _result1
-
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
-    _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
-
-    if _n2 >= _n1:
-        _result2["multishot_attempts"] = 2
-        _result2["multishot_winner"] = "retry"
-        return _result2
-
-    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
-    _result1["multishot_attempts"] = 2
-    _result1["multishot_winner"] = "primary"
-    return _result1
-
-
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Original solve loop, callable through kwargs to avoid re-stating the
-    validator-protected parameter signature outside of solve()."""
+    """Single-attempt solve loop with inline emergency single-shot fallback."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -2619,7 +2531,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-    _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2629,10 +2540,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    lint_turns_used = 0  # v72
+    # v34: lint_turns_used removed (lint-fix gate disabled).
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    completeness_nudges_used = 0  # v35: catches under-scoped patches on multi-file tasks
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2660,18 +2572,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. coverage-nudge — name issue-mentioned paths still untouched
-            2. criteria-nudge — name issue acceptance bullets not addressed
-            3. test — actually run the companion test if one exists; if it
+            1. completeness-nudge (v35) — patch touches < half of mentioned paths on a multi-file task
+            2. coverage-nudge — name issue-mentioned paths still untouched
+            3. criteria-nudge — name issue acceptance bullets not addressed
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. polish — drop low-signal hunks the model still emitted
-            5. syntax — quote any parser error back at the model
-            6. self-check — show the diff and ask "did you cover everything?"
-        Judge-half gates (coverage, criteria, companion test) fire before
-        cursor-half gates (polish, syntax) so the two-turn cap is spent on
-        the highest-leverage signals first.
+            5. polish — drop low-signal hunks the model still emitted
+            6. syntax — quote any parser error back at the model
+            7. self-check — show the diff and ask "did you cover everything?"
+        Judge-half gates (completeness, coverage, criteria, companion test)
+        fire before cursor-half gates (polish, syntax) so the budget is spent
+        on the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, completeness_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2690,6 +2603,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Hard-stop when the cap is reached (hail-mary excluded).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
+
+        # v35: completeness gate fires FIRST among non-hail-mary gates because
+        # the v34 mini-duel showed that "patch is far smaller than scope" is
+        # the dominant loss mode (062141: 117s elapsed, 13K lines vs king 225s,
+        # 50K lines, V34 score 0.16 vs K 0.58). Catching this before
+        # coverage/criteria gives the model a chance to expand BEFORE the
+        # finer-grained gates fire on the still-too-small patch.
+        if completeness_nudges_used < MAX_COMPLETENESS_NUDGES:
+            shortfall = _completeness_shortfall(patch, issue)
+            if shortfall is not None:
+                touched, mentioned, uncovered = shortfall
+                completeness_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_completeness_nudge_prompt(touched, mentioned, uncovered, issue),
+                    f"COMPLETENESS_NUDGE_QUEUED: touched={touched}/{mentioned}",
+                )
+                return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
@@ -2752,20 +2684,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v72: lint pass — runs ruff/eslint when project tooling is available.
-        # Different axis from syntax (which proves the file parses); lint
-        # catches style issues the LLM judge dings as "unfinished code".
-        if lint_turns_used < MAX_LINT_TURNS:
-            lint_errors = _check_lint(repo, patch)
-            if lint_errors:
-                lint_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_lint_fix_prompt(lint_errors),
-                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
-                )
-                return True
+        # v34: lint-fix gate removed — see config block above.
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -2787,8 +2706,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         preloaded_context = build_preloaded_context(repo, issue)
 
         _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
-        if _multishot_memo:
-            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _initial_user},
@@ -2809,6 +2726,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
+                # v34: clamp the call's socket timeout to remaining budget so a
+                # slow LLM near the end of the loop fails fast (preventing
+                # docker hard-kill from interrupting our return path).
+                step_llm_timeout = _adaptive_llm_timeout(solve_started_at)
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -2816,6 +2737,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=step_llm_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -2823,7 +2745,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 except Exception as exc:
                     logs.append(
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
-                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
+                        f"{MAX_STEP_RETRIES + 1}, timeout={step_llm_timeout}s):\n{exc}"
                     )
                     if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
@@ -2886,7 +2808,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                # v34: hard self-stop. Even at the adaptive command floor, a
+                # large command batch near the end could push the loop past Docker's
+                # kill. Bail out of the batch as soon as we cross out_of_time.
+                if out_of_time():
+                    skipped = len(command_batch) - command_index + 1
+                    logs.append(
+                        f"\nBUDGET_STOP: out_of_time at command {command_index}/"
+                        f"{len(command_batch)}; skipped {skipped} remaining commands."
+                    )
+                    break
+                # v34: clamp per-command timeout to remaining budget so a
+                # long-running shell command can't push us past docker hard-kill.
+                cmd_timeout = _adaptive_command_timeout(solve_started_at, command_timeout)
+                result = run_command(command, repo, timeout=cmd_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
@@ -2962,7 +2897,65 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        # v34: late-loop emergency single-shot. Fires when the loop exits with
+        # an empty patch AND the budget left fits one more focused LLM call.
+        # Replaces the king's wrapper-level emergency, which never reached its
+        # 60s reserve check inside the 300s docker hard-kill envelope.
+        # Hard guarantee: we never enter the emergency block once out_of_time
+        # has fired — the budget_left >= 60 check is sufficient by itself, but
+        # we re-check out_of_time defensively in case clock skew or a long
+        # final get_patch pushed us past the boundary mid-cleanup.
         patch = get_patch(repo)
+        elapsed = time.monotonic() - solve_started_at
+        budget_left = WALL_CLOCK_BUDGET_SECONDS - elapsed - WALL_CLOCK_RESERVE_SECONDS
+        if (
+            not patch.strip()
+            and not out_of_time()
+            and budget_left >= EMERGENCY_INLINE_MIN_REMAINING
+        ):
+            try:
+                emergency_target = _emergency_pick_target(repo, issue)
+            except Exception:
+                emergency_target = None
+            if emergency_target is not None:
+                logs.append(f"\n\nEMERGENCY_INLINE: empty after main loop, targeting {emergency_target}")
+                snippet = _read_context_file(repo, emergency_target, _EMERGENCY_PROMPT_TARGET_CHARS)
+                emergency_prompt = _emergency_build_prompt(emergency_target, snippet, issue)
+                emergency_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a one-shot patch generator. Output exactly one "
+                            "bash command then <final>summary</final>. Nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": emergency_prompt},
+                ]
+                emergency_timeout = max(_LLM_TIMEOUT_FLOOR, min(_EMERGENCY_TIMEOUT_SECONDS, int(budget_left - 15)))
+                try:
+                    emergency_text, _ec, _er = chat_completion(
+                        messages=emergency_messages,
+                        model=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=_EMERGENCY_MAX_TOKENS,
+                        timeout=emergency_timeout,
+                        max_retries=0,
+                    )
+                    logs.append("EMERGENCY_RESPONSE:\n" + emergency_text)
+                    for cmd in extract_commands(emergency_text)[:2]:
+                        # v34: hard self-stop guard. Bail before issuing any
+                        # further commands once budget reserve is gone.
+                        if out_of_time():
+                            logs.append("EMERGENCY_INLINE_BUDGET_EXHAUSTED: skipping remaining commands")
+                            break
+                        emerg_cmd_timeout = _adaptive_command_timeout(solve_started_at, _EMERGENCY_COMMAND_TIMEOUT)
+                        result = run_command(cmd, repo, timeout=emerg_cmd_timeout)
+                        logs.append(format_observation(result))
+                except Exception as exc:
+                    logs.append(f"EMERGENCY_INLINE_FAIL: {exc}")
+                patch = get_patch(repo)
+
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
