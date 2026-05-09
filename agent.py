@@ -117,6 +117,25 @@ _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+# Missing-required-class gate: when the issue says "implement the X class"
+# or "the X class is missing", but the diff does NOT add `class X` anywhere
+# AND no file in the touched directories declares `class X`, fire a hard
+# nudge that names the missing class and the most likely target path. The
+# common failure mode this closes is the agent finding a same-named class
+# in a *nested* sub-folder (a different package in Java/Kotlin/etc.),
+# concluding "the class exists already", and ignoring the criteria-nudge.
+# Fires BEFORE criteria-nudge so the more concrete signal wins the
+# refinement slot when both would trigger.
+#
+# Two attempts: with a single attempt, models tend to dismiss the gate by
+# re-asserting "X already exists in <subdir>/". The second attempt uses an
+# escalated prompt (build_missing_class_prompt(..., attempt=2)) that
+# explicitly rebuts that dismissal pattern. Together with
+# MAX_TOTAL_REFINEMENT_TURNS = 2 this means a stuck missing-class case
+# uses both refinement turns, crowding out criteria-nudge / self-check
+# for that round — fine, since those soft gates can't fix a missing-file
+# failure anyway.
+MAX_MISSING_CLASS_TURNS = 2
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -1770,6 +1789,291 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Required-class-declaration gate (v45)
+# -----------------------------
+#
+# When the issue says things like "the `Pixel` class is missing", "implement
+# the X class", or "the X class that provides ...", the strongest possible
+# proxy for "your patch is incomplete" is: did you actually emit a `class X`
+# declaration on a `+` line of the diff? If not, no soft criteria-nudge is
+# going to convince a confident-but-wrong model — a common failure mode is
+# the agent seeing a same-named class in a sibling sub-folder (a different
+# package) and dismissing the criterion. This gate reads the issue, finds the
+# class names that the criteria require, checks the diff and the touched
+# directories, and produces a hard, file-specific corrective prompt when
+# any required class is missing.
+
+_CLASS_REQUIRED_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    # "the `Pixel` class is fully implemented" / "the Pixel class is missing"
+    re.compile(
+        r"the\s+`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class\s+(?:is\s+(?:fully\s+)?(?:implemented|missing)|"
+        r"that\s+provides|provides|must\s+(?:be\s+)?(?:fully\s+)?implemented)",
+        re.IGNORECASE,
+    ),
+    # "implement the `Pixel` class" / "implement a Pixel class"
+    re.compile(
+        r"implement(?:\s+the|\s+a|\s+an)?\s+(?:missing\s+)?`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+    # "missing `Pixel` class" / "the missing Pixel class"
+    re.compile(
+        r"missing\s+`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+    # "create a `Pixel` class" / "add the Pixel class"
+    re.compile(
+        r"(?:create|add)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+)
+
+# Don't treat ordinary nouns capitalised at sentence start as required classes
+# even if a regex above happens to match them. These are common false hits.
+_CLASS_REQUIRED_BLOCKLIST: frozenset = frozenset({
+    "The", "This", "That", "These", "Those", "When", "Where", "Why", "Who",
+    "What", "How", "Your", "Our", "My", "Their", "His", "Her", "Its", "All",
+    "Any", "Each", "Every", "None", "Some", "Such", "Same", "Other", "Another",
+    "First", "Second", "Third", "Final", "New", "Old", "Picture", "Color",
+    "Image", "Test", "Tests", "Object", "String", "Integer", "Boolean",
+    "Method", "Methods", "Field", "Fields", "Class", "Classes", "Interface",
+    "Function", "Variable",
+})
+
+# Map source-file extensions used to look up an existing class declaration
+# and to suggest a path when none exists yet. `.java` first because that's
+# our highest-signal failure mode; the rest are a courtesy for other typed
+# OO languages the validator might surface.
+_CLASS_FILE_EXTENSIONS: Tuple[str, ...] = (
+    ".java", ".kt", ".scala", ".cs", ".ts", ".tsx",
+)
+
+
+def _required_classes_from_issue(issue_text: str) -> List[str]:
+    """Class names the issue explicitly asks the agent to implement/create.
+
+    Returns capitalised identifiers that match one of the "implement / missing
+    / class is fully implemented" patterns. Filters out grammar-cap false
+    positives via _CLASS_REQUIRED_BLOCKLIST. Order is first-mention; result
+    is deduplicated."""
+    seen: set = set()
+    result: List[str] = []
+    for pattern in _CLASS_REQUIRED_PATTERNS:
+        for match in pattern.finditer(issue_text):
+            name = match.group("name")
+            if not name or name in _CLASS_REQUIRED_BLOCKLIST:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def _patch_declares_class(patch: str, class_name: str) -> bool:
+    """Whether the diff adds a top-level `class <name>` declaration.
+
+    Looks specifically at `+` lines (unchanged context lines don't count —
+    the criterion is "your patch declares this class", not "the repo
+    happens to mention this class somewhere"). Permissive about modifiers
+    so it handles `public class`, `public final class`, `abstract class`,
+    `class`, etc. Also catches TypeScript-style `export class` and Kotlin
+    `data class`."""
+    declaration = re.compile(
+        r"^\+\s*(?:export\s+)?(?:default\s+)?"
+        r"(?:public\s+|private\s+|protected\s+|internal\s+)?"
+        r"(?:static\s+|abstract\s+|final\s+|sealed\s+|data\s+|open\s+)*"
+        r"class\s+" + re.escape(class_name) + r"\b",
+        re.MULTILINE,
+    )
+    return bool(declaration.search(patch))
+
+
+def _file_declares_class(repo: Path, relative_path: str, class_name: str) -> bool:
+    """Whether the file at relative_path declares `class <name>` in source."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return False
+    if not full.is_file():
+        return False
+    if full.suffix.lower() not in _CLASS_FILE_EXTENSIONS:
+        return False
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    pattern = re.compile(r"\bclass\s+" + re.escape(class_name) + r"\b")
+    return bool(pattern.search(text))
+
+
+def _repo_declares_class(repo: Path, class_name: str, search_dirs: List[str]) -> Optional[str]:
+    """Return the relative path of any file *directly in* one of search_dirs
+    that already declares `class <name>`.
+
+    NOTE: deliberately NON-recursive. The whole point of this gate is to
+    catch the failure mode where the agent sees a same-named class in a
+    nested subdirectory (a different package in Java/Kotlin/Scala/C#) and
+    concludes "the class exists, criterion satisfied" — even though the
+    correct fix requires creating the class in the same package as the
+    file under edit. Recursive search would re-introduce that bug. The
+    correct prior is "the class lives in the same package as the file
+    you're editing", which means the same directory the diff is touching.
+    """
+    if not search_dirs:
+        search_dirs = ["."]
+    seen_paths: set = set()
+    pattern = re.compile(r"\bclass\s+" + re.escape(class_name) + r"\b")
+    candidates: List[Path] = []
+    repo_resolved = repo.resolve()
+    for rel_dir in search_dirs:
+        base = (repo / rel_dir).resolve() if rel_dir not in {".", ""} else repo_resolved
+        try:
+            base.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not base.is_dir():
+            continue
+        for ext in _CLASS_FILE_EXTENSIONS:
+            for candidate in base.glob(f"*{ext}"):
+                if not candidate.is_file():
+                    continue
+                key = str(candidate)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                candidates.append(candidate)
+                if len(candidates) >= 200:  # bounded scan
+                    break
+            if len(candidates) >= 200:
+                break
+        if len(candidates) >= 200:
+            break
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if pattern.search(text):
+            try:
+                return str(path.relative_to(repo_resolved))
+            except (ValueError, RuntimeError):
+                return str(path)
+    return None
+
+
+def _patch_touched_dirs(patch: str) -> List[str]:
+    """Distinct relative directories of files touched by the patch."""
+    seen: List[str] = []
+    seen_set: set = set()
+    for path in _patch_changed_files(patch):
+        parent = str(Path(path).parent)
+        if parent == "":
+            parent = "."
+        if parent not in seen_set:
+            seen_set.add(parent)
+            seen.append(parent)
+    return seen
+
+
+def _dominant_class_extension(
+    repo: Path, patch: str, touched_dirs: List[str]
+) -> Optional[str]:
+    """Best-guess source extension for a missing class, derived from the
+    actual repo state — never hardcoded.
+
+    Resolution order:
+      1. Extension of the most-touched file in the diff that uses one of
+         the supported OO extensions. If you're editing `App.ts`, the
+         missing class should be `.ts`, not `.java`.
+      2. Most common supported extension found *directly in* (non-recursive)
+         any of the touched directories. Catches the case where the diff
+         only edits e.g. a build/config file but the package dir is
+         clearly Kotlin/Scala/etc.
+      3. None — caller should suggest a path without an extension and let
+         the model pick.
+    """
+    from collections import Counter
+
+    counts: Counter = Counter()
+    for changed in _patch_changed_files(patch):
+        ext = Path(changed).suffix.lower()
+        if ext in _CLASS_FILE_EXTENSIONS:
+            counts[ext] += 1
+    if counts:
+        return counts.most_common(1)[0][0]
+
+    repo_resolved = repo.resolve()
+    for rel_dir in touched_dirs:
+        base = (repo / rel_dir).resolve() if rel_dir not in {".", ""} else repo_resolved
+        try:
+            base.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not base.is_dir():
+            continue
+        for ext in _CLASS_FILE_EXTENSIONS:
+            for candidate in base.glob(f"*{ext}"):
+                if candidate.is_file():
+                    counts[ext] += 1
+    if counts:
+        return counts.most_common(1)[0][0]
+    return None
+
+
+def _suggest_class_file_path(
+    class_name: str, touched_dirs: List[str], extension: Optional[str]
+) -> Optional[str]:
+    """Best-guess relative path for a missing `class <name>` source file.
+
+    Combines the first touched directory (the "package" the agent is
+    editing) with the language extension picked by
+    `_dominant_class_extension`. Returns None when neither is available;
+    the prompt builder then falls back to "create it next to the files
+    you've been editing" without naming an extension.
+    """
+    if not touched_dirs:
+        return None
+    rel_dir = touched_dirs[0].rstrip("/")
+    if not extension:
+        return None
+    if rel_dir in {".", ""}:
+        return f"{class_name}{extension}"
+    return f"{rel_dir}/{class_name}{extension}"
+
+
+def _missing_required_classes(
+    repo: Path, patch: str, issue_text: str
+) -> List[Tuple[str, Optional[str]]]:
+    """Class names the issue requires that are missing from the patch.
+
+    "Missing" means: (1) the class is named in the issue under an
+    "implement/missing/fully-implemented/provides" verb, AND (2) the diff
+    does not add a `class X` declaration on a `+` line, AND (3) no file in
+    any directory the diff already touches declares `class X`. Each result
+    is paired with a best-guess relative path for a new file.
+    """
+    required = _required_classes_from_issue(issue_text)
+    if not required:
+        return []
+    touched = _patch_touched_dirs(patch)
+    extension = _dominant_class_extension(repo, patch, touched)
+    missing: List[Tuple[str, Optional[str]]] = []
+    for cls in required:
+        if _patch_declares_class(patch, cls):
+            continue
+        if _repo_declares_class(repo, cls, touched):
+            # Class already exists in or near the package the agent is
+            # editing — that satisfies the "X exists" half of the criterion;
+            # any "fully implemented" gap will be flagged by the regular
+            # criteria-nudge against the bullet text.
+            continue
+        suggested = _suggest_class_file_path(cls, touched, extension)
+        missing.append((cls, suggested))
+    return missing
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2149,6 +2453,119 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "Do NOT add scope the task did not ask for. Do NOT rewrite working "
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_missing_class_prompt(
+    missing: List[Tuple[str, Optional[str]]],
+    issue_text: str,
+    attempt: int = 1,
+) -> str:
+    """Hard, file-specific corrective prompt for the missing-class gate.
+
+    `attempt` is 1 on first invocation, 2 on the retry (when
+    MAX_MISSING_CLASS_TURNS > 1). The two prompts share their binding
+    facts (the verification result the harness already produced) but the
+    retry version is shorter and more terminal — designed to break the
+    "but X.java exists in a subdirectory" / "but the snippet is preloaded"
+    dismissal patterns commonly observed when the gate fires.
+
+    Structural choices that matter for efficacy:
+      - Verification facts come BEFORE the criteria text and BEFORE any
+        prose, because models that dismiss the gate skim the prompt and
+        anchor on whatever appears first.
+      - Required-action block uses concrete `cat > … << 'EOF'` syntax with
+        the resolved suggested path filled in, because abstract "create a
+        file" is dismissable while a copy-pasteable command is not.
+      - Anti-dismissal block names the three observed wrong arguments
+        ("but X exists in <subdir>", "but the snippet shows X", "but
+        TestClass already uses X via implicit import") so the model can't
+        reach for them without recognising the rebuttal. Java/Kotlin/etc.
+        semantics: subdirectories are different packages and don't satisfy
+        a same-package criterion.
+    """
+    if not missing:
+        return ""
+
+    # Concrete one-liner per missing class — what to do, with the resolved
+    # path. e.g. "  - `class Foo` -> create `pkg/Foo.java`"
+    action_lines: List[str] = []
+    for cls, suggested in missing[:6]:
+        if suggested:
+            action_lines.append(f"  - `class {cls}` -> create `{suggested}`")
+        else:
+            action_lines.append(
+                f"  - `class {cls}` -> create a new source file in the SAME "
+                f"directory as the other files you've edited (a sibling, not "
+                f"a sub-folder)"
+            )
+    actions = "\n".join(action_lines)
+
+    # Pre-built example heredoc using the first missing class's suggested
+    # path so the model has a concrete template, not just abstract guidance.
+    primary_cls, primary_path = missing[0]
+    example_path = primary_path or f"<same-dir-as-edited-files>/{primary_cls}.<ext>"
+
+    rebuttals = (
+        "DISMISSAL PATTERNS THAT ARE WRONG (do not use these in your reply):\n"
+        f"  - 'But `{primary_cls}.<ext>` already exists in a sub-folder like "
+        f"`subpkg/`, `lib/`, `vendor/`.' -> Subdirectories are DIFFERENT "
+        f"packages in Java/Kotlin/Scala/C#/TypeScript. The harness check "
+        f"already excluded them. They DO NOT satisfy this criterion.\n"
+        f"  - 'But `{primary_cls}` is in the preloaded snippet.' -> Preloading "
+        f"a file from a different directory does not place it in the package "
+        f"you're editing.\n"
+        f"  - 'But the file already imports / references `{primary_cls}`.' -> "
+        f"A reference is not a declaration. Typed OO languages do not "
+        f"implicitly import classes from sibling sub-packages.\n"
+    )
+
+    if attempt <= 1:
+        return (
+            "MISSING_CLASS_ENFORCEMENT (refinement turn 1 of 2)\n\n"
+            "VERIFIED FACTS — the harness ran two checks before this prompt "
+            "and both failed:\n"
+            "  1. Your diff's `+` lines do NOT contain `class X` for the "
+            "name(s) below (regex on the unified diff)\n"
+            "  2. The DIRECTORIES you have already touched (non-recursive — "
+            "subdirectories deliberately excluded) do NOT contain any source "
+            "file declaring `class X`\n\n"
+            "REQUIRED ACTION — emit one such command per missing class in "
+            "your NEXT response:\n\n"
+            f"{actions}\n\n"
+            "Concrete template to copy and fill in:\n\n"
+            "<command>\n"
+            f"cat > {example_path} << 'EOF'\n"
+            f"<full body of class {primary_cls} — every field and every "
+            "method named in the acceptance criteria, in the language of the "
+            "surrounding files, matching their imports/package decl/brace "
+            "style/comment style>\n"
+            "EOF\n"
+            "</command>\n\n"
+            f"{rebuttals}\n"
+            "After writing every missing class file, end with "
+            "`<final>summary</final>` if no other edits remain.\n\n"
+            "Acceptance criteria for the missing class(es):\n"
+            f"{issue_text[:1500]}\n"
+        )
+
+    # attempt >= 2 — the model already dismissed the gate once. Keep the
+    # binding facts and rebuttals but make the prompt shorter and more
+    # terminal: "this is your last chance, just write the file."
+    return (
+        "MISSING_CLASS_ENFORCEMENT (FINAL refinement turn 2 of 2)\n\n"
+        "Your previous response did NOT create the file(s). The harness's "
+        "two checks (diff has no `class X`; touched directories have no "
+        "file declaring `class X`) STILL hold. There is no further "
+        "refinement turn after this one.\n\n"
+        "REQUIRED ACTION — emit these heredoc commands NOW:\n\n"
+        f"{actions}\n\n"
+        f"{rebuttals}\n"
+        "Do not justify, do not search the codebase, do not argue. Write "
+        "each missing file with `cat > <path> << 'EOF' ... EOF`, then "
+        "`<final>`.\n\n"
+        "Acceptance criteria:\n"
         f"{issue_text[:1500]}\n"
     )
 
@@ -2633,6 +3050,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    missing_class_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2649,8 +3067,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         prompt_text: str,
         marker: str,
     ) -> None:
-        """Append assistant + corrective user message and journal it."""
-        logs.append(f"\n{marker}\n")
+        """Append assistant + corrective user message and journal it.
+
+        Also write the corrective prompt body to `logs`. Previously only
+        the short marker (e.g. `MISSING_CLASS_QUEUED:  Foo -> pkg/Foo.java`)
+        reached the log, while the actual prompt the model received went
+        into `messages` only — making
+        it impossible to audit after the fact whether the model dismissed a
+        gate because the prompt was weak or because the model itself failed
+        to comply. The next MODEL_RESPONSE in the log is now meaningful only
+        because we can read what it was responding to.
+        """
+        logs.append(
+            f"\n{marker}\n"
+            f"\nREFINEMENT_PROMPT:\n{prompt_text}"
+        )
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
@@ -2661,17 +3092,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
             1. coverage-nudge — name issue-mentioned paths still untouched
-            2. criteria-nudge — name issue acceptance bullets not addressed
-            3. test — actually run the companion test if one exists; if it
+            2. missing-class — name issue-required classes not declared by
+                               the diff (and not already present in any
+                               touched directory). v45.
+            3. criteria-nudge — name issue acceptance bullets not addressed
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. polish — drop low-signal hunks the model still emitted
-            5. syntax — quote any parser error back at the model
-            6. self-check — show the diff and ask "did you cover everything?"
+            5. polish — drop low-signal hunks the model still emitted
+            6. syntax — quote any parser error back at the model
+            7. self-check — show the diff and ask "did you cover everything?"
         Judge-half gates (coverage, criteria, companion test) fire before
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
+
+        Missing-class fires AFTER coverage-nudge but BEFORE criteria-nudge
+        because it produces the most concrete, file-specific corrective
+        prompt of the three name-something gates — it should win the single
+        refinement slot when both it and criteria-nudge would trigger.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2700,6 +3139,38 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # Missing-class gate: closes a common failure mode. When the issue
+        # calls a class out by name with an "implement / is missing /
+        # fully implemented" verb but the diff contains no
+        # `class X` declaration AND no file in the touched directories
+        # already declares it, send a hard, file-specific corrective prompt.
+        # Fires before criteria-nudge so the more concrete signal wins the
+        # single refinement slot when both would otherwise trigger.
+        #
+        # v46: gate runs up to MAX_MISSING_CLASS_TURNS times. Attempt 1 sends
+        # the structured-rebuttal prompt; attempt 2 sends the FINAL/terminal
+        # variant (build_missing_class_prompt's `attempt` arg). Both share
+        # the binding facts but the second is shorter and gives the model
+        # one final chance to comply before the loop exits.
+        if missing_class_turns_used < MAX_MISSING_CLASS_TURNS:
+            missing_classes = _missing_required_classes(repo, patch, issue)
+            if missing_classes:
+                attempt_number = missing_class_turns_used + 1
+                missing_class_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_class_prompt(
+                        missing_classes, issue, attempt=attempt_number
+                    ),
+                    f"MISSING_CLASS_QUEUED (attempt {attempt_number}/"
+                    f"{MAX_MISSING_CLASS_TURNS}):\n  "
+                    + ", ".join(
+                        f"{cls} -> {path or '?'}" for cls, path in missing_classes
+                    ),
                 )
                 return True
 
