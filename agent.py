@@ -114,6 +114,7 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
+_FORMAT_TIMEOUT = 8        # best-effort formatter timeout before lint
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
@@ -724,6 +725,67 @@ SECRETISH_PARTS = {
 }
 
 
+_PROJECT_HINT_FILES: Tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "Makefile",
+    "go.mod",
+    "Cargo.toml",
+    "jest.config.js",
+    "vitest.config.ts",
+)
+
+
+def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
+    """Compact top-level project hints for choosing targeted verification."""
+    tracked = set(_tracked_files(repo))
+    blocks: List[str] = []
+
+    for relative_path in _PROJECT_HINT_FILES:
+        if relative_path not in tracked:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            data = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if relative_path == "package.json":
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = {}
+            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+            if isinstance(scripts, dict) and scripts:
+                interesting = {
+                    key: scripts[key]
+                    for key in sorted(scripts)
+                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
+                }
+                if interesting:
+                    blocks.append("### package.json scripts\n```json\n" + json.dumps(interesting, indent=2)[:900] + "\n```")
+            continue
+
+        snippet = _truncate(data, 700)
+        if snippet.strip():
+            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
+
+        if len("\n\n".join(blocks)) >= max_chars:
+            break
+
+    if not blocks:
+        return ""
+    return _truncate(
+        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
+        + "\n\n".join(blocks),
+        max_chars,
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -742,6 +804,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
       3. Files that define issue-mentioned symbols use focused slices around
          those definitions, so long files reveal the likely edit region.
+
+      4. Compact project hints expose test/build scripts without spending an
+         extra inspection turn.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -786,6 +851,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    project_hints = _project_hint_block(repo)
+    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+        parts.append(project_hints)
+        used += len(project_hints)
+
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -794,6 +864,10 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
+_BACKTICK_PATH_HITS_MAX = 5
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -809,6 +883,15 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
+
+    seen_mentioned = set(mentioned)
+    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
+        matches = [path for path in tracked_set if ident in path and _context_file_allowed(path)]
+        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
+            for match in sorted(matches):
+                if match not in seen_mentioned:
+                    mentioned.append(match)
+                    seen_mentioned.add(match)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1525,6 +1608,59 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 # v72: lint integration ported from PR559 (UID 154). Clean ruff/eslint output
 # helps keep the patch production-looking while warnings make it look unfinished.
+
+def _organize_imports_python(repo: Path, relative_path: str) -> bool:
+    """Best-effort import organization before linting a touched Python file."""
+    if not _has_executable("ruff"):
+        return False
+    proc = run_command(
+        f"ruff check --select I --fix --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_FORMAT_TIMEOUT,
+    )
+    return proc.exit_code in (0, 1)
+
+
+def _autoformat_python(repo: Path, relative_path: str) -> bool:
+    """Best-effort Python formatting before linting a touched file."""
+    if not _has_executable("ruff"):
+        return False
+    proc = run_command(
+        f"ruff format --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_FORMAT_TIMEOUT,
+    )
+    return proc.exit_code == 0
+
+
+def _autoformat_js(repo: Path, relative_path: str) -> bool:
+    """Best-effort JS/TS formatting when prettier is available."""
+    local_prettier = repo / "node_modules" / ".bin" / "prettier"
+    if local_prettier.exists():
+        cmd = f"./node_modules/.bin/prettier --write --log-level=silent {_shell_quote(relative_path)}"
+    elif _has_executable("prettier"):
+        cmd = f"prettier --write --log-level=silent {_shell_quote(relative_path)}"
+    else:
+        return False
+    proc = run_command(cmd, repo, timeout=_FORMAT_TIMEOUT)
+    return proc.exit_code == 0
+
+
+def _autoformat_touched(repo: Path, patch: str) -> int:
+    """Run semantic-neutral cleanup on touched Python/JS files before lint."""
+    formatted = 0
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        ok = False
+        if suffix == ".py":
+            ok = _organize_imports_python(repo, relative_path) or ok
+            ok = _autoformat_python(repo, relative_path) or ok
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            ok = _autoformat_js(repo, relative_path)
+        if ok:
+            formatted += 1
+    return formatted
+
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     """v72: run `ruff check` on a Python file. Returns the first issue or None."""
@@ -3580,6 +3716,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
         if lint_turns_used < MAX_LINT_TURNS:
+            try:
+                _autoformat_touched(repo, patch)
+                patch = get_patch(repo) or patch
+            except Exception:
+                pass
             lint_errors = _check_lint(repo, patch)
             if lint_errors:
                 lint_turns_used += 1
