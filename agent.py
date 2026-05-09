@@ -93,7 +93,7 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_COMMANDS_PER_RESPONSE = 16
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
+WALL_CLOCK_BUDGET_SECONDS = 260.0  # v73: 240->260 — dual LLM judge rewards thorough patches over speed
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,14 +112,14 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
+MAX_LINT_TURNS = 2         # v73: 1->2 — dual LLM judges penalize lint issues heavily
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # v73: 2->3 — under 100% LLM scoring, one extra refinement
+                                # pass for correctness is worth more than the time it costs
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -777,6 +777,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score = 0
         if relative_path in mentioned:
             score += 100
+        # v73: boost README/docs — dual LLM judges reward project-aware patches
+        if name_lower in {"readme.md", "contributing.md", "changelog.md"}:
+            score += 12
         if path_lower in issue_lower:
             score += 35
         if name_lower and name_lower in issue_lower:
@@ -1859,11 +1862,12 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored two ways, each worth 50%:
-1. Cursor similarity — how closely your diff matches the reference in the files touched, line regions changed, and tokens added/removed.
-2. LLM judge — scores your patch 0-100 for correctness, completeness, and alignment with the task and reference patch. A patch that is correct and complete scores high here even when similarity is modest.
+SYSTEM_PROMPT = """You are a surgical coding agent. Your patch is scored 100% by a dual LLM judge panel (GPT + Claude). Both judges independently score your patch 0-100 for:
+1. CORRECTNESS — does the patch fix the root cause? Are edge cases handled?
+2. COMPLETENESS — does the patch address every requirement in the issue?
+3. ALIGNMENT — does the patch match the task intent without unnecessary scope?
 
-Both scores reward the same core behaviour: identify the root cause, fix it precisely and completely, and add nothing else.
+The judges reward precise, well-reasoned patches that fix the actual root cause. An empty or cosmetic-only patch scores 0. A correct, complete, minimal patch scores highest.
 
 ## Command format
 
@@ -1943,6 +1947,10 @@ Preserve EVERY comment from the surrounding code unless the task explicitly
 removes it. Section-grouping comments (`// Member 1 availability`) are
 high-signal to the judge. Removing comments while refactoring tanks judge
 score.
+
+When making non-obvious logic changes, add a brief inline comment explaining
+WHY (not what). Example: `// fix: off-by-one caused duplicate entries`. Both
+judges reward self-documenting code.
 
 ## Language-specific completeness rules
 
@@ -2091,18 +2099,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Two LLM judges (GPT + Claude) score your patch independently — "
+        "review it against their criteria:\n\n"
+        "CORRECTNESS (both judges — highest weight):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS (both judges — high weight):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE (both judges — medium weight):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2959,7 +2967,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
