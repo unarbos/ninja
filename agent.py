@@ -118,6 +118,14 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_APPLY_VALIDATION_TURNS = 1   # gate A: structural patch integrity check
+MAX_BROKEN_LOOK_NUDGES = 1       # gate B: judge-perception combined gate
+MAX_PLAN_CONSISTENCY_NUDGES = 1  # gate D: plan-vs-patch consistency
+_PLAN_STOPWORDS = {
+    "the", "a", "an", "to", "for", "and", "or", "with", "from",
+    "into", "this", "that", "be", "is", "are", "use", "via",
+    "in", "on", "of", "as", "by", "if", "when", "ensure",
+}
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -741,6 +749,15 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    # Issue-shape-aware augmentation (gate C): placed after ranked files,
+    # before recent-commit style anchors; no-op on surgical tasks.
+    _shape_aug = _shape_augmentation_block(repo, files[:MAX_PRELOADED_FILES], issue, tracked_set)
+    if _shape_aug:
+        _aug_budget = min(MAX_PRELOADED_CONTEXT_CHARS // 8, 4000)
+        if used + len(_shape_aug) <= MAX_PRELOADED_CONTEXT_CHARS + _aug_budget:
+            parts.append(_shape_aug)
+            used += len(_shape_aug)
+
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -749,6 +766,155 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
+# -----------------------------
+# Issue-shape-aware context augmentation (gate C)
+# -----------------------------
+
+def _classify_issue_shape(issue_text: str, tracked_set: Optional[set] = None) -> str:
+    """Return 'new_file', 'integration', 'refactor', or 'surgical'. First match wins."""
+    if tracked_set is not None:
+        path_tokens = re.findall(r"`([\w./-]+\.[a-zA-Z]{1,4})`", issue_text)
+        if any(p not in tracked_set for p in path_tokens):
+            return "new_file"
+    integration_words = {
+        "route", "routes", "endpoint", "endpoints", "schema", "schemas",
+        "model", "models", "migration", "migrations", "controller", "controllers",
+        "serializer", "serializers", "view", "views",
+    }
+    issue_lower = issue_text.lower()
+    if any(w in issue_lower for w in integration_words):
+        criteria = _extract_acceptance_criteria(issue_text)
+        if len(criteria) >= 4:
+            return "integration"
+    refactor_words = {"rename", "move", "refactor", "extract", "deduplicate"}
+    if any(w in issue_lower for w in refactor_words):
+        symbols = _extract_issue_symbols(issue_text)
+        if len(symbols) >= 2:
+            return "refactor"
+    return "surgical"
+
+
+def _new_file_inference_block(repo: Path, issue_text: str, tracked_set: set) -> str:
+    """Style template for inferred new files: one tracked sibling per new path."""
+    path_tokens = re.findall(r"`([\w./-]+\.[a-zA-Z]{1,4})`", issue_text)
+    new_paths = [p for p in path_tokens if p not in tracked_set]
+    if not new_paths:
+        return ""
+    parts: List[str] = []
+    for new_path in new_paths[:3]:
+        parent = str(Path(new_path).parent)
+        sibling = next(
+            (f for f in tracked_set if str(Path(f).parent) == parent and _context_file_allowed(f)),
+            None,
+        )
+        if sibling is None:
+            continue
+        text = _read_context_file(repo, sibling, 1500)
+        snippet = "\n".join(text.splitlines()[:30])
+        if snippet.strip():
+            parts.append(
+                f"Style template for `{new_path}` (from sibling `{sibling}`):\n```\n{snippet}\n```"
+            )
+    return "\n\n".join(parts)
+
+
+def _integration_partner_block(repo: Path, ranked_files: List[str], issue_text: str) -> str:
+    """Include sibling files from integration-heavy directories."""
+    integration_dir_re = re.compile(
+        r"^(routes?|controllers?|serializers?|migrations?|schemas?)/",
+        re.IGNORECASE,
+    )
+    tracked = _tracked_files(repo)
+    partner_dirs: set = set()
+    for f in tracked:
+        if integration_dir_re.match(f):
+            partner_dirs.add(str(Path(f).parent))
+    if not partner_dirs:
+        return ""
+    parts: List[str] = []
+    seen: set = set()
+    for ranked in ranked_files:
+        parent = str(Path(ranked).parent)
+        if parent not in partner_dirs:
+            continue
+        siblings = [
+            f for f in tracked
+            if str(Path(f).parent) == parent and f != ranked and _context_file_allowed(f)
+        ]
+        for sib in siblings[:2]:
+            if sib in seen:
+                continue
+            seen.add(sib)
+            snippet = _read_context_file(repo, sib, 1500)
+            if snippet.strip():
+                parts.append(f"Integration sibling `{sib}`:\n```\n{snippet}\n```")
+        if len(parts) >= 4:
+            break
+    return "\n\n".join(parts[:4])
+
+
+def _symbol_definition_block(repo: Path, ranked_files: List[str], issue_text: str) -> str:
+    """Pull ±15 lines around each issue-symbol definition in ranked files."""
+    symbols = _extract_issue_symbols(issue_text, max_symbols=6)
+    if not symbols:
+        return ""
+    def_re = re.compile(
+        r"^(?:def |function |class |async function )("
+        + "|".join(re.escape(s) for s in symbols)
+        + r")\b",
+        re.MULTILINE,
+    )
+    parts: List[str] = []
+    seen_syms: set = set()
+    for relative_path in ranked_files[:8]:
+        if not _context_file_allowed(relative_path):
+            continue
+        try:
+            text = (repo / relative_path).read_text("utf-8", "replace")
+        except Exception:
+            continue
+        file_lines = text.splitlines()
+        for m in def_re.finditer(text):
+            sym = m.group(1)
+            if sym in seen_syms:
+                continue
+            seen_syms.add(sym)
+            line_no = text[:m.start()].count("\n")
+            lo = max(line_no - 15, 0)
+            hi = min(line_no + 16, len(file_lines))
+            snippet = "\n".join(file_lines[lo:hi])
+            parts.append(
+                f"Definition of `{sym}` in `{relative_path}`:\n```\n{snippet}\n```"
+            )
+            if len(parts) >= 4:
+                break
+        if len(parts) >= 4:
+            break
+    return "\n\n".join(parts)
+
+
+def _shape_augmentation_block(
+    repo: Path, ranked_files: List[str], issue_text: str, tracked_set: set
+) -> str:
+    """Route to the appropriate context augmenter based on issue shape.
+
+    Returns empty string for the 'surgical' shape so tight 1-line tasks
+    don't receive extra context noise.
+    """
+    shape = _classify_issue_shape(issue_text, tracked_set)
+    if shape == "new_file":
+        block = _new_file_inference_block(repo, issue_text, tracked_set)
+    elif shape == "integration":
+        block = _integration_partner_block(repo, ranked_files, issue_text)
+    elif shape == "refactor":
+        block = _symbol_definition_block(repo, ranked_files, issue_text)
+    else:
+        return ""
+    if not block.strip():
+        return ""
+    return f"## Shape-aware context [{shape}]\n\n{block}"
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -994,6 +1160,106 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+# -----------------------------
+# Structural patch validation (gate A)
+# -----------------------------
+
+@dataclass
+class _HunkInfo:
+    target_path: str
+    target_start: int
+    context_lines: List[str]
+    lines: List[str]
+    is_new_file: bool
+
+
+def _iter_unified_hunks(patch: str):
+    """Yield _HunkInfo for each @@ hunk in a unified diff."""
+    target_path = ""
+    is_new_file = False
+    for block in re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE):
+        if not block.startswith("diff --git "):
+            continue
+        is_new_file = "\nnew file mode " in block
+        m = re.search(r"^diff --git a/.+ b/(.+)$", block, re.MULTILINE)
+        if m:
+            target_path = m.group(1)
+        for hunk_text in re.split(r"(?=^@@)", block, flags=re.MULTILINE)[1:]:
+            hdr = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", hunk_text)
+            if not hdr:
+                continue
+            target_start = int(hdr.group(1))
+            context_lines: List[str] = []
+            hunk_lines: List[str] = []
+            for line in hunk_text.splitlines()[1:]:
+                if line.startswith(" "):
+                    context_lines.append(line[1:])
+                    hunk_lines.append(line)
+                elif line.startswith("+") and not line.startswith("+++"):
+                    hunk_lines.append(line)
+                elif line.startswith("-") and not line.startswith("---"):
+                    hunk_lines.append(line)
+            yield _HunkInfo(
+                target_path=target_path,
+                target_start=target_start,
+                context_lines=context_lines,
+                lines=hunk_lines,
+                is_new_file=is_new_file,
+            )
+
+
+def _validate_patch_structurally(repo: Path, patch: str) -> Tuple[bool, List[str]]:
+    """Return (ok, errors[]) for a unified-diff patch.
+
+    Stage 1: git apply --check (binary pass/fail).
+    Stage 2: per-hunk worktree-context verification — sample one
+    non-empty context line per hunk, confirm it appears in the target
+    file within +/- 5 lines of the hunk's declared start line. Catches
+    fabricated-context hunks that --check's tolerance lets pass.
+    """
+    if not patch.strip():
+        return False, ["empty patch"]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check", "-"],
+            input=patch.encode(), capture_output=True, timeout=15,
+        )
+    except Exception as exc:
+        return False, [f"git apply --check failed: {exc}"]
+    errs: List[str] = []
+    if proc.returncode != 0:
+        errs.append(proc.stderr.decode("utf-8", "replace").strip()[:600])
+    for hunk in _iter_unified_hunks(patch):
+        target = repo / hunk.target_path
+        if not target.exists() or hunk.is_new_file:
+            continue
+        try:
+            lines = target.read_text("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        sample = next((c for c in hunk.context_lines if c.strip()), None)
+        if sample is None:
+            continue
+        lo = max(hunk.target_start - 5, 0)
+        hi = min(hunk.target_start + len(hunk.lines) + 5, len(lines))
+        if sample not in lines[lo:hi]:
+            errs.append(f"hunk for {hunk.target_path}:{hunk.target_start} has fabricated context")
+            break
+    return (not errs), errs[:4]
+
+
+def build_apply_validation_prompt(errors: List[str]) -> str:
+    """Repair prompt for structural patch failures."""
+    body = "\n  ".join(errors[:4])
+    return (
+        "Your patch failed structural validation:\n"
+        f"  {body}\n\n"
+        "Re-emit the unified diff with correct context lines that match "
+        "the file as it exists on disk. Do NOT change the logic — only "
+        "fix the context lines so git can apply the patch cleanly."
+    )
 
 
 def _diff_low_signal_summary(patch: str) -> str:
@@ -1767,6 +2033,183 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
+
+
+# -----------------------------
+# Judge-perception broken-look gate (gate B)
+# -----------------------------
+
+def _uncovered_callsite_files(
+    repo: Path, patch: str, modified_files: set, issue_text: str
+) -> List[str]:
+    """Files containing >=2 issue-named symbols that the patch didn't modify."""
+    symbols = _extract_issue_symbols(issue_text, max_symbols=8)
+    if not symbols:
+        return []
+    tracked = set(_tracked_files(repo))
+    candidates = [f for f in tracked if f not in modified_files and _context_file_allowed(f)]
+    hits: List[str] = []
+    for relative_path in candidates[:60]:
+        full = repo / relative_path
+        try:
+            text = full.read_text("utf-8", "replace")
+        except Exception:
+            continue
+        count = sum(1 for sym in symbols if sym in text)
+        if count >= 2:
+            hits.append(relative_path)
+            if len(hits) >= 5:
+                break
+    return hits
+
+
+def _unaddressed_imperative_actions(issue_text: str, patch: str) -> List[str]:
+    """(verb noun) pairs from imperative sentences not reflected in the patch."""
+    added = _patch_added_text(patch)
+    verb_noun_re = re.compile(
+        r"\b(add|remove|update|fix|change|rename|move|delete|create|insert|"
+        r"replace|return|raise|implement)\s+([A-Za-z][A-Za-z0-9_]{2,})\b",
+        re.IGNORECASE,
+    )
+    misses: List[str] = []
+    seen: set = set()
+    for m in verb_noun_re.finditer(issue_text):
+        noun = m.group(2).lower()
+        label = f"{m.group(1).lower()} {noun}"
+        if label in seen:
+            continue
+        seen.add(label)
+        if noun not in added and not _keyword_in_added(noun, added):
+            misses.append(label)
+            if len(misses) >= 5:
+                break
+    return misses
+
+
+def _patch_duplicate_imports(patch: str) -> List[str]:
+    """Import lines added twice in the same file within a patch."""
+    import_re = re.compile(
+        r"^(?:import |from |const \{?.* require\(|require\(|use )",
+        re.IGNORECASE,
+    )
+    file_imports: Dict[str, List[str]] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.search(r" b/(.+)$", line)
+            if m:
+                current_file = m.group(1)
+                file_imports.setdefault(current_file, [])
+        elif line.startswith("+") and not line.startswith("+++"):
+            body = line[1:]
+            if import_re.match(body.strip()):
+                file_imports.setdefault(current_file, []).append(body.strip())
+    dups: List[str] = []
+    for fname, imports in file_imports.items():
+        seen_here: set = set()
+        for imp in imports:
+            if imp in seen_here:
+                dups.append(f"{fname}: {imp[:80]}")
+                break
+            seen_here.add(imp)
+    return dups[:5]
+
+
+def _detect_broken_look(
+    repo: Path, patch: str, issue_text: str, modified_files: set
+) -> Dict[str, List[str]]:
+    """Scan for three judge-visible signals: uncovered callsites, unaddressed actions, duplicate imports.
+
+    Returns dict keyed by category; empty dict means no nudge needed.
+    """
+    findings: Dict[str, List[str]] = {}
+    callsites = _uncovered_callsite_files(repo, patch, modified_files, issue_text)
+    if callsites:
+        findings["uncovered_callsites"] = callsites[:5]
+    actions = _unaddressed_imperative_actions(issue_text, patch)
+    if actions:
+        findings["unaddressed_actions"] = actions[:5]
+    dup = _patch_duplicate_imports(patch)
+    if dup:
+        findings["duplicate_imports"] = dup[:5]
+    return findings
+
+
+def build_broken_look_prompt(findings: Dict[str, List[str]]) -> str:
+    """Single nudge listing all categories — judge-perception preflight."""
+    parts = ["Your patch has judge-perception issues to fix in one revision:"]
+    if "uncovered_callsites" in findings:
+        parts.append(
+            "• Callsites in these files reference issue symbols but were not updated: "
+            + ", ".join(findings["uncovered_callsites"])
+        )
+    if "unaddressed_actions" in findings:
+        parts.append(
+            "• These imperative actions from the issue are not in the patch: "
+            + ", ".join(findings["unaddressed_actions"])
+        )
+    if "duplicate_imports" in findings:
+        parts.append(
+            "• Duplicate import lines: " + ", ".join(findings["duplicate_imports"])
+        )
+    parts.append("Address every category in one re-emission of the unified diff.")
+    return "\n".join(parts)
+
+
+# -----------------------------
+# Plan-vs-patch consistency gate (gate D)
+# -----------------------------
+
+def _last_between(text: str, start_tag: str, end_tag: str) -> str:
+    """Return content of the last occurrence of start_tag...end_tag in text."""
+    idx = text.rfind(start_tag)
+    if idx == -1:
+        return ""
+    inner_start = idx + len(start_tag)
+    idx_end = text.find(end_tag, inner_start)
+    if idx_end == -1:
+        return ""
+    return text[inner_start:idx_end]
+
+
+def _plan_rows_missed(
+    conversation_text: str, patch: str, modified_files: set
+) -> List[str]:
+    """Parse last <plan>...</plan>; return rows the patch doesn't reflect."""
+    block = _last_between(conversation_text, "<plan>", "</plan>")
+    if not block:
+        return []
+    rows = [
+        re.sub(r"^[\s\-\*\d\.\)\]]+", "", line).strip()
+        for line in block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not rows:
+        return []
+    added = _patch_added_text(patch).lower()
+    paths_set = {p.lower() for p in modified_files}
+    misses: List[str] = []
+    for row in rows[:8]:
+        path_tokens = re.findall(r"[\w./-]+\.[a-zA-Z]{1,4}\b", row.lower())
+        if path_tokens and not any(p in paths_set for p in path_tokens):
+            misses.append(row[:140])
+            continue
+        words = [w.lower() for w in re.findall(r"\w{4,}", row)
+                 if w.lower() not in _PLAN_STOPWORDS]
+        if words and not any(w in added for w in words):
+            misses.append(row[:140])
+    return misses[:4]
+
+
+def build_plan_consistency_prompt(missed_rows: List[str]) -> str:
+    """Nudge the model toward rows in its own plan that the patch omits."""
+    bulleted = "\n".join(f"  - {r}" for r in missed_rows)
+    return (
+        "Your earlier <plan> committed to these rows but the patch "
+        "does not visibly implement them:\n" + bulleted +
+        "\nRe-emit the unified diff with each missing row addressed, "
+        "or amend the plan if the row is no longer in scope."
+    )
 
 
 # -----------------------------
@@ -2634,6 +3077,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    apply_validation_turns_used = 0
+    broken_look_nudges_used = 0
+    plan_consistency_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2671,7 +3117,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, apply_validation_turns_used, broken_look_nudges_used, plan_consistency_nudges_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2691,6 +3137,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
+        if apply_validation_turns_used < MAX_APPLY_VALIDATION_TURNS:
+            _ok, _errs = _validate_patch_structurally(repo, patch)
+            if not _ok:
+                apply_validation_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_apply_validation_prompt(_errs),
+                    "APPLY_VALIDATION_QUEUED:\n  " + "; ".join(_errs[:2]),
+                )
+                return True
+
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
             if missing:
@@ -2703,6 +3161,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if broken_look_nudges_used < MAX_BROKEN_LOOK_NUDGES:
+            _modified = set(_patch_changed_files(patch))
+            _findings = _detect_broken_look(repo, patch, issue, _modified)
+            if _findings:
+                broken_look_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_broken_look_prompt(_findings),
+                    "BROKEN_LOOK_QUEUED:\n  " + ", ".join(_findings.keys()),
+                )
+                return True
+
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
@@ -2712,6 +3183,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if plan_consistency_nudges_used < MAX_PLAN_CONSISTENCY_NUDGES:
+            _conv = "\n".join(m.get("content", "") for m in messages)
+            _modified = set(_patch_changed_files(patch))
+            _missed = _plan_rows_missed(_conv, patch, _modified)
+            if _missed:
+                plan_consistency_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_plan_consistency_prompt(_missed),
+                    "PLAN_CONSISTENCY_QUEUED:\n  " + " | ".join(r[:60] for r in _missed[:4]),
                 )
                 return True
 
