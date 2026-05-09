@@ -110,7 +110,7 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
-MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
+MAX_SELF_CHECK_TURNS = 2   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
