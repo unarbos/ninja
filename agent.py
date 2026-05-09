@@ -118,6 +118,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_CALLSITE_NUDGES = 1    # v73 (sol28): cascade-coverage check for multi-file issues
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -1769,6 +1770,162 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+# v73 (sol28): LLM-based criteria coverage check. The keyword-heuristic
+# `_unaddressed_criteria` misses semantic gaps — e.g., a criterion "implement
+# error path" matches existing `error` strings even when the new error path
+# isn't actually added. Asking the model to compare patch ↔ criteria catches
+# these. Cost: one extra ~30s call when the criteria gate fires; budget tight
+# but fits within WALL_CLOCK_BUDGET_SECONDS=240.
+
+_LLM_CRITERIA_REVIEW_TIMEOUT = 90
+_LLM_CRITERIA_REVIEW_MAX_PATCH_CHARS = 12000
+
+
+def _llm_unaddressed_criteria(
+    patch: str,
+    issue_text: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    *,
+    max_tokens: int = 1024,
+) -> Optional[List[str]]:
+    """Ask the model which criteria the patch fails to address.
+
+    Returns:
+      - None on transport error or if the model output is unparseable
+        (caller falls back to heuristic).
+      - [] when all criteria are covered.
+      - List of unaddressed criteria strings otherwise.
+    """
+    criteria = _extract_acceptance_criteria(issue_text)
+    if not criteria:
+        return []
+    if not patch.strip():
+        return list(criteria)
+
+    snippet = _truncate(patch, _LLM_CRITERIA_REVIEW_MAX_PATCH_CHARS)
+    crit_block = "\n".join(f"{i+1}. {c}" for i, c in enumerate(criteria))
+    user_msg = (
+        "You are reviewing a unified diff against a list of acceptance criteria. "
+        "For each criterion, decide whether the diff actually implements it.\n\n"
+        "Acceptance criteria:\n"
+        f"{crit_block}\n\n"
+        "Diff:\n"
+        "```\n" + snippet + "\n```\n\n"
+        "Output a single JSON array of integer indices (1-based) of criteria that are "
+        "NOT yet implemented by the diff. If everything is implemented, output `[]`. "
+        "Output ONLY the JSON array. No prose, no fences, no explanation."
+    )
+    try:
+        content, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a precise code reviewer. Output only the requested JSON."},
+                {"role": "user", "content": user_msg},
+            ],
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            timeout=_LLM_CRITERIA_REVIEW_TIMEOUT,
+        )
+    except Exception:
+        return None
+
+    text = content.strip()
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        text = re.sub(r"^```\w*\s*\n", "", text)
+        text = re.sub(r"\n```\s*$", "", text)
+    # Find first [...] block
+    m = re.search(r"\[[^\[\]]*\]", text)
+    if not m:
+        return None
+    try:
+        indices = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not isinstance(indices, list):
+        return None
+
+    missing: List[str] = []
+    for idx in indices:
+        if not isinstance(idx, int):
+            continue
+        i = idx - 1
+        if 0 <= i < len(criteria):
+            missing.append(criteria[i])
+    return missing
+
+
+# v73 (sol28): multi-callsite coverage check. _symbol_grep_hits already boosts
+# file ranking by symbol matches. After patching, we can detect the inverse
+# case: issue-named symbols whose callsites span multiple files but the patch
+# only touches some. Heuristic — no LLM call.
+
+_CALLSITE_MIN_HITS = 2
+_CALLSITE_MAX_FILES = 6
+
+
+def _callsite_coverage_gaps(
+    repo: Path,
+    patch: str,
+    issue_text: str,
+) -> List[str]:
+    """Files that contain issue-named symbols but aren't touched by the patch.
+
+    Returns: list of relative paths (deduped, capped). Empty list when no gaps
+    or when the symbol grep is inconclusive (single-file usage).
+    """
+    if not patch.strip():
+        return []
+    symbols = _extract_issue_symbols(issue_text)
+    if not symbols:
+        return []
+    tracked = _tracked_files(repo)
+    if not tracked:
+        return []
+    tracked_set = set(tracked)
+    hits = _symbol_grep_hits(repo, tracked_set, issue_text)
+    if not hits:
+        return []
+    # Need symbol coverage to span >=2 files for "callsite gap" to make sense
+    if len(hits) < _CALLSITE_MIN_HITS:
+        return []
+    touched = set(_patch_changed_files(patch))
+    gaps: List[str] = []
+    for relative_path, hit_count in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
+        if relative_path in touched:
+            continue
+        if not _context_file_allowed(relative_path):
+            continue
+        gaps.append(relative_path)
+        if len(gaps) >= _CALLSITE_MAX_FILES:
+            break
+    # Suppress when ALL hit files are already touched (no gap)
+    if not gaps:
+        return []
+    # Suppress when patch already touches at least half the hit files (judgment
+    # call: model probably made a deliberate scope choice)
+    if len(touched & set(hits.keys())) * 2 >= len(hits):
+        return []
+    return gaps
+
+
+def build_callsite_coverage_prompt(missing_files: List[str], issue_text: str) -> str:
+    bullet = "\n".join(f"- `{p}`" for p in missing_files[:6])
+    return (
+        "Your patch references symbols from the issue, but the following files contain "
+        "those same symbols and are NOT touched by your patch:\n\n"
+        f"{bullet}\n\n"
+        "If the issue's intent is that the change cascades through ALL callsites of "
+        "those symbols, you must update these files too. Re-emit a corrected patch "
+        "that covers them. If the issue scope genuinely excludes these files (e.g. they "
+        "are test fixtures, vendored code, or unrelated examples), keep your existing "
+        "patch unchanged.\n\nFormat: standard <command> blocks for the additional edits."
+    )
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -1881,37 +2038,23 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
 
-**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
-
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Edit comprehensively when the task needs it, surgically when it doesn't**:
-- Single-line substitutions: `sed -i 's/old/new/' file`
+**Edit surgically**: change only the lines that implement the fix.
+- One-line substitutions: `sed -i 's/old/new/' file`
 - Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits or new files: a Python heredoc or `cat > file <<'EOF'` block
-- Multi-file edits: emit ALL files in ONE response
+- Larger edits: a minimal Python script or heredoc
+- Never rewrite an entire function when only 1–3 lines need changing
 
-**Multi-file is common**: many reference patches touch multiple files. Do not artificially constrain to one file when the issue spans multiple concerns.
+**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
-
-## Functional completeness
-
-A patch that fully implements the requested behavior is generally rated higher than a partially-implemented one of similar size. To avoid leaving features half-done:
-
-- UI/component tasks: add `useState` + event handlers + wired data flow. Avoid skeleton markup with `// TODO` or pass-through props that don't update state.
-- Service/manager/store tasks: implement the actual methods with real logic, not method signatures with `// implement here`.
-- Form tasks: include input bindings, validation, submission handler, error/loading states — wire the form end-to-end.
-- Data fetch / mutation: include the actual fetch/mutate call with state updates, not `// fetch data here` comments.
-- API handlers: implement the full request/response logic, including error paths.
-
-The diff should be RUNNABLE end-to-end. If a reviewer cleared the repo and applied your patch, the feature should work without further code.
 
 ## Scope discipline — what to change
 
@@ -1922,55 +2065,16 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 
 Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
 
-## New files — create them when the task implies new functionality
-
-When the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist, create the file confidently using `new file mode 100644`. Common signals:
-- "Create a new <Component>" → emit a new .tsx/.vue/.py file
-- "Add a <Service>/<Manager>/<Store>" → create the new module
-- "Implement the <Form> with these fields" → new form component
-- "Add a route/page for X" → new page file
-- New helper modules to keep functions small and the diff readable
-
-Do NOT create gratuitous helpers. Create files only when the task structurally requires them.
-
 ## Scope discipline — what NOT to change
 
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
-- Test files unless the issue requires it OR your source change broke an existing test (most references do not include tests)
+- New helper functions or abstractions unless the issue explicitly requires them
+- New files unless the issue explicitly requires them
+- Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## Match the task's scope
-
-A patch that closely matches the requested behavior is rated higher than one that diverges. What this means concretely:
-
-- **Cover every explicit requirement in the issue.** Issues often have multiple bullets or numbered criteria. Read the issue twice, list the requirements, implement each. Missing one of the requested behaviors is a common reason patches are rated as incomplete.
-
-- **Don't add features the issue doesn't ask for.** Drive-by refactors, type-annotation backfills, comment rewrites, mode-only flips, and imports-you-don't-need are typically cited as "unrelated changes". Stay inside the issue's scope.
-
-- **Wire features end-to-end.** Half-implemented features tend to be rated as "users cannot actually use the feature". If you add a search filter, also add the input field and wire it; if you add a service method, wire the call site; if you add a route, wire the navigation.
-
-## Self-check before final
-
-Before emitting `<final>`, ask yourself:
-1. Did I implement EVERY numbered/bulleted requirement from the issue?
-2. Are there any chmod-only or file-mode changes in my diff? (Remove them.)
-3. Did I add anything the issue doesn't ask for? (Remove it.)
-4. Does any UI feature I added have its event handlers and state wired up?
-5. Does the patch compile/parse? Concretely:
-   - Every imported symbol is actually defined or imported elsewhere
-   - Every function called exists with matching signature
-   - Brace/paren/bracket counts balance
-   - No duplicate function/class/method definitions in the same file
-   - No mismatched types (e.g., calling string method on number)
-   - For TypeScript/Java/Go/C#: type annotations align with actual values
-6. Are there any duplicate hunks or near-duplicate code blocks that should consolidate?
-
-If yes to (2) or (3): clean up before finalizing.
-If issues with (5) or (6): fix them — broken/non-compiling code and duplicate definitions hurt the LLM-judge score significantly.
 
 ## Idiomatic refactors — CRITICAL for judge score
 
@@ -2018,19 +2122,6 @@ leave a related file partially edited. When in doubt, include more files.
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
 
-## TypeScript / TSX / JSX-specific idioms
-
-When editing .ts/.tsx/.jsx files, use these conventions unless the local file shows otherwise:
-- Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
-- Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
-- React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
-- State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
-- Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
-- Async: `async function` with try/catch, NOT `.then()` chains
-- Tailwind: compose classes inline in `className` — don't extract unnecessarily
-- shadcn/ui: import from `@/components/ui/<name>`
-- Type imports: `import type { Foo } from './bar'` when only the type is needed
-
 ## Preloaded snippets
 
 Preloaded files are the most likely edit targets. Edit them directly — do not re-read them.
@@ -2039,85 +2130,6 @@ Preloaded files are the most likely edit targets. Edit them directly — do not 
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 """
-
-
-_MULTI_FILE_KEYWORDS = (
-    "refactor",
-    "delegate",
-    "split into",
-    "split up",
-    "extract",
-    "migrate",
-    "cascade",
-    "across multiple",
-    "multiple files",
-    "across the",
-    "all of the",
-    "every",
-)
-
-
-def _detect_multi_file_task(issue_text: str) -> bool:
-    """Detect tasks that empirically need 4+ file edits.
-
-    Triggers: issue text mentions >=3 distinct file paths, OR has >=6
-    acceptance-criteria bullets, OR contains multi-file keyword.
-    Targets the stub-critique loss mode where mak edits 1 file x 64 lines
-    while challengers edit 4 files x 157 lines and win.
-    """
-    if not issue_text:
-        return False
-    paths = _extract_issue_path_mentions(issue_text)
-    if len(set(paths)) >= 3:
-        return True
-    criteria = _extract_acceptance_criteria(issue_text)
-    if len(criteria) >= 6:
-        return True
-    lower = issue_text.lower()
-    if any(kw in lower for kw in _MULTI_FILE_KEYWORDS):
-        return True
-    return False
-
-
-def _detect_target_languages(repo: Path) -> List[str]:
-    """Return the dominant file extensions in the repo (excluding common noise)."""
-    try:
-        tracked = _tracked_files(repo)
-    except Exception:
-        return []
-    counts: Dict[str, int] = {}
-    skip_exts = {".md", ".lock", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}
-    for path in tracked:
-        ext = Path(path).suffix.lower()
-        if not ext or ext in skip_exts:
-            continue
-        counts[ext] = counts.get(ext, 0) + 1
-    if not counts:
-        return []
-    ranked = sorted(counts.items(), key=lambda x: -x[1])
-    return [ext for ext, _ in ranked[:4]]
-
-
-def _build_language_idiom_block(target_languages: List[str]) -> str:
-    if not target_languages:
-        return ""
-    ts_like = {".ts", ".tsx", ".jsx"}
-    py_like = {".py"}
-    if any(ext in ts_like for ext in target_languages):
-        return (
-            "\nLanguage hint (TypeScript / TSX detected): use existing imports and aliases "
-            "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
-            "elements with onClick/onChange, useState with explicit types. Named function "
-            "exports preferred. Tailwind classes inline in className. shadcn/ui imports from "
-            "`@/components/ui/...`.\n"
-        )
-    if any(ext in py_like for ext in target_languages):
-        return (
-            "\nLanguage hint (Python detected): use type hints, `from __future__ import annotations` "
-            "if file already does, dataclasses for records, async/await over callbacks, and "
-            "stdlib over deps unless the codebase already imports otherwise.\n"
-        )
-    return ""
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
@@ -2147,41 +2159,6 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
-
-
-def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """v33 user message: wraps build_initial_user_prompt with multi-file/lang strategy hints.
-
-    No size targeter — empirical live data shows winners emit 5-15x baseline,
-    not 1.5x; explicit numeric guidance was inert in v32. Functional-completeness
-    language in SYSTEM_PROMPT is the live-validated wedge instead.
-    """
-    base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
-    multi_file = _detect_multi_file_task(issue_text)
-    lang_block = ""
-    try:
-        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
-    except Exception:
-        lang_block = ""
-
-    if multi_file:
-        strategy = (
-            "Strategy override: this task spans MULTIPLE files. Identify all affected files, then "
-            "emit ALL edit commands for ALL files in ONE response. Coordinate cross-file consistency "
-            "— when you change a function signature, type, or interface, cascade the change to every "
-            "caller. Skeleton/stub edits lose to working multi-file implementations even when smaller. "
-            "Comprehensive working implementations beat minimal patches in this codebase."
-        )
-    else:
-        strategy = (
-            "Strategy override: identify the ROOT CAUSE precisely, then implement the fix completely. "
-            "If the task describes new functionality (a component, form, service, page) not already "
-            "in the codebase, create the new file. Wire functional behavior end-to-end — state hooks, "
-            "event handlers, real logic. Skeleton patches with `// TODO` or pass-through props lose "
-            "to working implementations. Comprehensive working implementations beat minimal patches."
-        )
-
-    return base + lang_block + "\n" + strategy + "\n"
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2813,6 +2790,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    callsite_nudges_used = 0  # v73 (sol28)
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2851,7 +2829,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, callsite_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2884,7 +2862,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
+            # v73 (sol28): prefer the LLM-based criteria check over the
+            # keyword heuristic — the heuristic misses semantic gaps where
+            # criterion tokens already exist in the file context but the
+            # actual behavior isn't implemented. Falls back to heuristic on
+            # transport error.
+            unaddressed = _llm_unaddressed_criteria(
+                patch, issue, model, api_base, api_key,
+            )
+            if unaddressed is None:
+                logs.append("CRITERIA_LLM_FALLBACK: using heuristic")
+                unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
                 total_refinement_turns_used += 1
@@ -2892,6 +2880,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # v73 (sol28): callsite-coverage gate. Fires when issue-named symbols
+        # span multiple tracked files but the patch only touches some. Pure
+        # heuristic — no LLM call, fits the budget freely.
+        if (callsite_nudges_used < MAX_CALLSITE_NUDGES
+                and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS):
+            cs_gaps = _callsite_coverage_gaps(repo, patch, issue)
+            if cs_gaps:
+                callsite_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_callsite_coverage_prompt(cs_gaps, issue),
+                    "CALLSITE_NUDGE_QUEUED:\n  " + ", ".join(cs_gaps[:4]),
                 )
                 return True
 
@@ -2971,16 +2975,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
 
         _wall_start = time.monotonic()
-        # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
-        # v32 hardcoded 240s and became dead code under tighter king budgets,
-        # which cost us 4 empty rounds and the duel. This adapts to whatever
-        # budget the king sets — fires 60s before out_of_time().
-        emergency_injected = False
-        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -2992,33 +2990,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
-
-            elapsed = time.monotonic() - _wall_start
-            if (
-                elapsed >= _tle_emergency_threshold
-                and not emergency_injected
-                and not get_patch(repo).strip()
-            ):
-                emergency_injected = True
-                logs.append(
-                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_emergency_threshold:.1f}s "
-                    "patch still empty -- forcing minimal emit prompt before docker kill."
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "EMERGENCY — less than 60 seconds remain before timeout and your "
-                        "draft diff is still empty. An empty patch scores ZERO. A minimal, "
-                        "imperfect edit to the most plausible file from the issue scores "
-                        "non-zero and often wins (since the opponent may also TLE).\n\n"
-                        "In your NEXT response: pick ONE file and ONE edit that addresses "
-                        "the most central requirement in the issue. Use a single `sed -i` or "
-                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
-                        "not run grep. Do not list files. After the edit command, end your "
-                        "response with `<final>emergency edit</final>`. Do this in ONE "
-                        "response."
-                    ),
-                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
