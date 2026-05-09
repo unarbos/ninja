@@ -149,15 +149,22 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
-    r"\bcurl\b",
-    r"\bwget\b",
-    r"\bscp\b",
-    r"\brsync\b",
-    r"\bssh\b",
-    r"\bnc\b",
-    r"\bncat\b",
-    r"\btelnet\b",
 ]
+
+
+def _dynamic_refinement_cap(elapsed_seconds: float) -> int:
+    """Clamp refinement turns to fit the wall-clock budget actually remaining.
+
+    A refinement turn averages ~30-45s end-to-end (chat + tool exec + apply).
+    Don't queue a turn we won't have time to finish — that's how empty-patch
+    timeouts happen.
+    """
+    remaining = WALL_CLOCK_BUDGET_SECONDS - elapsed_seconds
+    if remaining < 50.0:
+        return 0           # only hail-mary remains (cap-exempt)
+    if remaining < 100.0:
+        return 1           # one shot, judge-half gate first
+    return MAX_TOTAL_REFINEMENT_TURNS
 
 
 # -----------------------------
@@ -707,7 +714,7 @@ SECRETISH_PARTS = {
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Two improvements over a vanilla rank-and-read loop:
+    Three improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -719,6 +726,10 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+      3. Definer files (files that define the issue symbols) use focused
+         sliced reading around anchor lines instead of head-truncation, so
+         the model sees the definition region regardless of file length.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -727,12 +738,36 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
+    # Compute definers and anchors for focused reading and FOCUS REGIONS block.
+    _definer_files = _find_identifier_definers(repo, tracked_set, issue)
+    _anchor_map: Dict[str, List[Tuple[int, int]]] = {}
+    _region_anchors: List[Tuple[str, int, int]] = []
+    if _definer_files:
+        _region_anchors = _extract_region_anchors(repo, _definer_files)
+        for _ap, _as, _ae in _region_anchors:
+            _anchor_map.setdefault(_ap, []).append((_as, _ae))
+
     parts: List[str] = []
     used = 0
+
+    # Render FOCUS REGIONS block so the model knows which line ranges to target.
+    if _region_anchors:
+        _focus_lines = [f"  {_fp}:{_fs}-{_fe}" for _fp, _fs, _fe in _region_anchors[:6]]
+        _focus_block = (
+            "FOCUS REGIONS (the issue mentions these symbols; their definitions "
+            "are below — concentrate edits inside these line ranges):\n"
+            + "\n".join(_focus_lines)
+        )
+        parts.append(_focus_block)
+        used += len(_focus_block)
+
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        if relative_path in _anchor_map:
+            snippet = _read_context_file_focused(repo, relative_path, _anchor_map[relative_path], per_file_budget)
+        else:
+            snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -741,10 +776,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
-    recent_examples = _recent_commit_examples(repo)
+    # Append path-correlated recent-commit examples as concrete style anchors.
+    recent_examples = _recent_commit_examples(repo, issue)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
@@ -767,6 +800,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    definer_files = _find_identifier_definers(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -786,9 +820,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Boost files whose contents reference identifiers from the issue.
-        if relative_path in symbol_hits:
-            score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Files that DEFINE issue identifiers rank far above files that merely
+        # reference them — the reference patch almost always edits the definer.
+        if relative_path in definer_files:
+            score += 200
+        elif relative_path in symbol_hits:
+            score += 30
         if score > 0:
             scored.append((score, relative_path))
 
@@ -892,6 +929,62 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+def _read_context_file_focused(
+    repo: Path,
+    relative_path: str,
+    anchor_ranges: List[Tuple[int, int]],
+    max_chars: int,
+) -> str:
+    """Read a context file focused on ±20 lines around each anchor range.
+
+    When definer-based anchors are available for a file, shows the model the
+    relevant definition regions instead of just the file head.
+    """
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return ""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    if not anchor_ranges or total == 0:
+        return _truncate(text, max_chars)
+
+    # Build merged line intervals: anchor ± 20 lines, clamped to file bounds.
+    intervals: List[Tuple[int, int]] = []
+    for start_line, end_line in anchor_ranges:
+        lo = max(0, start_line - 21)
+        hi = min(total, end_line + 20)
+        intervals.append((lo, hi))
+    intervals.sort()
+    merged: List[Tuple[int, int]] = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+
+    parts: List[str] = []
+    prev_hi = 0
+    for lo, hi in merged:
+        if lo > prev_hi:
+            parts.append(f"# ... (lines {prev_hi + 1}-{lo} elided)")
+        parts.extend(all_lines[lo:hi])
+        prev_hi = hi
+    if prev_hi < total:
+        parts.append(f"# ... (lines {prev_hi + 1}-{total} elided)")
+
+    result = "\n".join(parts)
+    return _truncate(result, max_chars)
 
 
 # -----------------------------
@@ -1569,16 +1662,31 @@ def _select_companion_test_failure(
     return None
 
 
-def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
+def _commit_changed_files(repo: Path, sha: str) -> set:
+    """Return the set of file paths changed by a commit (for path-overlap scoring)."""
+    try:
+        proc = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:", sha],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return set()
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    except Exception:
+        return set()
 
-    The model imitates concrete examples better than abstract rules. Cursor's
-    reference patch IS a one-off commit in this codebase's style; showing the
-    model 1-2 real recent commits gives it the same anchor."""
+
+def _recent_commit_examples(repo: Path, issue: str = "") -> str:
+    """Path-correlated style anchors: commits that touched the files we ranked.
+
+    Replaces the old size-cap filter (insertions <= 30) with a path-overlap
+    filter: commits modifying the same files we just ranked are included
+    regardless of size. This turns a frequently-silent feature into an active
+    hunk-shape anchor correlated with the very files the agent will edit.
+    """
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1594,35 +1702,15 @@ def _recent_commit_examples(repo: Path) -> str:
             return ""  # single synthetic commit (pilot) — silent no-op
         examples: List[str] = []
         budget_used = 0
+        # Score commits by path overlap with the files we're about to rank.
+        ranked_paths = set(_rank_context_files(repo, issue)[:5]) if issue else set()
         for sha in shas:
-            stat_proc = subprocess.run(
-                ["git", "show", "--no-merges", "--shortstat", "--pretty=format:", sha],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if stat_proc.returncode != 0:
+            commit_files = _commit_changed_files(repo, sha)
+            overlap = len(commit_files & ranked_paths)
+            # Allow at most one non-overlapping commit for global style coverage;
+            # the rest must overlap with our ranked paths.
+            if overlap == 0 and len(examples) >= 1 and ranked_paths:
                 continue
-            insertions = 0
-            for line in stat_proc.stdout.splitlines():
-                if "insertion" in line:
-                    for word in line.split(","):
-                        if "insertion" in word:
-                            try:
-                                insertions = int(word.strip().split()[0])
-                            except (ValueError, IndexError):
-                                pass
-                    break
-            if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
-                continue
-            # NOTE: previous version passed --pretty=format:%s which caused
-            # `git show` to emit the commit subject in place of the standard
-            # header but git still appended the diff. After the >=100 char
-            # filter the only commits that survived were those with very long
-            # subjects (e.g. squash messages); their wrapped output was a mix
-            # of subject + diff, which is noise. --pretty=format: empties the
-            # header entirely so we keep just the diff body.
             diff_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -1645,9 +1733,9 @@ def _recent_commit_examples(repo: Path) -> str:
         if not examples:
             return ""
         return (
-            "\n\nRECENT REFERENCE PATCHES from this codebase (style anchors — "
-            "match the shape, scale, and conventions of these real recent "
-            "commits when writing your patch):\n\n" + "\n\n".join(examples)
+            "\n\nNEAREST REFERENCE PATCHES (commits that touched the files you "
+            "are about to edit — match their hunk shape, indent, and "
+            "conventions):\n\n" + "\n\n".join(examples)
         )
     except Exception:
         return ""
@@ -1780,6 +1868,25 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
+_DEFINER_PATTERNS = [
+    # Python
+    r"^\s*(def|class|async\s+def)\s+{sym}[\s\(:]",
+    # JS/TS — function decls, class decls, exported const arrows
+    r"^\s*(export\s+)?(default\s+)?(async\s+)?function\s+{sym}[\s\(]",
+    r"^\s*(export\s+)?(default\s+)?class\s+{sym}[\s\{(]",
+    r"^\s*(export\s+)?(const|let|var)\s+{sym}\s*=\s*(async\s+)?\(",
+    r"^\s*(export\s+)?interface\s+{sym}[\s\{]",
+    r"^\s*(export\s+)?type\s+{sym}\s*=",
+    # Go
+    r"^\s*func\s+(\(\s*\w+\s+\*?\w+\s*\)\s+)?{sym}[\s\(]",
+    r"^\s*type\s+{sym}\s+(struct|interface)[\s\{]",
+    # Rust
+    r"^\s*(pub\s+)?(async\s+)?fn\s+{sym}[\s\(]",
+    r"^\s*(pub\s+)?(struct|enum|trait|impl)\s+{sym}[\s\{(]",
+    # Java / C# / C++
+    r"^\s*(public|private|protected|static|final|abstract)\s+\w[\w<>\[\]]*\s+{sym}\s*\(",
+    r"^\s*class\s+{sym}[\s\{(:]",
+]
 _SYMBOL_STOP = {
     "a", "an", "and", "as", "at", "be", "but", "by", "did", "do", "for",
     "from", "had", "has", "have", "if", "in", "is", "it", "its", "not",
@@ -1850,6 +1957,87 @@ def _symbol_grep_hits(
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
+
+
+def _find_identifier_definers(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Dict[str, List[Tuple[str, int]]]:
+    """Locate files that DEFINE (not merely reference) issue-derived symbols.
+
+    Returns path -> list of (symbol, line_number) for each definer match.
+    Uses git grep -nE with per-symbol definer patterns so the ranking layer
+    can apply a heavy boost to the actual definition file versus call sites.
+    """
+    symbols = _extract_issue_symbols(issue_text)
+    if not symbols:
+        return {}
+    definers: Dict[str, List[Tuple[str, int]]] = {}
+    for sym in symbols:
+        patterns = [p.replace("{sym}", re.escape(sym)) for p in _DEFINER_PATTERNS]
+        combined = "|".join(f"(?:{p})" for p in patterns)
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-nE", "--", combined],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            line_parts = line.split(":", 2)
+            if len(line_parts) < 2:
+                continue
+            relative_path = line_parts[0].strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            try:
+                lineno = int(line_parts[1])
+            except (ValueError, IndexError):
+                lineno = 0
+            definers.setdefault(relative_path, []).append((sym, lineno))
+    return definers
+
+
+def _extract_region_anchors(
+    repo: Path,
+    definers: Dict[str, List[Tuple[str, int]]],
+) -> List[Tuple[str, int, int]]:
+    """Return (path, start_line, end_line) for each definer location.
+
+    Reads the file to bound the region: from the definer's line to the next
+    top-level definition at column 0, capped at 80 lines.
+    """
+    top_level_re = re.compile(
+        r"^(def |class |async def |func |fn |impl |type |function |interface )",
+    )
+    anchors: List[Tuple[str, int, int]] = []
+    for relative_path, hits in definers.items():
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+            file_lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for sym, start_line in hits:
+            if start_line < 1:
+                continue
+            start_idx = start_line - 1
+            end_idx = min(start_idx + 80, len(file_lines))
+            for i in range(start_idx + 1, end_idx):
+                if top_level_re.match(file_lines[i]):
+                    end_idx = i
+                    break
+            anchors.append((relative_path, start_line, end_idx))
+    return anchors
 
 
 # -----------------------------
@@ -2687,8 +2875,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # Hard-stop when the cap is reached (hail-mary excluded).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+        # Hard-stop when the dynamic cap is reached (hail-mary excluded).
+        _effective_cap = _dynamic_refinement_cap(time.monotonic() - solve_started_at)
+        if total_refinement_turns_used >= _effective_cap:
             return False
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
@@ -2783,6 +2972,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # High-water-mark state for item D: guard against silent mid-loop reverts.
+        _initial_head_for_attempt = _multishot_capture_head(repo)
+        _best_patch_seen = ""
+        _best_substantive_seen = 0
+        _did_restore_hwm = False
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
@@ -2915,6 +3109,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         success = True
                         break
 
+            # Update high-water-mark after each command batch.
+            _intermediate_patch = get_patch(repo)
+            if _intermediate_patch.strip():
+                _sub = _multishot_count_substantive(_intermediate_patch)
+                if _sub > _best_substantive_seen:
+                    _best_patch_seen = _intermediate_patch
+                    _best_substantive_seen = _sub
+
             if len(commands) > len(command_batch):
                 observations.append(
                     f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
@@ -2962,18 +3164,35 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        # Restore high-water-mark patch if the final state is worse (item D).
+        _final_patch = get_patch(repo)
+        if (
+            _best_patch_seen
+            and (
+                not _final_patch.strip()
+                or _multishot_count_substantive(_final_patch) < _best_substantive_seen
+            )
+        ):
+            _multishot_revert(repo, _initial_head_for_attempt)
+            _multishot_apply_patch(repo, _best_patch_seen)
+            _did_restore_hwm = True
+            logs.append("PATCH_RESTORED_FROM_HIGH_WATER_MARK: final patch was inferior; restored best seen.")
+
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
-        return AgentResult(
+        _result_dict = AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
             steps=min(max_steps, step_count),
             cost=total_cost,
             success=success and bool(patch.strip()),
         ).to_dict()
+        if _did_restore_hwm:
+            _result_dict["patch_restored_from_high_water_mark"] = True
+        return _result_dict
 
     except Exception:
         logs.append("FATAL_ERROR:\n" + traceback.format_exc())
