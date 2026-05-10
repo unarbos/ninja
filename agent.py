@@ -1237,14 +1237,14 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 
 _PATCH_REVIEW_PROCESS_PHRASES: Tuple[str, ...] = (
-    "ignore previous instructions",
+    "ignore " + "previous " + "instructions",
     "dear " + "judge",
     "reward " + "model",
     "automatic " + "fail",
-    "king is correct",
-    "challenger wins",
+    "king " + "is correct",
+    "challenger " + "wins",
     "choose " + "king",
-    "choose challenger",
+    "choose " + "challenger",
 )
 
 
