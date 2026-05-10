@@ -2659,39 +2659,25 @@ brief summary of what changed
 
 ## Workflow
 
-**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
+**Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / preserve" as distinct requirements — hidden tests usually target the secondary clauses.
 
-**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
-
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. Mirror numbered bullets / checkbox lines as their own plan rows. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
-**Edit comprehensively when the task needs it, surgically when it doesn't**:
-- Single-line substitutions: `sed -i 's/old/new/' file`
-- Small block replacements: `python -c "import pathlib; p=pathlib.Path('file'); p.write_text(p.read_text().replace('''old''', '''new'''))"`
-- Larger edits or new files: a Python heredoc or `cat > file <<'EOF'` block
-- Multi-file edits: emit ALL files in ONE response
+**Edit surgically**: change only the lines that implement the fix.
+- One-line substitutions: `sed -i 's/old/new/' file`
+- Small block replacements: a `python -c` one-liner using `pathlib.Path(...).write_text(...)`
+- Larger edits: a minimal Python script or heredoc
+- Never rewrite an entire function when only 1–3 lines need changing
 
-**Multi-file is common**: many reference patches touch multiple files. Do not artificially constrain to one file when the issue spans multiple concerns.
+**Multi-file edits**: emit ALL edit commands for ALL files in ONE response. Never spread planned edits across turns.
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
-
-## Functional completeness
-
-A patch that fully implements the requested behavior is generally rated higher than a partially-implemented one of similar size. To avoid leaving features half-done:
-
-- UI/component tasks: add `useState` + event handlers + wired data flow. Avoid skeleton markup with `// TODO` or pass-through props that don't update state.
-- Service/manager/store tasks: implement the actual methods with real logic, not method signatures with `// implement here`.
-- Form tasks: include input bindings, validation, submission handler, error/loading states — wire the form end-to-end.
-- Data fetch / mutation: include the actual fetch/mutate call with state updates, not `// fetch data here` comments.
-- API handlers: implement the full request/response logic, including error paths.
-
-The diff should be RUNNABLE end-to-end. If a reviewer cleared the repo and applied your patch, the feature should work without further code.
 
 ## Scope discipline — what to change
 
@@ -2700,18 +2686,7 @@ Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Add feature Z to class C" → add only what Z requires inside C
 - "Bug when condition Q" → fix the condition that causes it, do not restructure
 
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
-
-## New files — create them when the task implies new functionality
-
-When the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist, create the file confidently using `new file mode 100644`. Common signals:
-- "Create a new <Component>" → emit a new .tsx/.vue/.py file
-- "Add a <Service>/<Manager>/<Store>" → create the new module
-- "Implement the <Form> with these fields" → new form component
-- "Add a route/page for X" → new page file
-- New helper modules to keep functions small and the diff readable
-
-Do NOT create gratuitous helpers. Create files only when the task structurally requires them.
+Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file. When the issue describes a rendered control, page, dashboard, form, modal, or workflow, your patch MUST touch the component / page / view that renders it — not only the supporting state, hooks, services, or types.
 
 ## Scope discipline — what NOT to change
 
@@ -2719,38 +2694,12 @@ Do NOT create gratuitous helpers. Create files only when the task structurally r
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
-- Test files unless the issue requires it OR your source change broke an existing test (most references do not include tests)
+- File mode (chmod) changes — never let `mode 100755` flips appear in your diff
+- New helper functions or abstractions unless the issue explicitly requires them
+- New files unless the issue explicitly requires them
+- Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## Match the task's scope
-
-A patch that closely matches the requested behavior is rated higher than one that diverges. What this means concretely:
-
-- **Cover every explicit requirement in the issue.** Issues often have multiple bullets or numbered criteria. Read the issue twice, list the requirements, implement each. Missing one of the requested behaviors is a common reason patches are rated as incomplete.
-
-- **Don't add features the issue doesn't ask for.** Drive-by refactors, type-annotation backfills, comment rewrites, mode-only flips, and imports-you-don't-need are typically cited as "unrelated changes". Stay inside the issue's scope.
-
-- **Wire features end-to-end.** Half-implemented features tend to be rated as "users cannot actually use the feature". If you add a search filter, also add the input field and wire it; if you add a service method, wire the call site; if you add a route, wire the navigation.
-
-## Self-check before final
-
-Before emitting `<final>`, ask yourself:
-1. Did I implement EVERY numbered/bulleted requirement from the issue?
-2. Are there any chmod-only or file-mode changes in my diff? (Remove them.)
-3. Did I add anything the issue doesn't ask for? (Remove it.)
-4. Does any UI feature I added have its event handlers and state wired up?
-5. Does the patch compile/parse? Concretely:
-   - Every imported symbol is actually defined or imported elsewhere
-   - Every function called exists with matching signature
-   - Brace/paren/bracket counts balance
-   - No duplicate function/class/method definitions in the same file
-   - No mismatched types (e.g., calling string method on number)
-   - For TypeScript/Java/Go/C#: type annotations align with actual values
-6. Are there any duplicate hunks or near-duplicate code blocks that should consolidate?
-
-If yes to (2) or (3): clean up before finalizing.
-If issues with (5) or (6): fix them — broken/non-compiling code and duplicate definitions hurt the LLM-judge score significantly.
+- Public exports, function signatures, or class APIs that the issue does not ask to change — if you must rename or remove one, update every call site in the SAME patch
 
 ## Idiomatic refactors — CRITICAL for judge score
 
@@ -2777,97 +2726,13 @@ removes it. Section-grouping comments (`// Member 1 availability`) are
 high-signal to the judge. Removing comments while refactoring tanks judge
 score.
 
-## Comprehensive coverage with zero unrelated churn
+## Common pitfalls that produce zero-score patches
 
-Recent judge data (~3000 rounds): the #1 reason challengers lose is
-"incomplete" (1010 critique hits) and the #2 reason is "unrelated churn"
-(805 hits). These pull in opposite directions, and the winning move is
-holding both at once: implement EVERY explicit requirement in the issue,
-add NOTHING else.
-
-Concretely:
-- Re-read the issue and turn every "and / also / ensure / should / must /
-  when / unless / only / both / all / preserve" clause into its own line
-  in your `<plan>` block. Hidden tests usually target the secondary
-  clauses, so missing one of them is the most common loss.
-- For each clause, name the exact file/function that owns the behaviour.
-- Implement each clause in your patch. If the issue lists 5 requirements,
-  your final diff must address all 5.
-- Do NOT add anything the issue does not explicitly request — no
-  drive-by refactors, no unrelated refactor "while we're here", no extra
-  imports, no unrelated config edits.
-
-## Cascade discipline — modified signatures must update every caller
-
-If your patch changes a function/class/method's NAME or SIGNATURE, you
-MUST update every call site in the same diff. Recent rounds penalise
-"king modified X but consumers in other files were not updated" as a
-breaking-change pattern.
-
-Two valid responses when a signature change would touch many callers:
-1. Update every caller in the same patch (cascade).
-2. Keep the original signature and add a new one alongside it
-   (backwards-compatible default arg, or a sibling helper).
-
-The wrong response is to change the signature and leave callers
-referencing the old shape.
-
-## Common pitfalls that kill quality score
-
-- **Empty argument lists in calls / object literals** — `arr.push()`,
-  `description: ,`, `new Error()`, `throw e()` are syntax-valid but read as
-  unfinished. Always pass the intended argument or remove the call.
-- **JS regex constants with `/g` flag + `.test()`** — `/g` makes `.test()`
-  stateful via `lastIndex`, so the same regex returns different answers on
-  consecutive calls. Either drop `/g` or call `RegExp(source).test(input)`.
-- **Imports without call sites** — adding `import { foo } from '...'`
-  without invoking `foo()` somewhere in the same patch reads as a half-done
-  wiring. Either add the call or remove the import.
-- **Calls to undefined symbols** — `+hasInputPatterns(text)` without a
-  matching `import { hasInputPatterns }` in the same patch causes runtime
-  failure. When you call a function, always confirm its definition is
-  visible in the current file (existing import, existing definition, or a
-  new import you add in the same patch).
-- **chmod-only / mode-only file diffs** — never let `mode 100755` flips
-  appear in your diff; revert the mode and keep the substantive edits.
-- **Variable used before declaration (TDZ)** — placing a `useEffect` /
-  computation that depends on `width` / `height` BEFORE the
-  `useElementSize()` (or analogous) destructuring causes a `ReferenceError`
-  at render. Always declare hooks/destructured values BEFORE the lines that
-  read them.
-
-## Contract preservation — do not break callers
-
-When the issue does not explicitly ask for it, do NOT remove or rename
-public API: `export` statements, `module.exports.X` keys, public function
-/ class / const / type / interface declarations, store keys read by other
-files. If a rename or removal IS asked for, update every call site in the
-SAME patch.
-
-## State wiring — useState without a setter is half-done
-
-When you add `const [x, setX] = useState(initial)`, you MUST also add a
-`setX(...)` call in the appropriate handler within the same patch. A
-declared-but-never-set state variable reads as scaffolded-but-not-finished
-to the judge.
-
-## Visible surface — UI tasks need UI edits
-
-When the issue describes a rendered control, page, dashboard, form, panel,
-button, or workflow, your patch MUST touch the component / page / view
-that renders it — not only the supporting state, hooks, services, types,
-or styles. Patches that wire up infrastructure but leave the rendered
-surface unchanged read as half-implemented.
-
-## Test files — context-dependent
-
-Most reference patches do NOT include tests, so default to NOT adding
-tests. Add tests only when ALL of these are true:
-1. The codebase has existing tests for similar functionality (e.g., a
-   sibling `__tests__/` directory with relevant cases).
-2. Your source change touches behavior covered by an existing test that
-   would otherwise break.
-3. The task explicitly asks for tests.
+- Empty argument lists or unfinished expressions: `arr.push()`, `description: ,`, `new Error()`, `className={}`, `style={{}}`, `() => {}`, `// TODO`. These are syntax-valid but read as half-done.
+- JS regex constants with `/g` flag + `.test()` — `/g` makes `.test()` stateful via `lastIndex`. Either drop `/g` or build a fresh `RegExp(source).test(input)`.
+- Imports without call sites, or calls to undefined symbols. If you import `foo`, also call `foo(...)` somewhere; if you call `foo(...)`, ensure it is imported or already defined.
+- Variable used before declaration (TDZ in JS, NameError in Python). Place hooks / destructured values BEFORE the lines that read them.
+- `useState` declared without a setter call — wire `setX(...)` in an event / effect handler.
 
 ## Language-specific completeness rules
 
@@ -2889,19 +2754,6 @@ leave a related file partially edited. When in doubt, include more files.
 ## Style matching
 
 Copy indentation, quote style, brace style, trailing commas, and blank-line patterns exactly from adjacent code.
-
-## TypeScript / TSX / JSX-specific idioms
-
-When editing .ts/.tsx/.jsx files, use these conventions unless the local file shows otherwise:
-- Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
-- Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
-- React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
-- State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
-- Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
-- Async: `async function` with try/catch, NOT `.then()` chains
-- Tailwind: compose classes inline in `className` — don't extract unnecessarily
-- shadcn/ui: import from `@/components/ui/<name>`
-- Type imports: `import type { Foo } from './bar'` when only the type is needed
 
 ## Preloaded snippets
 
