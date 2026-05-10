@@ -823,6 +823,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
+    region_anchors = []
 
     if region_anchors:
         focus_lines = [f"  {path}:{start}-{end}" for path, start, end in region_anchors[:6]]
@@ -2537,6 +2538,8 @@ focused inspection command
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
 **Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. When the issue names a specific test file or command, run that before experimenting with unrelated commands. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+
+**Completeness pass**: before emitting `<final>`, list every acceptance criterion from the issue and verify each appears in your added lines. If any criterion is missing or only partially addressed, fix it in the same response. The LLM judge consistently penalizes "missing N of M criteria" — this gate prevents it.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
