@@ -4777,11 +4777,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
 
         _wall_start = time.monotonic()
-        # Emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS:
-        # a hardcoded value can become dead code under a tighter budget. This
-        # adapts to whatever budget is set — fires 60s before out_of_time().
-        emergency_injected = False
+        # Two-stage emergency for empty patches.
+        # v45: 22% of v42's losses against PR #784 were "challenger timed out
+        # and submitted no usable patch." Root cause: the single late-emergency
+        # at 75% budget didn't leave the model enough time to actually emit.
+        # Stage 1 (55% budget) — soft warning: "patch is empty, narrow scope,
+        # pick one file and edit." Gives the model ~108s on a 240s budget to
+        # comply with a real edit.
+        # Stage 2 (75% budget) — hard emergency: "EMERGENCY, ONE sed edit
+        # NOW." Existing logic, kept as backstop in case stage 1 didn't bite.
+        _tle_warn_threshold = max(WALL_CLOCK_BUDGET_SECONDS * 0.55, 50.0)
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+        warn_injected = False
+        emergency_injected = False
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -4795,6 +4803,36 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             elapsed = time.monotonic() - _wall_start
+
+            # Stage 1: soft warning at 55% budget if patch still empty.
+            # Many of v42's timeouts had this profile: model still in
+            # exploration mode at 130-150s on a 240s budget, then got
+            # squeezed by the 180s hard emergency. Earlier warning gives
+            # ~108s to actually comply.
+            if (
+                elapsed >= _tle_warn_threshold
+                and not warn_injected
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                warn_injected = True
+                logs.append(
+                    f"TLE_WARN_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_warn_threshold:.1f}s "
+                    "patch still empty -- nudging model to narrow scope."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time check: more than half the budget is used and your "
+                        "draft diff is still empty. Stop exploring further files. "
+                        "Pick ONE file that owns the most central requirement in "
+                        "the issue and make a real edit on it now (a focused "
+                        "narrow fix is better than nothing). You can still refine "
+                        "afterwards if budget allows. Do NOT list files, do NOT "
+                        "broaden inspection — go straight to an edit command."
+                    ),
+                })
+
             if (
                 elapsed >= _tle_emergency_threshold
                 and not emergency_injected
