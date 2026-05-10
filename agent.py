@@ -1165,8 +1165,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Reference-architecture verbs in issues. When present we expect the patch
-# to CREATE new files, not just edit existing ones.
+# Issue verbs that imply files must be CREATED, not just edited.
 _NEW_FILE_VERB_RE = re.compile(
     r"\b(create|add|extract|split|move|introduce|new)\s+(?:a\s+|an\s+|new\s+)?(?:"
     r"file|component|page|module|class|util|helper|service|hook|store|"
@@ -1185,58 +1184,48 @@ def _patch_new_files(patch: str) -> List[str]:
     """Files added by the patch (new file mode), in order of first appearance."""
     out: List[str] = []
     seen: set = set()
-    cur_path = ""
+    cur = ""
     for line in patch.splitlines():
         if line.startswith("diff --git "):
             tokens = line.split()
-            cur_path = tokens[3][2:] if len(tokens) >= 4 and tokens[3].startswith("b/") else ""
-        elif line.startswith("new file mode") and cur_path and cur_path not in seen:
-            out.append(cur_path)
-            seen.add(cur_path)
+            cur = tokens[3][2:] if len(tokens) >= 4 and tokens[3].startswith("b/") else ""
+        elif line.startswith("new file mode") and cur and cur not in seen:
+            out.append(cur)
+            seen.add(cur)
     return out
 
 
 def _required_new_files_missing(patch: str, issue_text: str) -> List[str]:
-    """Issue asks to CREATE specific files; flag those still absent from the patch.
+    """Issue asks to create specific files; flag those still absent.
 
-    Targets the most common reference-mismatch failure: the issue/reference
-    expects the agent to create new components (e.g. `cells/HeaderCell.tsx`,
-    `lib/utils.ts`), but the agent edits the existing monolith instead.
-    Even if functional behaviour matches, the LLM judge consistently picks
-    the patch that follows the reference's file structure.
+    When the issue uses verbs like 'create / extract / split into / introduce
+    a new file', the requested behaviour usually depends on those files
+    actually existing. Editing a single monolith does not satisfy that:
+    imports and downstream call sites expect the new modules to exist.
     """
     if not issue_text:
         return []
-    has_create_verb = bool(
-        _NEW_FILE_VERB_RE.search(issue_text)
-        or _NEW_FILE_STRUCT_RE.search(issue_text)
-    )
-    if not has_create_verb:
+    if not (_NEW_FILE_VERB_RE.search(issue_text) or _NEW_FILE_STRUCT_RE.search(issue_text)):
         return []
-    mentioned_paths = _extract_issue_path_mentions(issue_text)
-    if not mentioned_paths:
+    mentioned = _extract_issue_path_mentions(issue_text)
+    if not mentioned:
         return []
-    new_files_in_patch = set(_patch_new_files(patch))
-    changed_files_in_patch = set(_patch_changed_files(patch))
+    new_files = set(_patch_new_files(patch))
+    changed = set(_patch_changed_files(patch))
     missing: List[str] = []
-    for path in mentioned_paths:
-        if path in new_files_in_patch or any(
-            f.endswith("/" + path) for f in new_files_in_patch
-        ):
+    for path in mentioned:
+        if path in new_files or any(f.endswith("/" + path) for f in new_files):
             continue
-        # Edited (not created) — likely pre-existing; not a missing-create case.
-        if path in changed_files_in_patch or any(
-            f.endswith("/" + path) for f in changed_files_in_patch
-        ):
+        if path in changed or any(f.endswith("/" + path) for f in changed):
             continue
         missing.append(path)
     return missing[:6]
 
 
-# Backticked literal scout. Issues frequently spell out exact constants, regex
-# patterns, format strings, error codes, or feature flags inside backticks.
-# When the reference uses those literals and the patch doesn't, the LLM judge
-# picks the king. This gate flags such literals so the model can wire them in.
+# Code-anchor literals: backticked tokens with identifier-shape markers
+# (`%`, `_`, `^`, digits, camelCase, CONSTANT_CASE, kebab-case). These are
+# usually load-bearing for runtime behaviour — substituting a paraphrase or
+# legacy value changes what the code actually does at runtime.
 _BACKTICK_LITERAL_RE = re.compile(r"`([^`\n]{2,80})`")
 _BACKTICK_LITERAL_STOP = frozenset({
     "true", "false", "null", "none", "undefined", "self", "this", "default",
@@ -1246,13 +1235,7 @@ _BACKTICK_LITERAL_STOP = frozenset({
 
 
 def _extract_required_literals(issue_text: str) -> List[str]:
-    """Backticked literals from the issue that look like CODE-LEVEL anchors.
-
-    Filters out keywords, prose phrases, and bare file paths. Keeps literals
-    that contain identifier-shape markers (`_`, `:`, `%`, regex meta, digits,
-    camelCase, CONSTANT_CASE, kebab-case) — these are the high-signal anchors
-    the reference patch typically uses literally.
-    """
+    """Backticked literals that look like CODE-LEVEL anchors, not prose."""
     if not issue_text:
         return []
     seen: set = set()
@@ -1268,25 +1251,17 @@ def _extract_required_literals(issue_text: str) -> List[str]:
             continue
         if raw.lower() in _BACKTICK_LITERAL_STOP:
             continue
-        # Drop pure prose (multi-word, no special chars or digits).
+        # Skip pure prose (multi-word, no special chars or digits).
         if " " in raw and not re.search(r"[_:=%^$().*+\\/{\[\]<>0-9-]", raw):
             continue
-        # Drop bare file paths — _uncovered_required_paths handles those.
+        # Skip bare file paths (handled by _uncovered_required_paths).
         if file_ext_re.search(raw) and "/" in raw:
             continue
         is_anchor = bool(
-            "_" in raw
-            or ":" in raw
-            or "%" in raw
-            or "^" in raw
-            or "$" in raw
-            or "(" in raw
-            or "=" in raw
-            or "->" in raw
-            or "==" in raw
+            "_" in raw or ":" in raw or "%" in raw or "^" in raw or "$" in raw
+            or "(" in raw or "=" in raw or "->" in raw or "==" in raw
             or any(c.isdigit() for c in raw)
-            or re.search(r"[a-z][A-Z]", raw)
-            or re.search(r"[A-Z]{2,}", raw)
+            or re.search(r"[a-z][A-Z]", raw) or re.search(r"[A-Z]{2,}", raw)
             or "-" in raw
         )
         if not is_anchor or len(raw) > 60:
@@ -1299,11 +1274,12 @@ def _extract_required_literals(issue_text: str) -> List[str]:
 
 
 def _required_literals_missing(patch: str, issue_text: str) -> List[str]:
-    """Backticked code literals from the issue that don't appear in patch additions.
+    """Backticked code anchors from the issue not present in patch additions.
 
-    Targets the constant/format-drift failure mode: the reference switches a
-    regex, feature flag, error code, or format string, but the agent keeps
-    the legacy value. Surfacing the literal lets the model wire it in.
+    When the issue spells out an exact literal (regex, feature flag, error
+    code, format string), that value is usually load-bearing. A paraphrase
+    or legacy value changes runtime behaviour even if surrounding logic is
+    correct.
     """
     literals = _extract_required_literals(issue_text)
     if not literals:
@@ -1311,11 +1287,7 @@ def _required_literals_missing(patch: str, issue_text: str) -> List[str]:
     added = _patch_added_text(patch)
     if not added:
         return literals
-    missing: List[str] = []
-    for lit in literals:
-        if lit.lower() not in added:
-            missing.append(lit)
-    return missing[:6]
+    return [lit for lit in literals if lit.lower() not in added][:6]
 
 
 # -----------------------------
@@ -2410,53 +2382,43 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
-def build_required_new_files_prompt(missing_paths: List[str], issue_text: str) -> str:
-    """Tell the model the issue asks to CREATE these files but the patch doesn't."""
-    bullets = "\n  ".join(f"- `{p}`" for p in missing_paths[:6]) or "(none)"
+def build_required_new_files_prompt(missing: List[str], issue_text: str) -> str:
+    """Surface 'create' verbs in the issue when no new file was added."""
+    bullets = "\n  ".join(f"- `{p}`" for p in missing[:6]) or "(none)"
     return (
-        "Reference-structure gap — the task explicitly asks to CREATE the "
-        "following file(s)/component(s), but your current patch neither "
-        "creates nor edits them:\n"
+        "File-structure gap — the task asks to CREATE these file(s) but "
+        "your current patch neither creates nor edits them:\n"
         f"  {bullets}\n\n"
-        "The reference solution organises the work into the file structure "
-        "the task describes. Editing an existing monolith is acceptable for "
-        "small fixes, but when the task says 'create', 'extract', 'split "
-        "into', or 'introduce new', you must add the new file(s) so the "
-        "merged code follows the requested architecture.\n\n"
+        "When the task says 'create', 'extract', 'split into', or "
+        "'introduce a new file', the requested behaviour usually depends on "
+        "those files existing so imports and downstream call sites work.\n\n"
         "For each missing path, decide:\n"
-        "  (a) you can implement the requested behaviour by adding that "
-        "file -> create it now (use a heredoc or `python -c` to write), "
-        "and update any imports/wiring that reference it; OR\n"
-        "  (b) the file is genuinely not needed (e.g., the existing file "
-        "already plays that role) -> respond with <final>summary</final> "
-        "and explain why in the summary.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n\n"
+        "  (a) it really is needed -> create it now (heredoc / `python -c`) "
+        "and wire any imports that reference it; OR\n"
+        "  (b) it's already covered by an existing file -> respond with "
+        "<final>summary</final> and explain in the summary.\n\n"
+        f"Task (for reference):\n{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
     )
 
 
-def build_required_literals_prompt(missing_literals: List[str], issue_text: str) -> str:
-    """Tell the model these backticked literals from the issue should appear in the patch."""
-    bullets = "\n  ".join(f"- `{lit}`" for lit in missing_literals[:6]) or "(none)"
+def build_required_literals_prompt(missing: List[str], issue_text: str) -> str:
+    """Surface backticked code anchors from the issue not in patch additions."""
+    bullets = "\n  ".join(f"- `{lit}`" for lit in missing[:6]) or "(none)"
     return (
-        "Required-literal gap — the task names these specific literal value(s) "
-        "(constants, regex, format strings, identifiers) but they do NOT "
-        "appear in your patch's added lines:\n"
+        "Specified-literal gap — the task names these exact value(s) but "
+        "they don't appear in your patch's added lines:\n"
         f"  {bullets}\n\n"
-        "When the issue spells out an exact literal in backticks, the "
-        "reference solution uses it verbatim. If you used a legacy value, a "
-        "synonym, or a paraphrase, the merged code drifts from the requested "
-        "behaviour and the LLM diff judge marks the patch as incomplete.\n\n"
+        "Backticked literals like regex patterns, feature flags, error codes, "
+        "and format strings usually need to be used verbatim — substituting a "
+        "paraphrase changes runtime behaviour.\n\n"
         "For each missing literal, decide:\n"
-        "  (a) the patch should use that exact value -> emit a <command> to "
-        "add it now (sed -i / python -c) wherever the relevant constant, "
-        "regex, format string, or identifier is defined; OR\n"
-        "  (b) the literal genuinely doesn't apply (e.g., it was an example "
-        "in surrounding prose) -> respond with <final>summary</final> and "
-        "explain why in the summary.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n\n"
+        "  (a) the patch needs that exact value -> emit a <command> to wire "
+        "it in (sed -i / python -c) wherever the constant, regex, format "
+        "string, or identifier is defined; OR\n"
+        "  (b) it was just descriptive prose, not a code anchor -> respond "
+        "with <final>summary</final> and explain in the summary.\n\n"
+        f"Task (for reference):\n{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
     )
 
@@ -2952,8 +2914,8 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
 
 MAX_VISIBLE_SURFACE_NUDGES = 1  # v16-B
 MAX_CASCADE_NUDGES = 1  # v16-B
-MAX_REQUIRED_NEW_FILES_NUDGES = 1  # reference-structure (create/split) gate
-MAX_REQUIRED_LITERALS_NUDGES = 1   # constant/format/regex anchor gate
+MAX_REQUIRED_NEW_FILES_NUDGES = 1
+MAX_REQUIRED_LITERALS_NUDGES = 1
 
 # === visible surface gap detection ===
 _VISIBLE_SURFACE_KEYWORD_RE = re.compile(
@@ -3373,9 +3335,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Reference-structure gate: when the issue says "create / split / extract",
-        # check that the patch actually adds the requested new files. Targets the
-        # most common LLM-judge loss pattern observed in real validator duels.
         if required_new_files_nudges_used < MAX_REQUIRED_NEW_FILES_NUDGES:
             missing_new = _required_new_files_missing(patch, issue)
             if missing_new:
@@ -3388,9 +3347,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Required-literals gate: when the issue spells out exact backticked
-        # literals (regex, constants, format strings) and the patch additions
-        # don't contain them, surface the gap so the model can wire them in.
         if required_literals_nudges_used < MAX_REQUIRED_LITERALS_NUDGES:
             missing_lits = _required_literals_missing(patch, issue)
             if missing_lits:
