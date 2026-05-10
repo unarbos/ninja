@@ -205,6 +205,8 @@ class CommandResult:
 
 
 @dataclass
+
+
 class AgentResult:
     patch: str
     logs: str
@@ -235,6 +237,8 @@ def _is_dangerous_command(command: str) -> Optional[str]:
         if re.search(pattern, lowered):
             return pattern
     return None
+
+
 def _resolve_inference_config(
     model: Optional[str],
     api_base: Optional[str],
@@ -252,9 +256,21 @@ def _resolve_inference_config(
         raise ValueError("api_key is required; validators must pass the per-run proxy token")
 
     return model_name, _normalize_api_base(base), key
+
+
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
+
+
+# -----------------------------
+# OpenAI-compatible client
+# -----------------------------
+
+# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
+# behavior, response parsing, or model-message strategy here. Keep all requests
+# pointed at the api_base/api_key supplied by solve(); the validator proxy
+# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -329,6 +345,8 @@ def chat_completion(
     usage = data.get("usage") or {}
     cost = 0.0 if usage else None
     return content, cost, data
+
+
 def format_observation(result: CommandResult) -> str:
     parts = [
         "COMMAND:",
@@ -346,6 +364,8 @@ def format_observation(result: CommandResult) -> str:
     if result.stderr.strip():
         parts.extend(["", "STDERR:", result.stderr])
     return "\n".join(parts) + "\n"
+
+
 def _normalize_api_base(api_base: str) -> str:
     base = api_base.rstrip("/")
     if base.endswith("/chat/completions"):
@@ -353,6 +373,8 @@ def _normalize_api_base(api_base: str) -> str:
     if base.endswith("/v1"):
         return base
     return base + "/v1"
+
+
 def _command_env() -> Dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -365,6 +387,8 @@ def _command_env() -> Dict[str, str]:
         "PAGER": "cat",
         "CI": "1",
     }
+
+
 def _repo_path(path: str | Path) -> Path:
     p = Path(path).resolve()
     if not p.exists():
@@ -372,8 +396,12 @@ def _repo_path(path: str | Path) -> Path:
     if not p.is_dir():
         raise NotADirectoryError(f"repo_path is not a directory: {p}")
     return p
+
+
 def _message_chars(messages: List[Dict[str, str]]) -> int:
     return sum(len(message.get("content") or "") + 32 for message in messages)
+
+
 def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if _message_chars(messages) <= MAX_CONVERSATION_CHARS:
         return messages
@@ -402,8 +430,12 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
         ),
     }
     return [*head, note, *tail]
+
+
 def _looks_like_traceback(text: str) -> bool:
     return any(marker in text for marker in _TRACEBACK_MARKERS)
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -417,6 +449,16 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+# -----------------------------
+# Shell execution
+# -----------------------------
+
+# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
+# repo. You may improve command validation, environment handling, timeouts, and
+# output shaping. Keep commands scoped to the repo and avoid secrets or network
+# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -498,6 +540,10 @@ ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOT
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
+# -----------------------------
+# Git helpers
+# -----------------------------
+
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
     if git_dir.exists():
@@ -513,6 +559,8 @@ def ensure_git_repo(repo: Path) -> None:
         text=True,
         timeout=30,
     )
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -540,11 +588,15 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
 def extract_final(model_text: str) -> Optional[str]:
     match = FINAL_RE.search(model_text)
     if not match:
         return None
     return match.group(1).strip()
+
+
 def get_patch(repo: Path) -> str:
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
@@ -590,14 +642,20 @@ def get_patch(repo: Path) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     return _strip_low_signal_hunks(cleaned)
+
+
 def extract_command(model_text: str) -> Optional[str]:
     commands = extract_commands(model_text)
     return commands[0] if commands else None
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     if path.suffix == ".pyc":
         return True
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+
+
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
@@ -611,6 +669,8 @@ def get_repo_summary(repo: Path) -> str:
         parts.append(format_observation(res))
 
     return "\n\n".join(parts)
+
+
 def extract_commands(model_text: str) -> List[str]:
     return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
 
@@ -769,6 +829,8 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
+
+
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     """Compact top-level project hints for choosing targeted verification."""
     tracked = set(_tracked_files(repo))
@@ -831,6 +893,8 @@ def _context_file_allowed(relative_path: str) -> bool:
     if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
         return False
     return True
+
+
 def _tracked_files(repo: Path) -> List[str]:
     try:
         proc = subprocess.run(
@@ -846,6 +910,8 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -907,6 +973,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         seen.add(relative_path)
         ranked.append(relative_path)
     return ranked
+
+
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
         r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w.-])",
@@ -918,6 +986,8 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
         if value and value not in mentions:
             mentions.append(value)
     return mentions
+
+
 def _issue_terms(issue: str) -> List[str]:
     stop = {
         "about",
@@ -984,6 +1054,8 @@ def _preload_needles(issue: str) -> List[str]:
         if len(term) >= 4:
             add(term)
     return out
+
+
 def _read_context_file(
     repo: Path,
     relative_path: str,
@@ -1005,6 +1077,8 @@ def _read_context_file(
     if needles:
         return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
+
+
 def _strip_preloaded_section(messages: List[Dict[str, str]]) -> int:
     """Replace the preloaded-snippets block in messages[1] with a brief breadcrumb.
 
@@ -1038,6 +1112,8 @@ def _strip_preloaded_section(messages: List[Dict[str, str]]) -> int:
         return 0
     user_msg["content"] = body[:start] + breadcrumb + body[end:]
     return len(block) - len(breadcrumb)
+
+
 def _extract_relevant_regions(
     text: str,
     needles: List[str],
@@ -1110,6 +1186,8 @@ def _extract_relevant_regions(
         )
 
     return "\n\n".join(parts)
+
+
 def _read_context_file_focused(
     repo: Path,
     relative_path: str,
@@ -1184,6 +1262,8 @@ def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
     """Hunk that only changes blank-line layout."""
     body = [line for line in added + removed if line.strip()]
     return not body and bool(added or removed)
+
+
 def _patch_changed_files(patch: str) -> List[str]:
     """Return the list of `b/` paths touched by a unified diff, in order."""
     seen: List[str] = []
@@ -1192,6 +1272,8 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
 def _line_is_comment(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
@@ -1203,6 +1285,8 @@ def _line_is_comment(line: str) -> bool:
     if stripped.startswith('"""') or stripped.startswith("'''"):
         return True
     return False
+
+
 def _strip_low_signal_hunks(diff_output: str) -> str:
     """Drop blank-only / whitespace-only / comment-only hunks from each file.
 
@@ -1247,6 +1331,8 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
 def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
     """Added and removed lines are identical after stripping whitespace."""
     if not added and not removed:
@@ -1256,11 +1342,15 @@ def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
     if not a and not r:
         return True
     return a == r
+
+
 def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
     body = [line for line in added + removed if line.strip()]
     if not body:
         return False
     return all(_line_is_comment(line) for line in body)
+
+
 def _diff_low_signal_summary(patch: str) -> str:
     """Human-readable summary of low-signal hunks for the polish prompt."""
     if not patch.strip():
@@ -1395,6 +1485,8 @@ _ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], re.Pattern[str]], ...] = (
 
 def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
     return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
+
+
 def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
     """Find explicitly requested artifact classes missing from the patch."""
     if not patch.strip():
@@ -1433,9 +1525,13 @@ def _dependency_metadata_gap_summary(patch: str) -> str:
     if any(_DEPENDENCY_MANIFEST_RE.search(path) for path in changed):
         return ""
     return "patch appears to introduce external package usage without touching a dependency manifest. Package root(s): " + ", ".join(roots[:8])
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
+
+
 def _introduced_dependency_roots(patch: str) -> List[str]:
     added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
     found: List[str] = []
@@ -1455,6 +1551,8 @@ def _introduced_dependency_roots(patch: str) -> List[str]:
             if root not in found:
                 found.append(root)
     return found
+
+
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
@@ -1470,6 +1568,8 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
 def _package_root_from_spec(spec: str) -> str:
     spec = spec.strip().strip("\"'").split("::", 1)[0]
     if not spec or spec.startswith(_LOCAL_IMPORT_PREFIXES):
@@ -1514,6 +1614,8 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}:{exc.lineno}: {exc.msg}"
     except Exception as exc:
         return f"{relative_path}: parse failure: {exc}"
+
+
 def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     full = (repo / relative_path).resolve()
     try:
@@ -1529,6 +1631,8 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}:{exc.lineno}: {exc.msg}"
     except Exception as exc:
         return f"{relative_path}: parse failure: {exc}"
+
+
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     """`node --check file.js` — bytecode parse only, no execution.
 
@@ -1591,6 +1695,8 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
         if "Error" in line or "Warning" in line:
             return f"{relative_path}: {line.strip()[:240]}"
     return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1617,6 +1723,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
+
+
 def build_lint_fix_prompt(errors: List[str]) -> str:
     """Prompt the model to fix lint issues."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
@@ -1627,6 +1735,8 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
         "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
         "confirm with <final>lint clean</final>."
     )
+
+
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
@@ -1700,6 +1810,8 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     if diffs:
         return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
+
+
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     """Run `ruff check` on a Python file. Returns the first issue or None."""
     if not _has_executable("ruff"):
@@ -1716,6 +1828,8 @@ def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
         return None
     first_line = output.splitlines()[0].strip()[:200]
     return f"{relative_path}: {first_line}"
+
+
 def _check_lint(repo: Path, patch: str) -> List[str]:
     """Lint every touched file with the appropriate tool. Up to 6 errors."""
     errors: List[str] = []
@@ -1768,6 +1882,8 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
         "the call entirely if it served no purpose. Do NOT add new behavior "
         "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
     )
+
+
 def _check_empty_args(patch: str) -> List[str]:
     findings: List[str] = []
     if not patch.strip():
@@ -1827,6 +1943,8 @@ def _check_corruption(patch: str) -> List[str]:
             if len(findings) >= 4:
                 return findings
     return findings
+
+
 def build_corruption_fix_prompt(findings: List[str]) -> str:
     body = "\n".join(f"  - {f}" for f in findings)
     return (
@@ -1855,6 +1973,8 @@ def build_duplicate_imports_fix_prompt(findings: List[str]) -> str:
         "removes the redundant import lines, keeping exactly one occurrence "
         "of each. Then end with `<final>imports deduplicated</final>`."
     )
+
+
 def _check_duplicate_imports(repo: Path, patch: str) -> List[str]:
     if not patch.strip():
         return []
@@ -1914,6 +2034,8 @@ def _check_critical_tag_removals(patch: str) -> List[str]:
             net = removed_count - added_count
             findings.append(f"net {net} `{tag}` tag(s) removed without re-adding")
     return findings
+
+
 def build_critical_tag_fix_prompt(findings: List[str]) -> str:
     body = "\n".join(f"  - {f}" for f in findings)
     return (
@@ -1924,6 +2046,8 @@ def build_critical_tag_fix_prompt(findings: List[str]) -> str:
         "the missing closing tag(s) at the correct position(s). Then end "
         "with `<final>tags restored</final>`."
     )
+
+
 def _check_php_syntax(repo: Path, patch: str) -> List[str]:
     findings: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1935,6 +2059,8 @@ def _check_php_syntax(repo: Path, patch: str) -> List[str]:
                 if len(findings) >= 4:
                     break
     return findings
+
+
 def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     if not _has_executable("php"):
         return None
@@ -1950,6 +2076,8 @@ def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return None
     first_line = output.splitlines()[0].strip()[:240]
     return f"{relative_path}: {first_line}"
+
+
 def build_php_syntax_fix_prompt(findings: List[str]) -> str:
     body = "\n".join(f"  - {f}" for f in findings)
     return (
@@ -1979,6 +2107,8 @@ def _check_cstyle_brace_balance(repo: Path, patch: str) -> List[str]:
                 if len(findings) >= 4:
                     break
     return findings
+
+
 def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
     try:
         text = (repo / relative_path).read_text(errors="ignore")
@@ -2036,6 +2166,8 @@ def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[
     if diffs:
         return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
+
+
 def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
     body = "\n".join(f"  - {f}" for f in findings)
     return (
@@ -2087,6 +2219,8 @@ def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
         "kind. Then end with `<final>required files added</final>`.\n\n"
         f"Issue (for reference):\n{snippet}"
     )
+
+
 def _check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
     if not patch.strip() or not issue_text:
         return None
@@ -2140,9 +2274,13 @@ def build_contract_preservation_prompt(findings: List[str]) -> str:
         "new name/API. Do not introduce unrelated behavior. Emit the minimal "
         "<command> block(s), then end with <final>contract preserved</final>."
     )
+
+
 def _shell_quote(value: str) -> str:
     """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2157,6 +2295,8 @@ def _has_executable(name: str) -> bool:
         return shutil.which(name) is not None
     except Exception:
         return False
+
+
 def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
     """Find removed public symbols still referenced by untouched files."""
     if not patch.strip():
@@ -2196,6 +2336,8 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
             if len(findings) >= _CONTRACT_MAX_FINDINGS:
                 break
     return findings
+
+
 def _extract_removed_public_symbol_names(patch: str) -> List[str]:
     seen: set[str] = set()
     names: List[str] = []
@@ -2276,6 +2418,8 @@ def _select_companion_test_failure(
         if output:
             return (partner, output)
     return None
+
+
 def _run_companion_test(
     repo: Path,
     test_path: str,
@@ -2376,6 +2520,8 @@ def _run_companion_test(
         return output[-2400:] if len(output) > 2400 else output
 
     return None
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """Read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -2457,6 +2603,8 @@ def _recent_commit_examples(repo: Path) -> str:
         )
     except Exception:
         return ""
+
+
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     """Return the most plausible test file for a source path, or None."""
     path = Path(relative_path)
@@ -2476,6 +2624,8 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
         if candidate in tracked and _context_file_allowed(candidate):
             return candidate
     return None
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -2544,6 +2694,8 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         if len(bullets) >= _CRITERIA_MAX_BULLETS:
             break
     return bullets
+
+
 def _criterion_keywords(criterion: str) -> List[str]:
     """Significant tokens from a criterion (drop stopwords + short words)."""
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", criterion.lower())
@@ -2569,6 +2721,8 @@ def _keyword_in_added(keyword: str, added_lower: str) -> bool:
                 return True
             break
     return False
+
+
 def _patch_added_text(patch: str) -> str:
     """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
@@ -2576,6 +2730,8 @@ def _patch_added_text(patch: str) -> str:
         if line.startswith("+") and not line.startswith("+++"):
             out.append(line[1:])
     return "\n".join(out).lower()
+
+
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines, surfaced before <final> so the model can close missing work.
@@ -2659,6 +2815,8 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if len(out) >= max_symbols:
             break
     return out
+
+
 def _find_identifier_definers(
     repo: Path,
     tracked_set: set,
@@ -2700,6 +2858,8 @@ def _find_identifier_definers(
                 lineno = 0
             definers.setdefault(relative_path, []).append((symbol, lineno))
     return definers
+
+
 def _extract_region_anchors(
     repo: Path,
     definers: Dict[str, List[Tuple[str, int]]],
@@ -2727,6 +2887,8 @@ def _extract_region_anchors(
                     break
             anchors.append((relative_path, start_line, end_idx))
     return anchors
+
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
@@ -2991,6 +3153,8 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
     )
+
+
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -3023,6 +3187,8 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features or unrelated scope."
     )
+
+
 def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
     return (
         "Requested-artifact check: the task appears to ask for a supporting "
@@ -3038,6 +3204,8 @@ def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
+
+
 def _detect_target_languages(repo: Path) -> List[str]:
     """Return the dominant file extensions in the repo (excluding common noise)."""
     try:
@@ -3055,6 +3223,8 @@ def _detect_target_languages(repo: Path) -> List[str]:
         return []
     ranked = sorted(counts.items(), key=lambda x: -x[1])
     return [ext for ext, _ in ranked[:4]]
+
+
 def _detect_multi_file_task(issue_text: str) -> bool:
     """Detect tasks that empirically need 4+ file edits.
 
@@ -3075,6 +3245,8 @@ def _detect_multi_file_task(issue_text: str) -> bool:
     if any(kw in lower for kw in _MULTI_FILE_KEYWORDS):
         return True
     return False
+
+
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
         "Integration check: your patch appears to add implementation code, but "
@@ -3091,6 +3263,8 @@ def build_integration_nudge_prompt(integration_summary: str, issue_text: str) ->
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
+
+
 def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> str:
     return (
         "Dependency metadata check: your patch appears to import or require a "
@@ -3106,6 +3280,8 @@ def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> s
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
+
+
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
@@ -3127,6 +3303,8 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
+
+
 def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
     """Wraps build_initial_user_prompt with multi-file/lang strategy hints.
 
@@ -3159,6 +3337,8 @@ def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str,
         )
 
     return base + lang_block + "\n" + strategy + "\n"
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -3173,6 +3353,8 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
         "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
         "then end with <final>summary</final>."
     )
+
+
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
@@ -3197,6 +3379,8 @@ def build_polish_prompt(junk_summary: str) -> str:
         "breaking the substantive edits, finalize immediately and keep the "
         "patch as-is."
     )
+
+
 def build_failed_verification_prompt(command: str, observation: str) -> str:
     tail = observation[-3000:] if len(observation) > 3000 else observation
     return (
@@ -3210,6 +3394,8 @@ def build_failed_verification_prompt(command: str, observation: str) -> str:
         "<final>summary</final>. Do not remove the substantive fix unless the "
         "failure proves it is wrong."
     )
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -3237,6 +3423,8 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
 def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
@@ -3246,6 +3434,8 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
         "Do NOT introduce new edits, do NOT refactor. Then end with "
         "<final>summary</final>."
     )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -3266,6 +3456,8 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "permissions. Do NOT add comments only as a substitute for code. Make "
         "a real code edit, then <final> immediately."
     )
+
+
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
@@ -3276,6 +3468,8 @@ by issuing exactly one bash command in this format:
 your command here
 </command>
 """
+
+
 def _build_language_idiom_block(target_languages: List[str]) -> str:
     if not target_languages:
         return ""
@@ -3296,6 +3490,8 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
             "stdlib over deps unless the codebase already imports otherwise.\n"
         )
     return ""
+
+
 def build_patch_safety_prompt(safety_summary: str) -> str:
     return (
         "Patch safety cleanup: your current diff adds review-process wording "
@@ -3308,6 +3504,8 @@ def build_patch_safety_prompt(safety_summary: str) -> str:
         "smallest relevant check if one is available, then end with "
         "<final>summary</final>."
     )
+
+
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
@@ -3362,6 +3560,8 @@ def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
         if _context_file_allowed(relative_path):
             return relative_path
     return None
+
+
 def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
     """Single-call fallback for empty-patch + MODEL_ERROR runs.
     Adapted from PR518 (UID 20)."""
@@ -3445,6 +3645,8 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
             patch=patch_text, logs=_safe_join_logs(logs),
             steps=0, cost=None, success=False,
         ).to_dict()
+
+
 def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
     """Stripped-down single-shot prompt: one command, one final, nothing else."""
     task_view = task_text[:1500]
@@ -3483,6 +3685,8 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
                 seen.add(key)
                 results.append(key)
     return results[:8]
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -3518,6 +3722,8 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         return True
 
     return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
 def _multishot_revert(repo: Path, head: Optional[str]) -> None:
     try:
         if head:
@@ -3530,6 +3736,8 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
                        cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
     except Exception:
         pass
+
+
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     """Original solve loop, callable through kwargs to avoid re-stating the
     validator-protected parameter signature outside of solve()."""
@@ -4134,6 +4342,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             cost=total_cost,
             success=False,
         ).to_dict()
+
+
 def solve(
     repo_path: str,
     issue: str,
@@ -4156,6 +4366,8 @@ def solve(
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+
+
 def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
     """Extract the last failing command from attempt logs for the retry memo."""
     logs_text = result.get("logs", "") or ""
@@ -4168,6 +4380,8 @@ def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
                 if cmd_match:
                     last_fail = cmd_match.group(1).strip()[:200]
     return last_fail
+
+
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
         return 0
@@ -4182,6 +4396,8 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Safety-net wrapper around the multishot driver."""
     repo_path = kwargs["repo_path"]
@@ -4207,6 +4423,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             cost=0.0,
             success=bool(salvaged.strip()),
         ).to_dict()
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
@@ -4224,6 +4442,8 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return True
     except Exception:
         return False
+
+
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
@@ -4253,6 +4473,8 @@ def main(argv: List[str]) -> int:
 
     print(output)
     return 0 if result.get("success") else 1
+
+
 def _looks_like_verification_command(command: str) -> bool:
     lowered = command.lower()
     patterns = [
@@ -4273,6 +4495,8 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\beslint\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
+
+
 def _looks_like_patch_review_command(command: str, result: CommandResult) -> bool:
     if result.exit_code != 0:
         return False
@@ -4281,6 +4505,8 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
         re.search(r"\bgit\s+(diff|status)\b", lowered)
         or re.search(r"\bgit\s+show\s+--stat\b", lowered)
     )
+
+
 def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
     match = re.search(r"(?m)^exit_code:\n(-?\d+)", observation_lower)
     if not match:
@@ -4289,6 +4515,8 @@ def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
         return int(match.group(1))
     except ValueError:
         return None
+
+
 def _format_multishot_memo(memo: Dict[str, Any]) -> str:
     """Render memo as a concise PRIOR ATTEMPT NOTES block for the user prompt."""
     files = memo.get("attempt1_files_touched") or []
@@ -4306,12 +4534,23 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
         parts.append(f"  Last failing command: {last_fail}")
     parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
     return "\n".join(parts)
+
+
 def _extract_observation_section(observation_lower: str, section: str) -> str:
     match = re.search(
         rf"(?ms)^{re.escape(section.lower())}:\n(.*?)(?:\n[a-z_]+:\n|\Z)",
         observation_lower,
     )
     return match.group(1).strip() if match else ""
+
+
+# -----------------------------
+# CLI for local testing
+# -----------------------------
+
+# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
+# CLI to make local experiments easier, but do not rely on CLI-only behavior for
+# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
@@ -4327,6 +4566,8 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--json-out", default="", help="Optional path to write result JSON.")
     return vars(parser.parse_args(argv))
+
+
 def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
     """Multishot logic, separated so the safety-net try/except wraps it cleanly."""
     repo_path = kwargs["repo_path"]
@@ -4432,6 +4673,8 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
     return _result1
+
+
 def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
     """Summarise attempt 1 so attempt 2 can take a different angle."""
     patch = result.get("patch", "") or ""
@@ -4441,6 +4684,8 @@ def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
         "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
         "attempt1_last_failed_command": _last_failed_commands_summary(result),
     }
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
