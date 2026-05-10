@@ -116,8 +116,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
+MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
+MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1297,6 +1299,139 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+_INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
+    "route", "routing", "router", "page", "screen", "view", "sidebar",
+    "navigation", "nav", "menu", "endpoint", "api", "controller", "service",
+    "handler", "wire", "integrate", "dashboard",
+)
+
+_INTEGRATION_ENTRYPOINT_RE = re.compile(
+    r"(^|/)(app|main|index|router|routes|urls|sidebar|navigation|nav|menu|"
+    r"controller|controllers|service|services|api|server|layout|dashboard)"
+    r"([./_-]|$)|"
+    r"(App|Main|Router|Routes|Sidebar|Navigation|Nav|Menu|Controller|Service|Layout|Dashboard)\."
+)
+
+_IMPLEMENTATION_FILE_RE = re.compile(
+    r"(^|/)(components?|pages?|views?|screens?|features?|modules?|services?|controllers?|api)/"
+    r"|[A-Z][A-Za-z0-9_]*(Page|View|Screen|Component|Panel|Card|Form|Modal|Controller|Service)\."
+)
+
+
+def _integration_gap_summary(patch: str, issue_text: str) -> str:
+    """Heuristic for patches that add implementation but may not wire it in."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    if not any(hint in issue_lower for hint in _INTEGRATION_ISSUE_HINTS):
+        return ""
+    changed = _patch_changed_files(patch)
+    if not changed or any(_INTEGRATION_ENTRYPOINT_RE.search(p) for p in changed):
+        return ""
+    implementation_paths = [p for p in changed if _IMPLEMENTATION_FILE_RE.search(p)]
+    added = _patch_added_text(patch)
+    added_mentions_integration = bool(
+        re.search(
+            r"\b(route|routes|router|navigate|navigation|sidebar|menu|endpoint|"
+            r"controller|service|handler|app\.|urlpatterns|path\(|Route\b|"
+            r"useNavigate|Link\b|NavLink|RouterProvider)\b",
+            added,
+        )
+    )
+    if not implementation_paths and not added_mentions_integration:
+        return ""
+    examples = ", ".join((implementation_paths or changed)[:6])
+    return (
+        "patch adds implementation-like files or code but no obvious route/nav/API "
+        f"entrypoint was touched. Changed implementation paths: {examples}"
+    )
+
+
+_ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], "re.Pattern[str]"], ...] = (
+    ("tests", ("test", "tests", "testing", "regression", "spec"), re.compile(r"(^|/)(tests?|__tests__|specs?)/|(_test|test_|\.test\.|\.spec\.)", re.IGNORECASE)),
+    ("docs", ("doc", "docs", "documentation", "readme", "guide", "adr"), re.compile(r"(^|/)(docs?|adr|guides?)/|(^|/)(readme|changelog|adr)[^/]*\.(md|rst|txt)$", re.IGNORECASE)),
+    ("version/package metadata", ("version", "bump", "package.json", "pyproject", "pom.xml", "gradle", "cargo.toml"), re.compile(r"(^|/)(package\.json|pyproject\.toml|pom\.xml|build\.gradle|build\.gradle\.kts|cargo\.toml|setup\.py|setup\.cfg|pubspec\.yaml|composer\.json)$", re.IGNORECASE)),
+    ("schema/migration", ("schema", "migration", "migrations", "sql", "prisma", "ddl"), re.compile(r"(^|/)(migrations?|schema|prisma)/|schema\.(sql|prisma)$|\.(sql)$", re.IGNORECASE)),
+    ("i18n/locale", ("i18n", "locale", "locales", "translation", "translations", "lang"), re.compile(r"(^|/)(i18n|locales?|lang|translations?)/|\.(po|pot|strings)$", re.IGNORECASE)),
+    ("fixture/sample", ("fixture", "fixtures", "sample", "example"), re.compile(r"(^|/)(fixtures?|samples?|examples?)/", re.IGNORECASE)),
+)
+
+
+def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
+    return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
+
+
+def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
+    """Find explicitly requested artifact classes missing from the patch."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    changed = _patch_changed_files(patch)
+    missing: List[str] = []
+    for label, hints, path_re in _ARTIFACT_REQUESTS:
+        if _issue_has_artifact_hint(issue_lower, hints) and not any(path_re.search(path) for path in changed):
+            missing.append(label)
+    if not missing:
+        return ""
+    return "task text appears to request these artifact(s), but no matching files were touched: " + ", ".join(missing[:6])
+
+
+_DEPENDENCY_MANIFEST_RE = re.compile(
+    r"(^|/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|"
+    r"requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|poetry\.lock|"
+    r"cargo\.toml|cargo\.lock|go\.mod|go\.sum|pom\.xml|build\.gradle|"
+    r"build\.gradle\.kts|composer\.json|composer\.lock|gemfile|pubspec\.yaml)$",
+    re.IGNORECASE,
+)
+_LOCAL_IMPORT_PREFIXES = (".", "/", "@/", "~/", "@renderer/", "@app/", "@src/", "src/", "app/")
+_COMMON_JS_GLOBALS = {"react", "react-dom", "vue", "svelte", "next", "fs", "path", "url", "http", "https", "crypto", "util", "stream", "events", "os"}
+_PY_STDLIB_ROOTS = set(getattr(sys, "stdlib_module_names", ()))
+
+
+def _package_root_from_spec(spec: str) -> str:
+    spec = spec.strip().strip("\"'").split("::", 1)[0]
+    if not spec or spec.startswith(_LOCAL_IMPORT_PREFIXES):
+        return ""
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else spec
+    return spec.split("/")[0]
+
+
+def _introduced_dependency_roots(patch: str) -> List[str]:
+    added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    found: List[str] = []
+    patterns = (
+        r"\bimport\s+(?:[^'\"]+\s+from\s+)?['\"]([^'\"]+)['\"]",
+        r"\bexport\s+[^'\"]+\s+from\s+['\"]([^'\"]+)['\"]",
+        r"\brequire\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        r"(?m)^\s*from\s+([A-Za-z_][\w.]*)\s+import\b",
+        r"(?m)^\s*import\s+([A-Za-z_][\w.]*)\b(?!\s+from\b)",
+        r"(?m)^\s*use\s+([A-Za-z_][\w:]*)\s*;",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, added):
+            root = _package_root_from_spec(match.group(1).split(".")[0])
+            if not root or root in _COMMON_JS_GLOBALS or root in _PY_STDLIB_ROOTS:
+                continue
+            if root not in found:
+                found.append(root)
+    return found
+
+
+def _dependency_metadata_gap_summary(patch: str) -> str:
+    """Flag new package usage without a matching dependency manifest touch."""
+    if not patch.strip():
+        return ""
+    roots = _introduced_dependency_roots(patch)
+    if not roots:
+        return ""
+    changed = _patch_changed_files(patch)
+    if any(_DEPENDENCY_MANIFEST_RE.search(path) for path in changed):
+        return ""
+    return "patch appears to introduce external package usage without touching a dependency manifest. Package root(s): " + ", ".join(roots[:8])
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -2125,7 +2260,7 @@ Preserve meaningful comments around changed code — section headers, TODO/FIXME
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response.
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response. When restyling or refactoring an existing component, function, or template, also preserve every observable behavior present pre-edit (transforms/animations, conditional rendering, class-state toggles, event handlers, return-state/reset semantics) unless the issue explicitly removes it — silently dropped behaviors regress hidden tests even when public API is unchanged.
 
 Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one. Patch the general root behavior, not only the visible case.
 
@@ -2392,6 +2527,58 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
+    return (
+        "Integration check: your patch appears to add implementation code, but "
+        "it may not wire that code into the app/API entrypoints that make it "
+        "reachable.\n\n"
+        f"{integration_summary}\n\n"
+        "Before finalizing, inspect or update the relevant integration point: "
+        "App/routes/router, sidebar/navigation/menu, urls.py/routes, controller/"
+        "service registration, main/index entry, or dashboard/layout wiring. "
+        "If the new code is already reachable through an existing convention, "
+        "finish with <final>summary</final> and name that convention. Otherwise "
+        "issue the minimal edit command(s) to wire it in. Do not broaden the "
+        "feature beyond the task.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
+    return (
+        "Requested-artifact check: the task appears to ask for a supporting "
+        "artifact, but the current patch does not touch a matching file.\n\n"
+        f"{artifact_summary}\n\n"
+        "Before finalizing, inspect the repository conventions for the requested "
+        "artifact type: tests/specs, docs/README/changelog, package/version "
+        "metadata, migrations/schema, locale files, or fixtures/examples. If the "
+        "artifact is truly unnecessary because the task text only mentioned it "
+        "as context, finish with <final>summary</final> and say why. Otherwise "
+        "issue the minimal edit command(s) needed to add or update the requested "
+        "artifact. Do not add unrelated artifacts.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> str:
+    return (
+        "Dependency metadata check: your patch appears to import or require a "
+        "package that may not be declared in the repository metadata.\n\n"
+        f"{dependency_summary}\n\n"
+        "Before finalizing, inspect the repo's dependency manifest convention "
+        "(package.json, pyproject.toml/requirements, Cargo.toml, go.mod, pom.xml, "
+        "Gradle, composer.json, Gemfile, pubspec.yaml, etc.). If the package is "
+        "already provided by the platform or existing transitive code convention, "
+        "finish with <final>summary</final> and say why. Otherwise add the "
+        "minimal manifest entry needed for the import to work. Do not add "
+        "unused dependencies.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2510,8 +2697,52 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
+    """Extract the last failing command from attempt logs for the retry memo."""
+    logs_text = result.get("logs", "") or ""
+    last_fail = ""
+    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
+        if "EXIT_CODE:\n" in chunk:
+            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
+            if ec_match and ec_match.group(1) != "0":
+                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
+                if cmd_match:
+                    last_fail = cmd_match.group(1).strip()[:200]
+    return last_fail
+
+
+def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
+    """Summarise attempt 1 so attempt 2 can take a different angle."""
+    patch = result.get("patch", "") or ""
+    return {
+        "attempt1_files_touched": _patch_changed_files(patch),
+        "attempt1_substantive_lines": _multishot_count_substantive(patch),
+        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
+        "attempt1_last_failed_command": _last_failed_commands_summary(result),
+    }
+
+
+def _format_multishot_memo(memo: Dict[str, Any]) -> str:
+    """Render memo as a concise PRIOR ATTEMPT NOTES block for the user prompt."""
+    files = memo.get("attempt1_files_touched") or []
+    lines = memo.get("attempt1_substantive_lines", 0)
+    missing = memo.get("attempt1_unaddressed_paths") or []
+    last_fail = memo.get("attempt1_last_failed_command", "")
+    parts = [
+        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
+        f"  Files touched: {', '.join(files) if files else 'none'}",
+        f"  Substantive lines added: {lines}",
+    ]
+    if missing:
+        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
+    if last_fail:
+        parts.append(f"  Last failing command: {last_fail}")
+    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
+    return "\n".join(parts)
+
+
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (multi-shot wrapper around _solve_inner)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2601,11 +2832,21 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _issue = kwargs.get("issue", "")
+        _unaddressed1 = _unaddressed_criteria(_patch1, _issue) if _patch1.strip() else []
+        _result2 = _solve_attempt(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _unaddressed2 = _unaddressed_criteria(_patch2, _issue) if _patch2.strip() else []
 
-        if _n2 >= _n1:
+        # Quality-aware tiebreak: prefer attempt 2 when it addresses MORE issue
+        # bullets, or when bullets tie and it has at least as many substantive
+        # lines. Falls back to line-count rule when no extractable bullets.
+        _u1 = len(_unaddressed1)
+        _u2 = len(_unaddressed2)
+        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
+
+        if _retry_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -2649,6 +2890,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2662,7 +2904,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    integration_nudges_used = 0
+    artifact_nudges_used = 0
+    dependency_nudges_used = 0
+    total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2706,7 +2951,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2805,6 +3050,42 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if integration_nudges_used < MAX_INTEGRATION_NUDGES:
+            integration_summary = _integration_gap_summary(patch, issue)
+            if integration_summary:
+                integration_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_integration_nudge_prompt(integration_summary, issue),
+                    "INTEGRATION_NUDGE_QUEUED:\n  " + integration_summary[:120],
+                )
+                return True
+
+        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
+            artifact_summary = _requested_artifact_gap_summary(patch, issue)
+            if artifact_summary:
+                artifact_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_artifact_nudge_prompt(artifact_summary, issue),
+                    "ARTIFACT_NUDGE_QUEUED:\n  " + artifact_summary[:120],
+                )
+                return True
+
+        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
+            dependency_summary = _dependency_metadata_gap_summary(patch)
+            if dependency_summary:
+                dependency_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dependency_nudge_prompt(dependency_summary, issue),
+                    "DEPENDENCY_NUDGE_QUEUED:\n  " + dependency_summary[:120],
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2824,13 +3105,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
+        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if _multishot_memo:
+            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
         initial_preload_stripped = False
 
         _wall_start = time.monotonic()
+        # Two-stage TLE handling for empty patches: a soft warning at ~55%
+        # budget, and a hard emergency at ~budget-60s. Both fire only when
+        # the on-disk patch is still empty. Outside the refinement-turn cap.
+        _tle_warn_threshold = max(WALL_CLOCK_BUDGET_SECONDS * 0.55, 50.0)
+        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+        warn_injected = False
+        emergency_injected = False
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -2864,6 +3156,57 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            elapsed = time.monotonic() - _wall_start
+
+            if (
+                elapsed >= _tle_warn_threshold
+                and not warn_injected
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                warn_injected = True
+                logs.append(
+                    f"TLE_WARN_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_warn_threshold:.1f}s "
+                    "patch still empty -- nudging model to narrow scope."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time check: more than half the budget is used and your "
+                        "draft diff is still empty. Stop exploring further files. "
+                        "Pick ONE file that owns the most central requirement in "
+                        "the issue and make a real edit on it now (a focused "
+                        "narrow fix is better than nothing). You can still refine "
+                        "afterwards if budget allows. Do NOT list files, do NOT "
+                        "broaden inspection -- go straight to an edit command."
+                    ),
+                })
+
+            if (
+                elapsed >= _tle_emergency_threshold
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                emergency_injected = True
+                logs.append(
+                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_emergency_threshold:.1f}s "
+                    "patch still empty -- forcing minimal emit prompt before docker kill."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EMERGENCY -- less than 60 seconds remain before timeout and your "
+                        "draft diff is still empty. Make one minimal, issue-motivated edit "
+                        "to preserve useful progress before time runs out.\n\n"
+                        "In your NEXT response: pick ONE file and ONE edit that addresses "
+                        "the most central requirement in the issue. Use a single `sed -i` or "
+                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
+                        "not run grep. Do not list files. After the edit command, end your "
+                        "response with `<final>emergency edit</final>`. Do this in ONE "
+                        "response."
+                    ),
+                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
