@@ -116,6 +116,8 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_UNWIRED_TURNS = 1      # v47: new export defined but never imported/used elsewhere in patch
+MAX_REQUIRED_FILE_TURNS = 1 # v47: issue explicitly requires creating a new file/component but patch doesn't add it
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -2436,6 +2438,150 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+# v47: unwired-component gate. Catches the loss pattern where the model adds
+# a new export (component / hook / page / setting) but never imports or
+# references it from any other patched file. Reference patches always wire
+# what they introduce. Two of gimmestar's PR #895 losses fit this profile
+# (sin_match bulk UI never made visible, custom date calendar trigger never
+# wired). Runs as a single refinement turn, bounded by MAX_UNWIRED_TURNS=1.
+
+_NEW_EXPORT_PATTERNS_V47: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\+(?!\+\+)\s*export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+default\s+([A-Z][A-Za-z0-9_]*)\s*[;\n]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+(?:const|let|var)\s+(use[A-Z][A-Za-z0-9_]*)\s*[=:]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+function\s+(use[A-Z][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+(?:const|let|var)\s+([A-Z][A-Za-z0-9_]+)\s*[=:]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+function\s+([A-Z][A-Za-z0-9_]+)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+class\s+([A-Z][A-Za-z0-9_]+)\s*[\{<]"),
+)
+
+
+def _v47_extract_new_exports_per_file(patch: str) -> Dict[str, List[str]]:
+    by_file: Dict[str, List[str]] = {}
+    current_file: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/"):].strip()
+            continue
+        if not current_file:
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for pat in _NEW_EXPORT_PATTERNS_V47:
+            m = pat.match(line)
+            if m:
+                name = m.group(1)
+                if name.isupper():
+                    break
+                if name not in by_file.get(current_file, []):
+                    by_file.setdefault(current_file, []).append(name)
+                break
+    return by_file
+
+
+def _v47_check_unwired_components(patch: str) -> List[str]:
+    new_exports = _v47_extract_new_exports_per_file(patch)
+    if not new_exports:
+        return []
+    unwired: List[str] = []
+    for source_file, names in new_exports.items():
+        for name in names:
+            ref_count = 0
+            current_file: Optional[str] = None
+            for line in patch.splitlines():
+                if line.startswith("+++ b/"):
+                    current_file = line[len("+++ b/"):].strip()
+                    continue
+                if current_file == source_file:
+                    continue
+                if not line.startswith("+") or line.startswith("+++"):
+                    continue
+                if re.search(r"\b" + re.escape(name) + r"\b", line[1:]):
+                    ref_count += 1
+                    break
+            if ref_count == 0:
+                unwired.append(f"{name} (defined in {source_file}, not used in any other patched file)")
+                if len(unwired) >= 4:
+                    return unwired
+    return unwired
+
+
+def build_v47_unwired_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "You added new exports but no other file in the patch imports / uses them:\n\n"
+        f"{body}\n\n"
+        "Reference patches always WIRE what they introduce. A new component "
+        "must be rendered somewhere; a new hook must be called somewhere; "
+        "a new page/route must be registered; a new setting toggle must be "
+        "shown in the UI. Without wiring, the feature isn't actually "
+        "integrated.\n\n"
+        "Emit ONE bash command that adds the wiring (import the symbol "
+        "where it's used, mount it in JSX, register it as a route, or "
+        "call the hook from the relevant component). Then end with "
+        "`<final>component wired</final>`."
+    )
+
+
+# v47: required-file gate. When the issue explicitly says "create a new
+# component <Foo>" or "add a <Bar>.tsx", verify the patch's added paths
+# include that name. Catches gimmestar's Mention model partial loss
+# (issue required full Mention model + sidebar links + scroll behavior;
+# challenger only created the model).
+
+_V47_REQUIRED_FILE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:create|add|implement|introduce|build)\s+a\s+new\s+([A-Za-z_][\w\-./]*\.(?:tsx?|jsx?|vue|svelte|py|go|rb|java|cs|php|md|yml|yaml|json|toml|sql))\b", re.IGNORECASE),
+    re.compile(r"\bnew\s+(?:file|module|component|page|view|service|controller|store|hook|util|helper)\s+(?:called\s+|named\s+)?[`\"']?([A-Z][A-Za-z_]+)[`\"']?", re.IGNORECASE),
+    re.compile(r"\bcreate\s+(?:a\s+)?[`\"']?([A-Z][A-Za-z_]+\.(?:tsx?|jsx?|vue|svelte|py))[`\"']?", re.IGNORECASE),
+)
+
+
+def _v47_check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
+    if not patch.strip() or not issue_text:
+        return None
+    expected: List[str] = []
+    seen: set = set()
+    for pat in _V47_REQUIRED_FILE_PATTERNS:
+        for m in pat.finditer(issue_text):
+            name = m.group(1).strip(" `\"'")
+            if name and name not in seen:
+                seen.add(name)
+                expected.append(name)
+    if not expected:
+        return None
+    added_paths: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            added_paths.add(line[len("+++ b/"):].strip())
+    matched: set = set()
+    for path in added_paths:
+        plower = path.lower()
+        for name in expected:
+            if name.lower() in plower:
+                matched.add(name)
+    missing = [n for n in expected if n not in matched]
+    return missing[:4] if missing else None
+
+
+def build_v47_required_file_prompt(missing: List[str], issue_text: str) -> str:
+    items = "\n".join(f"  - {m}" for m in missing)
+    snippet = issue_text.strip()
+    if len(snippet) > 800:
+        snippet = snippet[:800].rstrip() + " [...]"
+    return (
+        "The issue explicitly requires creating these new file(s) / "
+        "component(s), but your patch does NOT add them:\n\n"
+        f"{items}\n\n"
+        "When the issue says 'create a new X' or 'add a Y component', the "
+        "reference patch typically introduces those files. Emit ONE bash "
+        "command (heredoc / `python -c` write_text) that creates each "
+        "missing file with the requested implementation. Place each in "
+        "the directory the codebase already uses for files of that kind. "
+        "Then end with `<final>required files added</final>`.\n\n"
+        f"Issue (for reference):\n{snippet}"
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -2663,6 +2809,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    unwired_turns_used = 0       # v47: new export not used elsewhere in patch
+    required_file_turns_used = 0 # v47: issue requires creating a new file but patch doesn't add it
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2707,7 +2855,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, unwired_turns_used, required_file_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2806,6 +2954,36 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v47: required-file gate — issue says "create a new X.tsx" but
+        # patch never adds it. Catches the Mention-model partial loss
+        # pattern in gimmestar #4422.
+        if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
+            missing_files = _v47_check_required_file(patch, issue)
+            if missing_files:
+                required_file_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v47_required_file_prompt(missing_files, issue),
+                    "V47_REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
+                )
+                return True
+
+        # v47: unwired-component gate — added new export but no other
+        # patched file uses it. Catches sin_match bulk UI / date calendar
+        # trigger / similar wiring losses (gimmestar #4422).
+        if unwired_turns_used < MAX_UNWIRED_TURNS:
+            unwired = _v47_check_unwired_components(patch)
+            if unwired:
+                unwired_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v47_unwired_fix_prompt(unwired),
+                    "V47_UNWIRED_QUEUED:\n  " + "\n  ".join(unwired),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2832,9 +3010,67 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         initial_preload_stripped = False
 
         _wall_start = time.monotonic()
+        # Two-stage emergency for empty-patch timeouts.
+        # Stage 1 (55% budget) — soft warning: catches the case where model
+        # is still in exploration mode at 130-150s and would otherwise time
+        # out with no patch (gimmestar's landing-page loss in duel #4422).
+        # Stage 2 (75% budget) — hard emergency: forces ONE minimal sed edit
+        # if patch is still empty after stage 1.
+        _tle_warn_threshold = max(WALL_CLOCK_BUDGET_SECONDS * 0.55, 50.0)
+        _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+        warn_injected = False
+        emergency_injected = False
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            # Stage 1: soft warning at 55% budget if patch still empty.
+            elapsed_step = time.monotonic() - _wall_start
+            if (
+                elapsed_step >= _tle_warn_threshold
+                and not warn_injected
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                warn_injected = True
+                logs.append(
+                    f"TLE_WARN_EMIT:\nelapsed={elapsed_step:.1f}s threshold={_tle_warn_threshold:.1f}s "
+                    "patch still empty -- nudging model to narrow scope."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time check: more than half the budget is used and your "
+                        "draft diff is still empty. Stop exploring further files. "
+                        "Pick ONE file that owns the most central requirement in "
+                        "the issue and make a real edit on it now (a focused "
+                        "narrow fix is better than nothing). You can still refine "
+                        "afterwards if budget allows. Do NOT list files, do NOT "
+                        "broaden inspection — go straight to an edit command."
+                    ),
+                })
+            # Stage 2: hard emergency at 75% budget.
+            if (
+                elapsed_step >= _tle_emergency_threshold
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                emergency_injected = True
+                logs.append(
+                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed_step:.1f}s threshold={_tle_emergency_threshold:.1f}s "
+                    "patch still empty -- forcing minimal emit."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EMERGENCY — less than 60 seconds remain before timeout "
+                        "and your draft diff is still empty. Make ONE minimal, "
+                        "issue-motivated edit to preserve useful progress. Pick "
+                        "ONE file and ONE line/block. Use a single `sed -i` or "
+                        "`python -c` write. Do not explore. After the edit "
+                        "command, end with `<final>emergency edit</final>`."
+                    ),
+                })
 
             # Past step 4 the preloaded snippets are no longer load-bearing —
             # the model has either used them or moved on. Replace the bulky
