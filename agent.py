@@ -1461,7 +1461,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 
-def _self_review_gate(patch: str, issue: str, repo: "Optional[Path]" = None) -> List[str]:  # type: ignore[name-defined]
+def _self_review_gate(patch: str, issue: str, repo=None) -> list:
     """v10: Self-review patch before <final> - catch common failure patterns.
 
     Returns a list of problems found (empty = patch is clean).
@@ -1491,7 +1491,7 @@ def _self_review_gate(patch: str, issue: str, repo: "Optional[Path]" = None) -> 
 
 
 
-def _build_multifile_plan_hint(issue: str, preloaded_files: List[str], repo: "Optional[Path]" = None) -> str:  # type: ignore[name-defined]
+def _build_multifile_plan_hint(issue: str, preloaded_files: list, repo=None) -> str:
     """v10: Emit a hint when the issue likely requires multi-file edits.
 
     Fires when issue text contains >=2 architecture-signal words (excluding
