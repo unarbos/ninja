@@ -1045,7 +1045,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -2632,11 +2632,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # v11: simplify issue for retry when attempt 1 was empty
-        if not _patch1.strip():
-            _orig_issue = kwargs.get('issue', '')
+        # v11: simplify long issues for retry when attempt 1 was empty
+        if not _patch1.strip() and len(kwargs.get('issue', '')) > 500:
             kwargs = dict(kwargs)
-            kwargs['issue'] = _simplify_issue_for_retry(_orig_issue, list(preloaded_files) if 'preloaded_files' in dir() else [])
+            kwargs['issue'] = _simplify_issue_for_retry(kwargs['issue'], [])
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
