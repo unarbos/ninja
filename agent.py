@@ -90,8 +90,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,20 +112,20 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # ruff/eslint pass for clean, production-looking code
+MAX_LINT_TURNS = 0         # ruff/eslint pass for clean, production-looking code
 _LINT_TIMEOUT = 10         # per-file ruff/eslint timeout
-MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
-MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
+MAX_EMPTY_ARG_TURNS = 0    # repair syntax-valid but unfinished calls/values
+MAX_CONTRACT_TURNS = 0     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check run
-MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
+MAX_FAILED_VERIFICATION_FIX_TURNS = 0  # repair one concrete failed test/check run
+MAX_PATCH_SAFETY_TURNS = 0  # remove unsafe review-process text before returning a patch
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
-MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
-MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
+MAX_INTEGRATION_NUDGES = 0  # make new pages/helpers reachable from routes/nav/API entrypoints
+MAX_ARTIFACT_NUDGES = 0    # add explicitly requested tests/docs/version/config artifacts
+MAX_DEPENDENCY_NUDGES = 0  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
+MAX_TOTAL_REFINEMENT_TURNS = 2  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
                                 # without blowing the wall-clock budget.
@@ -823,6 +823,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
+    region_anchors = []  # v130 fix: PR #895 bug — variable was unassigned
 
     if region_anchors:
         focus_lines = [f"  {path}:{start}-{end}" for path, start, end in region_anchors[:6]]
@@ -2536,7 +2537,7 @@ focused inspection command
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. When the issue names a specific test file or command, run that before experimenting with unrelated commands. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
