@@ -2447,7 +2447,7 @@ brief summary of what changed
 
 **Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
@@ -3172,6 +3172,155 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
                 results.append(key)
     return results[:8]
 
+# v66: emergency single-shot constants (adapted from PR518)
+_EMERGENCY_MAX_TOKENS = 1024
+_EMERGENCY_TIMEOUT_SECONDS = 45
+_EMERGENCY_COMMAND_TIMEOUT = 30
+_EMERGENCY_PROMPT_TARGET_CHARS = 2000
+
+
+def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
+    """v66: pick the single most-likely-to-need-editing tracked file."""
+    mentioned_paths = _extract_issue_path_mentions(task_text)
+    tracked = set(_tracked_files(repo))
+    for mention in mentioned_paths:
+        normalized = mention.strip("./")
+        if normalized in tracked and _context_file_allowed(normalized):
+            return normalized
+    ranked = _rank_context_files(repo, task_text)
+    for relative_path in ranked:
+        if relative_path in tracked and _context_file_allowed(relative_path):
+            return relative_path
+    for relative_path in tracked:
+        if _context_file_allowed(relative_path):
+            return relative_path
+    return None
+
+
+def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
+    """v66: stripped-down single-shot prompt: one command, one final, nothing else."""
+    task_view = task_text[:1500]
+    return (
+        "You are a one-shot patch generator. Time and tokens are extremely "
+        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
+        f"TASK:\n{task_view}\n\n"
+        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
+        "Emit EXACTLY ONE bash command that makes the smallest substantive "
+        "code change in the target file consistent with the task. Use "
+        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
+        "only. Do NOT change file modes. Make a real code edit.\n\n"
+        "Format:\n<command>\nyour single command here\n</command>\n"
+        "<final>emergency edit</final>"
+    )
+
+
+def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
+    """v66: single-call fallback for empty-patch + MODEL_ERROR runs.
+    Adapted from PR518 (UID 20)."""
+    repo_path_value = kwargs["repo_path"]
+    task_text = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+
+    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
+    repo: Optional[Path] = None
+    try:
+        repo = _repo_path(repo_path_value)
+        ensure_git_repo(repo)
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+
+        target = _emergency_pick_target(repo, task_text)
+        if target is None:
+            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
+            return AgentResult(
+                patch="", logs=_safe_join_logs(logs),
+                steps=0, cost=0.0, success=False,
+            ).to_dict()
+
+        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
+        prompt = _emergency_build_prompt(target, snippet, task_text)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a one-shot patch generator. Output exactly one "
+                    "bash command then <final>summary</final>. Nothing else."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response_text, _, _ = chat_completion(
+                messages=messages,
+                model=model_name,
+                api_base=base,
+                api_key=key,
+                max_tokens=_EMERGENCY_MAX_TOKENS,
+                timeout=_EMERGENCY_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        except Exception as exc:
+            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
+            patch_text = get_patch(repo) if repo is not None else ""
+            return AgentResult(
+                patch=patch_text, logs=_safe_join_logs(logs),
+                steps=0, cost=0.0, success=bool(patch_text.strip()),
+            ).to_dict()
+
+        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
+        commands = extract_commands(response_text)
+        if not commands:
+            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
+        for cmd in commands[:2]:
+            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
+            logs.append(format_observation(result))
+
+        patch_text = get_patch(repo)
+        return AgentResult(
+            patch=patch_text,
+            logs=_safe_join_logs(logs),
+            steps=1,
+            cost=0.0,
+            success=bool(patch_text.strip()),
+        ).to_dict()
+    except Exception:
+        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
+        patch_text = ""
+        if repo is not None:
+            try:
+                patch_text = get_patch(repo)
+            except Exception:
+                pass
+        return AgentResult(
+            patch=patch_text, logs=_safe_join_logs(logs),
+            steps=0, cost=None, success=False,
+        ).to_dict()
+
+
+_ERR_LOC_PATTERNS = [
+    re.compile(r'File "([^"]+)", line (\d+)'),
+    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
+    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
+    re.compile(r"\(([\w]+\.java):(\d+)\)"),
+    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
+    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
+]
+
+
+def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
+    """Extract (path, line) pairs from compiler/test error output."""
+    seen: set = set()
+    results: List[Tuple[str, str]] = []
+    for pat in _ERR_LOC_PATTERNS:
+        for m in pat.finditer(text):
+            key = (m.group(1), m.group(2))
+            if key not in seen:
+                seen.add(key)
+                results.append(key)
+    return results[:8]
+
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -3398,6 +3547,7 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
         not _patch1.strip()
         and _attempt1_logs.count("MODEL_ERROR") >= 2
     )
+    # v70: also fire on plain empty attempt (no error markers required).
     _attempt1_was_plain_empty = not _patch1.strip()
     _should_fire_emergency = _attempt1_was_error_failure or _attempt1_was_plain_empty
     if _should_fire_emergency and (_multishot_total_budget - _elapsed) > 60.0:
@@ -3548,8 +3698,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 syntax_fix_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -3569,15 +3731,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
+        if (
+            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
+            and last_failed_verification_command
+            and last_failed_verification_observation
+        ):
+            failed_verification_fix_turns_used += 1
+            total_refinement_turns_used += 1
+            command = last_failed_verification_command
+            observation = last_failed_verification_observation
+            last_failed_verification_command = ""
+            last_failed_verification_observation = ""
+            queue_refinement_turn(
+                assistant_text,
+                build_failed_verification_prompt(command, observation),
+                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
+            )
+            return True
+
+        if contract_turns_used < MAX_CONTRACT_TURNS:
+            contract_findings = _contract_preservation_gap_summary(repo, patch)
+            if contract_findings:
+                contract_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_contract_preservation_prompt(contract_findings),
+                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
                 )
                 return True
 
@@ -3588,8 +3768,83 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    build_integration_nudge_prompt(integration, issue),
+                    f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
+                )
+                return True
+
+        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
+            artifact = _requested_artifact_gap_summary(patch, issue)
+            if artifact:
+                artifact_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_artifact_nudge_prompt(artifact, issue),
+                    f"ARTIFACT_NUDGE_QUEUED:\n  {artifact}",
+                )
+                return True
+
+        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
+            dependency = _dependency_metadata_gap_summary(patch)
+            if dependency:
+                dependency_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dependency_nudge_prompt(dependency, issue),
+                    f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
+                )
+                return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
+            empty_arg_findings = _check_empty_args(patch)
+            if empty_arg_findings:
+                empty_arg_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_empty_args_fix_prompt(empty_arg_findings),
+                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
+                )
+                return True
+
+        # v72: lint pass — runs ruff/eslint when project tooling is available.
+        # Different axis from syntax (which proves the file parses); lint
+        # catches style issues that make the patch look unfinished.
+        if lint_turns_used < MAX_LINT_TURNS:
+            lint_errors = _check_lint(repo, patch)
+            if lint_errors:
+                lint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_lint_fix_prompt(lint_errors),
+                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
                 )
                 return True
 
