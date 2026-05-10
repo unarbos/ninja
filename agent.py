@@ -2023,6 +2023,7 @@ FAILURE RECOVERY AND COMMAND ECONOMY
 If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
 
 A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+After at most 2 inspection commands (grep/cat/ls/head) without producing an edit, your next command MUST be a substantive edit to the most plausible target file from the issue (use `sed -i`, a `python -c "open(...).write(...)"` one-liner, or a heredoc). Continuing to inspect without editing is the dominant cause of timeout-empty patches that score zero — an imperfect 1-line edit that addresses the issue beats a 0-line forfeit.
 
 ====================================================================
 FINAL ANSWER
