@@ -2694,7 +2694,9 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
-- File mode (chmod) changes — never let `mode 100755` flips appear in your diff
+- File mode (chmod) changes — never let `mode 100755` flips appear in your diff. Do NOT run `chmod`, `chown`, or any command that touches file permissions.
+- Lockfiles — NEVER run `npm install`, `bun install`, `yarn install`, `pnpm install`, `pip install`, `cargo build`, `go mod tidy`, or any command that regenerates `package-lock.json`, `bun.lockb`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`, or `Gemfile.lock`. These produce huge auto-generated diffs that score zero on similarity AND read as off-task to the judge. Edit the manifest (`package.json`, `Cargo.toml`, etc.) directly when the issue requires a dependency change.
+- Build artifacts — never commit changes inside `node_modules/`, `__pycache__/`, `.next/`, `dist/`, `build/`, or any compiled output directory.
 - New helper functions or abstractions unless the issue explicitly requires them
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
