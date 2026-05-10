@@ -2840,6 +2840,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v10: self-review gate (catches chmod, placeholder URLs, Java stream mutations)
+        _srg_issues = _self_review_gate(patch)
+        if _srg_issues and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                "Your patch has issues that will hurt your score:\n" + "\n".join(f"- {p}" for p in _srg_issues) + "\n\nFix these before finalizing.",
+                "SELF_REVIEW_QUEUED: " + " | ".join(_srg_issues[:2]),
+            )
+            return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2858,10 +2869,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        _mf_hint = _build_multifile_plan_hint(issue, preloaded_files)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context) + _mf_hint},
         ]
         initial_preload_stripped = False
 
