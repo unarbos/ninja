@@ -857,9 +857,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
+    # Append recent-commit examples as concrete style anchors. Silent no-op
+    # when the repo has no real history (pilot snapshots have one synthetic
+    # commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -2075,11 +2075,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# v72: lint integration ported from PR559 (UID 154). Clean ruff/eslint output
-# helps keep the patch production-looking while warnings make it look unfinished.
+# Lint integration. Clean ruff/eslint output helps keep the patch
+# production-looking; warnings make it look unfinished to the LLM judge.
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `ruff check` on a Python file. Returns the first issue or None."""
+    """Run `ruff check` on a Python file. Returns the first issue or None."""
     if not _has_executable("ruff"):
         return None
     proc = run_command(
@@ -2097,7 +2097,7 @@ def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
-    """v72: run `eslint` on a JS/TS file. Returns first issue or None.
+    """Run `eslint` on a JS/TS file. Returns first issue or None.
     Skips when no eslint config or no local install is present."""
     has_config = any(
         (repo / name).exists()
@@ -2127,7 +2127,7 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_lint(repo: Path, patch: str) -> List[str]:
-    """v72: lint every touched file with the appropriate tool. Up to 6 errors."""
+    """Lint every touched file with the appropriate tool. Up to 6 errors."""
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
@@ -2144,7 +2144,7 @@ def _check_lint(repo: Path, patch: str) -> List[str]:
 
 
 def build_lint_fix_prompt(errors: List[str]) -> str:
-    """v72: prompt the model to fix lint issues."""
+    """Prompt the model to fix lint issues."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
         "Lint issues were found in your patch:\n\n"
@@ -2521,14 +2521,15 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
+    """Read recent small-diff commits from the staged repo via git log and
+    format them as in-context style anchors. Returns empty string when the
+    repo has no real history (single synthetic commit in pilot snapshots),
+    so this is a silent no-op locally and a real lift live where the
+    validator clones the upstream repo with full history.
 
     The model imitates concrete examples better than abstract rules. Showing
-    the model 1-2 real recent commits gives it a concrete style anchor."""
+    1-2 real recent commits gives it a concrete style anchor for hunk shape
+    and naming conventions."""
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -2603,7 +2604,7 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# v21 edge: criteria-nudge support
+# Criteria-nudge support: surface unmet acceptance bullets before <final>.
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
@@ -2662,17 +2663,15 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
-# criteria words (e.g. "selecting", "loaded") often surface in identifier form
-# as `select`, `load`, etc. A literal substring `in` check misses these and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix (with
-# a minimum-stem length to avoid false positives like `action`->`act` matching
-# `react`) bridges the natural-language ↔ identifier gap.
+# Natural-language criteria words ("selecting", "loaded") often surface in
+# identifier form as `select`, `load`. A literal `in` check misses these and
+# inflates the criteria-nudge false-positive rate. The min-stem length avoids
+# false positives like `action`→`act` matching `react`.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
+    """Stem-stripped membership check (bridges natural-language ↔ identifier)."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -2696,9 +2695,8 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines, surfaced before <final> so the model can close missing work.
 
-    v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
-    check, ported from UID49 PR#527 — closes the natural-language ↔ identifier
-    gap so criteria like "selecting items" match patches that contain `select`.
+    Uses stem-stripped `_keyword_in_added` rather than plain substring `in`
+    so criteria like "selecting items" match patches containing `select`.
     """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
@@ -3114,7 +3112,7 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
-def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
+def _build_full_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
     """Wrap the base user prompt with scoped strategy and language hints."""
     base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
     multi_file = _detect_multi_file_task(issue_text)
@@ -3448,7 +3446,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 # -----------------------------
-# v28 multi-shot helpers
+# Multi-shot helpers
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
@@ -3523,7 +3521,7 @@ def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
 
 
 def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """v66: stripped-down single-shot prompt: one command, one final, nothing else."""
+    """Stripped-down single-shot prompt: one command, one final, nothing else."""
     task_view = task_text[:1500]
     return (
         "You are a one-shot patch generator. Time and tokens are extremely "
@@ -3540,8 +3538,10 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
 
 
 def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """v66: single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
+    """Single-call fallback for empty-patch + MODEL_ERROR runs.
+
+    Last line of defense before returning a 0-line patch. Picks one likely
+    target file, asks the model for one bash command + final, and ships."""
     repo_path_value = kwargs["repo_path"]
     task_text = kwargs["issue"]
     model = kwargs.get("model")
@@ -3769,7 +3769,7 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 
 
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (multi-shot wrapper around _solve_attempt)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -3790,19 +3790,20 @@ def solve(
     """
     Main portable interface for validators.
 
-    v65: wrapped in patch-preserve safety net (from chain king PR486).
-    Any uncaught exception in the multishot body returns the on-disk patch
-    state instead of propagating, preserving useful progress when possible.
+    Wrapped in a patch-preserve safety net: any uncaught exception in the
+    multishot body returns the on-disk patch state instead of propagating,
+    preserving useful progress when possible.
     """
-    return _v65_solve_with_safety_net(
+    return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
 
 
-def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """v65 safety-net wrapper. Adapted from chain king PR486."""
+def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """Safety-net wrapper: catch unexpected exceptions and return whatever
+    patch the working tree currently has, never an opaque crash."""
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -3811,7 +3812,7 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         pass
 
     try:
-        return _v65_multishot_driver(kwargs, _multishot_repo_obj)
+        return _multishot_driver(kwargs, _multishot_repo_obj)
     except Exception as exc:
         salvaged = ""
         try:
@@ -3828,8 +3829,9 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
-def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
-    """The original UID195 multishot logic, separated so the safety-net try/except wraps it cleanly."""
+def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
+    """Multishot logic, kept separate so the safety-net try/except wraps it
+    cleanly without nesting the whole driver inside an exception handler."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -3840,7 +3842,7 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
 
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 540.0  # v69: 580->540, reserves 60s headroom for safety net before docker kill at 600s
+    _multishot_total_budget = 540.0  # reserves 60s headroom before docker kill at 600s
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -3865,18 +3867,15 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
 
     _elapsed = time.monotonic() - _multishot_started
 
-    # v70: broadened emergency trigger. Originally (v66/v69) only fired when
-    # attempt 1 returned empty AND had >=2 MODEL_ERROR markers. v70 also fires
-    # on ANY empty attempt 1 (not just transport failures) — sometimes the
-    # planning loop just exits cleanly with no patch, and we still want a
-    # cheap single-shot fallback rather than burning the retry budget on the
-    # same chain that produced nothing.
+    # Fire the emergency single-shot whenever attempt 1 produced an empty
+    # patch — whether from MODEL_ERROR retries or a clean planning-loop exit
+    # with no edits. Both cases score zero on similarity, so we'd rather
+    # spend a cheap one-shot than burn the retry budget on the same chain.
     _attempt1_logs = _result1.get("logs", "") or ""
     _attempt1_was_error_failure = (
         not _patch1.strip()
         and _attempt1_logs.count("MODEL_ERROR") >= 2
     )
-    # v70: also fire on plain empty attempt (no error markers required).
     _attempt1_was_plain_empty = not _patch1.strip()
     _should_fire_emergency = _attempt1_was_error_failure or _attempt1_was_plain_empty
     if _should_fire_emergency and (_multishot_total_budget - _elapsed) > 60.0:
@@ -4202,7 +4201,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v72: lint pass — runs ruff/eslint when project tooling is available.
+        # Lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
         if lint_turns_used < MAX_LINT_TURNS:
@@ -4241,14 +4240,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _build_full_initial_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
-        # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
-        # v32 hardcoded 240s and became dead code under tighter king budgets,
-        # which cost us 4 empty rounds and the duel. This adapts to whatever
-        # budget the king sets — fires 60s before out_of_time().
+        # The emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS,
+        # not an absolute number — a hardcoded threshold becomes dead code when
+        # the budget shrinks. Fires 60s before we'd hit out_of_time().
         emergency_injected = False
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
