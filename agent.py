@@ -103,11 +103,12 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# v34: 270 -> 235. Inner attempt yields back ~5 s sooner, leaving margin for
-# the safety-net wrapper + emergency single-shot pass before the validator's
-# 600 s docker kill. Keeps reserve at 20 s so the inner loop still emits a
-# patch on its own when nothing goes wrong.
-WALL_CLOCK_BUDGET_SECONDS = 235.0
+# v36: 235 -> 240. v34/v35 saw timeouts on big multi-file tasks (e.g. 1990-
+# line king patches); 235 was a slight over-correction. Current king uses
+# 240, ricichez v72 used 240 — the empirically-validated value with
+# reasonable safety-net + emergency reserve before the validator's 600 s
+# docker kill.
+WALL_CLOCK_BUDGET_SECONDS = 240.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -120,16 +121,103 @@ MAX_LINT_TURNS = 1         # v34: revert ruff/eslint diagnostics — recent roun
 MAX_EMPTY_ARG_TURNS = 1    # v34: re-prompt when patch contains malformed `: ,`, `.push()`, `new Error()` patterns
 MAX_CONTRACT_TURNS = 1     # v35: re-prompt when a patch removes an exported symbol that other files still reference
 MAX_SETTER_TURNS = 1       # v35: re-prompt when `const [x, setX] = useState(...)` is added but `setX(...)` is never called
+MAX_CASCADE_TURNS = 1      # v36: re-prompt when patch modifies a function signature with unpatched callers in other files
+MAX_SURFACE_TURNS = 1      # v36: re-prompt when issue describes a UI surface but patch only touches support code
+MAX_STUB_TURNS = 1         # v36: re-prompt for extended stub patterns (`className={}`, `// TODO`, empty handlers)
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 3  # v34: 2 -> 3. The new lint and empty-arg gates address frequent loss
-                                # patterns from recent rounds (lint: 114 hits, malformed args: 9 hits in
-                                # the 18 v33 losses); pre-v34 cap left them stranded behind earlier gates.
-                                # v35 keeps the cap at 3 — the contract-preservation and setter-wired gates
-                                # only fire on tasks where they're load-bearing, so they push out lower-
-                                # leverage gates only when needed.
+MAX_TOTAL_REFINEMENT_TURNS = 3  # v34: 2 -> 3. v35/v36 keep at 3 — the new gates fire only when they're
+                                # load-bearing. The total cap prevents refinement chains from blowing
+                                # the time budget under marq/CW competition where they have ~245s.
+
+# v36: cascade-gap gate knobs.
+_CASCADE_GREP_TIMEOUT_SECONDS = 6
+_CASCADE_MAX_FINDINGS = 4
+_CASCADE_MAX_CALLERS_PER_NAME = 4
+_CASCADE_NAME_DENYLIST = frozenset({
+    "default", "main", "init", "setup", "teardown",
+    "test", "tests", "describe", "it", "expect",
+    "constructor", "render", "Component",
+    "module", "exports",
+})
+
+# v36: visible-surface gap knobs. The detector fires when the issue text
+# describes a rendered UI ("page", "button", "form", "dashboard", ...) but
+# the patch only touches non-rendering paths. Drives the model to add the
+# component edit the LLM judge is actually grading on.
+_SURFACE_UI_KEYWORDS = (
+    "button", "form", "modal", "dialog", "page", "panel", "view",
+    "screen", "dashboard", "layout", "header", "footer", "sidebar",
+    "navbar", "menu", "table", "list", "card", "tab", "drawer",
+    "tooltip", "toast", "snackbar", "input field", "input box",
+    "render", "display", "show", "hide", "click", "submit",
+    "loading state", "empty state", "error state",
+)
+_SURFACE_UI_PATH_RE = re.compile(
+    r"(?:^|/)(?:components?|pages?|views?|screens?|app|src/app)/.*\.(tsx?|jsx?|vue|svelte|astro)$|"
+    r"\.(tsx|jsx|vue|svelte)$",
+    re.IGNORECASE,
+)
+_SURFACE_SUPPORT_PATH_RE = re.compile(
+    r"(?:^|/)(?:services?|hooks?|utils?|lib|helpers?|store|context|providers?|"
+    r"api|types?|constants?|styles?|css|sass|sql|migrations?|scripts?|"
+    r"config|tests?)(?:$|/)|"
+    r"\.(?:json|yaml|yml|toml|ini|cfg|md|txt|sql|css|sass|scss|less|"
+    r"d\.ts|test\.tsx?|spec\.tsx?)$",
+    re.IGNORECASE,
+)
+
+# v36: cascade-signature regex. Matches def/function/class/interface/etc.
+# at the start of an added or removed line — for each match, we'll grep
+# the rest of the repo for unpatched callers.
+_CASCADE_SIGNATURE_RE = re.compile(
+    r"^[+\-](?!--|\+\+)\s*(?:async\s+|public\s+|private\s+|protected\s+|"
+    r"static\s+|export\s+|export\s+default\s+|const\s+|let\s+|var\s+)*"
+    r"(?:def|function|fn|class|interface|struct|enum|trait)"
+    r"\s+([A-Za-z_][\w]{2,})\b",
+    re.MULTILINE,
+)
+
+# v36: extended stub-pattern detector. Goes beyond v34's empty-arg gate
+# to catch JSX `className={}`, `style={{}}`, `// TODO`, `// FIXME`, and
+# empty arrow-function bodies. v35 lost rounds that contained these.
+_V36_STUB_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "JSX attribute with empty expression",
+        re.compile(
+            r"^\+(?!\+\+).*\b(?:className|style|onClick|onChange|onSubmit|"
+            r"onBlur|onFocus|onMouseEnter|onMouseLeave|onKeyDown|key|id|"
+            r"value|placeholder|aria-[\w-]+)=\{\s*\}",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "JSX style with empty object",
+        re.compile(r"^\+(?!\+\+).*style=\{\{\s*\}\}", re.MULTILINE),
+    ),
+    (
+        "TODO/FIXME/XXX placeholder comment in added code",
+        re.compile(
+            r"^\+(?!\+\+).*(?://|#|/\*)\s*(?:TODO|FIXME|XXX|HACK|"
+            r"implement\s+later|to\s+be\s+implemented|not\s+implemented)\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "empty arrow function body",
+        re.compile(r"^\+(?!\+\+).*=>\s*\{\s*\}\s*[;,]?\s*$", re.MULTILINE),
+    ),
+    (
+        "Python `pass` as the only body of a non-trivial function",
+        re.compile(
+            r"^\+\s+pass\s*$\n^\+(?:\s*$\n)*(?!\+\s+(?:return|raise|"
+            r"yield|self|[a-zA-Z]))",
+            re.MULTILINE,
+        ),
+    ),
+)
 
 # v34: lint integration knobs.
 _LINT_TIMEOUT_SECONDS = 10
@@ -1792,6 +1880,247 @@ def build_v35_setter_wired_fix_prompt(findings: List[str]) -> str:
     )
 
 
+# v36: cascade-gap gate.
+#
+# Distinct from v35's contract-preservation gate, which only fires when an
+# export is REMOVED entirely. The cascade gate fires when the patch
+# *modifies* a function/class/method declaration (signature, body, or both)
+# AND consumers of that name in other files do not appear in the patch. The
+# refinement turn lets the model pick between (a) cascading the change to
+# every caller, or (b) preserving backwards compatibility on the original
+# signature.
+#
+# Inspired by the marqcartasa pattern observed in PR #756, but reimplemented
+# with our own naming, regex, and prompt body.
+
+def _v36_extract_modified_signatures(patch: str) -> List[str]:
+    """Pull names of functions/classes whose declaration line was added,
+    where the same name was also removed (i.e. a modification, not a
+    fresh addition or pure deletion)."""
+    if not patch.strip():
+        return []
+    added: set = set()
+    removed: set = set()
+    for match in _CASCADE_SIGNATURE_RE.finditer(patch):
+        line = match.group(0)
+        name = match.group(1)
+        if name in _CASCADE_NAME_DENYLIST:
+            continue
+        if line.startswith("+"):
+            added.add(name)
+        elif line.startswith("-"):
+            removed.add(name)
+    # Names that show up on both sides == modified declarations.
+    return sorted(added & removed)
+
+
+def _v36_check_cascade_gap(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
+    """For each modified declaration, find call sites in tracked files
+    outside the patched files. Returns a list of `(name, callers)` tuples
+    capped by `_CASCADE_MAX_FINDINGS`."""
+    names = _v36_extract_modified_signatures(patch)
+    if not names:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[Tuple[str, List[str]]] = []
+    for name in names[: _CASCADE_MAX_FINDINGS]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "-F", "--", f"{name}("],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CASCADE_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            callers.append(relative_path)
+            if len(callers) >= _CASCADE_MAX_CALLERS_PER_NAME:
+                break
+        if callers:
+            findings.append((name, callers))
+    return findings
+
+
+def build_v36_cascade_gap_fix_prompt(findings: List[Tuple[str, List[str]]]) -> str:
+    bullets: List[str] = []
+    for name, callers in findings:
+        sample = ", ".join(callers[:_CASCADE_MAX_CALLERS_PER_NAME])
+        bullets.append(f"- `{name}` is referenced in unpatched file(s): {sample}")
+    body = "\n  ".join(bullets) or "(none)"
+    return (
+        "Cascade gap — your patch modifies these callable declarations, "
+        "but consumers in OTHER files are not in the current patch:\n"
+        f"  {body}\n\n"
+        "For each, decide: (a) the existing callers are still correct "
+        "(e.g. the change is internal-only, or you added a backwards-"
+        "compatible default arg) — emit `<final>summary</final>` and "
+        "explain; (b) the callers DO need updating — issue the additional "
+        "edit commands for those caller files in the SAME response, then "
+        "end with `<final>cascade applied</final>`. Match the style and "
+        "indentation of each caller file. Do NOT add scope unrelated to "
+        "the cascade."
+    )
+
+
+# v36: visible-surface gate.
+#
+# The LLM judge consistently penalises "wired infrastructure but no UI" on
+# tasks that describe a rendered surface. We detect this when:
+#   - the issue text contains UI keywords (button/page/dashboard/form/etc),
+#   - AND the patch only touches non-rendering paths (services/hooks/
+#     utils/types/store/context/api/styles/sql/etc).
+# The gate fires once per attempt and the prompt steers the model into
+# adding the visible component edit.
+
+def _v36_check_visible_surface(issue_text: str, patch: str) -> bool:
+    if not issue_text or not patch.strip():
+        return False
+    lower_issue = issue_text.lower()
+    if not any(kw in lower_issue for kw in _SURFACE_UI_KEYWORDS):
+        return False
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return False
+    # If ANY changed file is a rendering surface, no gap.
+    if any(_SURFACE_UI_PATH_RE.search(p) for p in changed):
+        return False
+    # All changed files are support-only?
+    return all(_SURFACE_SUPPORT_PATH_RE.search(p) for p in changed)
+
+
+def build_v36_visible_surface_fix_prompt(issue_text: str) -> str:
+    snippet = issue_text.strip()
+    if len(snippet) > 1500:
+        snippet = snippet[:1500].rstrip() + " [...truncated]"
+    return (
+        "Visible-surface gap — the issue describes a rendered UI surface "
+        "(button, page, form, dashboard, panel, modal, etc.), but your "
+        "patch only touches support code (services / hooks / utils / "
+        "types / store / styles / SQL / config). The user-facing surface "
+        "still does not show the requested behaviour, so the judge will "
+        "score this as half-implemented.\n\n"
+        "Edit the component / page / view that renders the requested "
+        "surface NOW. Use the existing UI architecture; reuse existing "
+        "hooks and components rather than introducing new abstractions; "
+        "make the smallest edit needed to actually wire the visible "
+        "control or rendered output. Do NOT rewrite unrelated components "
+        "or expand scope.\n\n"
+        "Task (for reference):\n"
+        f"{snippet}\n\n"
+        "Then end with `<final>surface wired</final>`."
+    )
+
+
+# v36: extended stub-pattern gate.
+#
+# Goes beyond v34's empty-arg detector to catch the broader family of
+# "syntactically valid but unfinished" patterns the judge dings:
+#   - JSX `className={}`, `style={{}}`, empty event handlers
+#   - `// TODO`, `// FIXME` comments in added code
+#   - Empty arrow-function bodies `() => {}`
+#   - Lone `pass` in a Python function with no other body
+# v35 lost a round on `className={}` empty expressions specifically — that
+# pattern would not have fired the v34 empty-arg gate.
+
+def _v36_check_extended_stubs(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _V36_STUB_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 5:
+                return findings
+    return findings
+
+
+def build_v36_extended_stub_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains stub-shaped expressions that will read as "
+        "unfinished to the judge:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fills in the intended value, removes "
+        "the stub, or replaces the placeholder with the real code. Do NOT "
+        "add new behaviour beyond closing the stub. Then end with "
+        "`<final>stubs filled</final>`."
+    )
+
+
+# v36: multishot memo. When attempt 1 yields a low-signal patch and we
+# revert + retry, the second attempt benefits from knowing what the first
+# tried (files touched, paths missed, last failing command). Without the
+# memo, attempt 2 often re-does the same exploratory work and runs out of
+# budget. Inspired by ricichez v72's _build_multishot_memo / _format_*
+# pair; reimplemented with our own naming and prompt shape.
+
+def _v36_summarize_attempt(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
+    patch = result.get("patch", "") or ""
+    summary = {
+        "files_touched": _patch_changed_files(patch),
+        "substantive_lines": _multishot_count_substantive(patch),
+        "uncovered_paths": _uncovered_required_paths(patch, issue),
+        "last_failed_command": _v36_last_failing_command(result),
+    }
+    return summary
+
+
+def _v36_last_failing_command(result: Dict[str, Any]) -> str:
+    """Pull the last non-zero-exit command from attempt logs."""
+    logs_text = result.get("logs", "") or ""
+    last_fail = ""
+    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
+        if "EXIT_CODE:\n" in chunk:
+            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
+            if ec_match and ec_match.group(1) != "0":
+                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
+                if cmd_match:
+                    last_fail = cmd_match.group(1).strip()[:200]
+    return last_fail
+
+
+def _v36_format_attempt_memo(memo: Dict[str, Any]) -> str:
+    files = memo.get("files_touched") or []
+    lines = memo.get("substantive_lines", 0)
+    missing = memo.get("uncovered_paths") or []
+    last_fail = memo.get("last_failed_command", "")
+    parts = [
+        "PRIOR-ATTEMPT NOTES (a previous attempt was reverted; take a different angle):",
+        f"  Files touched in prior attempt: {', '.join(files) if files else 'none'}",
+        f"  Substantive lines added: {lines}",
+    ]
+    if missing:
+        parts.append(
+            "  Issue-mentioned paths still untouched: "
+            + ", ".join(missing[:6])
+        )
+    if last_fail:
+        parts.append(f"  Last failing command: {last_fail}")
+    parts.append(
+        "  Strategy: prioritise the unaddressed paths/requirements; do "
+        "NOT repeat the same approach that yielded a low-signal result."
+    )
+    return "\n".join(parts)
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2448,27 +2777,40 @@ removes it. Section-grouping comments (`// Member 1 availability`) are
 high-signal to the judge. Removing comments while refactoring tanks judge
 score.
 
-Also preserve adjacent structural choices the judge is rewarding more often
-in recent rounds: the *order* of imports, the *grouping* of related
-constants, the *blank-line rhythm* between methods, and the placement of
-helper definitions before vs after their callers. When in doubt, leave the
-surrounding shape alone.
+## Comprehensive coverage with zero unrelated churn
 
-## Idiomatic match — the highest-signal win lever
+Recent judge data (~3000 rounds): the #1 reason challengers lose is
+"incomplete" (1010 critique hits) and the #2 reason is "unrelated churn"
+(805 hits). These pull in opposite directions, and the winning move is
+holding both at once: implement EVERY explicit requirement in the issue,
+add NOTHING else.
 
-The judge praises "idiomatic" / "matches the codebase style" patches more
-often than any other quality signal. Concretely:
+Concretely:
+- Re-read the issue and turn every "and / also / ensure / should / must /
+  when / unless / only / both / all / preserve" clause into its own line
+  in your `<plan>` block. Hidden tests usually target the secondary
+  clauses, so missing one of them is the most common loss.
+- For each clause, name the exact file/function that owns the behaviour.
+- Implement each clause in your patch. If the issue lists 5 requirements,
+  your final diff must address all 5.
+- Do NOT add anything the issue does not explicitly request — no
+  drive-by refactors, no unrelated refactor "while we're here", no extra
+  imports, no unrelated config edits.
 
-- Use the same construct the surrounding file already uses for similar work
-  (a `for` loop where neighbours use `for`, a comprehension where they use
-  comprehensions, `dict.get()` where they use `dict.get()`).
-- Match the local error idiom — if the file throws `new HttpError(...)`,
-  do not introduce `throw new Error(...)` for the same kind of failure.
-- Mirror the local logging idiom (`logger.warn` vs `console.error` vs
-  `print(..., file=sys.stderr)`) — picking the wrong one reads as foreign.
-- Reuse helpers already defined in the file/module before introducing a new
-  one. Repetition of an existing helper is praised; a parallel new helper
-  with the same shape is dinged as duplication.
+## Cascade discipline — modified signatures must update every caller
+
+If your patch changes a function/class/method's NAME or SIGNATURE, you
+MUST update every call site in the same diff. Recent rounds penalise
+"king modified X but consumers in other files were not updated" as a
+breaking-change pattern.
+
+Two valid responses when a signature change would touch many callers:
+1. Update every caller in the same patch (cascade).
+2. Keep the original signature and add a new one alongside it
+   (backwards-compatible default arg, or a sibling helper).
+
+The wrong response is to change the signature and leave callers
+referencing the old shape.
 
 ## Common pitfalls that kill quality score
 
@@ -2496,40 +2838,26 @@ often than any other quality signal. Concretely:
 
 ## Contract preservation — do not break callers
 
-When the issue does not explicitly ask for it, do NOT remove or rename:
-- `export` statements (named or default)
-- `module.exports.X` keys
-- Function, class, const, type, or interface declarations that are public
-  (i.e. used by other files in the repo)
-- `useState` / store keys whose names are read elsewhere
-
-If a rename or removal IS asked for, you MUST update every call site in
-the SAME patch. The judge gives a hard penalty for "breaks existing
-exports / breaks callers" — recent dual-judge data flags this in roughly
-1 of every 4 multi-file losing patches.
+When the issue does not explicitly ask for it, do NOT remove or rename
+public API: `export` statements, `module.exports.X` keys, public function
+/ class / const / type / interface declarations, store keys read by other
+files. If a rename or removal IS asked for, update every call site in the
+SAME patch.
 
 ## State wiring — useState without a setter is half-done
 
 When you add `const [x, setX] = useState(initial)`, you MUST also add a
 `setX(...)` call in the appropriate handler within the same patch. A
 declared-but-never-set state variable reads as scaffolded-but-not-finished
-to the judge. The same applies to `useReducer`, Zustand `set()`, or
-language analogues.
+to the judge.
 
-## File placement — match the codebase's existing layout
+## Visible surface — UI tasks need UI edits
 
-When the task introduces NEW files, place them where the existing
-codebase puts files of the same kind:
-- React components → wherever the codebase keeps components
-  (`src/components/...`, `app/components/...`, `packages/ui/...`, etc.)
-- React hooks → `hooks/` directory if one exists
-- Utilities / helpers → `utils/`, `lib/`, or `helpers/` if one exists
-- Service-layer code → `services/`, `api/`, or `domain/` if present
-- Types / interfaces → wherever the codebase already defines its public
-  types
-
-The judge consistently rewards "file placement matches the reference"
-over "file placement is anywhere reasonable."
+When the issue describes a rendered control, page, dashboard, form, panel,
+button, or workflow, your patch MUST touch the component / page / view
+that renders it — not only the supporting state, hooks, services, types,
+or styles. Patches that wire up infrastructure but leave the rendered
+surface unchanged read as half-implemented.
 
 ## Test files — context-dependent
 
@@ -3285,7 +3613,14 @@ def _v34_multishot_driver(kwargs: Dict[str, Any], repo_obj: Optional[Path]) -> D
         return result1
 
     _multishot_revert(repo_obj, initial_head)
-    result2 = _solve_attempt(**inner_args)
+    # v36: pass a memo of attempt 1 so the second attempt avoids redoing
+    # the same exploratory work. The memo lists files touched, paths still
+    # untouched, and the last failing command — letting attempt 2 take a
+    # different angle within the remaining budget.
+    memo = _v36_summarize_attempt(result1, issue)
+    inner_args_with_memo = dict(inner_args)
+    inner_args_with_memo["_v36_memo"] = memo
+    result2 = _solve_attempt(**inner_args_with_memo)
     patch2 = result2.get("patch", "") or ""
     n2 = _multishot_count_substantive(patch2)
 
@@ -3326,6 +3661,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     empty_arg_turns_used = 0     # v34
     contract_turns_used = 0      # v35: removed-export-still-used detector
     setter_turns_used = 0        # v35: useState-without-setter detector
+    cascade_turns_used = 0       # v36: modified signature with unpatched callers
+    surface_turns_used = 0       # v36: UI task with no UI edit
+    stub_turns_used = 0          # v36: extended stub-pattern detector
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3367,7 +3705,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, setter_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, setter_turns_used, cascade_turns_used, surface_turns_used, stub_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3390,12 +3728,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # v35: contract-preservation gate. Highest-leverage gate by recent
-        # dual-judge data — about 1 of every 4 multi-file losses traces to
-        # "patch removes / rewrites a public symbol still imported by other
-        # files." We fire it FIRST among correctness gates (after hail-mary)
-        # so the gate budget goes to broken-callers issues before anything
-        # else.
+        # v35: contract-preservation gate (REMOVED-export still-used). Fires
+        # first among correctness gates because broken-callers were ~28% of
+        # v33's loss patterns.
         if contract_turns_used < MAX_CONTRACT_TURNS:
             contract_findings = _v35_check_contract_preservation(repo, patch)
             if contract_findings:
@@ -3408,10 +3743,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v34: empty-arg/value gate. Malformed-but-syntax-valid expressions
-        # ('description: ,', 'lines.push()', 'new Error()') were directly
-        # cited in 2 of v33's 18 losses. Cheap to detect, high judge leverage,
-        # so we fire it ahead of polish so it claims a refinement slot.
+        # v36: cascade-gap gate (MODIFIED signature with unpatched callers).
+        # Distinct from contract preservation — fires when a declaration was
+        # changed (not removed) and other files still call the old shape.
+        # Targets the "wrong approach / breaks consumers" loss pattern that
+        # contract preservation does not catch on its own.
+        if cascade_turns_used < MAX_CASCADE_TURNS:
+            cascade_findings = _v36_check_cascade_gap(repo, patch)
+            if cascade_findings:
+                cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                summary = " | ".join(
+                    f"{name}->{len(callers)} callers" for name, callers in cascade_findings
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v36_cascade_gap_fix_prompt(cascade_findings),
+                    f"CASCADE_FIX_QUEUED:\n  {summary}",
+                )
+                return True
+
+        # v34: empty-arg/value gate (`description: ,`, `arr.push()`,
+        # `new Error()`). Cheap, high-leverage; covers the canonical
+        # malformed-args pattern.
         if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
             empty_arg_findings = _v34_check_empty_args(patch)
             if empty_arg_findings:
@@ -3421,6 +3775,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_v34_empty_args_fix_prompt(empty_arg_findings),
                     "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
+                )
+                return True
+
+        # v36: extended stub gate (`className={}`, `style={{}}`, `// TODO`,
+        # empty arrow functions, lone Python `pass`). Catches the broader
+        # family of stub patterns the empty-arg gate misses. v35 lost a
+        # round on `className={}` specifically — this gate fixes it.
+        if stub_turns_used < MAX_STUB_TURNS:
+            stub_findings = _v36_check_extended_stubs(patch)
+            if stub_findings:
+                stub_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v36_extended_stub_fix_prompt(stub_findings),
+                    "STUB_FIX_QUEUED:\n  " + "\n  ".join(stub_findings),
                 )
                 return True
 
@@ -3464,10 +3834,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v36: visible-surface gate. Fires when issue describes UI surface
+        # but patch only touches support code. Pattern observed in marq
+        # PR #756; here implemented with our own keyword set / path regex.
+        if surface_turns_used < MAX_SURFACE_TURNS:
+            if _v36_check_visible_surface(issue, patch):
+                surface_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_v36_visible_surface_fix_prompt(issue),
+                    "SURFACE_FIX_QUEUED: UI keywords in issue but no UI files in patch",
+                )
+                return True
+
         # v35: useState-without-setter gate. React-specific, lower frequency
-        # than contract preservation (cited in ~1 of v33's 18 losses), but
-        # cheap to detect and the fix is mechanical. Fires after lint so the
-        # earlier slots prioritise universally applicable issues.
+        # than contract preservation. Fires after lint so the earlier slots
+        # prioritise universally applicable issues.
         if setter_turns_used < MAX_SETTER_TURNS:
             setter_findings = _v35_check_setter_wired(patch)
             if setter_findings:
@@ -3551,9 +3934,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context = build_preloaded_context(repo, issue)
 
+        initial_user_msg = _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)
+
+        # v36: if this attempt is being driven from the multishot retry path,
+        # prepend a PRIOR-ATTEMPT NOTES block so the second attempt can take
+        # a different angle from the first.
+        v36_memo = kwargs.get("_v36_memo")
+        if v36_memo:
+            initial_user_msg = (
+                _v36_format_attempt_memo(v36_memo) + "\n\n" + initial_user_msg
+            )
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": initial_user_msg},
         ]
 
         _wall_start = time.monotonic()
