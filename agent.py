@@ -1461,38 +1461,37 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 
-def _check_patch_scope(patch: str, task_text: str) -> Optional[str]:
-    """v11: Flag files in patch that aren't mentioned in the issue (churn risk).
-    Returns a warning string if >2 out-of-scope files found, else None."""
-    import re
-    changed = _patch_changed_files(patch)
-    if not changed:
-        return None
-    # Files mentioned in issue (basename match is sufficient)
-    issue_files = set(re.findall(r'[\w/.-]+\.(?:ts|tsx|js|jsx|py|go|java|cs|php|vue|svelte|rb)', task_text, re.I))
-    issue_stems = {p.split('/')[-1].lower() for p in issue_files}
-    out_of_scope = [f for f in changed if f.split('/')[-1].lower() not in issue_stems and len(issue_files) > 0]
-    if len(out_of_scope) > 2:
-        return f"Churn warning: {len(out_of_scope)} files not in issue scope: {', '.join(out_of_scope[:3])}"
-    return None
+def _self_review_gate(patch: str, issue: str, repo: "Optional[Path]" = None) -> List[str]:  # type: ignore[name-defined]
+    """v10: Self-review patch before <final> - catch common failure patterns.
+
+    Returns a list of problems found (empty = patch is clean).
+    Maximum 1 repair turn is triggered on non-empty results.
+    """
+    problems: List[str] = []
+
+    # 1. chmod/file-mode changes - penalised by eval, easy to strip
+    if re.search(r'^(new mode|old mode|new file mode|deleted file mode)', patch, re.M):
+        problems.append("chmod/file-mode changes detected - strip them")
+
+    # 2. Placeholder URLs - templated URLs fail functional evaluation
+    for pattern in [
+        r'\[PROJECT_REF\]',
+        r'your-project-url',
+        r'\[YOUR_',
+        r'https://supabase\.co/functions',
+    ]:
+        if re.search(pattern, patch, re.I):
+            problems.append(f"placeholder URL detected: {pattern}")
+
+    # 3. Java stream mutation - won't compile, common regression
+    if re.search(r'\.forEach\s*\([^)]*->\s*[^)]*\+=', patch):
+        problems.append("Java stream mutation - use mapToDouble/sum instead")
+
+    return problems
 
 
 
-def _simplify_issue_for_retry(issue_text: str, preloaded_files: list) -> str:
-    """v11: Simplify long issue text for multishot retry (attempt 2).
-    If issue > 500 chars, keep only: first 300 chars + file paths mentioned."""
-    if len(issue_text) <= 500:
-        return issue_text
-    import re
-    files_mentioned = re.findall(r'[\w/.-]+\.(?:ts|tsx|js|jsx|py|go|java|cs)', issue_text)
-    summary = issue_text[:300].strip()
-    if files_mentioned:
-        summary += f"\n\nKey files: {', '.join(list(dict.fromkeys(files_mentioned))[:5])}"
-    return summary
-
-
-
-def _build_multifile_plan_hint(task_text: str, preloaded_files: list, repo=None) -> str:  # type: ignore[name-defined]
+def _build_multifile_plan_hint(issue: str, preloaded_files: List[str], repo: "Optional[Path]" = None) -> str:  # type: ignore[name-defined]
     """v10: Emit a hint when the issue likely requires multi-file edits.
 
     Fires when issue text contains >=2 architecture-signal words (excluding
@@ -2658,10 +2657,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # v11: simplify long issues for retry when attempt 1 was empty
-        if not _patch1.strip() and len(kwargs.get('issue', '')) > 500:
-            kwargs = dict(kwargs)
-            kwargs['issue'] = _simplify_issue_for_retry(kwargs['issue'], [])
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
@@ -2866,15 +2861,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v11: churn firewall
-        _scope_warning = _check_patch_scope(patch, issue)
-        if _scope_warning and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+        # v10/v11: self-review gate
+        _srg_issues = _self_review_gate(patch)
+        if _srg_issues and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
-            queue_refinement_turn(
-                assistant_text,
-                f"Scope check: {_scope_warning}\nFocus only on files mentioned in the issue.",
-                f"SCOPE_CHECK_QUEUED: {_scope_warning[:60]}"
-            )
+            queue_refinement_turn(assistant_text,
+                "Your patch has issues:\n" + "\n".join(f"- {p}" for p in _srg_issues) + "\n\nFix these.",
+                "SELF_REVIEW_QUEUED")
             return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
