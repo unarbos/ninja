@@ -132,6 +132,9 @@ MAX_UNDERSIZED_TURNS = 1   # issue mentions 3+ files, patch touches <2
 MAX_CORRUPTION_TURNS = 1   # heredoc / prompt markers leaked into source files
 MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched source file
 MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags without matching adds
+MAX_PHP_SYNTAX_TURNS = 1   # PHP / Blade syntax error in a touched .php file
+MAX_CSTYLE_BRACE_TURNS = 1 # brace imbalance in C-family / Java-family files where ' is a char literal
+MAX_REQUIRED_FILE_TURNS = 1 # issue explicitly requires creating a new file but patch doesn't add it
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -2151,6 +2154,216 @@ def build_critical_tag_fix_prompt(findings: List[str]) -> str:
     )
 
 
+# PHP-syntax gate: `php -l` lint check on touched .php / .blade.php files.
+# Catches the "fatal syntax error" / "broken Blade components" pattern
+# observed in marqcartasa #4402 and ninjaking66 UID159 #4396 losses.
+# Skips silently when `php` is not installed in the validator image.
+
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    if not _has_executable("php"):
+        return None
+    proc = run_command(
+        f"php -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=10,
+    )
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stderr or proc.stdout or "").strip()
+    if not output:
+        return None
+    first_line = output.splitlines()[0].strip()[:240]
+    return f"{relative_path}: {first_line}"
+
+
+def _check_php_syntax(repo: Path, patch: str) -> List[str]:
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix in {".php"} or relative_path.endswith(".blade.php"):
+            err = _check_php_syntax_one(repo, relative_path)
+            if err:
+                findings.append(err)
+                if len(findings) >= 4:
+                    break
+    return findings
+
+
+def build_php_syntax_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch produces a PHP / Blade syntax error in these files:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes ONLY the syntax error (most often "
+        "a missing semicolon, mismatched `{` / `}`, unclosed `@if` / "
+        "`@foreach`, or stray `<?php` markers). Do NOT change unrelated "
+        "lines. Then end with `<final>php syntax fixed</final>`."
+    )
+
+
+# C-style brace balance: counts braces / parens / brackets in C-family
+# languages where `'` is a char literal (so apostrophes in code/comments
+# don't confuse the counter). Generic `_check_brace_balance_one` already
+# covers JS-style; this fires on .c / .cc / .cpp / .h / .hpp / .java /
+# .cs / .swift / .kt / .scala. Catches the "extra closing brace" pattern
+# in mid-edit C++ patches.
+
+_CSTYLE_BRACE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+    ".java", ".cs", ".swift", ".kt", ".scala",
+}
+
+
+def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
+    try:
+        text = (repo / relative_path).read_text(errors="ignore")
+    except Exception:
+        return None
+    # Strip char literals like 'a' first, then balance.
+    stripped = re.sub(r"'(?:\\.|[^'\\])'", "", text)
+    counts = {"{": 0, "}": 0, "(": 0, ")": 0, "[": 0, "]": 0}
+    in_string = False
+    in_block_comment = False
+    in_line_comment = False
+    i = 0
+    while i < len(stripped):
+        ch = stripped[i]
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and i + 1 < len(stripped) and stripped[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            if ch == "\\" and i + 1 < len(stripped):
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == "/" and i + 1 < len(stripped):
+            if stripped[i + 1] == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if stripped[i + 1] == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+    diffs = []
+    for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
+def _check_cstyle_brace_balance(repo: Path, patch: str) -> List[str]:
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix in _CSTYLE_BRACE_SUFFIXES:
+            err = _check_brace_balance_cstyle_one(repo, relative_path)
+            if err:
+                findings.append(err)
+                if len(findings) >= 4:
+                    break
+    return findings
+
+
+def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Brace imbalance detected in C-family files:\n\n"
+        f"{body}\n\n"
+        "These files now have unmatched `{` / `}`, `(` / `)`, or `[` / `]` "
+        "after your edit, which will fail to compile. Emit ONE bash command "
+        "that adds the missing closing token(s) or removes the extra "
+        "opener(s). Do NOT touch unrelated lines. Then end with "
+        "`<final>braces balanced</final>`."
+    )
+
+
+# Required-file gate: when the issue explicitly requires creating a new
+# file ("create a new component <Foo>", "add a <Bar> service", "implement
+# a <Baz> module"), check whether the patch actually adds a new file.
+# Drives the "covers more / matches reference" praise on tasks where the
+# reference patch creates new files.
+
+_REQUIRED_FILE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:create|add|implement|introduce|build)\s+a\s+new\s+([A-Za-z_][\w\-./]*\.(?:tsx?|jsx?|vue|svelte|py|go|rb|java|cs|php|md|yml|yaml|json|toml|sql))\b", re.IGNORECASE),
+    re.compile(r"\bnew\s+(?:file|module|component|page|view|service|controller|store|hook|util|helper)\s+(?:called\s+|named\s+)?[`\"']?([A-Z][A-Za-z_]+)[`\"']?", re.IGNORECASE),
+    re.compile(r"\bcreate\s+(?:a\s+)?[`\"']?([A-Z][A-Za-z_]+\.(?:tsx?|jsx?|vue|svelte|py))[`\"']?", re.IGNORECASE),
+)
+
+
+def _check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
+    if not patch.strip() or not issue_text:
+        return None
+    expected: List[str] = []
+    seen: set = set()
+    for pattern in _REQUIRED_FILE_PATTERNS:
+        for match in pattern.finditer(issue_text):
+            name = match.group(1).strip(" `\"'")
+            if name and name not in seen:
+                seen.add(name)
+                expected.append(name)
+    if not expected:
+        return None
+    # Patch must contain `new file mode 100` line OR a `+++` line for a
+    # path matching one of the expected names.
+    added_paths: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            added_paths.add(line[len("+++ b/"):].strip())
+    # Check: does the patch's added paths reference any expected name?
+    matched: set = set()
+    for path in added_paths:
+        path_lower = path.lower()
+        for name in expected:
+            if name.lower() in path_lower:
+                matched.add(name)
+    missing = [n for n in expected if n not in matched]
+    if not missing:
+        return None
+    return missing[:4]
+
+
+def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
+    items = "\n".join(f"  - {m}" for m in missing)
+    snippet = issue_text.strip()
+    if len(snippet) > 800:
+        snippet = snippet[:800].rstrip() + " [...]"
+    return (
+        "The issue explicitly requires creating these new file(s) / "
+        "module(s) / component(s), but your patch does NOT add them:\n\n"
+        f"{items}\n\n"
+        "When the issue says 'create a new X' or 'add a Y component', the "
+        "reference patch typically introduces those files. Emit ONE bash "
+        "command (heredoc / `python -c` write_text) that creates each "
+        "missing file with the requested implementation. Place each file "
+        "in the directory the codebase already uses for files of that "
+        "kind. Then end with `<final>required files added</final>`.\n\n"
+        f"Issue (for reference):\n{snippet}"
+    )
+
+
 _REMOVED_PUBLIC_SYMBOL_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^-(?!--)\s*export\s+(?:default\s+)?"
@@ -4033,6 +4246,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     corruption_turns_used = 0
     dup_import_turns_used = 0
     tag_turns_used = 0
+    php_syntax_turns_used = 0
+    cstyle_brace_turns_used = 0
+    required_file_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -4087,7 +4303,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4450,6 +4666,55 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_critical_tag_fix_prompt(tag_findings),
                     "TAG_FIX_QUEUED:\n  " + "\n  ".join(tag_findings),
+                )
+                return True
+
+        # PHP / Blade syntax check — `php -l` lint on touched .php /
+        # .blade.php files. Catches the "broken Blade components" loss
+        # pattern observed in marqcartasa & ninjaking66 UID159 close-margin
+        # losses. Skipped silently if `php` isn't on PATH.
+        if php_syntax_turns_used < MAX_PHP_SYNTAX_TURNS:
+            php_findings = _check_php_syntax(repo, patch)
+            if php_findings:
+                php_syntax_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_php_syntax_fix_prompt(php_findings),
+                    "PHP_SYNTAX_QUEUED:\n  " + "\n  ".join(php_findings),
+                )
+                return True
+
+        # C-style brace balance — distinct from generic syntax check;
+        # treats `'x'` as char literal so apostrophes don't break the
+        # counter. Fires on .c / .cpp / .h / .java / .cs / .swift / .kt
+        # / .scala. Catches the "extra `}` after edit" pattern in mid-
+        # patch C-family files.
+        if cstyle_brace_turns_used < MAX_CSTYLE_BRACE_TURNS:
+            cstyle_findings = _check_cstyle_brace_balance(repo, patch)
+            if cstyle_findings:
+                cstyle_brace_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cstyle_brace_fix_prompt(cstyle_findings),
+                    "CSTYLE_BRACE_QUEUED:\n  " + "\n  ".join(cstyle_findings),
+                )
+                return True
+
+        # Required-file gate — issue explicitly requires creating a new
+        # file/component but the patch doesn't add it. Drives the
+        # "matches reference" praise on multi-file refactor tasks where
+        # the reference patch introduces new files.
+        if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
+            missing_files = _check_required_file(patch, issue)
+            if missing_files:
+                required_file_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_required_file_fix_prompt(missing_files, issue),
+                    "REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
                 )
                 return True
 
