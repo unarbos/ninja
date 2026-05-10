@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
+WALL_CLOCK_BUDGET_SECONDS = 240.0  # leaves ~60s headroom for safety net + emergency fallback before the docker kill at 600s
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,8 +112,8 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
-_LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
+MAX_LINT_TURNS = 1         # ruff/eslint pass for clean, production-looking code
+_LINT_TIMEOUT = 10         # per-file ruff/eslint timeout
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
@@ -126,10 +126,10 @@ MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config 
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
-                                # Why 3 (not 2): on multi-file confirmation_retest tasks the
-                                # 2-cap is consumed by coverage+criteria nudges, leaving syntax
-                                # repair starved — half of duel-004362 losses shipped non-compiling
-                                # code. Exempted gates: hail-mary, syntax-fix.
+                                # Sized to leave room for both a syntax/lint repair and a
+                                # scope nudge (coverage or criteria) on multi-file tasks
+                                # without blowing the wall-clock budget.
+                                # Exempted gates: hail-mary, syntax-fix.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
