@@ -93,7 +93,7 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches do not solve tasks, so any transient model
 # error or stuck loop is costly. Be aggressive about retrying instead of
@@ -125,6 +125,12 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_CORRUPTION_TURNS = 1   # heredoc / harness-tag markers leaked into source
+MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched file
+MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags (template/script/style)
+MAX_PHP_SYNTAX_TURNS = 1   # `php -l` syntax error in a touched .php / .blade.php
+MAX_CSTYLE_BRACE_TURNS = 1 # brace imbalance in C-family/Java/Kotlin/Scala
+MAX_REQUIRED_FILE_TURNS = 1  # issue requires creating a new file but patch missing it
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -840,11 +846,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
+    needles = _preload_needles(issue)
+
     for relative_path in files[:MAX_PRELOADED_FILES]:
         if relative_path in anchor_map:
             snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
         else:
-            snippet = _read_context_file(repo, relative_path, per_file_budget)
+            snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1010,7 +1018,157 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+_PRELOAD_SECTION_HEADER = "Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):"
+_PRELOAD_SECTION_END = "Before planning, read the ENTIRE issue above"
+_PRELOAD_FILE_HEADER_RE = re.compile(r"^### (\S+)$", re.MULTILINE)
+
+
+def _strip_preloaded_section(messages: List[Dict[str, str]]) -> int:
+    """Replace the preloaded-snippets block in messages[1] with a brief breadcrumb.
+
+    Returns chars saved (0 if nothing was replaced). By the mid-loop the model
+    has either internalized the preload or located targets via grep; keeping
+    the bulk pinned costs tokens on every later request. A short filename
+    breadcrumb preserves orientation without the bulk.
+    """
+    if len(messages) < 2:
+        return 0
+    user_msg = messages[1]
+    if user_msg.get("role") != "user":
+        return 0
+    body = user_msg.get("content", "")
+    start = body.find(_PRELOAD_SECTION_HEADER)
+    if start == -1:
+        return 0
+    end = body.find(_PRELOAD_SECTION_END, start)
+    if end == -1:
+        return 0
+    block = body[start:end]
+    files = _PRELOAD_FILE_HEADER_RE.findall(block)
+    if files:
+        breadcrumb = (
+            "Preloaded snippets (already shown earlier) were trimmed to free tokens. "
+            "Files originally included: " + ", ".join(files[:12]) + "\n\n"
+        )
+    else:
+        breadcrumb = "Preloaded snippets were trimmed to free tokens.\n\n"
+    if len(breadcrumb) >= len(block):
+        return 0
+    user_msg["content"] = body[:start] + breadcrumb + body[end:]
+    return len(block) - len(breadcrumb)
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers first (strongest signal), then file-stem
+    mentions (so `foo.py` in the issue picks out lines referencing `foo`),
+    then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    """Return windows around lines matching any needle, capped at max_chars.
+
+    When the file already fits, return verbatim. When no needles match,
+    fall back to head/tail truncation. Otherwise produce merged windows
+    around each matching line, prefixed with line-range headers.
+    """
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within "
+            f"{max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
+
+
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1023,6 +1181,8 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
@@ -1743,6 +1903,354 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
     )
 
 
+_CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "shell heredoc marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*<<['\"]?(?:EOF|PYEOF|TXT|END|SCRIPT|HEREDOC)['\"]?\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "agent control tag leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*</?(?:command|final|plan)>\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "raw shell prompt marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*\$\s+[a-z]+\s+\S+.*\$\s*$",
+            re.MULTILINE,
+        ),
+    ),
+)
+
+
+def _check_corruption(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _CORRUPTION_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_corruption_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains markers that belong to your shell or agent "
+        "harness, NOT to the source file being edited:\n\n"
+        f"{body}\n\n"
+        "These leak into source typically when a heredoc edit ran past its "
+        "terminator or when the model's `<command>` / `<plan>` blocks were "
+        "captured verbatim into the file. Emit ONE bash command that either "
+        "(a) reverts the file to its original content for the affected "
+        "region, or (b) re-applies the intended edit cleanly without any "
+        "harness markup. Then end with `<final>corruption removed</final>`."
+    )
+
+
+_DUP_IMPORT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java", ".rb"}
+
+
+def _check_duplicate_imports(repo: Path, patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix not in _DUP_IMPORT_SUFFIXES:
+            continue
+        try:
+            file_path = repo / relative_path
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            text = file_path.read_text(errors="ignore")
+        except Exception:
+            continue
+        seen_imports: Dict[str, int] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            is_import = (
+                stripped.startswith("import ")
+                or stripped.startswith("from ")
+                or stripped.startswith("require(")
+                or (suffix == ".go" and stripped.startswith('import "'))
+            )
+            if not is_import:
+                continue
+            seen_imports[stripped] = seen_imports.get(stripped, 0) + 1
+        for imp, count in seen_imports.items():
+            if count > 1:
+                findings.append(f"{relative_path}: {imp[:120]} appears {count}x")
+                if len(findings) >= 4:
+                    return findings
+    return findings
+
+
+def build_duplicate_imports_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch results in duplicate import lines in these files:\n\n"
+        f"{body}\n\n"
+        "Duplicate imports are a code-quality red flag and may even break "
+        "the parser depending on the language. Emit ONE bash command that "
+        "removes the redundant import lines, keeping exactly one occurrence "
+        "of each. Then end with `<final>imports deduplicated</final>`."
+    )
+
+
+_CRITICAL_TAGS = ("</template>", "</script>", "</style>", "</html>", "</body>", "</head>")
+
+
+def _check_critical_tag_removals(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for tag in _CRITICAL_TAGS:
+        removed_count = 0
+        added_count = 0
+        for line in patch.splitlines():
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+            if tag in line:
+                if line.startswith("-"):
+                    removed_count += 1
+                elif line.startswith("+"):
+                    added_count += 1
+        if removed_count > added_count:
+            net = removed_count - added_count
+            findings.append(f"net {net} `{tag}` tag(s) removed without re-adding")
+    return findings
+
+
+def build_critical_tag_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch removes top-level closing tags that templates rely on:"
+        f"\n\n{body}\n\n"
+        "These tags terminate template / script / style sections; removing "
+        "them silently breaks the file. Emit ONE bash command that re-adds "
+        "the missing closing tag(s) at the correct position(s). Then end "
+        "with `<final>tags restored</final>`."
+    )
+
+
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    if not _has_executable("php"):
+        return None
+    proc = run_command(
+        f"php -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stderr or proc.stdout or "").strip()
+    if not output:
+        return None
+    first_line = output.splitlines()[0].strip()[:240]
+    return f"{relative_path}: {first_line}"
+
+
+def _check_php_syntax(repo: Path, patch: str) -> List[str]:
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".php" or relative_path.endswith(".blade.php"):
+            err = _check_php_syntax_one(repo, relative_path)
+            if err:
+                findings.append(err)
+                if len(findings) >= 4:
+                    break
+    return findings
+
+
+def build_php_syntax_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch produces a PHP / Blade syntax error in these files:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes ONLY the syntax error (most often "
+        "a missing semicolon, mismatched `{` / `}`, unclosed `@if` / "
+        "`@foreach`, or stray `<?php` markers). Do NOT change unrelated "
+        "lines. Then end with `<final>php syntax fixed</final>`."
+    )
+
+
+_CSTYLE_BRACE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+    ".java", ".cs", ".kt", ".scala",
+}
+
+
+def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
+    try:
+        text = (repo / relative_path).read_text(errors="ignore")
+    except Exception:
+        return None
+    stripped = re.sub(r"'(?:\\.|[^'\\])'", "", text)
+    counts = {"{": 0, "}": 0, "(": 0, ")": 0, "[": 0, "]": 0}
+    in_string = False
+    in_block_comment = False
+    in_line_comment = False
+    i = 0
+    while i < len(stripped):
+        ch = stripped[i]
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and i + 1 < len(stripped) and stripped[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            if ch == "\\" and i + 1 < len(stripped):
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == "/" and i + 1 < len(stripped):
+            if stripped[i + 1] == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if stripped[i + 1] == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
+def _check_cstyle_brace_balance(repo: Path, patch: str) -> List[str]:
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix in _CSTYLE_BRACE_SUFFIXES:
+            err = _check_brace_balance_cstyle_one(repo, relative_path)
+            if err:
+                findings.append(err)
+                if len(findings) >= 4:
+                    break
+    return findings
+
+
+def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Brace imbalance detected in C-family files:\n\n"
+        f"{body}\n\n"
+        "These files now have unmatched `{` / `}`, `(` / `)`, or `[` / `]` "
+        "after your edit, which will fail to compile. Emit ONE bash command "
+        "that adds the missing closing token(s) or removes the extra "
+        "opener(s). Do NOT touch unrelated lines. Then end with "
+        "`<final>braces balanced</final>`."
+    )
+
+
+_REQUIRED_FILE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(
+        r"\b(?:create|add|implement|introduce|build)\s+a\s+new\s+"
+        r"([A-Za-z_][\w\-./]*\.(?:tsx?|jsx?|vue|svelte|py|go|rb|"
+        r"java|cs|php|md|yml|yaml|json|toml|sql))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bnew\s+(?:file|module|component|page|view|service|"
+        r"controller|store|hook|util|helper)\s+(?:called\s+|named\s+)?"
+        r"[`\"']?([A-Z][A-Za-z_]+)[`\"']?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcreate\s+(?:a\s+)?[`\"']?([A-Z][A-Za-z_]+\.(?:tsx?|"
+        r"jsx?|vue|svelte|py))[`\"']?",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
+    if not patch.strip() or not issue_text:
+        return None
+    expected: List[str] = []
+    seen: set = set()
+    for pattern in _REQUIRED_FILE_PATTERNS:
+        for match in pattern.finditer(issue_text):
+            name = match.group(1).strip(" `\"'")
+            if name and name not in seen:
+                seen.add(name)
+                expected.append(name)
+    if not expected:
+        return None
+    added_paths: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            added_paths.add(line[len("+++ b/"):].strip())
+    matched: set = set()
+    for path in added_paths:
+        path_lower = path.lower()
+        for name in expected:
+            if name.lower() in path_lower:
+                matched.add(name)
+    missing = [n for n in expected if n not in matched]
+    if not missing:
+        return None
+    return missing[:4]
+
+
+def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
+    items = "\n".join(f"  - {m}" for m in missing)
+    snippet = issue_text.strip()
+    if len(snippet) > 800:
+        snippet = snippet[:800].rstrip() + " [...]"
+    return (
+        "The issue explicitly requires creating these new file(s) / "
+        "module(s) / component(s), but your patch does NOT add them:\n\n"
+        f"{items}\n\n"
+        "When the issue says 'create a new X' or 'add a Y component', the "
+        "reference patch typically introduces those files. Emit ONE bash "
+        "command (heredoc / `python -c` write_text) that creates each "
+        "missing file with the requested implementation. Place each file "
+        "in the directory the codebase already uses for files of that "
+        "kind. Then end with `<final>required files added</final>`.\n\n"
+        f"Issue (for reference):\n{snippet}"
+    )
+
+
 _REMOVED_PUBLIC_SYMBOL_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^-(?!--)\s*export\s+(?:default\s+)?"
@@ -2448,6 +2956,13 @@ brief summary of what changed
 **Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
+- Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
+- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- Visible surface: if the issue mentions rendered UI (button, page, form, modal, view, layout, navigation entry) but your candidate target list only contains support code (services, types, hooks, state, schemas, JSON/SQL config, CSS-only), add the page/component/view file that actually renders the requested behaviour as a plan row — patches that edit only support code without the surface lose to ones that wire the visible UI.
+- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Verification: targeted test command expected after patching.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
@@ -3618,6 +4133,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0
     empty_arg_turns_used = 0
+    corruption_turns_used = 0
+    dup_import_turns_used = 0
+    tag_turns_used = 0
+    php_syntax_turns_used = 0
+    cstyle_brace_turns_used = 0
+    required_file_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -3672,7 +4193,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3966,6 +4487,93 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Corruption: heredoc / `<command>` / `<plan>` / shell-prompt markers
+        # leaked into added lines. A patch carrying harness markup is a
+        # near-guaranteed parse failure — fire ahead of style gates.
+        if corruption_turns_used < MAX_CORRUPTION_TURNS:
+            corruption_findings = _check_corruption(patch)
+            if corruption_findings:
+                corruption_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_corruption_fix_prompt(corruption_findings),
+                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
+                )
+                return True
+
+        # Critical-tag removal: net deletion of </template>, </script>,
+        # </style>, </html>, </body>, </head> without re-adding leaves
+        # templates structurally broken.
+        if tag_turns_used < MAX_TAG_TURNS:
+            tag_findings = _check_critical_tag_removals(patch)
+            if tag_findings:
+                tag_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_critical_tag_fix_prompt(tag_findings),
+                    "CRITICAL_TAG_QUEUED:\n  " + "\n  ".join(tag_findings),
+                )
+                return True
+
+        # C-family brace balance: covers .c/.cpp/.h*/.java/.cs/.kt/.scala
+        # which the existing _check_brace_balance_one (TS/JSX/Swift) skips.
+        # Char-literal stripping ('a') avoids C-specific false positives.
+        if cstyle_brace_turns_used < MAX_CSTYLE_BRACE_TURNS:
+            cstyle_findings = _check_cstyle_brace_balance(repo, patch)
+            if cstyle_findings:
+                cstyle_brace_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cstyle_brace_fix_prompt(cstyle_findings),
+                    "CSTYLE_BRACE_QUEUED:\n  " + "\n  ".join(cstyle_findings),
+                )
+                return True
+
+        # PHP / Blade syntax: `php -l` is fast and authoritative when php
+        # is installed. Fills the language gap left by _check_syntax.
+        if php_syntax_turns_used < MAX_PHP_SYNTAX_TURNS:
+            php_findings = _check_php_syntax(repo, patch)
+            if php_findings:
+                php_syntax_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_php_syntax_fix_prompt(php_findings),
+                    "PHP_SYNTAX_QUEUED:\n  " + "\n  ".join(php_findings),
+                )
+                return True
+
+        # Duplicate imports: a common artifact of repeated edits to the
+        # imports block. Different axis from lint (lint may be unavailable).
+        if dup_import_turns_used < MAX_DUP_IMPORT_TURNS:
+            dup_findings = _check_duplicate_imports(repo, patch)
+            if dup_findings:
+                dup_import_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duplicate_imports_fix_prompt(dup_findings),
+                    "DUP_IMPORT_QUEUED:\n  " + "\n  ".join(dup_findings),
+                )
+                return True
+
+        # Required-file: issue says "create a new <Component>" but no
+        # `+++ b/...` line in the patch references that name.
+        if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
+            missing_files = _check_required_file(patch, issue)
+            if missing_files:
+                required_file_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_required_file_fix_prompt(missing_files, issue),
+                    "REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -4000,8 +4608,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         emergency_injected = False
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
+        preload_stripped = False
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if step == 5 and not preload_stripped:
+                preload_stripped = True
+                saved = _strip_preloaded_section(messages)
+                if saved > 0:
+                    logs.append(f"PRELOAD_STRIPPED:\nFreed {saved} chars from initial user message.")
 
             if out_of_time():
                 logs.append(
