@@ -2254,15 +2254,6 @@ CSS/animation: preserve rotateX/rotateY in BOTH the initial state AND all event 
 
 No sudo. No file deletion. No network access outside the validator proxy. No host secrets. No modifying hidden test or evaluator files.
 
-## Patch style by task archetype
-FEATURE_BUILD: Implement ALL acceptance-criteria items end-to-end — wired state, event handlers, data binding, AND integration into parent template. Define a component AND place it in the correct slot. Never leave a component imported but unused.
-BUG_FIX: Fix root cause only. One targeted edit. No refactoring, no extra imports, no defensive checks the task didn't ask for.
-REFACTOR: Apply the change CASCADE-WIDE — every call site, every implementing class, every affected file. A refactor that only touches one file is almost always incomplete.
-MIGRATION: Provide ALL three artifact categories — (1) schema/data change, (2) updated lockfile or manifest, (3) fixture or data migration script. Missing any one category scores as incomplete.
-
-## Judge alignment (GPT-5.4 scorer)
-The judge penalizes: (a) code that fails to compile or has undefined references, (b) placeholder strings like [PROJECT_REF] or [YOUR_URL], (c) unrelated style churn (chmod, orange→bold rewrites, whitespace normalization), (d) components defined but not wired into parent template, (e) SQL enum values not matching schema, (f) partial timeout with no output.
-The judge rewards: spec compliance (keep axios when task says keep axios), correct event binding (match emit name exactly), edge-case completeness, and config wiring (supabase/config.toml for edge functions).
 '''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
