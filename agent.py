@@ -1460,6 +1460,37 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+
+def _check_patch_scope(patch: str, task_text: str) -> Optional[str]:
+    """v11: Flag files in patch that aren't mentioned in the issue (churn risk).
+    Returns a warning string if >2 out-of-scope files found, else None."""
+    import re
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return None
+    # Files mentioned in issue (basename match is sufficient)
+    issue_files = set(re.findall(r'[\w/.-]+\.(?:ts|tsx|js|jsx|py|go|java|cs|php|vue|svelte|rb)', task_text, re.I))
+    issue_stems = {p.split('/')[-1].lower() for p in issue_files}
+    out_of_scope = [f for f in changed if f.split('/')[-1].lower() not in issue_stems and len(issue_files) > 0]
+    if len(out_of_scope) > 2:
+        return f"Churn warning: {len(out_of_scope)} files not in issue scope: {', '.join(out_of_scope[:3])}"
+    return None
+
+
+
+def _simplify_issue_for_retry(issue_text: str, preloaded_files: list) -> str:
+    """v11: Simplify long issue text for multishot retry (attempt 2).
+    If issue > 500 chars, keep only: first 300 chars + file paths mentioned."""
+    if len(issue_text) <= 500:
+        return issue_text
+    import re
+    files_mentioned = re.findall(r'[\w/.-]+\.(?:ts|tsx|js|jsx|py|go|java|cs)', issue_text)
+    summary = issue_text[:300].strip()
+    if files_mentioned:
+        summary += f"\n\nKey files: {', '.join(list(dict.fromkeys(files_mentioned))[:5])}"
+    return summary
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -2601,6 +2632,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        # v11: simplify issue for retry when attempt 1 was empty
+        if not _patch1.strip():
+            _orig_issue = kwargs.get('issue', '')
+            kwargs = dict(kwargs)
+            kwargs['issue'] = _simplify_issue_for_retry(_orig_issue, list(preloaded_files) if 'preloaded_files' in dir() else [])
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
@@ -2804,6 +2840,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
+
+        # v11: churn firewall
+        _scope_warning = _check_patch_scope(patch, issue)
+        if _scope_warning and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                f"Scope check: {_scope_warning}\nFocus only on files mentioned in the issue.",
+                f"SCOPE_CHECK_QUEUED: {_scope_warning[:60]}"
+            )
+            return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
