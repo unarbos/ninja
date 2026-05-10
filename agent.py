@@ -2524,7 +2524,7 @@ focused inspection command
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
 
-**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
+**Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. When the issue quotes an error message, exception class, log line, or stacktrace fragment, grep for that EXACT string first — it usually pinpoints the throwing line in one search and removes the need for paraphrased exploration. Do not loop on inspection.
 
 **Edit comprehensively when the task needs it, surgically when it doesn't**:
 - Single-line substitutions: `sed -i 's/old/new/' file`
