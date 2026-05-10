@@ -125,8 +125,11 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
+                                # Why 3 (not 2): on multi-file confirmation_retest tasks the
+                                # 2-cap is consumed by coverage+criteria nudges, leaving syntax
+                                # repair starved — half of duel-004362 losses shipped non-compiling
+                                # code. Exempted gates: hail-mary, syntax-fix.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -3476,16 +3479,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. patch-safety — remove unsafe review-process wording
-            2. coverage-nudge — name issue-mentioned paths still untouched
-            3. criteria-nudge — name issue acceptance bullets not addressed
-            4. test — actually run the companion test if one exists; if it
+            1. syntax-fix — repair Python/TS/JS SyntaxError (exempt from cap)
+            2. patch-safety — remove unsafe review-process wording
+            3. coverage-nudge — name issue-mentioned paths still untouched
+            4. criteria-nudge — name issue acceptance bullets not addressed
+            5. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            5. failed-verification — repair the latest concrete failed check
-            6. contract — preserve public symbols still referenced by callers
-            7. integration/artifact/dependency — close common missing pieces
-            8. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            9. self-check — show the diff and ask "did you cover everything?"
+            6. failed-verification — repair the latest concrete failed check
+            7. contract — preserve public symbols still referenced by callers
+            8. integration/artifact/dependency — close common missing pieces
+            9. polish/empty-arg/lint — remove churn and tool errors
+           10. self-check — show the diff and ask "did you cover everything?"
+
+        syntax-fix runs before the cap because non-parsing patches are
+        guaranteed losses; the LLM judge often penalises broken code harder
+        than missing scope (see duel 004362, ~half of losses).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
@@ -3503,7 +3511,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # Hard-stop when the cap is reached (hail-mary excluded).
+        # Syntax-fix is exempt from the cap and runs ahead of any nudge.
+        # A non-parsing patch is a guaranteed loss regardless of scope, and the
+        # repair is usually a small surgical edit — cheap to run and worth doing
+        # even when other gates would otherwise consume the cap.
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Hard-stop when the cap is reached (hail-mary and syntax-fix excluded).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -3631,18 +3654,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_polish_prompt(junk),
                     f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
