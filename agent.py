@@ -807,6 +807,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
       4. Compact project hints expose test/build scripts without spending an
          extra inspection turn.
+
+      5. Backticked path-like names that are not tracked files are surfaced as
+         candidate create targets for tasks that explicitly ask for new files.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -851,6 +854,11 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
+    create_hint = _files_to_create_hint(issue, tracked_set)
+    if create_hint and used + len(create_hint) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+        parts.append(create_hint)
+        used += len(create_hint)
+
     project_hints = _project_hint_block(repo)
     if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
         parts.append(project_hints)
@@ -868,6 +876,38 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5
+
+_BACKTICK_PATHLIKE_RE = re.compile(
+    r"`([A-Za-z][\w./_-]{2,80}"
+    r"(?:/[A-Za-z][\w./_-]{1,80}"
+    r"|\.(?:py|js|jsx|ts|tsx|svelte|vue|go|rs|java|kt|rb|php|cs|cpp|c|h|hpp|"
+    r"swift|dart|ex|exs|md|rst|txt|json|ya?ml|toml|sql|sh|bash|zsh|html|css|scss)"
+    r"))`",
+    re.IGNORECASE,
+)
+
+
+def _files_to_create_hint(issue_text: str, tracked_set: set) -> str:
+    """Surface explicit backticked path-like names that do not exist yet."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for ident in _BACKTICK_PATHLIKE_RE.findall(issue_text or ""):
+        normalized = ident.strip("./")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized in tracked_set or any(path.endswith("/" + normalized) for path in tracked_set):
+            continue
+        candidates.append(normalized)
+        if len(candidates) >= 8:
+            break
+    if not candidates:
+        return ""
+    return (
+        "CANDIDATE FILES TO CREATE (explicit backticked path-like names not found "
+        "among tracked files; create only if the task actually requires them):\n"
+        + "\n".join(f"  - {candidate}" for candidate in candidates)
+    )
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
