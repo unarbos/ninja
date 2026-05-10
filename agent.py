@@ -88,7 +88,10 @@ DEFAULT_API_KEY = (
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "32000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
+# Bumped from 180000 alongside MAX_OBSERVATION_CHARS so a few large observations
+# (e.g. a full pytest -v dump or a cat of a 30k-char source file) don't truncate
+# the conversation tail and lose the most recent agent reasoning before final.
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "320000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
