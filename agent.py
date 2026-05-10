@@ -115,8 +115,9 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_RISK_AUDITS = 1        # pre-final semantic/deployability audit for broad patches
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -544,7 +545,7 @@ def get_patch(repo: Path) -> str:
         ":(exclude).git",
     ]
     proc = subprocess.run(
-        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
+        ["git", "diff", "--binary", "HEAD", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -616,6 +617,84 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     if path.suffix == ".pyc":
         return True
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+
+
+def _cleanup_patch_artifacts(repo: Path) -> None:
+    """Remove generated artifacts and mode-only churn before the harness diffs.
+
+    The returned patch is already filtered, but some runners package the final
+    working tree themselves. Keep the repo state aligned with the scored patch:
+    no bytecode/cache files and no chmod-only noise from broad shell commands.
+    """
+    root = repo.resolve()
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        parts = Path(dirpath).parts
+        if ".git" in parts or "node_modules" in parts:
+            dirnames[:] = []
+            continue
+        for cache_dir in ("__pycache__", ".pytest_cache"):
+            if cache_dir in dirnames:
+                shutil.rmtree(Path(dirpath) / cache_dir, ignore_errors=True)
+                dirnames.remove(cache_dir)
+        for filename in filenames:
+            if filename.endswith((".pyc", ".pyo")):
+                try:
+                    Path(dirpath, filename).unlink()
+                except OSError:
+                    pass
+
+    try:
+        changed = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        if changed.returncode == 0:
+            skipped = [p for p in changed.stdout.splitlines() if _should_skip_patch_path(p)]
+            if skipped:
+                subprocess.run(
+                    ["git", "checkout", "--", *skipped],
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15,
+                )
+    except Exception:
+        pass
+
+    try:
+        summary = subprocess.run(
+            ["git", "diff", "--summary", "HEAD", "--"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        if summary.returncode != 0:
+            return
+        for line in summary.stdout.splitlines():
+            match = re.match(r"\s*mode change (100[0-7]{3}) => 100[0-7]{3} (.+)$", line)
+            if not match:
+                continue
+            head_mode, relative_path = match.groups()
+            full = (repo / relative_path).resolve()
+            try:
+                full.relative_to(root)
+                current = full.stat().st_mode
+                if head_mode.endswith("755"):
+                    os.chmod(full, current | 0o111)
+                else:
+                    os.chmod(full, current & ~0o111)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1329,6 +1408,118 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_js_structure_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch JS/TS breakage that parse-only checks miss."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    source = "\n".join(lines)
+
+    dangling = re.search(r"(?:\$\{[^}\n]*(?:\|\||&&|\?\?|[?:+\-*/%])\s*\}|(?:\|\||&&|\?\?|[?:+\-*/%])\s*[,;)\]}])", source)
+    if dangling:
+        line_no = source[:dangling.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: dangling JavaScript expression `{dangling.group(0)[:80]}`"
+
+    empty_jsx = re.search(r"\b(?:className|style|value|onClick|onChange|disabled|checked|href|src)\s*=\s*\{\s*\}", source)
+    if empty_jsx:
+        line_no = source[:empty_jsx.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: empty JSX expression `{empty_jsx.group(0)}`"
+
+    if "react" in source.lower() and re.search(r"\buse[A-Z][A-Za-z0-9_]*\s*\(", source):
+        hook_after_return = re.search(
+            r"\bif\s*\([^)]*\)\s*\{\s*return\b[\s\S]{0,700}?\}\s*(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*use[A-Z][A-Za-z0-9_]*\s*\(",
+            source,
+        )
+        if hook_after_return:
+            line_no = source[:hook_after_return.start()].count("\n") + 1
+            return f"{relative_path}:{line_no}: React hook appears after a conditional early return"
+
+    declared: set[str] = set()
+    imported: set[str] = set()
+    for line in lines:
+        for name in re.findall(r"\b(?:const|let|var|function|class|interface|type)\s+([A-Za-z_$][\w$]*)", line):
+            declared.add(name)
+        for match in re.finditer(r"\bconst\s+\[\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)", line):
+            declared.update(match.groups())
+        for match in re.finditer(r"\b(?:const|let|var)\s+\{\s*([^}=]+?)\s*\}", line):
+            for name in re.findall(r"(?:^|,)\s*([A-Za-z_$][\w$]*)\s*(?::|,|$)", match.group(1)):
+                declared.add(name)
+        imp = re.match(r"\s*import\s+(.+?)\s+from\s+['\"]", line)
+        if imp:
+            chunk = imp.group(1).strip()
+            if chunk.startswith("{"):
+                imported.update(re.findall(r"\b([A-Za-z_$][\w$]*)\b", chunk))
+            else:
+                first = chunk.split(",", 1)[0].strip()
+                if re.match(r"^[A-Za-z_$][\w$]*$", first):
+                    imported.add(first)
+        fn = re.match(r"\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(([^)]*)\)", line)
+        if fn:
+            for name in re.findall(r"\b([A-Za-z_$][\w$]*)\b", fn.group(1)):
+                declared.add(name)
+        arrow = re.search(r"(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*\(([^)]*)\)\s*=>", line)
+        if arrow:
+            for name in re.findall(r"\b([A-Za-z_$][\w$]*)\b", arrow.group(1)):
+                declared.add(name)
+
+    available = declared | imported | {
+        "Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object",
+        "Promise", "React", "String", "console", "document", "localStorage",
+        "undefined", "window",
+    }
+    for ret in re.finditer(r"\breturn\s*\{([^{};]{1,700})\}", source, flags=re.DOTALL):
+        body = ret.group(1)
+        for item in body.split(","):
+            name = item.strip()
+            if not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                continue
+            if name not in available:
+                line_no = source[:ret.start()].count("\n") + 1
+                return f"{relative_path}:{line_no}: returned shorthand `{name}` is not declared/imported"
+
+    for tag in re.finditer(r"<([A-Z][A-Za-z0-9_$]*)\b", source):
+        name = tag.group(1)
+        if name not in available:
+            line_no = source[:tag.start()].count("\n") + 1
+            return f"{relative_path}:{line_no}: JSX component `{name}` is not declared/imported"
+
+    current_function_params: set[str] = set()
+    for idx, line in enumerate(lines, 1):
+        fn = re.match(r"\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(([^)]*)\)", line)
+        if fn:
+            current_function_params = set(re.findall(r"\b([A-Za-z_$][\w$]*)\b", fn.group(1)))
+        stripped = line.strip()
+        attr = re.match(r"([A-Za-z][\w:-]*)\s*=", stripped)
+        jsx_attr_names = {
+            "accept", "alt", "aria-label", "checked", "className", "disabled",
+            "href", "id", "name", "onBlur", "onChange", "onClick", "onFocus",
+            "placeholder", "role", "src", "style", "title", "type", "value",
+        }
+        if attr and (attr.group(1) in jsx_attr_names or attr.group(1).startswith(("aria-", "data-"))):
+            # JSX attributes often live on their own indented line:
+            #   type="text"
+            #   value={x}
+            # Do not confuse them with imperative assignments like `client = ...`.
+            continue
+        match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*=(?!=)", line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in available or name in current_function_params:
+            continue
+        return f"{relative_path}:{idx}: assignment to undeclared `{name}`"
+
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1344,13 +1535,17 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_python_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
+            if result is None:
+                result = _check_js_structure_one(repo, relative_path)
             if result is None and suffix == ".js":
                 # node was unavailable; fall back to brace balance check.
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
-            result = _check_brace_balance_one(repo, relative_path)
+            result = _check_js_structure_one(repo, relative_path)
+            if result is None:
+                result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
@@ -1947,6 +2142,19 @@ Never hardcode the visible example unless the issue explicitly requests that exa
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
 
 ====================================================================
+COMPLETENESS PATTERNS
+====================================================================
+
+Some issues are small but cross an ownership boundary. If the issue names or implies one of these, cover the whole behavior, not only the first file you find:
+
+- Cache/offline/reload/PWA: initialize visible state from the durable cache synchronously when possible, then refresh in the background; keep cold-start loading/error behavior when no cache exists; persist every mutation path that changes cached data.
+- Settings/global UI/admin/dashboard: update both the control surface and the rendered/owned surface that consumes it. A settings-only or view-only patch is incomplete. If localStorage backs mounted UI, use a shared store, storage/custom event, or callback wiring so changes apply immediately without reload and dismissals reset when the message/config changes.
+- LLM/classifier/prompt/workflow behavior: update validation/runtime logic plus the prompt/example/schema owner that teaches the workflow. Do not replace an existing classifier with a weaker regex-only path unless the issue explicitly asks for that.
+- Keyboard shortcuts/editor clipboard: require Ctrl/Cmd shortcuts, preserve the existing selection model, and patch the editor owner rather than a generic drawing/event file.
+- Reorganization/removal/slimming: keep public action names, route keys, file names, and file extensions stable unless the issue asks to rename them; delete/move the requested files, but do not leave compatibility names broken or duplicate `.js`/`.jsx` component copies. Check nearby URL maps, requirements/config files, tests, and docs/artifacts that describe the same feature.
+- Required artifacts such as review notes, sample/demo data, migrations, docs, or config are part of the patch when the issue asks for them. Add the artifact in the existing convention instead of only changing runtime code.
+
+====================================================================
 SURGICAL EDITING
 ====================================================================
 
@@ -2056,7 +2264,7 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is usually in the owning function or a small owner set. Identify every owner surface required by the issue (runtime, UI/admin surface, prompt/schema, migration/data/docs artifact, tests), then make the minimal edits that fix the ROOT CAUSE without changing public names or compatibility keys.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -2215,6 +2423,89 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
+    """General semantic risks that commonly beat syntax-only validation."""
+    issue_lower = issue_text.lower()
+    added = _patch_added_text(patch)
+    changed = [p.lower() for p in _patch_changed_files(patch)]
+    findings: List[str] = []
+
+    if any(word in issue_lower for word in ("cache", "offline", "reload", "refresh")):
+        if "data ?? []" in added or "?? [])" in added:
+            findings.append("offline/cache patch appears able to overwrite existing data with empty arrays on fetch error")
+        if "touch-action: none" in added:
+            findings.append("touch-action:none is broad and can break normal scrolling; prefer overscroll containment on the correct scroll roots")
+        if "setloading(true)" in added.replace(" ", "") and ("cache" in added or "cached" in added):
+            findings.append("cached-data path may still force a loading/blank state before rendering cached content")
+
+    if any(word in issue_lower for word in ("settings", "banner", "global", "broadcast")):
+        touches_root = any(path.endswith(("app.tsx", "app.jsx", "app.js")) or "/app." in path for path in changed)
+        touches_settings = any("settings" in path or "preference" in path for path in changed)
+        if "banner" in issue_lower and not touches_root:
+            findings.append("global banner/surface requested but root App entry point is not changed")
+        if "settings" in issue_lower and not touches_settings:
+            findings.append("settings UI requested but no settings/preference owner file is changed")
+        if ("localstorage" in added and "addeventlistener" not in added and "usesyncexternalstore" not in added
+                and "dispatchEvent".lower() not in added):
+            findings.append("settings and rendered surface look like isolated localStorage reads, not reactive shared state")
+
+    if any(word in issue_lower for word in ("simulation", "simulator", "play", "pause", "scrub", "route", "progress")):
+        compact = added.replace(" ", "")
+        if re.search(r"\b([A-Za-z_$][\w$]*)&&!\1\b", compact):
+            findings.append("contradictory boolean condition added in simulation/control logic")
+        if any(word in issue_lower for word in ("scrub", "slider", "progress")) and "pause" not in added and "playing" not in added:
+            findings.append("scrub/progress interaction should stop or reconcile playback state, not only set the position")
+        if "setinterval" in added and ("clearinterval" not in added and "return()" not in compact):
+            findings.append("timer-based simulation patch lacks obvious cleanup")
+        if any(dep in added for dep in ("lucide-react", "@react-spring", "framer-motion")):
+            findings.append("simulation patch adds new UI/animation dependency instead of using existing stack")
+
+    if any(word in issue_lower for word in ("remove", "delete", "move", "cleanup", "reorganize")):
+        if "deleted file mode" not in patch and "rename from" not in patch and "rename to" not in patch:
+            findings.append("task asks for removal/move/cleanup but final patch has no deletion or rename")
+        basenames: Dict[str, set[str]] = {}
+        for path in changed:
+            suffix = Path(path).suffix
+            if suffix not in {".js", ".jsx", ".ts", ".tsx"}:
+                continue
+            basenames.setdefault(str(Path(path).with_suffix("")), set()).add(suffix)
+        if any({".js", ".jsx"} <= suffixes or {".ts", ".tsx"} <= suffixes for suffixes in basenames.values()):
+            findings.append("reorganization patch creates duplicate component/module names with mixed extensions; keep the requested/existing file convention")
+
+    if any(word in issue_lower for word in ("demo data", "review notes", "migration", "requirements", "config")):
+        if "demo data" in issue_lower and not any(("demo" in path or "data" in path) for path in changed):
+            findings.append("task asks for demo-data artifact but no matching artifact file is changed")
+        if "review notes" in issue_lower and not any("review" in path and "note" in path for path in changed):
+            findings.append("task asks for review notes but no review-notes artifact is changed")
+        if "requirements" in issue_lower and not any("requirements" in path for path in changed):
+            findings.append("task asks for dependency requirements cleanup but requirements file is not changed")
+
+    if any(word in issue_lower for word in ("clipboard", "copy", "paste", "cut", "shortcut")):
+        if re.search(r"key\s*={2,3}\s*['\"][cxv]['\"]", added) and "ctrlkey" not in added and "metakey" not in added:
+            findings.append("keyboard shortcut handler appears to trigger on plain letters instead of Ctrl/Cmd shortcuts")
+
+    if any(word in issue_lower for word in ("booking", "calendar", "attendee", "match")):
+        if "summary" in added and "displayname" not in added and "attendee" in issue_lower:
+            findings.append("booking/calendar matching should use attendee identity fields before event title/summary fallbacks")
+
+    return findings[:8]
+
+
+def build_risk_audit_prompt(findings: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {item}" for item in findings[:8]) or "(none)"
+    return (
+        "Pre-final risk audit found likely correctness/completeness problems:\n"
+        f"  {bullets}\n\n"
+        "Fix these directly in the owning files. Do not add unrelated features, "
+        "do not create parallel replacement modules when an existing owner exists, "
+        "and do not answer with explanation only unless inspection proves a finding "
+        "is false. After the correction, run the most targeted verification that "
+        "is available and end with <final>summary</final>.\n\n"
+        "Task:\n"
+        f"{issue_text[:1600]}\n"
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2285,6 +2576,27 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_patch_score(issue: str, patch: str) -> int:
+    if not patch.strip():
+        return -10_000
+    substantive = min(240, _multishot_count_substantive(patch))
+    risks = len(_patch_risk_findings(issue, patch))
+    missing_paths = len(_uncovered_required_paths(patch, issue))
+    missing_criteria = len(_unaddressed_criteria(patch, issue))
+    junk = 1 if _diff_low_signal_summary(patch) else 0
+    return substantive - (80 * risks) - (70 * missing_paths) - (18 * missing_criteria) - (35 * junk)
+
+
+def _multishot_should_retry(issue: str, patch: str) -> bool:
+    if _multishot_count_substantive(patch) < _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        return True
+    if _patch_risk_findings(issue, patch):
+        return True
+    if _uncovered_required_paths(patch, issue):
+        return True
+    return False
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2407,19 +2719,23 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_started = time.monotonic()
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
+        _issue = kwargs.get("issue", "") or ""
 
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _score1 = _multishot_patch_score(_issue, _patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        if not _multishot_should_retry(_issue, _patch1):
             _result1["multishot_attempts"] = 1
+            _result1["multishot_score"] = _score1
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
+            _result1["multishot_score"] = _score1
             return _result1
 
         if _multishot_repo_obj is not None:
@@ -2427,10 +2743,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _score2 = _multishot_patch_score(_issue, _patch2)
 
-        if _n2 >= _n1:
+        if (_score2, _n2) >= (_score1, _n1):
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
+            _result2["multishot_score"] = _score2
             return _result2
 
         if _multishot_repo_obj is not None:
@@ -2439,6 +2757,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_apply_patch(_multishot_repo_obj, _patch1)
         _result1["multishot_attempts"] = 2
         _result1["multishot_winner"] = "primary"
+        _result1["multishot_score"] = _score1
         return _result1
 
     except Exception as exc:
@@ -2449,6 +2768,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         salvaged = ""
         try:
             if _multishot_repo_obj is not None:
+                _cleanup_patch_artifacts(_multishot_repo_obj)
                 salvaged = get_patch(_multishot_repo_obj)
         except Exception:
             salvaged = ""
@@ -2484,6 +2804,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    risk_audits_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2522,14 +2843,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             2. syntax — quote any parser error back at the model
             3. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            4. risk-audit — catch semantic integration risks not visible to syntax
+            5. coverage-nudge — name issue-mentioned paths still untouched
+            6. criteria-nudge — name issue acceptance bullets not addressed
+            7. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
+        (we know the patch parses) but BEFORE risk/coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, risk_audits_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2595,6 +2917,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_test_fix_prompt(test_path, output),
                     f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if risk_audits_used < MAX_RISK_AUDITS:
+            findings = _patch_risk_findings(issue, patch)
+            if findings:
+                risk_audits_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_risk_audit_prompt(findings, issue),
+                    "RISK_AUDIT_QUEUED:\n  " + "\n  ".join(findings),
                 )
                 return True
 
@@ -2815,6 +3149,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        _cleanup_patch_artifacts(repo)
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
@@ -2833,6 +3168,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
+                _cleanup_patch_artifacts(repo)
                 patch = get_patch(repo)
             except Exception:
                 pass
@@ -2849,7 +3185,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
+    stdout_body = _extract_observation_section(lower, "stdout")
     stderr_body = _extract_observation_section(lower, "stderr")
+    check_text = "\n".join(part for part in (stdout_body, stderr_body) if part)
 
     bad_markers = [
         " failed",
@@ -2860,27 +3198,34 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "assertionerror",
         "syntaxerror",
         "exception",
+        "block not found",
+        "old block not found",
+        "not found",
+        "0 replacements",
+        "no changes",
+        "nothing to commit",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
+    good_patterns = [
+        r"\b\d+\s+passed\b",
+        r"\ball\s+passed\b",
+        r"^ok\b",
+        r"\bsuccess(?:ful|fully)?\b",
+        r"\bbuild\s+(?:passed|succeeded|successful)\b",
+        r"\bcompiled\s+successfully\b",
+        r"\btypecheck(?:ing)?\s+(?:passed|succeeded|successful)\b",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
-        has_bad = True
+    has_good = any(re.search(pattern, check_text, re.MULTILINE) for pattern in good_patterns)
+    has_bad = any(marker in check_text for marker in bad_markers)
 
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
 
-    return (exit_code == 0 or has_good) and has_good and not has_bad
+    return _looks_like_verification_command(command) and (exit_code == 0 or has_good) and has_good and not has_bad
 
 
 def _looks_like_verification_command(command: str) -> bool:
