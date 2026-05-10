@@ -2447,7 +2447,22 @@ brief summary of what changed
 
 **Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a `<plan>` block followed immediately by one focused inspection command. Use this format:
+
+<plan>
+- Requirement: restate every explicit issue requirement.
+- Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
+- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Verification: targeted test command expected after patching.
+</plan>
+<command>
+focused inspection command
+</command>
+
+If multi-file, list every file under "Likely target". Never wrap `<plan>` or `<command>` in markdown fences.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
