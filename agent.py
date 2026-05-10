@@ -2986,8 +2986,13 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "likely target file from the preloaded snippets (or one focused grep). "
         "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
         "TARGETED CODE CHANGE in that file. Do NOT change file modes or "
-        "permissions. Do NOT add comments only as a substitute for code. Make "
-        "a real code edit, then <final> immediately."
+        "permissions. Do NOT add comments only as a substitute for code. "
+        "The edit MUST be executable code (a new statement, a changed "
+        "expression, a new function/method body) — `# TODO`, `// TODO`, "
+        "`pass`-only stubs, `raise NotImplementedError`, or doc-only "
+        "additions do not count. Reference at least one concrete identifier "
+        "or phrase from the issue above so the change is clearly motivated. "
+        "Make a real code edit, then <final> immediately."
     )
 
 
