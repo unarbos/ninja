@@ -117,6 +117,7 @@ _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_LLM_AC_VERIFY_TURNS = 1  # v79: PR#732 — ask the same model which numbered AC are unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -1266,6 +1267,89 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
+
+
+# v79: PR#732 — semantic LLM-judged AC verification.
+# Heuristic AC checks (keyword in added text) miss synonyms and rephrasing.
+# Asking the model itself which numbered criteria are still unaddressed gives
+# semantic completeness coverage without needing the validator's judge.
+
+def _llm_unaddressed_criteria(
+    patch: str,
+    issue_text: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    *,
+    max_tokens: int = 800,
+) -> Optional[List[str]]:
+    """v79: ask the model which acceptance criteria the patch fails to address.
+    Returns [] when all covered, list of unaddressed criterion numbers/titles otherwise,
+    None on API failure. Single API call, ~5-10s."""
+    criteria = _extract_acceptance_criteria(issue_text)
+    if not criteria:
+        return []
+    if not patch.strip():
+        return [str(i + 1) for i in range(len(criteria))]
+    truncated = patch if len(patch) <= 3500 else patch[:1800] + "\n...\n" + patch[-1500:]
+    crit_block = "\n".join(f"  {i+1}. {c[:200]}" for i, c in enumerate(criteria))
+    prompt = (
+        "You are a strict code-review judge. The task has these numbered "
+        "acceptance criteria:\n\n"
+        f"{crit_block}\n\n"
+        "Here is the candidate patch:\n```diff\n"
+        f"{truncated}\n```\n\n"
+        "For each numbered criterion above, decide whether the patch ADDRESSES it. "
+        "Respond ONLY with a single line:\n"
+        "  COVERED: 1, 2, 3, ...\n"
+        "  MISSING: 4, 5, ...\n"
+        "Use bare comma-separated numbers. If all covered: 'MISSING: none'. "
+        "If patch is empty or tangential: 'MISSING: 1, 2, 3, ...' (all). "
+        "Do not add commentary."
+    )
+    messages = [
+        {"role": "system", "content": "You verify patch completeness against numbered acceptance criteria. Respond in the exact two-line format requested."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        response_text, _, _ = chat_completion(
+            messages=messages, model=model, api_base=api_base, api_key=api_key,
+            max_tokens=max_tokens, timeout=45, max_retries=1,
+        )
+    except Exception:
+        return None
+    missing_match = re.search(r"MISSING:\s*([^\n]+)", response_text, flags=re.IGNORECASE)
+    if not missing_match:
+        return []
+    missing_text = missing_match.group(1).strip().lower()
+    if missing_text in {"none", "(none)", "[none]", "n/a", "-"}:
+        return []
+    nums = re.findall(r"\b\d+\b", missing_text)
+    out: List[str] = []
+    for n in nums:
+        idx = int(n)
+        if 1 <= idx <= len(criteria):
+            out.append(f"{idx}. {criteria[idx-1][:200]}")
+    return out
+
+
+def build_llm_ac_verify_prompt(unaddressed: List[str], issue_text: str) -> str:
+    """v79: surface model-self-judged unaddressed acceptance criteria."""
+    bullets = "\n  ".join(f"- {c}" for c in unaddressed[:6]) or "(none)"
+    return (
+        "LLM-self-verified completeness gap — your model just judged its own "
+        "patch against the numbered acceptance criteria and identified these "
+        "as NOT yet addressed:\n"
+        f"  {bullets}\n\n"
+        "Either (a) issue the additional <command> blocks needed to satisfy "
+        "each listed criterion, then end with <final>summary</final>, OR "
+        "(b) if the criterion was already addressed but in code the self-check "
+        "missed (different name/style), respond with <final>summary</final> and "
+        "explain in the summary why each item is actually covered.\n\n"
+        "Do NOT add scope the task did not ask for. Do NOT rewrite working code.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
 
 
 # v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
@@ -2472,141 +2556,6 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
-
-# ============================================================
-# v13 PORTS — LLM-judge focused (target: cleaner content)
-# ============================================================
-
-# v13: refinement caps for new gates
-MAX_VISIBLE_SURFACE_NUDGES = 1
-MAX_AUTOFORMAT_TURNS = 1
-
-# === Visible-surface validation (port PR#733 VladaWebDev) ===
-def _visible_surface_missing(issue_text: str, patch: str) -> bool:
-    """UI/task asks for rendered behavior but patch only touched support code."""
-    issue_lower = issue_text.lower()
-    if not re.search(
-        r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
-        r"panel|control|slider|simulator|simulation|editor|appointment|booking|"
-        r"workshop|taller|resident|apartment)\b",
-        issue_lower,
-    ):
-        return False
-    changed = _patch_changed_files(patch)
-    if not changed:
-        return False
-    ui_re = re.compile(
-        r"(^|/)(app|main|index)\.(jsx|tsx|js|ts)$|"
-        r"(^|/)(pages?|views?|components?|screens?)/.*\.(jsx|tsx|js|ts)$",
-        re.IGNORECASE,
-    )
-    if any(ui_re.search(path) for path in changed):
-        return False
-    support_only = all(
-        re.search(r"(^|/)(stores?|hooks?|services?|api|lib|types?|models?|utils?)/", path, re.IGNORECASE)
-        or path.endswith((".json", ".sql", ".md", ".css"))
-        for path in changed
-    )
-    return support_only
-
-
-# -----------------------------
-# Issue-symbol grep ranking
-# -----------------------------
-#
-# `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough — a one-line bug fix often
-# names a function or class without mentioning the file. We extract identifier-
-# shaped tokens from the issue and grep the repo for them; files that contain
-# those identifiers get a context-rank boost.
-
-_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
-_SYMBOL_STOP = {
-    "about", "after", "alert", "argument", "before", "build", "called", "change",
-    "check", "class", "code", "command", "config", "context", "default", "expect",
-    "expected", "fail", "false", "field", "fields", "file", "files", "fix",
-    "fixed", "function", "given", "global", "header", "headers", "import",
-    "issue", "method", "module", "needed", "needs", "object", "params", "parse",
-    "path", "patch", "production", "project", "property", "public", "remove",
-    "reset", "return", "should", "static", "string", "support", "test", "tests",
-    "their", "there", "thing", "this", "true", "type", "types", "update",
-    "using", "value", "values", "when", "with", "will", "without", "write",
-}
-
-
-
-def build_visible_surface_nudge_prompt(issue_text: str) -> str:
-    return (
-        "Visible-feature gap — the task asks for rendered controls, a page, "
-        "dashboard, form, simulator, or workflow, but your patch only changes "
-        "supporting state/config/service files.\n\n"
-        "Patch the component/page/view that renders the requested behavior now. "
-        "Use the existing UI architecture and the smallest edit: wire the "
-        "visible control/list/empty-state/submit usage required by the issue. "
-        "Do not rewrite unrelated components.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n\n"
-        "Then end with <final>summary</final>."
-    )
-
-
-
-# === Autoformat (port PR#744 night-pal) ===
-def _organize_imports_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort import organization before linting a touched Python file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff check --select I --fix --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code in (0, 1)
-
-
-def _autoformat_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort Python formatting before linting a touched file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff format --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code == 0
-
-
-def _autoformat_js(repo: Path, relative_path: str) -> bool:
-    """Best-effort JS/TS formatting when prettier is available."""
-    local_prettier = repo / "node_modules" / ".bin" / "prettier"
-    if local_prettier.exists():
-        cmd = f"./node_modules/.bin/prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    elif _has_executable("prettier"):
-        cmd = f"prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    else:
-        return False
-    proc = run_command(cmd, repo, timeout=_FORMAT_TIMEOUT)
-    return proc.exit_code == 0
-
-
-def _autoformat_touched(repo: Path, patch: str) -> int:
-    """Run semantic-neutral cleanup on touched Python/JS files before lint."""
-    formatted = 0
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        ok = False
-        if suffix == ".py":
-            ok = _organize_imports_python(repo, relative_path) or ok
-            ok = _autoformat_python(repo, relative_path) or ok
-        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-            ok = _autoformat_js(repo, relative_path)
-        if ok:
-            formatted += 1
-    return formatted
-
-
-# ============================================================
-
 def solve(
     repo_path: str,
     issue: str,
@@ -2762,13 +2711,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     success = False
     consecutive_no_command = 0
     polish_turns_used = 0
-    visible_surface_nudges_used = 0  # v13
-    autoformat_turns_used = 0  # v13
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     lint_turns_used = 0  # v72
     test_fix_turns_used = 0
     coverage_nudges_used = 0
+    llm_ac_verify_turns_used = 0  # v79
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
@@ -2808,7 +2756,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, visible_surface_nudges_used, autoformat_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, llm_ac_verify_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2851,25 +2799,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
-
-        # v13: visible-surface gate — catches missing public symbols
-        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
-            visible_surface_nudges_used += 1
-            total_refinement_turns_used += 1
-            queue_refinement_turn(
-                assistant_text,
-                build_visible_surface_nudge_prompt(issue),
-                'VISIBLE_SURFACE_NUDGE_QUEUED',
-            )
-            return True
-
-        # v13: autoformat — silent in-place format on touched files
-        if autoformat_turns_used < MAX_AUTOFORMAT_TURNS:
-            try:
-                if _autoformat_touched(repo, patch) > 0:
-                    autoformat_turns_used += 1
-            except Exception:
-                pass
 
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
@@ -2920,6 +2849,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_lint_fix_prompt(lint_errors),
                     "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                )
+                return True
+
+        # v79: PR#732 — semantic LLM-judged AC verification.
+        # Single API call, ~5-10s. Fires after heuristic gates miss anything.
+        if llm_ac_verify_turns_used < MAX_LLM_AC_VERIFY_TURNS:
+            unaddressed = _llm_unaddressed_criteria(
+                patch, issue, model_name, api_base, api_key,
+            )
+            if unaddressed:
+                llm_ac_verify_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_llm_ac_verify_prompt(unaddressed, issue),
+                    "LLM_AC_VERIFY_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
