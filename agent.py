@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -103,8 +104,16 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # baseline per-attempt budget; dynamic estimator stays within ±FLEX of this
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Dynamic wall-clock guard. The constant above is the *baseline*; the actual
+# budget for a given (repo, issue) is computed by `_estimate_wall_clock_budget`
+# and clamped to [BASELINE - FLEX, BASELINE + FLEX], with absolute safety bounds
+# of [HARD_MIN, HARD_MAX] so a runaway estimate cannot starve or oversubscribe
+# the multi-shot envelope. Inspired by `_agents/time_limit_estimate.py`.
+WALL_CLOCK_BUDGET_HARD_MIN = 120.0
+WALL_CLOCK_BUDGET_HARD_MAX = 600.0
+WALL_CLOCK_BUDGET_FLEX_SECONDS = 60.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -491,6 +500,185 @@ def format_observation(result: CommandResult) -> str:
 
 
 # -----------------------------
+# Dynamic wall-clock budget estimation
+# -----------------------------
+#
+# Ported from `_agents/time_limit_estimate.py` (least-squares fit to the
+# `max(min(600, 2*cursor+1), 120)` ceiling, blended with a structural repo
+# score). Differences vs the offline tool:
+#   * No reference patch is available at solve-time, so the patch-shape
+#     features (patch bytes / patch lines / `diff --git` count) are zero.
+#     The model coefficients tolerate this via `log1p(max(x, 1))` clamps.
+#   * The "task text" is the live `issue` string passed into `solve()`; we
+#     count its UTF-8 byte length in Python instead of `wc -c`-ing a file.
+#   * The bash probe is launched with the same style as the agent's
+#     `run_command` (`shell=True, executable="/bin/bash", env=_command_env()`)
+#     and inherits the same hardened PATH/HOME/etc, so it behaves identically
+#     to the rest of the agent's shell surface.
+#
+# The output is intentionally clamped: the dynamic estimate is wrapped to
+# `[BASELINE - FLEX, BASELINE + FLEX]` (and then to `[HARD_MIN, HARD_MAX]`)
+# so the per-attempt wall clock cannot drift far from the proven baseline.
+
+_WALL_CLOCK_PROBE_BASH = r"""set -euo pipefail
+cd "${REPO:?}"
+files=$(find . -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+dirs=$(find . -type d 2>/dev/null | wc -l | tr -d "[:space:]")
+code=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) 2>/dev/null | wc -l | tr -d "[:space:]")
+line_stat=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+lines=${line_stat:-0}
+case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+printf '%s\t%s\t%s\t%s\n' "$files" "$dirs" "$code" "$lines"
+"""
+
+# Coefficients verbatim from `time_limit_estimate.py`. Order matches
+# `_wall_clock_feature_vector`: bias, log(files), log(dirs), log(code_files),
+# log(lines), log(prompt_bytes), log(patch_bytes), patch_bytes^0.25,
+# log(patch_lines), log(diff_git_count).
+_WALL_CLOCK_CAP_BETA: Tuple[float, ...] = (
+    -1502.280905,
+    17.15374,
+    24.155525,
+    -25.281183,
+    15.948134,
+    129.154837,
+    -5.283372,
+    -11.022089,
+    109.164775,
+    7.151717,
+)
+_WALL_CLOCK_LIN_BLEND = 0.488
+_WALL_CLOCK_STRUCT_BLEND = 1.06
+_WALL_CLOCK_RATIO_TARGET_SCALE = 1.68
+_WALL_CLOCK_PROBE_TIMEOUT_SEC = 30
+
+
+def _wall_clock_feature_vector(probe: Tuple[int, int, int, int, int, int, int, int]) -> List[float]:
+    f, d, c, ln, p, pb, pl, dg = probe
+    return [
+        1.0,
+        math.log1p(f),
+        math.log1p(d),
+        math.log1p(max(c, 1)),
+        math.log1p(max(ln, 1)),
+        math.log1p(max(p, 1)),
+        math.log1p(max(pb, 1)),
+        (max(pb, 0) ** 0.25),
+        math.log1p(max(pl, 1)),
+        math.log1p(max(dg, 1)),
+    ]
+
+
+def _wall_clock_linear_cap_hat(features: List[float]) -> float:
+    pred = sum(b * x for b, x in zip(_WALL_CLOCK_CAP_BETA, features))
+    return float(max(WALL_CLOCK_BUDGET_HARD_MIN, min(WALL_CLOCK_BUDGET_HARD_MAX, pred)))
+
+
+def _wall_clock_structural_score(probe: Tuple[int, int, int, int, int, int, int, int]) -> float:
+    """Repo-only complexity score; same caps as the offline estimator."""
+    f, d, c, ln, p, pb, _pl, _dg = probe
+    f_cap = min(max(f, 0), 400_000)
+    d_cap = min(max(d, 0), 100_000)
+    c_cap = min(max(c, 0), 120_000)
+    ln_cap = min(max(ln, 0), 3_000_000)
+    p_cap = min(max(p, 0), 2_000_000)
+    pb_cap = min(max(pb, 0), 8_000_000)
+
+    tree = min(math.log1p(f_cap) * 3.0 + math.log1p(d_cap) * 1.6, 70.0)
+    code = min(math.log1p(c_cap) * 5.8 + math.sqrt(max(c_cap, 1)) * 0.65, 75.0)
+    vol = min(math.log1p(max(ln_cap, 1)) * 4.3 + (ln_cap ** 0.25) * 0.25, 95.0)
+    patch = min(math.log1p(max(pb_cap, 1)) * 3.6 + (pb_cap ** 0.20) * 0.22, 80.0)
+    prompt = min(math.log1p(max(p_cap, 1)) * 2.3 + (p_cap / 110_000.0), 28.0)
+    avg_loc = (ln_cap / c_cap) if c_cap > 0 else 0.0
+    dens = 1.0 + max(-0.08, min(0.12, (avg_loc - 120.0) / 2300.0))
+    base = 22.0 + tree + code + vol + patch + prompt
+    raw = base * dens
+    if c_cap == 0 and ln_cap == 0:
+        raw = 22.0 + tree * 0.90 + patch * 0.80 + prompt * 0.70
+    return float(raw)
+
+
+def _estimate_seconds_from_probe(probe: Tuple[int, int, int, int, int, int, int, int]) -> int:
+    """Combine patch-/tree-informed cap estimate with structural score; integer seconds."""
+    feats = _wall_clock_feature_vector(probe)
+    cap_hat = _wall_clock_linear_cap_hat(feats)
+    struct = _wall_clock_structural_score(probe)
+    blended = min(_WALL_CLOCK_LIN_BLEND * cap_hat, _WALL_CLOCK_STRUCT_BLEND * struct)
+    scaled = blended * _WALL_CLOCK_RATIO_TARGET_SCALE
+    est = int(round(scaled))
+    return max(int(WALL_CLOCK_BUDGET_HARD_MIN), min(est, int(WALL_CLOCK_BUDGET_HARD_MAX) - 1))
+
+
+def _run_wall_clock_probe(repo_dir: Path) -> Tuple[int, int, int, int]:
+    """Run the bash complexity probe (770-style invocation)."""
+    env = {**_command_env(), "REPO": str(repo_dir.resolve())}
+    proc = subprocess.run(
+        _WALL_CLOCK_PROBE_BASH,
+        cwd=str(repo_dir),
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_WALL_CLOCK_PROBE_TIMEOUT_SEC,
+        executable="/bin/bash",
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "").strip() or f"probe exit {proc.returncode}")
+    line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+    parts = line.split("\t")
+    if len(parts) != 4:
+        raise RuntimeError(f"unexpected probe output: {line!r}")
+    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+
+
+def _estimate_wall_clock_budget(repo_dir: Path, issue: str) -> float:
+    """Dynamically size the per-attempt wall-clock budget for this (repo, issue).
+
+    Returns a value clamped to ``[BASELINE - FLEX, BASELINE + FLEX]`` and to
+    the absolute safety bounds ``[HARD_MIN, HARD_MAX]``. Falls back to the
+    baseline `WALL_CLOCK_BUDGET_SECONDS` if anything goes wrong (probe fails,
+    bash unavailable, math overflow, etc.) — never raises.
+    """
+    lo = max(WALL_CLOCK_BUDGET_HARD_MIN, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    hi = min(WALL_CLOCK_BUDGET_HARD_MAX, WALL_CLOCK_BUDGET_SECONDS + WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    try:
+        files, dirs, code_files, lines = _run_wall_clock_probe(repo_dir)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    prompt_bytes = len(issue.encode("utf-8")) if issue else 0
+    # Patch features unavailable during live solve; supplied as zeros.
+    probe = (files, dirs, code_files, lines, prompt_bytes, 0, 0, 0)
+    try:
+        estimated = _estimate_seconds_from_probe(probe)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    return float(max(lo, min(hi, float(estimated))))
+
+
+# -----------------------------
 # Action parsing
 # -----------------------------
 
@@ -603,6 +791,21 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         )
         if mode_only:
             continue
+        # v48: when a file has real content edits AND a mode change,
+        # the chmod is incidental and the judge consistently flags it as
+        # "unrelated file mode churn." Drop the `old mode` / `new mode`
+        # lines so only the substantive content edit remains.
+        # Only do this when the block also contains a real content hunk
+        # (`@@ ` or `new file mode ` or binary marker).
+        has_content = "\n@@ " in block or "\nnew file mode " in block or "\nGIT binary patch" in block or "\nBinary files " in block
+        if has_content and ("\nold mode " in block or "\nnew mode " in block):
+            cleaned_lines: List[str] = []
+            for line in block.splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+                    continue
+                cleaned_lines.append(line)
+            block = "".join(cleaned_lines)
         kept.append(block)
 
     result = "".join(kept)
@@ -765,8 +968,11 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
+
+    Returns `(context_text, included_files)` so the caller can later strip the
+    bulky snippet block but still keep the file-name breadcrumb.
 
     Two improvements over a vanilla rank-and-read loop:
 
@@ -780,26 +986,34 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
+
+    Each file snippet is fetched via `_read_context_file` with issue-derived
+    needles so we keep only the regions relevant to the task instead of the
+    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return ""
+        return "", []
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
+    needles = _preload_needles(issue)
+
     parts: List[str] = []
+    included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
+        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
@@ -814,7 +1028,38 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), included
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers (`_extract_issue_symbols`) first since they
+    are the strongest signal, then file-stem mentions (so `foo.py` in the
+    issue picks out lines referencing `foo`), then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -967,7 +1212,19 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
+    """Read a tracked file, optionally returning only issue-relevant windows.
+
+    When `needles` is provided and the file is larger than `max_chars`, we
+    extract regions around lines that match any needle (case-insensitive
+    substring) plus a few lines of context, instead of head/tail truncation.
+    Falls back to `_truncate` when no needles match or the file already fits.
+    """
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -980,7 +1237,84 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    """Return windows around lines matching any needle, capped at `max_chars`.
+
+    When the file already fits within `max_chars`, the whole file is returned
+    verbatim. When no needles match, fall back to `_truncate` (head/tail
+    summary). Otherwise produce a concatenation of merged windows around each
+    matching line, prefixed with line-range headers so the model can reason
+    about location.
+    """
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -1906,6 +2240,7 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2037,13 +2372,19 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
 
+_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
+_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
+{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
+{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2064,6 +2405,45 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+_PRELOAD_BLOCK_RE = re.compile(
+    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
+    re.DOTALL,
+)
+
+
+def _strip_preloaded_section(
+    initial_user_text: str,
+    preloaded_files: List[str],
+    modified_files: Optional[List[str]] = None,
+) -> str:
+    """Replace the bulky preloaded snippet block with a short breadcrumb.
+
+    Triggered after step 4 to free token budget for later iterations: the
+    model has already seen the snippets in earlier turns and only needs to
+    know which files were preloaded (and which it has already touched) so it
+    can re-open them on demand instead of re-reading the whole block on
+    every request.
+    """
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+
+    lines: List[str] = []
+    if modified_files:
+        lines.append("You modified these files so far: " + ", ".join(modified_files))
+    if preloaded_files:
+        lines.append(
+            "You previously inspected these files (snippets dropped to save context — "
+            "re-open with `sed -n` or `cat` if a region is needed): "
+            + ", ".join(preloaded_files)
+        )
+    if not lines:
+        replacement = "[Preloaded context omitted to save token budget.]"
+    else:
+        replacement = "\n".join(lines)
+
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2378,9 +2758,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
-       be either (a) so short it cannot produce a patch, or (b) push past
+       Two attempts at the per-attempt wall-clock budget (baseline 270s,
+       dynamically sized in [BASELINE-FLEX, BASELINE+FLEX] = [210s, 330s]
+       per (repo, issue) by `_estimate_wall_clock_budget`) already saturate
+       the _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have
+       to be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
        The empty-patch case is already handled inside `_solve_attempt` by
        the hail-mary refinement turn (see `maybe_queue_refinement`), and
@@ -2496,8 +2878,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     # model loop and starve the retry of any time. We stop the inner loop
     # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
     # return whatever patch is already on disk.
+    #
+    # The budget itself is sized dynamically per (repo, issue) by the
+    # `_estimate_wall_clock_budget` helper after `repo` is resolved; until
+    # that runs we use the baseline `WALL_CLOCK_BUDGET_SECONDS` so this
+    # closure is safe to call before the refinement happens.
+    wall_clock_budget = float(WALL_CLOCK_BUDGET_SECONDS)
+
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return wall_clock_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2643,19 +3032,55 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     try:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
+        # Dynamically size the per-attempt wall-clock budget based on repo
+        # complexity (bash probe) and issue length. Stays within ±FLEX of the
+        # baseline and absolute [HARD_MIN, HARD_MAX] so a misestimate cannot
+        # starve or oversubscribe the multi-shot envelope. Falls back to the
+        # baseline silently if the probe or estimator fails.
+        wall_clock_budget = _estimate_wall_clock_budget(repo, issue)
+        logs.append(
+            "WALL_CLOCK_BUDGET_DYNAMIC:\n"
+            f"  baseline={WALL_CLOCK_BUDGET_SECONDS:.1f}s "
+            f"flex=±{WALL_CLOCK_BUDGET_FLEX_SECONDS:.0f}s "
+            f"hard=[{WALL_CLOCK_BUDGET_HARD_MIN:.0f},{WALL_CLOCK_BUDGET_HARD_MAX:.0f}]s "
+            f"chosen={wall_clock_budget:.1f}s"
+        )
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
+        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            # Past step 4 the preloaded snippets are no longer load-bearing —
+            # the model has either used them or moved on. Replace the bulky
+            # block in the initial user message with a short breadcrumb so
+            # the next request fits more recent context within the token cap.
+            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
+                original_initial = messages[1].get("content") or ""
+                modified_files = _patch_changed_files(get_patch(repo))
+                stripped = _strip_preloaded_section(
+                    original_initial,
+                    preloaded_files,
+                    modified_files=modified_files,
+                )
+                if stripped != original_initial:
+                    messages[1] = {**messages[1], "content": stripped}
+                    saved = max(0, len(original_initial) - len(stripped))
+                    logs.append(
+                        "INITIAL_PRELOAD_TRIMMED: "
+                        f"step={step} preloaded={len(preloaded_files)} "
+                        f"modified={len(modified_files)} saved_chars={saved}"
+                    )
+                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
