@@ -93,7 +93,7 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches do not solve tasks, so any transient model
 # error or stuck loop is costly. Be aggressive about retrying instead of
@@ -863,11 +863,13 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
+    needles = _preload_needles(issue)
+
     for relative_path in files[:MAX_PRELOADED_FILES]:
         if relative_path in anchor_map:
             snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
         else:
-            snippet = _read_context_file(repo, relative_path, per_file_budget)
+            snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1033,7 +1035,157 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+_PRELOAD_SECTION_HEADER = "Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):"
+_PRELOAD_SECTION_END = "Before planning, read the ENTIRE issue above"
+_PRELOAD_FILE_HEADER_RE = re.compile(r"^### (\S+)$", re.MULTILINE)
+
+
+def _strip_preloaded_section(messages: List[Dict[str, str]]) -> int:
+    """Replace the preloaded-snippets block in messages[1] with a brief breadcrumb.
+
+    Returns chars saved (0 if nothing was replaced). By the mid-loop the model
+    has either internalized the preload or located targets via grep; keeping
+    the bulk pinned costs tokens on every later request. A short filename
+    breadcrumb preserves orientation without the bulk.
+    """
+    if len(messages) < 2:
+        return 0
+    user_msg = messages[1]
+    if user_msg.get("role") != "user":
+        return 0
+    body = user_msg.get("content", "")
+    start = body.find(_PRELOAD_SECTION_HEADER)
+    if start == -1:
+        return 0
+    end = body.find(_PRELOAD_SECTION_END, start)
+    if end == -1:
+        return 0
+    block = body[start:end]
+    files = _PRELOAD_FILE_HEADER_RE.findall(block)
+    if files:
+        breadcrumb = (
+            "Preloaded snippets (already shown earlier) were trimmed to free tokens. "
+            "Files originally included: " + ", ".join(files[:12]) + "\n\n"
+        )
+    else:
+        breadcrumb = "Preloaded snippets were trimmed to free tokens.\n\n"
+    if len(breadcrumb) >= len(block):
+        return 0
+    user_msg["content"] = body[:start] + breadcrumb + body[end:]
+    return len(block) - len(breadcrumb)
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers first (strongest signal), then file-stem
+    mentions (so `foo.py` in the issue picks out lines referencing `foo`),
+    then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    """Return windows around lines matching any needle, capped at max_chars.
+
+    When the file already fits, return verbatim. When no needles match,
+    fall back to head/tail truncation. Otherwise produce merged windows
+    around each matching line, prefixed with line-range headers.
+    """
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within "
+            f"{max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
+
+
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1046,6 +1198,8 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
@@ -4327,8 +4481,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         emergency_injected = False
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
+        preload_stripped = False
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if step == 5 and not preload_stripped:
+                preload_stripped = True
+                saved = _strip_preloaded_section(messages)
+                if saved > 0:
+                    logs.append(f"PRELOAD_STRIPPED:\nFreed {saved} chars from initial user message.")
 
             if out_of_time():
                 logs.append(
