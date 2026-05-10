@@ -4455,6 +4455,7 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     return vars(parser.parse_args(argv))
 
 
+# main function
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
