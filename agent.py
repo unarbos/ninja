@@ -1491,6 +1491,32 @@ def _simplify_issue_for_retry(issue_text: str, preloaded_files: list) -> str:
     return summary
 
 
+
+def _build_multifile_plan_hint(issue: str, preloaded_files: List[str], repo: "Optional[Path]" = None) -> str:  # type: ignore[name-defined]
+    """v10: Emit a hint when the issue likely requires multi-file edits.
+
+    Fires when issue text contains >=2 architecture-signal words (excluding
+    'test' which is too broad). Returns empty string when not triggered.
+    """
+    multi_signals = [
+        'route', 'model', 'controller', 'view', 'component', 'service',
+        'migration', 'serializer', 'schema', 'hook', 'store',
+    ]
+    issue_lower = issue.lower()
+    signals = [s for s in multi_signals if s in issue_lower]
+    if len(signals) < 2:
+        return ""
+    file_names = [Path(f).name for f in preloaded_files[:6]]
+    hint = (
+        f"[Multi-file hint: issue likely affects {', '.join(signals[:4])} layers. "
+        f"Currently preloaded: {', '.join(file_names)}. "
+        "Check if other related files need coordinated changes too.]"
+    )
+    if len(signals) >= 4:
+        hint += " [Warning: 4+ signals - use find/grep to discover related files beyond preloaded set.]"
+    return hint
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -2869,10 +2895,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        _mf_hint = _build_multifile_plan_hint(issue, preloaded_files)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context) + _mf_hint},
         ]
         initial_preload_stripped = False
 
