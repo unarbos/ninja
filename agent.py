@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -90,10 +91,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,7 +104,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,6 +113,8 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_PATCH_LINT_TURNS = 1   # consolidated patch corruption / stub / placeholder lint
+MAX_CALLER_CHECK_TURNS = 1 # caller-side cascade check for changed signatures
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -471,6 +474,16 @@ def _command_env() -> Dict[str, str]:
     }
 
 
+def _dynamic_command_timeout(
+    remaining_seconds: float, step_index: int, base: int
+) -> int:
+    """Scale command timeout to remaining wall-clock budget so the last
+    step doesn't burn a fixed 15s when 6s remain."""
+    if remaining_seconds <= 8:
+        return max(4, int(remaining_seconds * 0.7))
+    return max(base, min(base * 2, int(remaining_seconds // 3)))
+
+
 def format_observation(result: CommandResult) -> str:
     parts = [
         "COMMAND:",
@@ -765,11 +778,8 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
-
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
 
     Two improvements over a vanilla rank-and-read loop:
 
@@ -783,34 +793,26 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return "", []
+        return ""
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
-    needles = _preload_needles(issue)
-
     parts: List[str] = []
-    included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
-        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
@@ -825,38 +827,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts), included
-
-
-def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: explicit identifiers (`_extract_issue_symbols`) first since they
-    are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
-    """
-    out: List[str] = []
-    seen: set = set()
-
-    def add(token: str) -> None:
-        if not token:
-            return
-        key = token.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(token)
-
-    for sym in _extract_issue_symbols(issue):
-        add(sym)
-    for mention in _extract_issue_path_mentions(issue):
-        stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
-    for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
-    return out
+    return "\n\n".join(parts)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -898,6 +869,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    quoted_hits = _quoted_string_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -920,6 +892,10 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Stronger boost for files containing exact quoted error/log strings
+        # from the issue — these are high-precision signals from the task author.
+        if relative_path in quoted_hits:
+            score += 100 + min(60, 15 * quoted_hits[relative_path])
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1009,19 +985,7 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(
-    repo: Path,
-    relative_path: str,
-    max_chars: int,
-    needles: Optional[List[str]] = None,
-) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows.
-
-    When `needles` is provided and the file is larger than `max_chars`, we
-    extract regions around lines that match any needle (case-insensitive
-    substring) plus a few lines of context, instead of head/tail truncation.
-    Falls back to `_truncate` when no needles match or the file already fits.
-    """
+def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1034,84 +998,7 @@ def _read_context_file(
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    if needles:
-        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
-
-
-def _extract_relevant_regions(
-    text: str,
-    needles: List[str],
-    max_chars: int,
-    *,
-    ctx_before: int = 8,
-    ctx_after: int = 12,
-) -> str:
-    """Return windows around lines matching any needle, capped at `max_chars`.
-
-    When the file already fits within `max_chars`, the whole file is returned
-    verbatim. When no needles match, fall back to `_truncate` (head/tail
-    summary). Otherwise produce a concatenation of merged windows around each
-    matching line, prefixed with line-range headers so the model can reason
-    about location.
-    """
-    if not text:
-        return text
-    if len(text) <= max_chars:
-        return text
-
-    needles_lower: List[str] = []
-    seen: set = set()
-    for n in needles:
-        if not n:
-            continue
-        key = n.lower()
-        if len(key) < 3 or key in seen:
-            continue
-        seen.add(key)
-        needles_lower.append(key)
-    if not needles_lower:
-        return _truncate(text, max_chars)
-
-    lines = text.splitlines()
-    matched: List[int] = []
-    for i, line in enumerate(lines):
-        ll = line.lower()
-        if any(n in ll for n in needles_lower):
-            matched.append(i)
-
-    if not matched:
-        return _truncate(text, max_chars)
-
-    windows: List[Tuple[int, int]] = []
-    for i in matched:
-        start = max(0, i - ctx_before)
-        end = min(len(lines), i + ctx_after + 1)
-        if windows and start <= windows[-1][1]:
-            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-        else:
-            windows.append((start, end))
-
-    parts: List[str] = []
-    used = 0
-    total_lines = len(lines)
-    omitted = 0
-    for idx, (start, end) in enumerate(windows):
-        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
-        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
-        block = header + "\n" + body
-        if parts and used + len(block) + 2 > max_chars:
-            omitted = len(windows) - idx
-            break
-        parts.append(block)
-        used += len(block) + 2
-
-    if omitted > 0:
-        parts.append(
-            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
-        )
-
-    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -1214,6 +1101,23 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _patch_canonical_hash(patch: str) -> str:
+    """Normalize whitespace and strip comment-only lines, then hash.
+    Used to detect attempt-equivalent patches and short-circuit retry."""
+    normalized: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            body = line[1:].strip().lower()
+            if body and not _line_is_comment(body):
+                normalized.append(body)
+        elif line.startswith("-") and not line.startswith("---"):
+            body = line[1:].strip().lower()
+            if body and not _line_is_comment(body):
+                normalized.append(line[0] + body)
+    digest = hashlib.sha1("\n".join(normalized).encode("utf-8", errors="replace")).hexdigest()
+    return digest
 
 
 def _diff_low_signal_summary(patch: str) -> str:
@@ -1486,6 +1390,68 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         if result:
             errors.append(result)
     return errors
+
+
+_LINT_HEREDOC_RE = re.compile(r"<<\s*'?EOF'?|<command>|<final>", re.IGNORECASE)
+_LINT_PLACEHOLDER_RE = re.compile(
+    r"YOUR_API_KEY|YOUR_TOKEN|example\.com|localhost(?::\d+)|http://127\.\d+\.\d+\.\d+:\d+"
+)
+_LINT_STUB_RE = re.compile(r"^\s*(pass|TODO|FIXME|# \.\.\.)\s*$", re.IGNORECASE)
+_LINT_EMPTY_JSX_RE = re.compile(r'className=\{\s*\}|style=\{\s*\}')
+
+
+def _lint_patch_findings(repo: Path, patch: str) -> List[Tuple[str, str]]:
+    """Single-pass patch lint covering corruption, dup-imports, stubs,
+    placeholder URLs, and tag-leak markers in newly-added lines."""
+    findings: List[Tuple[str, str]] = []
+    plus_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            plus_lines.append(line[1:])
+    if not plus_lines:
+        return findings
+
+    # Corruption: agent-tag or heredoc markers landed in source.
+    for line in plus_lines:
+        if _LINT_HEREDOC_RE.search(line):
+            findings.append(("corruption", f"agent/heredoc marker in patch: {line.strip()[:80]}"))
+            break
+
+    # Duplicate imports: the same `import X` or `from X import Y` appears
+    # in both the + lines and the surrounding context (already present).
+    added_imports = [ln.strip() for ln in plus_lines if re.match(r"^(import |from \S+ import )", ln.strip())]
+    if added_imports:
+        existing_text = patch
+        for imp in added_imports:
+            # Count occurrences in all non-header lines (both + and context)
+            count = sum(
+                1 for ln in patch.splitlines()
+                if not ln.startswith("+++") and not ln.startswith("---")
+                and imp in ln
+            )
+            if count >= 2:
+                findings.append(("dup_import", f"duplicate import: {imp[:80]}"))
+                break
+
+    # Stubs / incomplete bodies: pass / TODO / FIXME alone on a line.
+    for line in plus_lines:
+        if _LINT_STUB_RE.match(line):
+            findings.append(("stub", f"incomplete placeholder: {line.strip()[:80]}"))
+            break
+
+    # Placeholder URLs / keys hardcoded without env-var fallback.
+    for line in plus_lines:
+        if _LINT_PLACEHOLDER_RE.search(line):
+            findings.append(("placeholder_url", f"placeholder value in patch: {line.strip()[:80]}"))
+            break
+
+    # Empty JSX attribute stubs.
+    for line in plus_lines:
+        if _LINT_EMPTY_JSX_RE.search(line):
+            findings.append(("empty_jsx_attr", f"empty JSX attribute: {line.strip()[:80]}"))
+            break
+
+    return findings
 
 
 def _has_executable(name: str) -> bool:
@@ -1955,6 +1921,57 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
+def _quoted_string_grep_hits(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Dict[str, int]:
+    """Extract quoted error/log/stacktrace substrings (>=6 chars) from
+    issue and git-grep them. Files containing exact matches outrank
+    symbol-only matches in _rank_context_files."""
+    # Pull double-quoted and single-quoted substrings from the issue.
+    candidates: List[str] = []
+    seen_cands: set = set()
+    for pattern in (r'"([^"]{6,120})"', r"'([^']{6,120})'"):
+        for m in re.finditer(pattern, issue_text):
+            phrase = m.group(1).strip()
+            if phrase and phrase not in seen_cands:
+                seen_cands.add(phrase)
+                candidates.append(phrase)
+    # Also extract literal lines from triple-backtick code blocks.
+    for block_match in re.finditer(r"```[^\n]*\n(.*?)```", issue_text, re.DOTALL):
+        for line in block_match.group(1).splitlines():
+            stripped = line.strip()
+            if len(stripped) >= 6 and stripped not in seen_cands:
+                seen_cands.add(stripped)
+                candidates.append(stripped)
+    if not candidates:
+        return {}
+    hits: Dict[str, int] = {}
+    for phrase in candidates[:12]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", phrase],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 1
+    return hits
+
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
@@ -1991,6 +2008,56 @@ def _symbol_grep_hits(
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
+
+
+_SIG_CHANGE_RE = re.compile(
+    r"^\+(?:def |async def |function |class )(\w+)\s*\(",
+    re.MULTILINE,
+)
+
+
+def _callers_of_changed_signatures(
+    repo: Path, patch: str
+) -> List[Tuple[str, str]]:
+    """Detect callable signatures changed in the patch and grep the repo
+    for caller files outside the patched set. Returns [(symbol, path)]."""
+    changed_files = set(_patch_changed_files(patch))
+    symbols: List[str] = []
+    seen_sym: set = set()
+    for m in _SIG_CHANGE_RE.finditer(patch):
+        name = m.group(1)
+        if name not in seen_sym and len(name) >= 3:
+            seen_sym.add(name)
+            symbols.append(name)
+    if not symbols:
+        return []
+    results: List[Tuple[str, str]] = []
+    seen_pairs: set = set()
+    for symbol in symbols[:8]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", symbol],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            caller_path = line.strip()
+            if not caller_path:
+                continue
+            if caller_path in changed_files:
+                continue
+            pair = (symbol, caller_path)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                results.append(pair)
+    return results[:12]
 
 
 # -----------------------------
@@ -2169,19 +2236,13 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
 
-_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
-_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
-
-
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2202,45 +2263,6 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
-
-
-_PRELOAD_BLOCK_RE = re.compile(
-    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
-    re.DOTALL,
-)
-
-
-def _strip_preloaded_section(
-    initial_user_text: str,
-    preloaded_files: List[str],
-    modified_files: Optional[List[str]] = None,
-) -> str:
-    """Replace the bulky preloaded snippet block with a short breadcrumb.
-
-    Triggered after step 4 to free token budget for later iterations: the
-    model has already seen the snippets in earlier turns and only needs to
-    know which files were preloaded (and which it has already touched) so it
-    can re-open them on demand instead of re-reading the whole block on
-    every request.
-    """
-    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
-        return initial_user_text
-
-    lines: List[str] = []
-    if modified_files:
-        lines.append("You modified these files so far: " + ", ".join(modified_files))
-    if preloaded_files:
-        lines.append(
-            "You previously inspected these files (snippets dropped to save context — "
-            "re-open with `sed -n` or `cat` if a region is needed): "
-            + ", ".join(preloaded_files)
-        )
-    if not lines:
-        replacement = "[Preloaded context omitted to save token budget.]"
-    else:
-        replacement = "\n".join(lines)
-
-    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2435,6 +2457,39 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_patch_lint_prompt(findings: List[Tuple[str, str]]) -> str:
+    """Show consolidated patch lint findings and ask the model to fix them."""
+    bullets = "\n  ".join(f"- [{kind}] {msg}" for kind, msg in findings[:8])
+    return (
+        "Patch lint detected issues that the diff judge penalises:\n"
+        f"  {bullets}\n\n"
+        "Fix each of the above:\n"
+        "  - corruption (<<EOF, <command>, <final> in source): remove those "
+        "literal strings — they are agent markup that leaked into the code.\n"
+        "  - dup_import: remove the duplicate import line.\n"
+        "  - stub (pass/TODO/FIXME alone): replace with real implementation.\n"
+        "  - placeholder_url: replace hardcoded URL/key with the correct value "
+        "or an env-var lookup.\n"
+        "  - empty_jsx_attr: fill the attribute value or remove the attribute.\n\n"
+        "Issue the minimal <command> fix(es), then end with <final>summary</final>."
+    )
+
+
+def build_caller_check_prompt(callers: List[Tuple[str, str]]) -> str:
+    """Warn the model that files outside the patch call the changed signatures."""
+    bullets = "\n  ".join(f"- `{sym}` referenced in {path}" for sym, path in callers[:8])
+    return (
+        "Cascade-gap warning — the following files call symbols whose signatures "
+        "changed in your patch, but were NOT updated:\n"
+        f"  {bullets}\n\n"
+        "For each file above: open it, check the call site, and update it if the "
+        "new signature requires a different argument shape. If the call is still "
+        "compatible (no signature change, only an internal impl change), confirm "
+        "that with a brief comment in <final>.\n\n"
+        "Issue the minimal <command> blocks needed, then end with <final>summary</final>."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -2594,9 +2649,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _remaining = _multishot_total_budget - _elapsed
+        if _remaining < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
+
+        # Early-exit: if attempt-1 produced a non-trivial patch and remaining
+        # budget is less than twice the minimum reserve, skip the retry —
+        # a second attempt won't meaningfully improve over a real first patch.
+        if _n1 >= 1 and _remaining < 2 * _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "budget_conservative"
             return _result1
 
         if _multishot_repo_obj is not None:
@@ -2604,6 +2668,26 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+
+        # Better tiebreak: prefer the attempt with fewer unaddressed criteria;
+        # fall back to substantive-line count when criteria are tied.
+        _issue_text = kwargs.get("issue", "")
+        _uncrit1 = len(_unaddressed_criteria(_patch1, _issue_text))
+        _uncrit2 = len(_unaddressed_criteria(_patch2, _issue_text))
+
+        if _uncrit2 < _uncrit1:
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry_criteria"
+            return _result2
+
+        if _uncrit1 < _uncrit2:
+            if _multishot_repo_obj is not None:
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            if _patch1 and _multishot_repo_obj is not None:
+                _multishot_apply_patch(_multishot_repo_obj, _patch1)
+            _result1["multishot_attempts"] = 2
+            _result1["multishot_winner"] = "primary_criteria"
+            return _result1
 
         if _n2 >= _n1:
             _result2["multishot_attempts"] = 2
@@ -2658,6 +2742,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    patch_lint_turns_used = 0
+    caller_check_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -2697,16 +2783,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
+            3. patch-lint — corruption/dup-import/stub/placeholder check
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            5. caller-check — warn about call sites of changed signatures
+            6. coverage-nudge — name issue-mentioned paths still untouched
+            7. criteria-nudge — name issue acceptance bullets not addressed
+            8. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
+        and lint (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, patch_lint_turns_used, caller_check_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2753,6 +2841,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if patch_lint_turns_used < MAX_PATCH_LINT_TURNS:
+            lint_findings = _lint_patch_findings(repo, patch)
+            if lint_findings:
+                patch_lint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_patch_lint_prompt(lint_findings),
+                    "PATCH_LINT_QUEUED:\n  " + "; ".join(f"{k}:{m[:40]}" for k, m in lint_findings[:4]),
+                )
+                return True
+
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
         # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
         # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
@@ -2772,6 +2872,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_test_fix_prompt(test_path, output),
                     f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if caller_check_turns_used < MAX_CALLER_CHECK_TURNS:
+            callers = _callers_of_changed_signatures(repo, patch)
+            if callers:
+                caller_check_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_caller_check_prompt(callers),
+                    "CALLER_CHECK_QUEUED:\n  " + "; ".join(f"{s}:{p}" for s, p in callers[:4]),
                 )
                 return True
 
@@ -2822,40 +2934,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
-        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            # Past step 4 the preloaded snippets are no longer load-bearing —
-            # the model has either used them or moved on. Replace the bulky
-            # block in the initial user message with a short breadcrumb so
-            # the next request fits more recent context within the token cap.
-            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
-                original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
-                stripped = _strip_preloaded_section(
-                    original_initial,
-                    preloaded_files,
-                    modified_files=modified_files,
-                )
-                if stripped != original_initial:
-                    messages[1] = {**messages[1], "content": stripped}
-                    saved = max(0, len(original_initial) - len(stripped))
-                    logs.append(
-                        "INITIAL_PRELOAD_TRIMMED: "
-                        f"step={step} preloaded={len(preloaded_files)} "
-                        f"modified={len(modified_files)} saved_chars={saved}"
-                    )
-                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
@@ -2944,7 +3033,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                result = run_command(
+                    command, repo,
+                    timeout=_dynamic_command_timeout(
+                        max(0.0, time_remaining()), step, command_timeout
+                    ),
+                )
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
