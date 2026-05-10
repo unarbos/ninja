@@ -2536,7 +2536,7 @@ focused inspection command
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. When the issue names a specific test file or command, run that before experimenting with unrelated commands. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
