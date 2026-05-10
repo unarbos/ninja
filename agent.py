@@ -3311,6 +3311,21 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+def _multishot_quality_score(patch: str, issue_text: str) -> int:
+    """Prefer the retry only when it is at least as targeted as the first patch."""
+    score = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return score
+    if _patch_covers_required_paths(patch, issue_text):
+        score += 20
+    criteria = _extract_acceptance_criteria(issue_text)
+    if criteria:
+        missing = _unaddressed_criteria(patch, issue_text)
+        addressed = max(0, len(criteria) - len(missing))
+        score += addressed * 5
+    return score
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -3530,11 +3545,13 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    _q1 = _multishot_quality_score(_patch1, issue)
+    _q2 = _multishot_quality_score(_patch2, issue)
+    if _q2 >= _q1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_quality"] = (_q1, _q2)
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
