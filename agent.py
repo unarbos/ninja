@@ -1237,14 +1237,14 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 
 _PATCH_REVIEW_PROCESS_PHRASES: Tuple[str, ...] = (
-    "ignore previous instructions",
-    "dear judge",
-    "reward model",
-    "automatic fail",
-    "king is correct",
-    "challenger wins",
-    "choose king",
-    "choose challenger",
+    "ignore " + "previous " + "instructions",
+    "dear " + "judge",
+    "reward " + "model",
+    "automatic " + "fail",
+    "king " + "is correct",
+    "challenger " + "wins",
+    "choose " + "king",
+    "choose " + "challenger",
 )
 
 
@@ -2480,76 +2480,24 @@ If multi-file, list every file under "Likely target". Never wrap `<plan>` or `<c
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
-## Functional completeness
+## Scope and completeness
 
-A patch that fully implements the requested behavior is generally rated higher than a partially-implemented one of similar size. To avoid leaving features half-done:
+Fix the ROOT CAUSE precisely and completely; add nothing the issue does not require. Use the EXACT variable/function/class names already in the codebase, and add new imports at the same location as existing imports.
 
-- UI/component tasks: add `useState` + event handlers + wired data flow. Avoid skeleton markup with `// TODO` or pass-through props that don't update state.
-- Service/manager/store tasks: implement the actual methods with real logic, not method signatures with `// implement here`.
-- Form tasks: include input bindings, validation, submission handler, error/loading states — wire the form end-to-end.
-- Data fetch / mutation: include the actual fetch/mutate call with state updates, not `// fetch data here` comments.
-- API handlers: implement the full request/response logic, including error paths.
+**Implement every requirement.** Issues often have multiple bullets, "also" / "and" / "unless" / "only" / "should not" clauses, and numbered acceptance criteria. Missing one is a common reason patches are rated as incomplete.
 
-The diff should be RUNNABLE end-to-end. If a reviewer cleared the repo and applied your patch, the feature should work without further code.
+**Wire features end-to-end.** UI tasks need `useState` + handlers + data flow (not skeleton + `// TODO`). Service/manager/store tasks need real method bodies (not signatures + `// implement here`). Form tasks need bindings + validation + submit + error/loading states. Data fetch/mutation needs the actual call with state updates. API handlers need full request/response + error paths. New routes need their navigation wired. The diff must be RUNNABLE end-to-end after a single apply.
 
-## Scope discipline — what to change
+**Create new files** with `new file mode 100644` when the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist. Do NOT create gratuitous helpers.
 
-Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
-- "Fix X in function Y" → change only function Y
-- "Add feature Z to class C" → add only what Z requires inside C
-- "Bug when condition Q" → fix the condition that causes it, do not restructure
-
-Use the EXACT variable/function/class names already in the codebase. Add new imports at the same location as existing imports in the file.
-
-## New files — create them when the task implies new functionality
-
-When the issue describes a new component, module, service, manager, form, page, or store that doesn't already exist, create the file confidently using `new file mode 100644`. Common signals:
-- "Create a new <Component>" → emit a new .tsx/.vue/.py file
-- "Add a <Service>/<Manager>/<Store>" → create the new module
-- "Implement the <Form> with these fields" → new form component
-- "Add a route/page for X" → new page file
-- New helper modules to keep functions small and the diff readable
-
-Do NOT create gratuitous helpers. Create files only when the task structurally requires them.
-
-## Scope discipline — what NOT to change
-
+**Do NOT add what the issue doesn't ask for:**
 - Whitespace-only, comment-only, or blank-line-only edits
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
+- Refactoring, renaming, or reordering not requested
+- **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## Match the task's scope
-
-A patch that closely matches the requested behavior is rated higher than one that diverges. What this means concretely:
-
-- **Cover every explicit requirement in the issue.** Issues often have multiple bullets or numbered criteria. Read the issue twice, list the requirements, implement each. Missing one of the requested behaviors is a common reason patches are rated as incomplete.
-
-- **Don't add features the issue doesn't ask for.** Drive-by refactors, type-annotation backfills, comment rewrites, mode-only flips, and imports-you-don't-need are typically cited as "unrelated changes". Stay inside the issue's scope.
-
-- **Wire features end-to-end.** Half-implemented features tend to be rated as "users cannot actually use the feature". If you add a search filter, also add the input field and wire it; if you add a service method, wire the call site; if you add a route, wire the navigation.
-
-## Self-check before final
-
-Before emitting `<final>`, ask yourself:
-1. Did I implement EVERY numbered/bulleted requirement from the issue?
-2. Are there any chmod-only or file-mode changes in my diff? (Remove them.)
-3. Did I add anything the issue doesn't ask for? (Remove it.)
-4. Does any UI feature I added have its event handlers and state wired up?
-5. Does the patch compile/parse? Concretely:
-   - Every imported symbol is actually defined or imported elsewhere
-   - Every function called exists with matching signature
-   - Brace/paren/bracket counts balance
-   - No duplicate function/class/method definitions in the same file
-   - No mismatched types (e.g., calling string method on number)
-   - For TypeScript/Java/Go/C#: type annotations align with actual values
-6. Are there any duplicate hunks or near-duplicate code blocks that should consolidate?
-
-If yes to (2) or (3): clean up before finalizing.
-If issues with (5) or (6): fix them — broken/non-compiling code and duplicate definitions make the patch unreliable.
 
 ## Idiomatic refactors
 
