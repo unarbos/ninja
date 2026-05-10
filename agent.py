@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # leaves ~60s headroom for safety net + emergency fallback before the docker kill at 600s
+WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -112,8 +112,8 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # ruff/eslint pass for clean, production-looking code
-_LINT_TIMEOUT = 10         # per-file ruff/eslint timeout
+MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking code
+_LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
@@ -125,11 +125,8 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
-                                # Sized to leave room for both a syntax/lint repair and a
-                                # scope nudge (coverage or criteria) on multi-file tasks
-                                # without blowing the wall-clock budget.
-                                # Exempted gates: hail-mary, syntax-fix.
+MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+                                # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -858,9 +855,9 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # Append recent-commit examples as concrete style anchors. Silent no-op
-    # when the repo has no real history (pilot snapshots have one synthetic
-    # commit) — the helper returns "" and we add nothing.
+    # v21 edge: append recent-commit examples as concrete style anchors. Silent
+    # no-op when the repo has no real history (pilot snapshots have one
+    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1608,11 +1605,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# Lint integration: clean ruff/eslint output
+# v72: lint integration ported from PR559 (UID 154). Clean ruff/eslint output
 # helps keep the patch production-looking while warnings make it look unfinished.
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
-    """Run `ruff check` on a Python file. Returns the first issue or None."""
+    """v72: run `ruff check` on a Python file. Returns the first issue or None."""
     if not _has_executable("ruff"):
         return None
     proc = run_command(
@@ -1630,7 +1627,7 @@ def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
-    """Run `eslint` on a JS/TS file. Returns first issue or None.
+    """v72: run `eslint` on a JS/TS file. Returns first issue or None.
     Skips when no eslint config or no local install is present."""
     has_config = any(
         (repo / name).exists()
@@ -1660,7 +1657,7 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_lint(repo: Path, patch: str) -> List[str]:
-    """Lint every touched file with the appropriate tool. Up to 6 errors."""
+    """v72: lint every touched file with the appropriate tool. Up to 6 errors."""
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
@@ -1677,7 +1674,7 @@ def _check_lint(repo: Path, patch: str) -> List[str]:
 
 
 def build_lint_fix_prompt(errors: List[str]) -> str:
-    """Prompt the model to fix lint issues."""
+    """v72: prompt the model to fix lint issues."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
         "Lint issues were found in your patch:\n\n"
@@ -2054,7 +2051,7 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """Read recent small-diff commits from the staged repo via git log
+    """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
     repo has no real history (single synthetic commit in pilot snapshots), so
     this is a silent no-op locally and a real lift live where the validator
@@ -2136,7 +2133,7 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# criteria-nudge support
+# v21 edge: criteria-nudge support
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
@@ -2195,17 +2192,17 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# Stem-stripping suffix list. Natural-language criteria words (e.g.
-# "selecting", "loaded") often surface in identifier form as `select`,
-# `load`, etc. A literal substring check misses these and inflates the
-# criteria-nudge false-positive rate. Stripping the suffix (with a
-# minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ↔ identifier gap.
+# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
+# criteria words (e.g. "selecting", "loaded") often surface in identifier form
+# as `select`, `load`, etc. A literal substring `in` check misses these and
+# inflates the criteria-nudge false-positive rate. Stripping the suffix (with
+# a minimum-stem length to avoid false positives like `action`->`act` matching
+# `react`) bridges the natural-language ↔ identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    """Stem-stripped membership check."""
+    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -2229,9 +2226,9 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines, surfaced before <final> so the model can close missing work.
 
-    Uses stem-stripped `_keyword_in_added` instead of a plain substring
-    check — closes the natural-language ↔ identifier gap so criteria like
-    "selecting items" match patches that contain `select`.
+    v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
+    check, ported from UID49 PR#527 — closes the natural-language ↔ identifier
+    gap so criteria like "selecting items" match patches that contain `select`.
     """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
@@ -2506,6 +2503,7 @@ Do NOT create gratuitous helpers. Create files only when the task structurally r
 - **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
+- **Placeholder URLs**: never output `https://[PROJECT_REF].supabase.co` or any bracket-template URL — wire Supabase functions via `supabase/config.toml` function entries or env vars. **Integration cascade**: on issues describing a feature spanning multiple concerns (page + route + nav + data fetch; model + migration + serializer + view + URL), enumerate every required integration point as its own plan row.
 
 ## Match the task's scope
 
@@ -2563,7 +2561,7 @@ of the surrounding structure. Preserve them unless the task requires removal.
 ## Language-specific completeness rules
 
 **Java:** Write complete method bodies — never use '// similar logic' stubs.
-Cascade all call-site changes when modifying signatures. Include all imports.
+Cascade all call-site changes when modifying signatures. Include all imports. **Stream ops**: never mutate a captured local inside a lambda/stream (not effectively final) — use `stream().mapToDouble(Cls::method).sum()` instead of `forEach(x -> total += x.val)`.
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed
 function. Include full signatures and all required #include changes.
@@ -2712,8 +2710,8 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
-def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """Wraps build_initial_user_prompt with multi-file/lang strategy hints.
+def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
+    """v33 user message: wraps build_initial_user_prompt with multi-file/lang strategy hints.
 
     Adds multi-file and language strategy hints without changing the
     validator-facing interface.
@@ -3012,165 +3010,11 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 # -----------------------------
-# multi-shot helpers
+# v28 multi-shot helpers
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
-_MULTISHOT_INCOMPLETE_CRITERIA_THRESHOLD = 4  # retry when this many extracted
-                                              # issue bullets are unaddressed —
-                                              # catches large-but-incomplete
-                                              # patches that the line-count
-                                              # threshold misses.
-
-# Emergency single-shot constants
-_EMERGENCY_MAX_TOKENS = 1024
-_EMERGENCY_TIMEOUT_SECONDS = 45
-_EMERGENCY_COMMAND_TIMEOUT = 30
-_EMERGENCY_PROMPT_TARGET_CHARS = 2000
-
-
-def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """Pick the single most-likely-to-need-editing tracked file."""
-    mentioned_paths = _extract_issue_path_mentions(task_text)
-    tracked = set(_tracked_files(repo))
-    for mention in mentioned_paths:
-        normalized = mention.strip("./")
-        if normalized in tracked and _context_file_allowed(normalized):
-            return normalized
-    ranked = _rank_context_files(repo, task_text)
-    for relative_path in ranked:
-        if relative_path in tracked and _context_file_allowed(relative_path):
-            return relative_path
-    for relative_path in tracked:
-        if _context_file_allowed(relative_path):
-            return relative_path
-    return None
-
-
-def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """Stripped-down single-shot prompt: one command, one final, nothing else."""
-    task_view = task_text[:1500]
-    return (
-        "You are a one-shot patch generator. Time and tokens are extremely "
-        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
-        f"TASK:\n{task_view}\n\n"
-        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
-        "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in the target file consistent with the task. Use "
-        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
-        "only. Do NOT change file modes. Make a real code edit.\n\n"
-        "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
-    )
-
-
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """Single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-
-    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
-    repo: Optional[Path] = None
-    try:
-        repo = _repo_path(repo_path_value)
-        ensure_git_repo(repo)
-        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-
-        target = _emergency_pick_target(repo, task_text)
-        if target is None:
-            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict()
-
-        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-        prompt = _emergency_build_prompt(target, snippet, task_text)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response_text, _, _ = chat_completion(
-                messages=messages,
-                model=model_name,
-                api_base=base,
-                api_key=key,
-                max_tokens=_EMERGENCY_MAX_TOKENS,
-                timeout=_EMERGENCY_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-        except Exception as exc:
-            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
-            patch_text = get_patch(repo) if repo is not None else ""
-            return AgentResult(
-                patch=patch_text, logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=bool(patch_text.strip()),
-            ).to_dict()
-
-        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
-        commands = extract_commands(response_text)
-        if not commands:
-            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
-        for cmd in commands[:2]:
-            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
-            logs.append(format_observation(result))
-
-        patch_text = get_patch(repo)
-        return AgentResult(
-            patch=patch_text,
-            logs=_safe_join_logs(logs),
-            steps=1,
-            cost=0.0,
-            success=bool(patch_text.strip()),
-        ).to_dict()
-    except Exception:
-        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
-        patch_text = ""
-        if repo is not None:
-            try:
-                patch_text = get_patch(repo)
-            except Exception:
-                pass
-        return AgentResult(
-            patch=patch_text, logs=_safe_join_logs(logs),
-            steps=0, cost=None, success=False,
-        ).to_dict()
-
-
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test error output."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
 
 # v66: emergency single-shot constants (adapted from PR518)
 _EMERGENCY_MAX_TOKENS = 1024
@@ -3429,7 +3273,7 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 
 
 # -----------------------------
-# Main agent (multi-shot wrapper around _solve_inner)
+# Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -3450,19 +3294,19 @@ def solve(
     """
     Main portable interface for validators.
 
-    Wrapped in patch-preserve safety net: any uncaught exception in the
-    multishot body returns the on-disk patch state instead of propagating,
-    preserving useful progress when possible.
+    v65: wrapped in patch-preserve safety net (from chain king PR486).
+    Any uncaught exception in the multishot body returns the on-disk patch
+    state instead of propagating, preserving useful progress when possible.
     """
-    return _solve_with_safety_net(
+    return _v65_solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
 
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """Safety-net wrapper around the multishot driver."""
+def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """v65 safety-net wrapper. Adapted from chain king PR486."""
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -3471,7 +3315,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         pass
 
     try:
-        return _multishot_driver(kwargs, _multishot_repo_obj)
+        return _v65_multishot_driver(kwargs, _multishot_repo_obj)
     except Exception as exc:
         salvaged = ""
         try:
@@ -3488,8 +3332,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
-def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
-    """Multishot logic, separated so the safety-net try/except wraps it cleanly."""
+def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
+    """The original UID195 multishot logic, separated so the safety-net try/except wraps it cleanly."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -3500,7 +3344,7 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
 
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 540.0  # reserves 60s headroom for safety net before docker kill at 600s
+    _multishot_total_budget = 540.0  # v69: 580->540, reserves 60s headroom for safety net before docker kill at 600s
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -3514,34 +3358,23 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
-    # Retry triggers, in order of severity:
-    #   (a) patch empty — nothing to ship.
-    #   (b) too few substantive lines AND missed an issue-mentioned path —
-    #       the patch is both small and off-target. A surgical 1-2 line fix
-    #       that DOES cover the required paths is correct; don't discard it.
-    #   (c) many extracted acceptance bullets unaddressed — the patch may be
-    #       large but is missing the headline scope (e.g. a 4000-line patch
-    #       that omits the requested header/composer/component). Line count
-    #       alone hides this; the criteria signal catches it.
+    # Only retry when the patch is empty OR it has too few substantive lines
+    # AND failed to touch any path the issue explicitly mentions. A surgical
+    # 1-2 line fix that covers the required paths is correct — don't discard it.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _unaddressed1 = _unaddressed_criteria(_patch1, issue) if _patch1.strip() else []
-    _criteria_starved = len(_unaddressed1) >= _MULTISHOT_INCOMPLETE_CRITERIA_THRESHOLD
-    _should_retry = (
-        (not _patch1.strip())
-        or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
-        or _criteria_starved
-    )
+    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
     if not _should_retry:
         _result1["multishot_attempts"] = 1
         return _result1
 
     _elapsed = time.monotonic() - _multishot_started
 
-    # Emergency single-shot trigger: fires whenever attempt 1 returned empty,
-    # whether due to transport failures (>=2 MODEL_ERROR markers) or a
-    # planning loop that exited cleanly with no patch. The single-shot
-    # fallback is cheaper than burning the retry budget on the same chain
-    # that produced nothing.
+    # v70: broadened emergency trigger. Originally (v66/v69) only fired when
+    # attempt 1 returned empty AND had >=2 MODEL_ERROR markers. v70 also fires
+    # on ANY empty attempt 1 (not just transport failures) — sometimes the
+    # planning loop just exits cleanly with no patch, and we still want a
+    # cheap single-shot fallback rather than burning the retry budget on the
+    # same chain that produced nothing.
     _attempt1_logs = _result1.get("logs", "") or ""
     _attempt1_was_error_failure = (
         not _patch1.strip()
@@ -3570,19 +3403,7 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
-    # Quality-aware tiebreak: prefer attempt 2 when it addresses MORE issue
-    # bullets, or when bullets tie and it has at least as many substantive
-    # lines. This protects against the failure mode where attempt 2 produces
-    # a smaller-but-more-complete patch (e.g. trims unrelated churn while
-    # adding the missing component) and would otherwise lose to a larger,
-    # off-target attempt 1. Falls back to the line-count rule when the issue
-    # has no extractable bullet structure (both unaddressed counts are 0).
-    _unaddressed2 = _unaddressed_criteria(_patch2, issue) if _patch2.strip() else []
-    _u1 = len(_unaddressed1)
-    _u2 = len(_unaddressed2)
-    _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
-
-    if _retry_wins:
+    if _n2 >= _n1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
         return _result2
@@ -3616,7 +3437,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    lint_turns_used = 0
+    lint_turns_used = 0  # v72
     empty_arg_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
@@ -3656,21 +3477,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. syntax-fix — repair Python/TS/JS SyntaxError (exempt from cap)
-            2. patch-safety — remove unsafe review-process wording
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. criteria-nudge — name issue acceptance bullets not addressed
-            5. test — actually run the companion test if one exists; if it
+            1. patch-safety — remove unsafe review-process wording
+            2. coverage-nudge — name issue-mentioned paths still untouched
+            3. criteria-nudge — name issue acceptance bullets not addressed
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            6. failed-verification — repair the latest concrete failed check
-            7. contract — preserve public symbols still referenced by callers
-            8. integration/artifact/dependency — close common missing pieces
-            9. polish/empty-arg/lint — remove churn and tool errors
-           10. self-check — show the diff and ask "did you cover everything?"
-
-        syntax-fix runs before the cap because non-parsing patches are
-        guaranteed losses; the LLM judge often penalises broken code harder
-        than missing scope (see duel 004362, ~half of losses).
+            5. failed-verification — repair the latest concrete failed check
+            6. contract — preserve public symbols still referenced by callers
+            7. integration/artifact/dependency — close common missing pieces
+            8. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
+            9. self-check — show the diff and ask "did you cover everything?"
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
@@ -3688,14 +3504,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # Syntax-fix is exempt from the cap and runs ahead of any nudge.
-        # A non-parsing patch is a guaranteed loss regardless of scope, and the
-        # repair is usually a small surgical edit — cheap to run and worth doing
-        # even when other gates would otherwise consume the cap.
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
+        # Hard-stop when the cap is reached (hail-mary excluded).
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
+        if patch_safety_turns_used < MAX_PATCH_SAFETY_TURNS:
+            safety = _patch_safety_summary(patch)
+            if safety:
+                patch_safety_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_patch_safety_prompt(safety),
+                    f"PATCH_SAFETY_QUEUED:\n  {safety}",
+                )
+                return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
@@ -3712,139 +3541,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
-        # Hard-stop when the cap is reached (hail-mary and syntax-fix excluded).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
-            return False
-
-        if patch_safety_turns_used < MAX_PATCH_SAFETY_TURNS:
-            safety = _patch_safety_summary(patch)
-            if safety:
-                patch_safety_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_patch_safety_prompt(safety),
-                    f"PATCH_SAFETY_QUEUED:\n  {safety}",
-                )
-                return True
-
-        if (
-            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
-            and last_failed_verification_command
-            and last_failed_verification_observation
-        ):
-            failed_verification_fix_turns_used += 1
-            total_refinement_turns_used += 1
-            command = last_failed_verification_command
-            observation = last_failed_verification_observation
-            last_failed_verification_command = ""
-            last_failed_verification_observation = ""
-            queue_refinement_turn(
-                assistant_text,
-                build_failed_verification_prompt(command, observation),
-                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
-            )
-            return True
-
-        if contract_turns_used < MAX_CONTRACT_TURNS:
-            contract_findings = _contract_preservation_gap_summary(repo, patch)
-            if contract_findings:
-                contract_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_contract_preservation_prompt(contract_findings),
-                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_integration_nudge_prompt(integration, issue),
-                    f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
-                )
-                return True
-
-        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
-            artifact = _requested_artifact_gap_summary(patch, issue)
-            if artifact:
-                artifact_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_artifact_nudge_prompt(artifact, issue),
-                    f"ARTIFACT_NUDGE_QUEUED:\n  {artifact}",
-                )
-                return True
-
-        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
-            dependency = _dependency_metadata_gap_summary(patch)
-            if dependency:
-                dependency_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_dependency_nudge_prompt(dependency, issue),
-                    f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
-                )
-                return True
-
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
-            empty_arg_findings = _check_empty_args(patch)
-            if empty_arg_findings:
-                empty_arg_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_empty_args_fix_prompt(empty_arg_findings),
-                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
-                )
-                return True
-
-        # v72: lint pass — runs ruff/eslint when project tooling is available.
-        # Different axis from syntax (which proves the file parses); lint
-        # catches style issues that make the patch look unfinished.
-        if lint_turns_used < MAX_LINT_TURNS:
-            lint_errors = _check_lint(repo, patch)
-            if lint_errors:
-                lint_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_lint_fix_prompt(lint_errors),
-                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
                 )
                 return True
 
@@ -3939,6 +3635,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
         if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
             empty_arg_findings = _check_empty_args(patch)
             if empty_arg_findings:
@@ -3951,7 +3659,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Lint pass — runs ruff/eslint when project tooling is available.
+        # v72: lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
         if lint_turns_used < MAX_LINT_TURNS:
@@ -3990,13 +3698,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_planning_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
 
         _wall_start = time.monotonic()
-        # Emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS:
-        # a hardcoded value can become dead code under a tighter budget. This
-        # adapts to whatever budget is set — fires 60s before out_of_time().
+        # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
+        # v32 hardcoded 240s and became dead code under tighter king budgets,
+        # which cost us 4 empty rounds and the duel. This adapts to whatever
+        # budget the king sets — fires 60s before out_of_time().
         emergency_injected = False
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
