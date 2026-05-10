@@ -738,6 +738,53 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
     "vitest.config.ts",
 )
 
+_INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
+    "api",
+    "app",
+    "client",
+    "component",
+    "components",
+    "config",
+    "controller",
+    "controllers",
+    "db",
+    "form",
+    "handler",
+    "handlers",
+    "layout",
+    "migration",
+    "migrations",
+    "model",
+    "models",
+    "page",
+    "pages",
+    "repository",
+    "repositories",
+    "route",
+    "routes",
+    "router",
+    "schema",
+    "schemas",
+    "screen",
+    "screens",
+    "service",
+    "services",
+    "store",
+    "types",
+    "view",
+    "views",
+)
+
+_INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
+    "Dockerfile",
+    "Makefile",
+    "build.gradle",
+    "docker-compose.yml",
+    "package.json",
+    "pyproject.toml",
+    "settings.gradle",
+)
+
 
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     """Compact top-level project hints for choosing targeted verification."""
@@ -807,6 +854,10 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
       4. Compact project hints expose test/build scripts without spending an
          extra inspection turn.
+
+      5. A few high-confidence integration neighbors can be appended after the
+         direct hits, so route/API/schema/UI wiring is visible without
+         displacing the primary target files.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -814,6 +865,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_integration_partners(files, tracked_set, issue)
 
     definer_files = _find_identifier_definers(repo, tracked_set, issue)
     anchor_map: Dict[str, List[Tuple[int, int]]] = {}
@@ -931,6 +983,89 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         seen.add(relative_path)
         ranked.append(relative_path)
     return ranked
+
+
+def _split_path_tokens(relative_path: str) -> set:
+    """Lower-case path/name tokens used for cheap related-file discovery."""
+    tokens: set = set()
+    for part in Path(relative_path).parts:
+        for token in re.findall(r"[a-z0-9]+", part.lower()):
+            if len(token) >= 3:
+                tokens.add(token)
+    return tokens
+
+
+def _looks_like_integration_surface(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.name in _INTEGRATION_ROOT_FILES:
+        return True
+    tokens = _split_path_tokens(relative_path)
+    return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Append a few likely wiring files after direct hits and tests."""
+    if not files or not tracked:
+        return files
+
+    seen = set(files)
+    anchors = files[:6]
+    anchor_dirs = {
+        str(Path(path).parent).replace("\\", "/")
+        for path in anchors
+        if str(Path(path).parent) not in {"", "."}
+    }
+    anchor_top_dirs = {Path(path).parts[0] for path in anchors if Path(path).parts}
+    anchor_tokens = set()
+    for path in anchors:
+        anchor_tokens.update(_split_path_tokens(path))
+
+    issue_tokens = set(_issue_terms(issue))
+    issue_symbols = {symbol.lower() for symbol in _extract_issue_symbols(issue, max_symbols=16)}
+    signal_tokens = {token for token in (anchor_tokens | issue_tokens | issue_symbols) if len(token) >= 4}
+    root_file_wanted = bool(
+        issue_tokens
+        & {
+            "build", "cli", "config", "dependency", "dependencies", "docker",
+            "package", "script", "setup", "workflow",
+        }
+    )
+
+    candidates: List[Tuple[int, str]] = []
+    for relative_path in sorted(tracked):
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        if not _looks_like_integration_surface(relative_path):
+            continue
+
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        parent = str(path.parent).replace("\\", "/")
+        score = 0
+        semantic_score = 0
+        if parent in anchor_dirs:
+            score += 6
+        if path.parts and path.parts[0] in anchor_top_dirs:
+            score += 3
+        semantic_score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
+        semantic_score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
+        semantic_score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        score += semantic_score
+        if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
+            score += 5
+        if "test" in path_lower or "spec" in path_lower:
+            score -= 2
+
+        if score >= 7 and (semantic_score > 0 or (path.name in _INTEGRATION_ROOT_FILES and root_file_wanted)):
+            candidates.append((score, relative_path))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:3]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+    return augmented
 
 
 def _tracked_files(repo: Path) -> List[str]:
