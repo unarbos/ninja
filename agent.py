@@ -125,6 +125,13 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_CASCADE_TURNS = 1      # patch modifies callable's signature; consumers in unpatched files
+MAX_EXT_STUB_TURNS = 1     # JSX className={}, style={{}}, // TODO, empty arrow body
+MAX_PLACEHOLDER_TURNS = 1  # hardcoded placeholder URLs / credentials / test endpoints
+MAX_UNDERSIZED_TURNS = 1   # issue mentions 3+ files, patch touches <2
+MAX_CORRUPTION_TURNS = 1   # heredoc / prompt markers leaked into source files
+MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched source file
+MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags without matching adds
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -1740,6 +1747,407 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
         "intended argument(s), supply a descriptive error message, or remove "
         "the call entirely if it served no purpose. Do NOT add new behavior "
         "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
+    )
+
+
+# Cascade-gap gate (modified-signature, distinct from contract preservation
+# which only catches REMOVED public symbols). Fires when the patch MODIFIES
+# a callable's declaration line (same name on both `-` and `+`) and
+# consumers in OTHER files were not also updated.
+
+_CASCADE_SIG_RE = re.compile(
+    r"^[+\-](?!--|\+\+)\s*(?:async\s+|public\s+|private\s+|protected\s+|"
+    r"static\s+|export\s+|export\s+default\s+|const\s+|let\s+|var\s+)*"
+    r"(?:def|function|fn|class|interface|struct|enum|trait)"
+    r"\s+([A-Za-z_][\w]{2,})\b",
+    re.MULTILINE,
+)
+_CASCADE_NAME_DENYLIST = frozenset({
+    "default", "main", "init", "setup", "teardown",
+    "test", "tests", "describe", "it", "expect",
+    "constructor", "render", "Component",
+    "module", "exports",
+})
+
+
+def _check_cascade_gap(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
+    if not patch.strip():
+        return []
+    added: set = set()
+    removed: set = set()
+    for match in _CASCADE_SIG_RE.finditer(patch):
+        name = match.group(1)
+        if name in _CASCADE_NAME_DENYLIST:
+            continue
+        if match.group(0).startswith("+"):
+            added.add(name)
+        elif match.group(0).startswith("-"):
+            removed.add(name)
+    modified = sorted(added & removed)
+    if not modified:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[Tuple[str, List[str]]] = []
+    for name in modified[:4]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "-F", "--", f"{name}("],
+                cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=6, check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            callers.append(relative_path)
+            if len(callers) >= 4:
+                break
+        if callers:
+            findings.append((name, callers))
+    return findings
+
+
+def build_cascade_gap_fix_prompt(findings: List[Tuple[str, List[str]]]) -> str:
+    bullets = []
+    for name, callers in findings:
+        sample = ", ".join(callers[:4])
+        bullets.append(f"- `{name}` referenced in unpatched file(s): {sample}")
+    body = "\n  ".join(bullets) or "(none)"
+    return (
+        "Cascade gap — your patch modifies these callable declarations, but "
+        "consumers in OTHER files are not in the current patch:\n"
+        f"  {body}\n\n"
+        "For each, decide: (a) the existing callers are still correct "
+        "(internal-only change, or backwards-compatible default arg) — emit "
+        "`<final>summary</final>` and explain; (b) the callers DO need "
+        "updating — issue the additional edit commands for those caller files "
+        "in the SAME response, then end with `<final>cascade applied</final>`. "
+        "Match the style and indentation of each caller file."
+    )
+
+
+# Extended-stub gate: catches the broader stub family `_check_empty_args`
+# misses — JSX `className={}`, `style={{}}`, `// TODO` placeholders,
+# empty arrow bodies.
+
+_EXT_STUB_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    (
+        "JSX attribute with empty expression",
+        re.compile(
+            r"^\+(?!\+\+).*\b(?:className|style|onClick|onChange|onSubmit|"
+            r"onBlur|onFocus|onMouseEnter|onMouseLeave|onKeyDown|key|id|"
+            r"value|placeholder|aria-[\w-]+)=\{\s*\}",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "JSX style with empty object",
+        re.compile(r"^\+(?!\+\+).*style=\{\{\s*\}\}", re.MULTILINE),
+    ),
+    (
+        "TODO/FIXME placeholder comment in added code",
+        re.compile(
+            r"^\+(?!\+\+).*(?://|#|/\*)\s*(?:TODO|FIXME|XXX|HACK|"
+            r"implement\s+later|to\s+be\s+implemented|not\s+implemented)\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "empty arrow function body",
+        re.compile(r"^\+(?!\+\+).*=>\s*\{\s*\}\s*[;,]?\s*$", re.MULTILINE),
+    ),
+)
+
+
+def _check_extended_stubs(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _EXT_STUB_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 5:
+                return findings
+    return findings
+
+
+def build_extended_stub_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains stub-shaped expressions that read as unfinished:"
+        f"\n\n{body}\n\n"
+        "Emit ONE bash command that fills in the intended value, removes the "
+        "stub, or replaces the placeholder with real code. Do NOT add new "
+        "behavior beyond closing the stub. Then end with "
+        "`<final>stubs filled</final>`."
+    )
+
+
+# Placeholder-endpoint gate: hardcoded test URLs / credentials / localhost
+# without env-var fallback that read as forgotten dev artifacts.
+
+_PLACEHOLDER_ENDPOINT_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    (
+        "obvious-placeholder URL hostname",
+        re.compile(
+            r"^\+(?!\+\+).*[\"'](?:https?://)(?:"
+            r"example\.(?:com|net|org)|your[-_.]?(?:domain|api|app|site)|"
+            r"placeholder|to[-_.]?be[-_.]?replaced|change[-_.]?me|"
+            r"replace[-_.]?me|todo[-_.]?url|api\.example|"
+            r"my[-_.]?(?:api|app|site|server)|some[-_.]?(?:host|api|server))"
+            r"[/\"']",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "TODO-string placeholder credential",
+        re.compile(
+            r"^\+(?!\+\+).*[\"'](?:YOUR[_-]?API[_-]?KEY|YOUR[_-]?TOKEN|"
+            r"REPLACE[_-]?ME|YOUR[_-]?SECRET|TODO[_-]?(?:KEY|TOKEN|URL|SECRET)|"
+            r"FIXME[_-]?(?:KEY|TOKEN|URL|SECRET)|<your[-_]?[a-z_-]+>)[\"']",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "hardcoded localhost without env-var fallback in non-config file",
+        re.compile(
+            r"^\+(?!\+\+)(?!.*\b(?:process\.env|os\.environ|getenv|"
+            r"import\.meta\.env|env\[|\benv\.))(?!.*\.(?:env|json|yaml|yml|"
+            r"toml|ini|cfg|md|test|spec)).*[\"']https?://(?:localhost|"
+            r"127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?[/\"']",
+            re.MULTILINE,
+        ),
+    ),
+)
+
+
+def _check_placeholder_endpoints(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _PLACEHOLDER_ENDPOINT_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:200]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_placeholder_endpoint_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains hardcoded placeholder URLs / credentials that "
+        "read as leftover dev artifacts rather than real configuration:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that either (a) reads the value from the "
+        "appropriate env var (`process.env.X`, `os.environ.get('X')`, "
+        "`import.meta.env.X`, etc.) using the convention of nearby code, or "
+        "(b) replaces the placeholder with the issue-required real value. "
+        "Then end with `<final>endpoint wired</final>`."
+    )
+
+
+# Undersized-patch gate: when the issue text mentions multiple distinct file
+# paths but the patch only touches one or zero of them.
+
+def _check_undersized_patch(patch: str, issue_text: str) -> Optional[Tuple[List[str], List[str]]]:
+    if not patch.strip() or not issue_text:
+        return None
+    mentioned = _extract_issue_path_mentions(issue_text)
+    distinct_mentions = list({p.strip("./") for p in mentioned if len(p.strip("./")) > 3})
+    if len(distinct_mentions) < 3:
+        return None
+    touched = _patch_changed_files(patch)
+    if len(touched) >= 2:
+        return None
+    return (distinct_mentions[:6], touched)
+
+
+def build_undersized_patch_fix_prompt(mentioned: List[str], touched: List[str]) -> str:
+    mention_list = "\n  ".join(f"- {m}" for m in mentioned)
+    touch_list = ", ".join(touched) or "(none)"
+    return (
+        "Coverage gap — the issue mentions multiple distinct files, but your "
+        "patch only touches a small subset of them:\n\n"
+        f"Issue-mentioned paths:\n  {mention_list}\n\n"
+        f"Files touched in current patch: {touch_list}\n\n"
+        "When an issue lists three or more concrete files, the reference "
+        "patch typically touches all of them. Open each unaddressed path "
+        "now and emit the edit commands needed to satisfy the task across "
+        "every file in the SAME response. Do not start unrelated work. "
+        "Then end with `<final>coverage extended</final>`."
+    )
+
+
+# Corruption gate: catches shell heredoc fragments and prompt markers
+# accidentally leaked into source files. Real-world failure mode where
+# the model's edit included `<<EOF`, a leading `<command>` tag, or
+# `<plan>` markup as if it were source code.
+
+_CORRUPTION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    (
+        "shell heredoc marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*<<['\"]?(?:EOF|PYEOF|TXT|END|SCRIPT|HEREDOC)['\"]?\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "agent control tag leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*</?(?:command|final|plan)>\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "raw shell prompt marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*\$\s+[a-z]+\s+\S+.*\$\s*$",
+            re.MULTILINE,
+        ),
+    ),
+)
+
+
+def _check_corruption(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _CORRUPTION_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_corruption_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains markers that belong to your shell or agent "
+        "harness, NOT to the source file being edited:\n\n"
+        f"{body}\n\n"
+        "These leak into source typically when a heredoc edit ran past its "
+        "terminator or when the model's `<command>` / `<plan>` blocks were "
+        "captured verbatim into the file. Emit ONE bash command that either "
+        "(a) reverts the file to its original content for the affected "
+        "region, or (b) re-applies the intended edit cleanly without any "
+        "harness markup. Then end with `<final>corruption removed</final>`."
+    )
+
+
+# Duplicate-imports gate: catches identical import lines repeated in a
+# touched source file. Common error when the model adds an import that
+# already existed.
+
+def _check_duplicate_imports(repo: Path, patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java", ".rb"}:
+            continue
+        try:
+            file_path = repo / relative_path
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            text = file_path.read_text(errors="ignore")
+        except Exception:
+            continue
+        seen_imports: Dict[str, int] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            is_import = (
+                stripped.startswith("import ")
+                or stripped.startswith("from ")
+                or stripped.startswith("require(")
+                or (suffix == ".go" and stripped.startswith('import "'))
+            )
+            if not is_import:
+                continue
+            seen_imports[stripped] = seen_imports.get(stripped, 0) + 1
+        for imp, count in seen_imports.items():
+            if count > 1:
+                findings.append(f"{relative_path}: {imp[:120]} appears {count}x")
+                if len(findings) >= 4:
+                    return findings
+    return findings
+
+
+def build_duplicate_imports_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch results in duplicate import lines in these files:\n\n"
+        f"{body}\n\n"
+        "Duplicate imports are a code-quality red flag and may even break "
+        "the parser depending on the language. Emit ONE bash command that "
+        "removes the redundant import lines, keeping exactly one occurrence "
+        "of each. Then end with `<final>imports deduplicated</final>`."
+    )
+
+
+# Critical-tag-removals gate: detects removal of top-level HTML/Vue closing
+# tags without matching adds — silent breakage for templates.
+
+_CRITICAL_TAGS = ("</template>", "</script>", "</style>", "</html>", "</body>", "</head>")
+
+
+def _check_critical_tag_removals(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for tag in _CRITICAL_TAGS:
+        removed_count = 0
+        added_count = 0
+        for line in patch.splitlines():
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+            if tag in line:
+                if line.startswith("-"):
+                    removed_count += 1
+                elif line.startswith("+"):
+                    added_count += 1
+        if removed_count > added_count:
+            net = removed_count - added_count
+            findings.append(f"net {net} `{tag}` tag(s) removed without re-adding")
+    return findings
+
+
+def build_critical_tag_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch removes top-level closing tags that templates rely on:"
+        f"\n\n{body}\n\n"
+        "These tags terminate template / script / style sections; removing "
+        "them silently breaks the file. Emit ONE bash command that re-adds "
+        "the missing closing tag(s) at the correct position(s). Then end "
+        "with `<final>tags restored</final>`."
     )
 
 
@@ -3618,6 +4026,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0
     empty_arg_turns_used = 0
+    cascade_turns_used = 0
+    ext_stub_turns_used = 0
+    placeholder_turns_used = 0
+    undersized_turns_used = 0
+    corruption_turns_used = 0
+    dup_import_turns_used = 0
+    tag_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -3672,7 +4087,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3891,6 +4306,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Cascade-gap: contract preservation only catches REMOVED public
+        # symbols. The cascade gate catches the distinct case where a
+        # callable's declaration was MODIFIED and consumers in OTHER files
+        # weren't also updated.
+        if cascade_turns_used < MAX_CASCADE_TURNS:
+            cascade_findings = _check_cascade_gap(repo, patch)
+            if cascade_findings:
+                cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                summary = " | ".join(
+                    f"{name}->{len(callers)} callers" for name, callers in cascade_findings
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cascade_gap_fix_prompt(cascade_findings),
+                    f"CASCADE_FIX_QUEUED:\n  {summary}",
+                )
+                return True
+
         if integration_nudges_used < MAX_INTEGRATION_NUDGES:
             integration = _integration_gap_summary(patch, issue)
             if integration:
@@ -3927,6 +4361,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Placeholder-endpoint: hardcoded test URLs / placeholder credentials.
+        if placeholder_turns_used < MAX_PLACEHOLDER_TURNS:
+            placeholder_findings = _check_placeholder_endpoints(patch)
+            if placeholder_findings:
+                placeholder_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_placeholder_endpoint_fix_prompt(placeholder_findings),
+                    "PLACEHOLDER_FIX_QUEUED:\n  " + "\n  ".join(placeholder_findings),
+                )
+                return True
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -3951,6 +4398,61 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Extended-stub: catches the broader stub family `_check_empty_args`
+        # misses — JSX `className={}`, `style={{}}`, `// TODO` comments, empty
+        # arrow function bodies.
+        if ext_stub_turns_used < MAX_EXT_STUB_TURNS:
+            ext_stub_findings = _check_extended_stubs(patch)
+            if ext_stub_findings:
+                ext_stub_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_extended_stub_fix_prompt(ext_stub_findings),
+                    "EXT_STUB_QUEUED:\n  " + "\n  ".join(ext_stub_findings),
+                )
+                return True
+
+        # Corruption: shell heredoc fragments / agent control tags leaked
+        # into the source. Subtle parser-level breakage.
+        if corruption_turns_used < MAX_CORRUPTION_TURNS:
+            corruption_findings = _check_corruption(patch)
+            if corruption_findings:
+                corruption_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_corruption_fix_prompt(corruption_findings),
+                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
+                )
+                return True
+
+        # Duplicate-imports: identical import lines in a touched file.
+        if dup_import_turns_used < MAX_DUP_IMPORT_TURNS:
+            dup_findings = _check_duplicate_imports(repo, patch)
+            if dup_findings:
+                dup_import_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duplicate_imports_fix_prompt(dup_findings),
+                    "DUP_IMPORT_QUEUED:\n  " + "\n  ".join(dup_findings),
+                )
+                return True
+
+        # Critical-tag-removal: removed top-level HTML/Vue closing tags.
+        if tag_turns_used < MAX_TAG_TURNS:
+            tag_findings = _check_critical_tag_removals(patch)
+            if tag_findings:
+                tag_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_critical_tag_fix_prompt(tag_findings),
+                    "TAG_FIX_QUEUED:\n  " + "\n  ".join(tag_findings),
+                )
+                return True
+
         # Lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
@@ -3963,6 +4465,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_lint_fix_prompt(lint_errors),
                     "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                )
+                return True
+
+        # Undersized-patch: when issue mentions ≥3 files but patch touches
+        # <2 files. Different signal from coverage_nudge (path coverage)
+        # and criteria_nudge (bullet coverage).
+        if undersized_turns_used < MAX_UNDERSIZED_TURNS:
+            undersized = _check_undersized_patch(patch, issue)
+            if undersized is not None:
+                mentioned, touched = undersized
+                undersized_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_undersized_patch_fix_prompt(mentioned, touched),
+                    f"UNDERSIZED_QUEUED: {len(mentioned)} mentioned, {len(touched)} touched",
                 )
                 return True
 
