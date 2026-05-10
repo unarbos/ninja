@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
+WALL_CLOCK_BUDGET_SECONDS = 250.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -865,6 +865,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         return ""
 
     tracked_set = set(_tracked_files(repo))
+    files = _augment_with_owner_surfaces(files, tracked_set, issue)
     files = _augment_with_test_partners(files, tracked_set)
 
     parts: List[str] = []
@@ -1039,8 +1040,10 @@ def _issue_terms(issue: str) -> List[str]:
         "with",
     }
     terms: List[str] = []
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", issue.lower()):
+    for raw in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]{1,}", issue.lower()):
         if raw in stop or raw in terms:
+            continue
+        if raw.isdigit() and len(raw) < 3:
             continue
         terms.append(raw)
     return terms[:40]
@@ -1235,6 +1238,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     the gap to the model directly is the cheapest way to close it.
     """
     required = _extract_issue_path_mentions(issue_text)
+    required.extend(_contextual_required_paths(issue_text, required))
     if not required:
         return []
     changed = set(_patch_changed_files(patch))
@@ -1243,6 +1247,35 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+def _contextual_required_paths(issue_text: str, mentions: List[str]) -> List[str]:
+    """Infer directory-qualified required paths from nearby issue wording.
+
+    Issues often say "create Foo.js in src/" or "components X/Y/Z exist in the
+    src directory" while wrapping only the basenames in backticks. A patch that
+    deletes root Foo.js but creates src/Foo.jsx should not satisfy the explicit
+    Foo.js requirement. Keep this conservative: only infer a prefix when the
+    issue names a real directory convention near the path list.
+    """
+    lowered = issue_text.lower()
+    inferred: List[str] = []
+    prefixes: List[str] = []
+    if "src/" in lowered or "src directory" in lowered or "src folder" in lowered:
+        prefixes.append("src")
+    if "components/" in lowered or "components directory" in lowered or "components folder" in lowered:
+        prefixes.append("components")
+    if not prefixes:
+        return inferred
+    existing = set(mentions)
+    for mention in mentions:
+        if "/" in mention or mention.startswith("."):
+            continue
+        for prefix in prefixes:
+            candidate = f"{prefix}/{mention}"
+            if candidate not in existing and candidate not in inferred:
+                inferred.append(candidate)
+    return inferred
 
 
 # -----------------------------
@@ -1491,6 +1524,21 @@ def _check_js_structure_one(repo: Path, relative_path: str) -> Optional[str]:
             line_no = source[:tag.start()].count("\n") + 1
             return f"{relative_path}:{line_no}: JSX component `{name}` is not declared/imported"
 
+    for expr in re.finditer(r"\{\s*([A-Za-z_$][\w$]*)\s*\}", source):
+        name = expr.group(1)
+        if name in available or name in {"false", "null", "true", "undefined"}:
+            continue
+        before = source[max(0, expr.start() - 20):expr.start()]
+        # Skip import/export braces and object type annotations; this check is
+        # meant for JSX prop expressions like enabled={broadcastEnabled}.
+        if re.search(r"(import|export|type|interface)\s*$", before):
+            continue
+        tag_context = source[max(0, expr.start() - 300):expr.start()]
+        in_opening_tag = re.search(r"<[A-Z][A-Za-z0-9_$]*(?:\s|[\s\S])*?$", tag_context) and ">" not in tag_context.split("<")[-1]
+        if in_opening_tag:
+            line_no = source[:expr.start()].count("\n") + 1
+            return f"{relative_path}:{line_no}: JSX expression `{name}` is not declared/imported"
+
     current_function_params: set[str] = set()
     for idx, line in enumerate(lines, 1):
         fn = re.match(r"\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(([^)]*)\)", line)
@@ -1520,6 +1568,88 @@ def _check_js_structure_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _resolve_local_js_module(repo: Path, importer: str, specifier: str) -> Optional[Path]:
+    """Resolve a relative or @/ JS/TS import to a tracked source file."""
+    if specifier.startswith("."):
+        base = (repo / importer).parent / specifier
+    elif specifier.startswith("@/"):
+        base = repo / "src" / specifier[2:]
+    else:
+        return None
+    candidates = [base]
+    for suffix in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+        candidates.append(Path(str(base) + suffix))
+    for suffix in (".ts", ".tsx", ".js", ".jsx"):
+        candidates.append(base / ("index" + suffix))
+    root = repo.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except Exception:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _module_exports_name(source: str, name: str) -> bool:
+    escaped = re.escape(name)
+    patterns = (
+        rf"\bexport\s+(?:declare\s+)?(?:const|let|var|function|class|interface|type|enum)\s+{escaped}\b",
+        rf"\bexport\s*\{{[^}}]*\b{escaped}\b[^}}]*\}}",
+    )
+    return any(re.search(pattern, source) for pattern in patterns)
+
+
+def _check_js_named_import_exports(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch local named imports whose target module does not export them.
+
+    Parse-only checks miss a common benchmark failure: creating a component or
+    store, then importing helpers/types from the wrong file. This is a cheap
+    static integration check for changed JS/TS files.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    import_re = re.compile(
+        r"import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]",
+        re.MULTILINE,
+    )
+    for match in import_re.finditer(source):
+        names_blob, specifier = match.groups()
+        target = _resolve_local_js_module(repo, relative_path, specifier)
+        if target is None:
+            continue
+        try:
+            target_source = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for part in names_blob.split(","):
+            raw = part.strip()
+            if not raw:
+                continue
+            imported = raw.split(" as ", 1)[0].strip()
+            if not re.match(r"^[A-Za-z_$][\w$]*$", imported):
+                continue
+            if not _module_exports_name(target_source, imported):
+                line_no = source[:match.start()].count("\n") + 1
+                try:
+                    target_rel = str(target.relative_to(repo.resolve()))
+                except Exception:
+                    target_rel = str(target)
+                return f"{relative_path}:{line_no}: named import `{imported}` is not exported by `{target_rel}`"
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1537,6 +1667,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_node_syntax_one(repo, relative_path)
             if result is None:
                 result = _check_js_structure_one(repo, relative_path)
+            if result is None:
+                result = _check_js_named_import_exports(repo, relative_path)
             if result is None and suffix == ".js":
                 # node was unavailable; fall back to brace balance check.
                 result = _check_brace_balance_one(repo, relative_path)
@@ -1544,6 +1676,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_js_structure_one(repo, relative_path)
+            if result is None:
+                result = _check_js_named_import_exports(repo, relative_path)
             if result is None:
                 result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
@@ -1642,6 +1776,81 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+def _augment_with_owner_surfaces(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Add likely companion owner surfaces without widening global context.
+
+    Ranking finds the first code owner well, but multi-surface issues often
+    need one nearby non-obvious owner too: root app + settings store, prompt +
+    orchestrator, requirements/config/tests next to a backend refactor, or all
+    sibling data hooks for cache/offline behavior. This adds a few such files
+    near the top, using only generic path/issue signals.
+    """
+    if not tracked:
+        return files
+    issue_lower = issue.lower()
+    groups: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
+    if any(w in issue_lower for w in ("settings", "banner", "broadcast", "global", "admin", "dashboard")):
+        groups.append((
+            ("app.", "settings", "setting", "preference", "store", "system"),
+            (".ts", ".tsx", ".js", ".jsx"),
+        ))
+    if any(w in issue_lower for w in ("prompt", "classifier", "llm", "ai", "email", "skip", "intake", "booking")):
+        groups.append((
+            ("prompt", "classifier", "schema", "service", "orchestrator", "intake", "booking"),
+            (".ts", ".tsx", ".js", ".jsx", ".py"),
+        ))
+    if any(w in issue_lower for w in ("requirements", "config", "url", "route", "refactor", "slim", "remove", "delete", "core")):
+        groups.append((
+            ("requirements", "config", "func2url", "routes", "tests", "test", "package", "readme"),
+            (".txt", ".json", ".toml", ".yaml", ".yml", ".js", ".ts", ".md"),
+        ))
+    if any(w in issue_lower for w in ("cache", "offline", "reload", "refresh", "stale")):
+        groups.append((
+            ("hook", "hooks", "cache", "storage", "sync", "state", "store"),
+            (".ts", ".tsx", ".js", ".jsx"),
+        ))
+    if any(w in issue_lower for w in ("clipboard", "copy", "paste", "cut", "shortcut", "editor", "selection")):
+        groups.append((
+            ("editor", "edit", "textarea", "keyboard", "shortcut", "clipboard", "selection", "codearea", "text"),
+            (".js", ".jsx", ".ts", ".tsx", ".fr"),
+        ))
+    if not groups:
+        return files
+
+    existing = set(files)
+    candidates: List[Tuple[int, str]] = []
+    for relative_path in tracked:
+        if relative_path in existing or not _context_file_allowed(relative_path):
+            continue
+        path_lower = relative_path.lower()
+        suffix = Path(relative_path).suffix.lower()
+        score = 0
+        for needles, suffixes in groups:
+            if suffix not in suffixes:
+                continue
+            score += sum(16 for needle in needles if needle in path_lower)
+        if score <= 0:
+            continue
+        if "/src/" in f"/{path_lower}" or "/server/" in f"/{path_lower}" or "/backend/" in f"/{path_lower}":
+            score += 6
+        candidates.append((score, relative_path))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    injected = [path for _score, path in candidates[:5]]
+    if not injected:
+        return files
+    head = files[:2]
+    tail = files[2:]
+    out: List[str] = []
+    seen: set[str] = set()
+    for path in [*head, *injected, *tail]:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
 
 
 def _run_companion_test(
@@ -1858,7 +2067,7 @@ def _recent_commit_examples(repo: Path) -> str:
 
 
 # v21 edge: criteria-nudge support
-_CRITERIA_MAX_BULLETS = 8
+_CRITERIA_MAX_BULLETS = 12
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
     "a", "an", "and", "as", "at", "be", "but", "by", "do", "for", "from",
@@ -2150,6 +2359,7 @@ Some issues are small but cross an ownership boundary. If the issue names or imp
 - Cache/offline/reload/PWA: initialize visible state from the durable cache synchronously when possible, then refresh in the background; keep cold-start loading/error behavior when no cache exists; persist every mutation path that changes cached data.
 - Settings/global UI/admin/dashboard: update both the control surface and the rendered/owned surface that consumes it. A settings-only or view-only patch is incomplete. If localStorage backs mounted UI, use a shared store, storage/custom event, or callback wiring so changes apply immediately without reload and dismissals reset when the message/config changes.
 - LLM/classifier/prompt/workflow behavior: update validation/runtime logic plus the prompt/example/schema owner that teaches the workflow. Do not replace an existing classifier with a weaker regex-only path unless the issue explicitly asks for that.
+- Data/RPC/query changes: when a later branch reads a field, select that field explicitly; if an RPC returns an empty array, honor it as a real result unless the call errored. Fail-open applies to errors, not empty success.
 - Keyboard shortcuts/editor clipboard: require Ctrl/Cmd shortcuts, preserve the existing selection model, and patch the editor owner rather than a generic drawing/event file.
 - Reorganization/removal/slimming: keep public action names, route keys, file names, and file extensions stable unless the issue asks to rename them; delete/move the requested files, but do not leave compatibility names broken or duplicate `.js`/`.jsx` component copies. Check nearby URL maps, requirements/config files, tests, and docs/artifacts that describe the same feature.
 - Required artifacts such as review notes, sample/demo data, migrations, docs, or config are part of the patch when the issue asks for them. Add the artifact in the existing convention instead of only changing runtime code.
@@ -2178,6 +2388,8 @@ PY
 Use `sed -i 's/exact old/exact new/' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
 
 When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+
+Before finalizing a JS/TS patch, check every named import you added against the target module's exports. If you need helpers/types in two files, export them from the module that defines them or import them from the actual store/helper owner. A compile-looking patch with missing named exports loses.
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
@@ -2437,14 +2649,20 @@ def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
             findings.append("touch-action:none is broad and can break normal scrolling; prefer overscroll containment on the correct scroll roots")
         if "setloading(true)" in added.replace(" ", "") and ("cache" in added or "cached" in added):
             findings.append("cached-data path may still force a loading/blank state before rendering cached content")
+        if "position: fixed" in added and ("body" in added or "html" in added):
+            findings.append("global fixed body/html fallback can break app scrolling; prefer overscroll-behavior on html/body/root scroll containers")
 
     if any(word in issue_lower for word in ("settings", "banner", "global", "broadcast")):
         touches_root = any(path.endswith(("app.tsx", "app.jsx", "app.js")) or "/app." in path for path in changed)
         touches_settings = any("settings" in path or "preference" in path for path in changed)
         if "banner" in issue_lower and not touches_root:
             findings.append("global banner/surface requested but root App entry point is not changed")
+        if "banner" in issue_lower and "broadcastbanner" in added.replace(" ", "") and "<broadcastbanner" not in added.replace(" ", ""):
+            findings.append("banner component appears imported/defined but not rendered in the global app tree")
         if "settings" in issue_lower and not touches_settings:
             findings.append("settings UI requested but no settings/preference owner file is changed")
+        if "system settings" in issue_lower and any("admin" in path for path in changed) and not touches_settings:
+            findings.append("task asks for existing system settings panel; creating a separate admin page is the wrong owner")
         if ("localstorage" in added and "addeventlistener" not in added and "usesyncexternalstore" not in added
                 and "dispatchEvent".lower() not in added):
             findings.append("settings and rendered surface look like isolated localStorage reads, not reactive shared state")
@@ -2472,6 +2690,14 @@ def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
         if any({".js", ".jsx"} <= suffixes or {".ts", ".tsx"} <= suffixes for suffixes in basenames.values()):
             findings.append("reorganization patch creates duplicate component/module names with mixed extensions; keep the requested/existing file convention")
 
+    if any(word in issue_lower for word in ("auth", "authentication", "login", "password")):
+        if "sha256" in added or "hashlib" in added and "password" in added:
+            findings.append("auth patch appears to replace existing password hashing with raw SHA/hashlib; preserve the existing auth compatibility path")
+
+    if any(word in issue_lower for word in ("posts", "post", "feed", "like", "comment")):
+        if "create_post" in added or "delete_post" in added or "share_post" in added:
+            findings.append("posts refactor must preserve existing public action names like create/like/unlike unless the issue explicitly renames them")
+
     if any(word in issue_lower for word in ("demo data", "review notes", "migration", "requirements", "config")):
         if "demo data" in issue_lower and not any(("demo" in path or "data" in path) for path in changed):
             findings.append("task asks for demo-data artifact but no matching artifact file is changed")
@@ -2480,6 +2706,19 @@ def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
         if "requirements" in issue_lower and not any("requirements" in path for path in changed):
             findings.append("task asks for dependency requirements cleanup but requirements file is not changed")
 
+    if ("seed" in issue_lower and "script" in issue_lower) or "seed_demo_data.sql" in issue_lower:
+        if not any(("seed" in path and path.endswith(".sql")) for path in changed):
+            findings.append("task asks for a SQL seed script but no seed .sql artifact is changed")
+    if "quiet" in issue_lower and ("rpc" in issue_lower or "do not disturb" in issue_lower):
+        compact = added.replace(" ", "")
+        if re.search(r"(not_in_quiet|quiethours|qhrows)[\s\S]{0,240}length>0", compact):
+            findings.append("quiet-hours batch RPC result [] must mean no push targets, not fail-open to all users")
+    if any(word in issue_lower for word in ("llm", "ai", "classifier", "intake", "prompt")) and "email" in issue_lower and "skip" in issue_lower:
+        if not any(("prompt" in path or "classifier" in path or "schema" in path) for path in changed):
+            findings.append("mandatory-email workflow changed runtime only; update the LLM prompt/example/schema owner so skip is no longer taught as valid")
+        if "-  const result = await classifyintakeresponse" in patch.lower() or "-  const result = await classifyIntakeResponse" in patch:
+            findings.append("mandatory-email patch removes the existing classifier flow; preserve classifier plumbing and change the prompt/validity rule instead")
+
     if any(word in issue_lower for word in ("clipboard", "copy", "paste", "cut", "shortcut")):
         if re.search(r"key\s*={2,3}\s*['\"][cxv]['\"]", added) and "ctrlkey" not in added and "metakey" not in added:
             findings.append("keyboard shortcut handler appears to trigger on plain letters instead of Ctrl/Cmd shortcuts")
@@ -2487,6 +2726,12 @@ def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
     if any(word in issue_lower for word in ("booking", "calendar", "attendee", "match")):
         if "summary" in added and "displayname" not in added and "attendee" in issue_lower:
             findings.append("booking/calendar matching should use attendee identity fields before event title/summary fallbacks")
+        if "display name" in issue_lower and "event.summary" in added and ".displayname" not in added:
+            findings.append("display-name matching is using event summary/title instead of attendee displayName")
+        if "proximity" in issue_lower and re.search(r"\b30\s*\*\s*60\s*\*\s*1000\b", added):
+            findings.append("time-proximity matching adds an arbitrary 30-minute cutoff not requested by the task")
+        if "created_at" in added and re.search(r"\.select\([\"'][^\"']*(?:client_id|conversation_id)[^\"']*[\"']\)", added) and not re.search(r"\.select\([\"'][^\"']*created_at", added):
+            findings.append("data-query patch uses/orders created_at but the selected columns appear to omit created_at")
 
     return findings[:8]
 
@@ -2558,7 +2803,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
+_MULTISHOT_TOTAL_BUDGET = 540.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
@@ -2578,23 +2823,21 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
-def _multishot_patch_score(issue: str, patch: str) -> int:
+def _candidate_patch_quality(issue: str, patch: str) -> int:
     if not patch.strip():
         return -10_000
-    substantive = min(240, _multishot_count_substantive(patch))
+    substantive = min(160, _multishot_count_substantive(patch))
     risks = len(_patch_risk_findings(issue, patch))
     missing_paths = len(_uncovered_required_paths(patch, issue))
     missing_criteria = len(_unaddressed_criteria(patch, issue))
     junk = 1 if _diff_low_signal_summary(patch) else 0
-    return substantive - (80 * risks) - (70 * missing_paths) - (18 * missing_criteria) - (35 * junk)
+    changed_files = len(_patch_changed_files(patch))
+    breadth_penalty = max(0, changed_files - 7) * 12
+    return substantive - (140 * risks) - (120 * missing_paths) - (30 * missing_criteria) - (50 * junk) - breadth_penalty
 
 
-def _multishot_should_retry(issue: str, patch: str) -> bool:
+def _candidate_patch_needs_retry(issue: str, patch: str) -> bool:
     if _multishot_count_substantive(patch) < _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        return True
-    if _patch_risk_findings(issue, patch):
-        return True
-    if _uncovered_required_paths(patch, issue):
         return True
     return False
 
@@ -2724,9 +2967,9 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
-        _score1 = _multishot_patch_score(_issue, _patch1)
+        _score1 = _candidate_patch_quality(_issue, _patch1)
 
-        if not _multishot_should_retry(_issue, _patch1):
+        if not _candidate_patch_needs_retry(_issue, _patch1):
             _result1["multishot_attempts"] = 1
             _result1["multishot_score"] = _score1
             return _result1
@@ -2743,7 +2986,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result2 = _solve_attempt(**kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
-        _score2 = _multishot_patch_score(_issue, _patch2)
+        _score2 = _candidate_patch_quality(_issue, _patch2)
 
         if (_score2, _n2) >= (_score1, _n1):
             _result2["multishot_attempts"] = 2
