@@ -2817,6 +2817,51 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
     return ""
 
 
+_TASK_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    ("bugfix", re.compile(r"\b(fix|bug|broken|crash|error|fail|incorrect|wrong|regression|traceback|exception)\b", re.I)),
+    ("test", re.compile(r"\b(add|write|update).{0,24}\b(test|tests|spec|coverage|fixture|assert)\b|\bmissing test\b", re.I)),
+    ("feature", re.compile(r"\b(add|implement|create|introduce|support|enable|allow|expose)\b", re.I)),
+    ("refactor", re.compile(r"\b(refactor|rename|extract|move|migrate|consolidate|deduplicate|reorganize)\b", re.I)),
+)
+
+
+def _classify_task_type(issue_text: str) -> str:
+    """Classify the issue only to choose a conservative prompt hint."""
+    for label, pattern in _TASK_TYPE_PATTERNS:
+        if pattern.search(issue_text or ""):
+            return label
+    return "unknown"
+
+
+_TASK_TYPE_ADDENDA: Dict[str, str] = {
+    "bugfix": (
+        "Task-shape hint: this reads like a bug fix. Prefer a tiny local root-cause "
+        "change in the existing owner code, plus only the narrow test/update needed "
+        "to prove the failing case."
+    ),
+    "test": (
+        "Task-shape hint: this reads like a test/coverage task. Prefer matching the "
+        "existing test framework and fixture style. Avoid production-code changes "
+        "unless the issue explicitly requires them."
+    ),
+    "feature": (
+        "Task-shape hint: this reads like a feature task. Implement the smallest "
+        "end-to-end behavior that the issue asks for, including required wiring "
+        "through existing routes, config, UI, or API surfaces."
+    ),
+    "refactor": (
+        "Task-shape hint: this reads like a refactor/migration. Preserve external "
+        "behavior and public contracts. Cascade only required call-site, import, "
+        "test, or config updates."
+    ),
+}
+
+
+def _build_task_type_block(issue_text: str) -> str:
+    addendum = _TASK_TYPE_ADDENDA.get(_classify_task_type(issue_text))
+    return f"\n{addendum}\n" if addendum else ""
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2850,6 +2895,7 @@ def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: s
     """Wrap the base user prompt with scoped strategy and language hints."""
     base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
     multi_file = _detect_multi_file_task(issue_text)
+    task_type_block = _build_task_type_block(issue_text)
     lang_block = ""
     try:
         lang_block = _build_language_idiom_block(_detect_target_languages(repo))
@@ -2870,7 +2916,7 @@ def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: s
             "issue explicitly requires them or the existing architecture leaves no existing owner."
         )
 
-    return base + lang_block + "\n" + strategy + "\n"
+    return base + task_type_block + lang_block + "\n" + strategy + "\n"
 
 
 def build_no_command_repair_prompt() -> str:
@@ -3311,6 +3357,21 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+def _multishot_quality_score(patch: str, issue_text: str) -> int:
+    """Prefer the retry only when it is at least as targeted as the first patch."""
+    score = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return score
+    if _patch_covers_required_paths(patch, issue_text):
+        score += 20
+    criteria = _extract_acceptance_criteria(issue_text)
+    if criteria:
+        missing = _unaddressed_criteria(patch, issue_text)
+        addressed = max(0, len(criteria) - len(missing))
+        score += addressed * 5
+    return score
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -3530,11 +3591,13 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
     _patch2 = _result2.get("patch", "") or ""
-    _n2 = _multishot_count_substantive(_patch2)
 
-    if _n2 >= _n1:
+    _q1 = _multishot_quality_score(_patch1, issue)
+    _q2 = _multishot_quality_score(_patch2, issue)
+    if _q2 >= _q1:
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
+        _result2["multishot_quality"] = (_q1, _q2)
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
