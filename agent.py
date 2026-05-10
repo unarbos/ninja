@@ -90,8 +90,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_CONTEXT_CHARS = 36000
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -125,6 +125,10 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_CASCADE_TURNS = 1      # callable signature modified, callers in untouched files still use old shape
+MAX_EXT_STUB_TURNS = 1     # JSX className={}, style={{}}, // TODO, empty arrow body — stub patterns
+MAX_PLACEHOLDER_TURNS = 1  # hardcoded placeholder URLs / credentials / test endpoints
+MAX_UNDERSIZED_TURNS = 1   # issue mentions 3+ files but patch touches <2
 MAX_CORRUPTION_TURNS = 1   # heredoc / harness-tag markers leaked into source
 MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched file
 MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags (template/script/style)
@@ -794,7 +798,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Three improvements over a vanilla rank-and-read loop:
@@ -818,7 +822,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return ""
+        return "", []
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
@@ -832,6 +836,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             anchor_map.setdefault(anchor_path, []).append((anchor_start, anchor_end))
 
     parts: List[str] = []
+    included: List[str] = []
     used = 0
 
     if region_anchors:
@@ -859,6 +864,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
+        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo)
@@ -873,7 +879,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), included
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1018,44 +1024,47 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-_PRELOAD_SECTION_HEADER = "Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):"
-_PRELOAD_SECTION_END = "Before planning, read the ENTIRE issue above"
-_PRELOAD_FILE_HEADER_RE = re.compile(r"^### (\S+)$", re.MULTILINE)
+_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
+_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+_PRELOAD_BLOCK_RE = re.compile(
+    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
+    re.DOTALL,
+)
 
 
-def _strip_preloaded_section(messages: List[Dict[str, str]]) -> int:
-    """Replace the preloaded-snippets block in messages[1] with a brief breadcrumb.
+def _strip_preloaded_section(
+    initial_user_text: str,
+    preloaded_files: List[str],
+    modified_files: Optional[List[str]] = None,
+) -> str:
+    """Replace the bulky preloaded snippet block with a short breadcrumb.
 
-    Returns chars saved (0 if nothing was replaced). By the mid-loop the model
-    has either internalized the preload or located targets via grep; keeping
-    the bulk pinned costs tokens on every later request. A short filename
-    breadcrumb preserves orientation without the bulk.
+    Triggered after step 4 to free token budget for later iterations: the
+    model has already seen the snippets in earlier turns and only needs to
+    know which files were preloaded (and which it has already touched) so it
+    can re-open them on demand instead of re-reading the whole block on
+    every request. Listing already-modified files in the breadcrumb is the
+    load-bearing bit for multi-file tasks — the model uses it to know what
+    integration points are still pending.
     """
-    if len(messages) < 2:
-        return 0
-    user_msg = messages[1]
-    if user_msg.get("role") != "user":
-        return 0
-    body = user_msg.get("content", "")
-    start = body.find(_PRELOAD_SECTION_HEADER)
-    if start == -1:
-        return 0
-    end = body.find(_PRELOAD_SECTION_END, start)
-    if end == -1:
-        return 0
-    block = body[start:end]
-    files = _PRELOAD_FILE_HEADER_RE.findall(block)
-    if files:
-        breadcrumb = (
-            "Preloaded snippets (already shown earlier) were trimmed to free tokens. "
-            "Files originally included: " + ", ".join(files[:12]) + "\n\n"
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+
+    lines: List[str] = []
+    if modified_files:
+        lines.append("You modified these files so far: " + ", ".join(modified_files))
+    if preloaded_files:
+        lines.append(
+            "You previously inspected these files (snippets dropped to save context — "
+            "re-open with `sed -n` or `cat` if a region is needed): "
+            + ", ".join(preloaded_files)
         )
+    if not lines:
+        replacement = "[Preloaded context omitted to save token budget.]"
     else:
-        breadcrumb = "Preloaded snippets were trimmed to free tokens.\n\n"
-    if len(breadcrumb) >= len(block):
-        return 0
-    user_msg["content"] = body[:start] + breadcrumb + body[end:]
-    return len(block) - len(breadcrumb)
+        replacement = "\n".join(lines)
+
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def _preload_needles(issue: str) -> List[str]:
@@ -1900,6 +1909,221 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
         "intended argument(s), supply a descriptive error message, or remove "
         "the call entirely if it served no purpose. Do NOT add new behavior "
         "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
+    )
+
+
+# Cascade gap: a callable's declaration was MODIFIED (matched in both - and
+# + lines of the same hunk), and other untouched files still call the old
+# name/shape. Catches the documented king-loss pattern of "diverges with
+# new field names/signatures, adds an unrelated helper without integrating it".
+_CASCADE_SIG_RE = re.compile(
+    r"^[+-](?!\+\+|--)\s*"
+    r"(?:export\s+(?:default\s+)?)?"
+    r"(?:async\s+)?"
+    r"(?:def|function|class|const|let|var|interface|type)\s+"
+    r"([A-Za-z_$][\w$]*)\b"
+)
+_CASCADE_GREP_TIMEOUT_SECONDS = 6
+_CASCADE_MAX_NAMES = 6
+_CASCADE_MAX_CALLERS_PER_NAME = 3
+
+
+def _check_cascade_gap(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
+    """Find callable names whose signature line appears in BOTH - and + sides
+    of the same hunk, AND that are still referenced by files the patch did
+    not touch."""
+    if not patch.strip():
+        return []
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    candidate_names: List[str] = []
+    seen: set = set()
+    for block in blocks:
+        if not block.strip():
+            continue
+        added_names: set = set()
+        removed_names: set = set()
+        for line in block.splitlines():
+            match = _CASCADE_SIG_RE.match(line)
+            if not match:
+                continue
+            name = match.group(1)
+            if line.startswith("+"):
+                added_names.add(name)
+            elif line.startswith("-"):
+                removed_names.add(name)
+        for name in added_names & removed_names:
+            if name in seen or name in _CONTRACT_NAME_DENYLIST:
+                continue
+            seen.add(name)
+            candidate_names.append(name)
+            if len(candidate_names) >= _CASCADE_MAX_NAMES:
+                break
+        if len(candidate_names) >= _CASCADE_MAX_NAMES:
+            break
+    if not candidate_names:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[Tuple[str, List[str]]] = []
+    for name in candidate_names:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "--word-regexp", "-F", "--", name],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CASCADE_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            callers.append(relative_path)
+            if len(callers) >= _CASCADE_MAX_CALLERS_PER_NAME:
+                break
+        if callers:
+            findings.append((name, callers))
+    return findings
+
+
+def build_cascade_gap_fix_prompt(findings: List[Tuple[str, List[str]]]) -> str:
+    body = "\n".join(
+        f"  - `{name}` — callers in: {', '.join(callers)}"
+        for name, callers in findings
+    )
+    return (
+        "Cascade gap: your patch modifies the declaration of one or more "
+        "callable(s), but other files still reference the old shape:\n\n"
+        f"{body}\n\n"
+        "Either (a) update each listed caller to the new signature/name in "
+        "the SAME response, or (b) keep the old declaration as a "
+        "compatibility wrapper that calls the new one. Skeleton edits that "
+        "leave callers broken lose to working multi-file implementations. "
+        "Then end with `<final>cascade closed</final>`."
+    )
+
+
+# Extended-stub patterns: catches the broader stub family that
+# `_check_empty_args` misses — JSX `className={}`, `style={{}}`, `// TODO`,
+# empty arrow bodies, unused-helper signals.
+_EXT_STUB_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("empty JSX expression `{}`", re.compile(r"^\+(?!\+\+).*\b(?:className|style|onClick|onChange|value|placeholder)=\{\s*\}", re.MULTILINE)),
+    ("empty JSX double-brace `{{}}`", re.compile(r"^\+(?!\+\+).*=\{\{\s*\}\}", re.MULTILINE)),
+    ("`// TODO` left in added code", re.compile(r"^\+(?!\+\+).*//\s*TODO\b", re.MULTILINE | re.IGNORECASE)),
+    ("`# TODO` left in added code", re.compile(r"^\+(?!\+\+)\s*#\s*TODO\b", re.MULTILINE | re.IGNORECASE)),
+    ("empty arrow body `=> {}`", re.compile(r"^\+(?!\+\+).*=>\s*\{\s*\}\s*[,;)]?\s*$", re.MULTILINE)),
+    ("placeholder `pass` in new function", re.compile(r"^\+(?!\+\+)\s+pass\s*(#.*)?$", re.MULTILINE)),
+)
+
+
+def _check_extended_stubs(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _EXT_STUB_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip()
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_extended_stub_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains stub patterns that read as half-finished code:\n\n"
+        f"{body}\n\n"
+        "Half-implemented features tend to be rated as 'users cannot actually "
+        "use the feature'. Emit ONE bash command that fills these stubs with "
+        "real values / event handlers / function bodies. Do NOT add behavior "
+        "the issue does not ask for. Then end with `<final>stubs filled</final>`."
+    )
+
+
+# Placeholder-endpoint patterns: hardcoded test URLs, credentials, or
+# localhost fallbacks that look like forgotten dev artifacts.
+_PLACEHOLDER_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("hardcoded `example.com` URL", re.compile(r"^\+(?!\+\+).*https?://(?:www\.)?example\.(?:com|org|net)\b", re.MULTILINE | re.IGNORECASE)),
+    ("hardcoded `localhost` without env-var fallback", re.compile(r"^\+(?!\+\+).*[\"'`]https?://localhost(?::\d+)?[\"'`/]", re.MULTILINE)),
+    ("placeholder API key (`YOUR_API_KEY` / `xxxx`)", re.compile(r"^\+(?!\+\+).*[\"'`](?:YOUR_[A-Z_]+|xxx+|TODO_[A-Z_]+|REPLACE_ME|CHANGE_ME)[\"'`]", re.MULTILINE)),
+    ("hardcoded test/dummy credential", re.compile(r"^\+(?!\+\+).*\b(?:password|secret|api_key|token)\s*=\s*[\"'](?:test|dummy|password123|secret|admin|placeholder)[\"']", re.MULTILINE | re.IGNORECASE)),
+)
+
+
+def _check_placeholder_endpoints(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _PLACEHOLDER_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_placeholder_endpoint_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains hardcoded placeholder values that look like "
+        "leftover dev artifacts:\n\n"
+        f"{body}\n\n"
+        "These read as 'forgot to wire to config'. Replace each with either "
+        "(a) an env-var read with a sensible default, (b) the value the issue "
+        "specifies, or (c) the existing config-source pattern in this codebase. "
+        "Emit ONE bash command. Then end with `<final>placeholders replaced</final>`."
+    )
+
+
+# Undersized-patch coverage: when the issue mentions ≥3 distinct file paths
+# but the patch only touches <2 files. Different signal from path-mention
+# coverage (which keys on which specific paths) — keys on file-count breadth.
+def _check_undersized_patch(patch: str, issue_text: str) -> Optional[Tuple[List[str], List[str]]]:
+    if not patch.strip() or not issue_text:
+        return None
+    mentioned = _extract_issue_path_mentions(issue_text)
+    distinct_mentions = list({p.strip("./") for p in mentioned if len(p.strip("./")) > 3})
+    if len(distinct_mentions) < 3:
+        return None
+    touched = _patch_changed_files(patch)
+    if len(touched) >= 2:
+        return None
+    return (distinct_mentions[:6], touched)
+
+
+def build_undersized_patch_fix_prompt(mentioned: List[str], touched: List[str]) -> str:
+    mention_list = "\n  ".join(f"- {m}" for m in mentioned)
+    touch_list = ", ".join(touched) or "(none)"
+    return (
+        "Coverage gap — the issue mentions multiple distinct files, but your "
+        "patch only touches a small subset of them:\n\n"
+        f"Issue-mentioned paths:\n  {mention_list}\n\n"
+        f"Files touched in current patch: {touch_list}\n\n"
+        "When an issue lists three or more concrete files, the reference "
+        "patch typically touches all of them. Open each unaddressed path "
+        "now and emit the edit commands needed to satisfy the task across "
+        "every file in the SAME response. Do not start unrelated work. "
+        "Then end with `<final>coverage extended</final>`."
     )
 
 
@@ -3202,9 +3426,11 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
+{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
+{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -4133,6 +4359,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0
     empty_arg_turns_used = 0
+    cascade_turns_used = 0
+    ext_stub_turns_used = 0
+    placeholder_turns_used = 0
+    undersized_turns_used = 0
     corruption_turns_used = 0
     dup_import_turns_used = 0
     tag_turns_used = 0
@@ -4193,7 +4423,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4487,6 +4717,69 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Cascade gap: fires when a callable's signature line was modified
+        # (matches in both - and + sides of a hunk) and other untouched files
+        # still call the old shape. Catches the "diverged with new
+        # field names/signatures without updating callers" failure mode.
+        if cascade_turns_used < MAX_CASCADE_TURNS:
+            cascade_findings = _check_cascade_gap(repo, patch)
+            if cascade_findings:
+                cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                summary = " | ".join(
+                    f"{name}->{len(callers)} callers" for name, callers in cascade_findings
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cascade_gap_fix_prompt(cascade_findings),
+                    f"CASCADE_QUEUED:\n  {summary}",
+                )
+                return True
+
+        # Extended-stub: catches `style={{}}`, `// TODO`, empty arrow bodies,
+        # placeholder `pass` — broader stub family that empty-arg misses.
+        # Catches "added a helper without integrating it" patterns.
+        if ext_stub_turns_used < MAX_EXT_STUB_TURNS:
+            ext_stub_findings = _check_extended_stubs(patch)
+            if ext_stub_findings:
+                ext_stub_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_extended_stub_fix_prompt(ext_stub_findings),
+                    "EXT_STUB_QUEUED:\n  " + "\n  ".join(ext_stub_findings),
+                )
+                return True
+
+        # Placeholder endpoints: hardcoded test URLs / credentials / localhost.
+        if placeholder_turns_used < MAX_PLACEHOLDER_TURNS:
+            placeholder_findings = _check_placeholder_endpoints(patch)
+            if placeholder_findings:
+                placeholder_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_placeholder_endpoint_fix_prompt(placeholder_findings),
+                    "PLACEHOLDER_QUEUED:\n  " + "\n  ".join(placeholder_findings),
+                )
+                return True
+
+        # Undersized patch: issue mentions ≥3 distinct files but patch
+        # touches <2. Different signal from coverage_nudge (which keys on
+        # specific paths) — keys on file-count breadth.
+        if undersized_turns_used < MAX_UNDERSIZED_TURNS:
+            undersized = _check_undersized_patch(patch, issue)
+            if undersized is not None:
+                mentioned, touched = undersized
+                undersized_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_undersized_patch_fix_prompt(mentioned, touched),
+                    f"UNDERSIZED_QUEUED: {len(mentioned)} mentioned, {len(touched)} touched",
+                )
+                return True
+
         # Corruption: heredoc / `<command>` / `<plan>` / shell-prompt markers
         # leaked into added lines. A patch carrying harness markup is a
         # near-guaranteed parse failure — fire ahead of style gates.
@@ -4591,7 +4884,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
         _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
         if _multishot_memo:
@@ -4612,11 +4905,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if step == 5 and not preload_stripped:
+            # Past step 4 the preloaded snippets are no longer load-bearing.
+            # The breadcrumb that replaces them lists already-modified files
+            # so the model can keep multi-file integration in mind without
+            # re-sending the full snippet block on every later request.
+            if step > 4 and not preload_stripped and len(messages) >= 2:
+                original_initial = messages[1].get("content") or ""
+                modified_files = _patch_changed_files(get_patch(repo))
+                stripped = _strip_preloaded_section(
+                    original_initial,
+                    preloaded_files,
+                    modified_files=modified_files,
+                )
+                if stripped != original_initial:
+                    messages[1] = {**messages[1], "content": stripped}
+                    saved = max(0, len(original_initial) - len(stripped))
+                    logs.append(
+                        "PRELOAD_STRIPPED: "
+                        f"step={step} preloaded={len(preloaded_files)} "
+                        f"modified={len(modified_files)} saved_chars={saved}"
+                    )
                 preload_stripped = True
-                saved = _strip_preloaded_section(messages)
-                if saved > 0:
-                    logs.append(f"PRELOAD_STRIPPED:\nFreed {saved} chars from initial user message.")
 
             if out_of_time():
                 logs.append(
