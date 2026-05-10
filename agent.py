@@ -3072,12 +3072,13 @@ def _build_task_type_block(issue_text: str) -> str:
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+    ctx = preloaded_context
     context_section = ""
-    if preloaded_context.strip():
+    if ctx.strip():
         context_section = f"""
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
-{preloaded_context}
+{ctx}
 """
 
     return f"""Fix this issue:
