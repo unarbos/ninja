@@ -125,6 +125,8 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_CASCADE_TURNS = 1      # patch modifies a callable's signature; consumers in unpatched files
+MAX_UNDEFINED_JSX_TURNS = 1  # JSX tag used but symbol not imported or declared
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -1659,9 +1661,41 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_typecheck_ts(repo: Path, patch: str) -> Optional[str]:
+    """Run tsc --noEmit when a tsconfig is present. Returns first error line
+    that touches a file modified by the patch."""
+    has_tsconfig = any(
+        (repo / name).exists()
+        for name in ("tsconfig.json", "tsconfig.base.json", "tsconfig.app.json")
+    )
+    if not has_tsconfig:
+        return None
+    if (repo / "node_modules" / ".bin" / "tsc").exists():
+        cmd = "./node_modules/.bin/tsc --noEmit --skipLibCheck --pretty false"
+    elif _has_executable("tsc"):
+        cmd = "tsc --noEmit --skipLibCheck --pretty false"
+    else:
+        return None
+    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT * 3)
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or proc.stderr or "").strip()
+    if not output:
+        return None
+    changed = set(_patch_changed_files(patch))
+    for line in output.splitlines():
+        if "error TS" not in line:
+            continue
+        path_part = line.split("(", 1)[0].strip()
+        if path_part in changed:
+            return f"tsc: {line.strip()[:200]}"
+    return None
+
+
 def _check_lint(repo: Path, patch: str) -> List[str]:
     """Lint every touched file with the appropriate tool. Up to 6 errors."""
     errors: List[str] = []
+    has_ts = False
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
         err: Optional[str] = None
@@ -1669,10 +1703,16 @@ def _check_lint(repo: Path, patch: str) -> List[str]:
             err = _check_lint_python(repo, relative_path)
         elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
             err = _check_lint_js(repo, relative_path)
+            if suffix in {".ts", ".tsx"}:
+                has_ts = True
         if err:
             errors.append(err)
             if len(errors) >= 6:
                 break
+    if has_ts and len(errors) < 6:
+        ts_err = _check_typecheck_ts(repo, patch)
+        if ts_err:
+            errors.append(ts_err)
     return errors
 
 
@@ -1740,6 +1780,172 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
         "intended argument(s), supply a descriptive error message, or remove "
         "the call entirely if it served no purpose. Do NOT add new behavior "
         "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
+    )
+
+
+_CASCADE_SIG_RE = re.compile(
+    r"^[+\-](?!--|\+\+)\s*(?:async\s+|public\s+|private\s+|protected\s+|"
+    r"static\s+|export\s+|export\s+default\s+|const\s+|let\s+|var\s+)*"
+    r"(?:def|function|fn|class|interface|struct|enum|trait)"
+    r"\s+([A-Za-z_][\w]{2,})\b",
+    re.MULTILINE,
+)
+_CASCADE_NAME_DENYLIST = frozenset({
+    "default", "main", "init", "setup", "teardown",
+    "test", "tests", "describe", "it", "expect",
+    "constructor", "render", "Component",
+    "module", "exports",
+    "update", "process", "handle", "run", "get", "set",
+    "create", "delete", "load", "save", "format", "parse",
+    "validate",
+})
+
+
+def _check_cascade_gap(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
+    """Find callable declarations modified by the patch whose consumers in
+    other files are not also touched."""
+    if not patch.strip():
+        return []
+    added: set = set()
+    removed: set = set()
+    for match in _CASCADE_SIG_RE.finditer(patch):
+        name = match.group(1)
+        if name in _CASCADE_NAME_DENYLIST:
+            continue
+        if match.group(0).startswith("+"):
+            added.add(name)
+        elif match.group(0).startswith("-"):
+            removed.add(name)
+    modified = sorted(added & removed)
+    if not modified:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[Tuple[str, List[str]]] = []
+    for name in modified[:4]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "-F", "--", f"{name}("],
+                cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=6, check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            callers.append(relative_path)
+            if len(callers) >= 4:
+                break
+        if callers:
+            findings.append((name, callers))
+    return findings
+
+
+def build_cascade_gap_fix_prompt(findings: List[Tuple[str, List[str]]]) -> str:
+    bullets = []
+    for name, callers in findings:
+        sample = ", ".join(callers[:4])
+        bullets.append(f"- `{name}` referenced in unpatched file(s): {sample}")
+    body = "\n  ".join(bullets) or "(none)"
+    return (
+        "Cascade gap — your patch modifies these callable declarations, but "
+        "consumers in OTHER files are not in the current patch:\n"
+        f"  {body}\n\n"
+        "For each, decide: (a) the existing callers are still correct "
+        "(internal-only change, or backwards-compatible default arg) — emit "
+        "`<final>summary</final>` and explain; (b) the callers DO need "
+        "updating — issue the additional edit commands for those caller files "
+        "in the SAME response, then end with `<final>cascade applied</final>`. "
+        "Match the style and indentation of each caller file."
+    )
+
+
+_JSX_OPEN_TAG_RE = re.compile(r"<([A-Z][A-Za-z0-9_]*)\b")
+_JSX_FILE_SUFFIXES = {".tsx", ".jsx", ".vue", ".svelte"}
+_JSX_IDENT_DENYLIST = frozenset({
+    "Fragment", "Suspense", "StrictMode", "Profiler",
+    "Component", "PureComponent", "Children", "Context",
+    "URL", "FormData", "Blob", "File", "Image", "Audio",
+    "Date", "Promise", "Array", "Object", "Math", "JSON",
+    "Symbol", "Number", "String", "Boolean", "Error", "RegExp",
+})
+
+
+def _undefined_jsx_identifier_gap_summary(repo: Path, patch: str) -> List[str]:
+    """Find PascalCase JSX tags introduced by added lines that are not
+    imported, declared, or otherwise defined within the post-patch file."""
+    if not patch.strip():
+        return []
+    by_file: Dict[str, set] = {}
+    current_file: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            current_file = None
+            continue
+        if line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if Path(path).suffix.lower() in _JSX_FILE_SUFFIXES:
+                current_file = path
+                by_file.setdefault(current_file, set())
+            else:
+                current_file = None
+            continue
+        if not current_file or not line.startswith("+") or line.startswith("+++"):
+            continue
+        for m in _JSX_OPEN_TAG_RE.finditer(line[1:]):
+            name = m.group(1)
+            if name not in _JSX_IDENT_DENYLIST:
+                by_file[current_file].add(name)
+
+    findings: List[str] = []
+    for relative_path, names in by_file.items():
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            source = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for name in names:
+            esc = re.escape(name)
+            if re.search(
+                rf"(?m)(?:^|[\s,{{(])"
+                rf"(?:import\s+(?:[A-Za-z_$][\w$]*\s*,\s*)?\{{[^}}]*\b{esc}\b|"
+                rf"import\s+{esc}\s+from|"
+                rf"import\s+\*\s+as\s+{esc}\b|"
+                rf"(?:const|let|var)\s+{esc}\b|"
+                rf"function\s+{esc}\s*\(|"
+                rf"class\s+{esc}\b|"
+                rf"type\s+{esc}\b|"
+                rf"interface\s+{esc}\b|"
+                rf"{esc}\s*:\s*[A-Za-z_$])",
+                source,
+            ):
+                continue
+            findings.append(f"{relative_path}: <{name}> used but not imported or declared")
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def build_undefined_jsx_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Reference check: your patch introduces JSX/TSX components that are "
+        "not imported or declared in their file:\n\n"
+        f"{body}\n\n"
+        "For each one, either add the matching `import { Name } from '...'` "
+        "at the top of the file (matching the project's existing import "
+        "style), or remove the tag if it was inserted by mistake. Do NOT "
+        "change other lines. Then end with `<final>references resolved</final>`."
     )
 
 
@@ -3628,6 +3834,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     artifact_nudges_used = 0
     dependency_nudges_used = 0
     hail_mary_turns_used = 0
+    cascade_turns_used = 0
+    undefined_jsx_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     last_failed_verification_command = ""
@@ -3672,7 +3880,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, cascade_turns_used, undefined_jsx_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3758,6 +3966,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_contract_preservation_prompt(contract_findings),
                     "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
+                )
+                return True
+
+        if cascade_turns_used < MAX_CASCADE_TURNS:
+            cascade_findings = _check_cascade_gap(repo, patch)
+            if cascade_findings:
+                cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cascade_gap_fix_prompt(cascade_findings),
+                    "CASCADE_GAP_QUEUED:\n  " + "\n  ".join(
+                        f"{n}: {','.join(c)}" for n, c in cascade_findings
+                    ),
+                )
+                return True
+
+        if undefined_jsx_turns_used < MAX_UNDEFINED_JSX_TURNS:
+            jsx_findings = _undefined_jsx_identifier_gap_summary(repo, patch)
+            if jsx_findings:
+                undefined_jsx_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_undefined_jsx_prompt(jsx_findings),
+                    "UNDEFINED_JSX_QUEUED:\n  " + "\n  ".join(jsx_findings),
                 )
                 return True
 
@@ -3994,11 +4228,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
 
         _wall_start = time.monotonic()
-        # Emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS:
-        # a hardcoded value can become dead code under a tighter budget. This
-        # adapts to whatever budget is set — fires 60s before out_of_time().
-        emergency_injected = False
+        # Two-stage TLE handling for empty patches: a soft warning at ~55%
+        # budget, and a hard emergency at ~budget-60s. Both fire only when
+        # the on-disk patch is still empty.
+        _tle_warn_threshold = max(WALL_CLOCK_BUDGET_SECONDS * 0.55, 50.0)
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+        warn_injected = False
+        emergency_injected = False
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -4012,6 +4248,31 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             elapsed = time.monotonic() - _wall_start
+
+            if (
+                elapsed >= _tle_warn_threshold
+                and not warn_injected
+                and not emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                warn_injected = True
+                logs.append(
+                    f"TLE_WARN_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_warn_threshold:.1f}s "
+                    "patch still empty -- nudging model to narrow scope."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time check: more than half the budget is used and your "
+                        "draft diff is still empty. Stop exploring further files. "
+                        "Pick ONE file that owns the most central requirement in "
+                        "the issue and make a real edit on it now (a focused "
+                        "narrow fix is better than nothing). You can still refine "
+                        "afterwards if budget allows. Do NOT list files, do NOT "
+                        "broaden inspection — go straight to an edit command."
+                    ),
+                })
+
             if (
                 elapsed >= _tle_emergency_threshold
                 and not emergency_injected
