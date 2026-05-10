@@ -125,16 +125,12 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_CASCADE_TURNS = 1      # callable signature modified, callers in untouched files still use old shape
-MAX_EXT_STUB_TURNS = 1     # JSX className={}, style={{}}, // TODO, empty arrow body — stub patterns
-MAX_PLACEHOLDER_TURNS = 1  # hardcoded placeholder URLs / credentials / test endpoints
-MAX_UNDERSIZED_TURNS = 1   # issue mentions 3+ files but patch touches <2
+# Cap-exempt syntax-equivalent gates: each catches a guaranteed-loss patch
+# (broken file / unparsable template) for languages _check_syntax skips.
 MAX_CORRUPTION_TURNS = 1   # heredoc / harness-tag markers leaked into source
-MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched file
 MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags (template/script/style)
 MAX_PHP_SYNTAX_TURNS = 1   # `php -l` syntax error in a touched .php / .blade.php
 MAX_CSTYLE_BRACE_TURNS = 1 # brace imbalance in C-family/Java/Kotlin/Scala
-MAX_REQUIRED_FILE_TURNS = 1  # issue requires creating a new file but patch missing it
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -826,6 +822,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_integration_partners(files, tracked_set, issue)
 
     definer_files = _find_identifier_definers(repo, tracked_set, issue)
     anchor_map: Dict[str, List[Tuple[int, int]]] = {}
@@ -1912,221 +1909,6 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
     )
 
 
-# Cascade gap: a callable's declaration was MODIFIED (matched in both - and
-# + lines of the same hunk), and other untouched files still call the old
-# name/shape. Catches the documented king-loss pattern of "diverges with
-# new field names/signatures, adds an unrelated helper without integrating it".
-_CASCADE_SIG_RE = re.compile(
-    r"^[+-](?!\+\+|--)\s*"
-    r"(?:export\s+(?:default\s+)?)?"
-    r"(?:async\s+)?"
-    r"(?:def|function|class|const|let|var|interface|type)\s+"
-    r"([A-Za-z_$][\w$]*)\b"
-)
-_CASCADE_GREP_TIMEOUT_SECONDS = 6
-_CASCADE_MAX_NAMES = 6
-_CASCADE_MAX_CALLERS_PER_NAME = 3
-
-
-def _check_cascade_gap(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
-    """Find callable names whose signature line appears in BOTH - and + sides
-    of the same hunk, AND that are still referenced by files the patch did
-    not touch."""
-    if not patch.strip():
-        return []
-    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
-    candidate_names: List[str] = []
-    seen: set = set()
-    for block in blocks:
-        if not block.strip():
-            continue
-        added_names: set = set()
-        removed_names: set = set()
-        for line in block.splitlines():
-            match = _CASCADE_SIG_RE.match(line)
-            if not match:
-                continue
-            name = match.group(1)
-            if line.startswith("+"):
-                added_names.add(name)
-            elif line.startswith("-"):
-                removed_names.add(name)
-        for name in added_names & removed_names:
-            if name in seen or name in _CONTRACT_NAME_DENYLIST:
-                continue
-            seen.add(name)
-            candidate_names.append(name)
-            if len(candidate_names) >= _CASCADE_MAX_NAMES:
-                break
-        if len(candidate_names) >= _CASCADE_MAX_NAMES:
-            break
-    if not candidate_names:
-        return []
-    changed_paths = set(_patch_changed_files(patch))
-    findings: List[Tuple[str, List[str]]] = []
-    for name in candidate_names:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "--name-only", "--word-regexp", "-F", "--", name],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=_CASCADE_GREP_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except Exception:
-            continue
-        if proc.returncode not in (0, 1):
-            continue
-        callers: List[str] = []
-        for hit in proc.stdout.splitlines():
-            relative_path = hit.strip()
-            if not relative_path or relative_path in changed_paths:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            callers.append(relative_path)
-            if len(callers) >= _CASCADE_MAX_CALLERS_PER_NAME:
-                break
-        if callers:
-            findings.append((name, callers))
-    return findings
-
-
-def build_cascade_gap_fix_prompt(findings: List[Tuple[str, List[str]]]) -> str:
-    body = "\n".join(
-        f"  - `{name}` — callers in: {', '.join(callers)}"
-        for name, callers in findings
-    )
-    return (
-        "Cascade gap: your patch modifies the declaration of one or more "
-        "callable(s), but other files still reference the old shape:\n\n"
-        f"{body}\n\n"
-        "Either (a) update each listed caller to the new signature/name in "
-        "the SAME response, or (b) keep the old declaration as a "
-        "compatibility wrapper that calls the new one. Skeleton edits that "
-        "leave callers broken lose to working multi-file implementations. "
-        "Then end with `<final>cascade closed</final>`."
-    )
-
-
-# Extended-stub patterns: catches the broader stub family that
-# `_check_empty_args` misses — JSX `className={}`, `style={{}}`, `// TODO`,
-# empty arrow bodies, unused-helper signals.
-_EXT_STUB_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    ("empty JSX expression `{}`", re.compile(r"^\+(?!\+\+).*\b(?:className|style|onClick|onChange|value|placeholder)=\{\s*\}", re.MULTILINE)),
-    ("empty JSX double-brace `{{}}`", re.compile(r"^\+(?!\+\+).*=\{\{\s*\}\}", re.MULTILINE)),
-    ("`// TODO` left in added code", re.compile(r"^\+(?!\+\+).*//\s*TODO\b", re.MULTILINE | re.IGNORECASE)),
-    ("`# TODO` left in added code", re.compile(r"^\+(?!\+\+)\s*#\s*TODO\b", re.MULTILINE | re.IGNORECASE)),
-    ("empty arrow body `=> {}`", re.compile(r"^\+(?!\+\+).*=>\s*\{\s*\}\s*[,;)]?\s*$", re.MULTILINE)),
-    ("placeholder `pass` in new function", re.compile(r"^\+(?!\+\+)\s+pass\s*(#.*)?$", re.MULTILINE)),
-)
-
-
-def _check_extended_stubs(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _EXT_STUB_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip()
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:160]}")
-            if len(findings) >= 4:
-                return findings
-    return findings
-
-
-def build_extended_stub_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains stub patterns that read as half-finished code:\n\n"
-        f"{body}\n\n"
-        "Half-implemented features tend to be rated as 'users cannot actually "
-        "use the feature'. Emit ONE bash command that fills these stubs with "
-        "real values / event handlers / function bodies. Do NOT add behavior "
-        "the issue does not ask for. Then end with `<final>stubs filled</final>`."
-    )
-
-
-# Placeholder-endpoint patterns: hardcoded test URLs, credentials, or
-# localhost fallbacks that look like forgotten dev artifacts.
-_PLACEHOLDER_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    ("hardcoded `example.com` URL", re.compile(r"^\+(?!\+\+).*https?://(?:www\.)?example\.(?:com|org|net)\b", re.MULTILINE | re.IGNORECASE)),
-    ("hardcoded `localhost` without env-var fallback", re.compile(r"^\+(?!\+\+).*[\"'`]https?://localhost(?::\d+)?[\"'`/]", re.MULTILINE)),
-    ("placeholder API key (`YOUR_API_KEY` / `xxxx`)", re.compile(r"^\+(?!\+\+).*[\"'`](?:YOUR_[A-Z_]+|xxx+|TODO_[A-Z_]+|REPLACE_ME|CHANGE_ME)[\"'`]", re.MULTILINE)),
-    ("hardcoded test/dummy credential", re.compile(r"^\+(?!\+\+).*\b(?:password|secret|api_key|token)\s*=\s*[\"'](?:test|dummy|password123|secret|admin|placeholder)[\"']", re.MULTILINE | re.IGNORECASE)),
-)
-
-
-def _check_placeholder_endpoints(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _PLACEHOLDER_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip().splitlines()[0]
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:160]}")
-            if len(findings) >= 4:
-                return findings
-    return findings
-
-
-def build_placeholder_endpoint_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains hardcoded placeholder values that look like "
-        "leftover dev artifacts:\n\n"
-        f"{body}\n\n"
-        "These read as 'forgot to wire to config'. Replace each with either "
-        "(a) an env-var read with a sensible default, (b) the value the issue "
-        "specifies, or (c) the existing config-source pattern in this codebase. "
-        "Emit ONE bash command. Then end with `<final>placeholders replaced</final>`."
-    )
-
-
-# Undersized-patch coverage: when the issue mentions ≥3 distinct file paths
-# but the patch only touches <2 files. Different signal from path-mention
-# coverage (which keys on which specific paths) — keys on file-count breadth.
-def _check_undersized_patch(patch: str, issue_text: str) -> Optional[Tuple[List[str], List[str]]]:
-    if not patch.strip() or not issue_text:
-        return None
-    mentioned = _extract_issue_path_mentions(issue_text)
-    distinct_mentions = list({p.strip("./") for p in mentioned if len(p.strip("./")) > 3})
-    if len(distinct_mentions) < 3:
-        return None
-    touched = _patch_changed_files(patch)
-    if len(touched) >= 2:
-        return None
-    return (distinct_mentions[:6], touched)
-
-
-def build_undersized_patch_fix_prompt(mentioned: List[str], touched: List[str]) -> str:
-    mention_list = "\n  ".join(f"- {m}" for m in mentioned)
-    touch_list = ", ".join(touched) or "(none)"
-    return (
-        "Coverage gap — the issue mentions multiple distinct files, but your "
-        "patch only touches a small subset of them:\n\n"
-        f"Issue-mentioned paths:\n  {mention_list}\n\n"
-        f"Files touched in current patch: {touch_list}\n\n"
-        "When an issue lists three or more concrete files, the reference "
-        "patch typically touches all of them. Open each unaddressed path "
-        "now and emit the edit commands needed to satisfy the task across "
-        "every file in the SAME response. Do not start unrelated work. "
-        "Then end with `<final>coverage extended</final>`."
-    )
-
-
 _CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     (
         "shell heredoc marker leaked into source",
@@ -2182,58 +1964,6 @@ def build_corruption_fix_prompt(findings: List[str]) -> str:
         "(a) reverts the file to its original content for the affected "
         "region, or (b) re-applies the intended edit cleanly without any "
         "harness markup. Then end with `<final>corruption removed</final>`."
-    )
-
-
-_DUP_IMPORT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java", ".rb"}
-
-
-def _check_duplicate_imports(repo: Path, patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        if suffix not in _DUP_IMPORT_SUFFIXES:
-            continue
-        try:
-            file_path = repo / relative_path
-            if not file_path.exists() or not file_path.is_file():
-                continue
-            text = file_path.read_text(errors="ignore")
-        except Exception:
-            continue
-        seen_imports: Dict[str, int] = {}
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            is_import = (
-                stripped.startswith("import ")
-                or stripped.startswith("from ")
-                or stripped.startswith("require(")
-                or (suffix == ".go" and stripped.startswith('import "'))
-            )
-            if not is_import:
-                continue
-            seen_imports[stripped] = seen_imports.get(stripped, 0) + 1
-        for imp, count in seen_imports.items():
-            if count > 1:
-                findings.append(f"{relative_path}: {imp[:120]} appears {count}x")
-                if len(findings) >= 4:
-                    return findings
-    return findings
-
-
-def build_duplicate_imports_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch results in duplicate import lines in these files:\n\n"
-        f"{body}\n\n"
-        "Duplicate imports are a code-quality red flag and may even break "
-        "the parser depending on the language. Emit ONE bash command that "
-        "removes the redundant import lines, keeping exactly one occurrence "
-        "of each. Then end with `<final>imports deduplicated</final>`."
     )
 
 
@@ -2403,75 +2133,6 @@ def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
         "that adds the missing closing token(s) or removes the extra "
         "opener(s). Do NOT touch unrelated lines. Then end with "
         "`<final>braces balanced</final>`."
-    )
-
-
-_REQUIRED_FILE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
-    re.compile(
-        r"\b(?:create|add|implement|introduce|build)\s+a\s+new\s+"
-        r"([A-Za-z_][\w\-./]*\.(?:tsx?|jsx?|vue|svelte|py|go|rb|"
-        r"java|cs|php|md|yml|yaml|json|toml|sql))\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bnew\s+(?:file|module|component|page|view|service|"
-        r"controller|store|hook|util|helper)\s+(?:called\s+|named\s+)?"
-        r"[`\"']?([A-Z][A-Za-z_]+)[`\"']?",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bcreate\s+(?:a\s+)?[`\"']?([A-Z][A-Za-z_]+\.(?:tsx?|"
-        r"jsx?|vue|svelte|py))[`\"']?",
-        re.IGNORECASE,
-    ),
-)
-
-
-def _check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
-    if not patch.strip() or not issue_text:
-        return None
-    expected: List[str] = []
-    seen: set = set()
-    for pattern in _REQUIRED_FILE_PATTERNS:
-        for match in pattern.finditer(issue_text):
-            name = match.group(1).strip(" `\"'")
-            if name and name not in seen:
-                seen.add(name)
-                expected.append(name)
-    if not expected:
-        return None
-    added_paths: set = set()
-    for line in patch.splitlines():
-        if line.startswith("+++ b/"):
-            added_paths.add(line[len("+++ b/"):].strip())
-    matched: set = set()
-    for path in added_paths:
-        path_lower = path.lower()
-        for name in expected:
-            if name.lower() in path_lower:
-                matched.add(name)
-    missing = [n for n in expected if n not in matched]
-    if not missing:
-        return None
-    return missing[:4]
-
-
-def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
-    items = "\n".join(f"  - {m}" for m in missing)
-    snippet = issue_text.strip()
-    if len(snippet) > 800:
-        snippet = snippet[:800].rstrip() + " [...]"
-    return (
-        "The issue explicitly requires creating these new file(s) / "
-        "module(s) / component(s), but your patch does NOT add them:\n\n"
-        f"{items}\n\n"
-        "When the issue says 'create a new X' or 'add a Y component', the "
-        "reference patch typically introduces those files. Emit ONE bash "
-        "command (heredoc / `python -c` write_text) that creates each "
-        "missing file with the requested implementation. Place each file "
-        "in the directory the codebase already uses for files of that "
-        "kind. Then end with `<final>required files added</final>`.\n\n"
-        f"Issue (for reference):\n{snippet}"
     )
 
 
@@ -2653,6 +2314,119 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
         if partner and partner not in seen:
             augmented.append(partner)
             seen.add(partner)
+    return augmented
+
+
+_INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
+    "Dockerfile",
+    "Makefile",
+    "build.gradle",
+    "docker-compose.yml",
+    "package.json",
+    "pyproject.toml",
+    "settings.gradle",
+)
+
+
+_INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
+    "api", "app", "client", "component", "components", "config",
+    "controller", "controllers", "context", "db", "form", "handler",
+    "handlers", "layout", "migration", "migrations", "model", "models",
+    "page", "pages", "repository", "repositories", "route", "routes",
+    "router", "schema", "schemas", "screen", "screens", "service",
+    "services", "store", "types", "view", "views",
+)
+
+
+def _split_path_tokens(relative_path: str) -> set:
+    """Lower-case path/name tokens used for cheap related-file discovery."""
+    tokens: set = set()
+    for part in Path(relative_path).parts:
+        for token in re.findall(r"[a-z0-9]+", part.lower()):
+            if len(token) >= 3:
+                tokens.add(token)
+    return tokens
+
+
+def _looks_like_integration_surface(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.name in _INTEGRATION_ROOT_FILES:
+        return True
+    tokens = _split_path_tokens(relative_path)
+    return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Append a few likely integration files after direct hits and tests.
+
+    The agent already finds the local function named by an issue; this
+    surfaces adjacent wiring (routes, API clients, schemas, migrations, UI
+    entry pages, build metadata) without disturbing the direct ranking.
+    """
+    if not files or not tracked:
+        return files
+
+    seen = set(files)
+    anchors = files[:6]
+    anchor_dirs = {
+        str(Path(p).parent).replace("\\", "/")
+        for p in anchors
+        if str(Path(p).parent) not in {"", "."}
+    }
+    anchor_top_dirs = {
+        Path(p).parts[0]
+        for p in anchors
+        if Path(p).parts
+    }
+    anchor_tokens: set = set()
+    for path in anchors:
+        anchor_tokens.update(_split_path_tokens(path))
+
+    issue_tokens = set(_issue_terms(issue))
+    issue_symbols = {s.lower() for s in _extract_issue_symbols(issue, max_symbols=16)}
+    signal_tokens = {t for t in (anchor_tokens | issue_tokens | issue_symbols) if len(t) >= 4}
+    root_file_wanted = bool(
+        issue_tokens
+        & {
+            "build", "cli", "config", "dependency", "dependencies", "docker",
+            "package", "script", "setup", "workflow",
+        }
+    )
+
+    candidates: List[Tuple[int, str]] = []
+    for relative_path in sorted(tracked):
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        if not _looks_like_integration_surface(relative_path):
+            continue
+
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        parent = str(path.parent).replace("\\", "/")
+        parts = path.parts
+        score = 0
+
+        if parent in anchor_dirs:
+            score += 6
+        if parts and parts[0] in anchor_top_dirs:
+            score += 3
+        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
+        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
+        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
+            score += 5
+        if "test" in path_lower or "spec" in path_lower:
+            score -= 2
+
+        if score >= 6:
+            candidates.append((score, relative_path))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:4]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
     return augmented
 
 
@@ -4211,16 +3985,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     lint_turns_used = 0
     empty_arg_turns_used = 0
-    cascade_turns_used = 0
-    ext_stub_turns_used = 0
-    placeholder_turns_used = 0
-    undersized_turns_used = 0
     corruption_turns_used = 0
-    dup_import_turns_used = 0
     tag_turns_used = 0
     php_syntax_turns_used = 0
     cstyle_brace_turns_used = 0
-    required_file_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -4275,7 +4043,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, corruption_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4315,6 +4083,55 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # Cap-exempt syntax-equivalent gates: each catches a guaranteed-loss
+        # patch that won't compile/parse for languages or framings that the
+        # earlier _check_syntax pass skips. Promoted ahead of the cap so a
+        # broken-file repair never has to compete with style or coverage
+        # nudges for the 3-turn budget.
+        if corruption_turns_used < MAX_CORRUPTION_TURNS:
+            corruption_findings = _check_corruption(patch)
+            if corruption_findings:
+                corruption_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_corruption_fix_prompt(corruption_findings),
+                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
+                )
+                return True
+
+        if cstyle_brace_turns_used < MAX_CSTYLE_BRACE_TURNS:
+            cstyle_findings = _check_cstyle_brace_balance(repo, patch)
+            if cstyle_findings:
+                cstyle_brace_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cstyle_brace_fix_prompt(cstyle_findings),
+                    "CSTYLE_BRACE_QUEUED:\n  " + "\n  ".join(cstyle_findings),
+                )
+                return True
+
+        if php_syntax_turns_used < MAX_PHP_SYNTAX_TURNS:
+            php_findings = _check_php_syntax(repo, patch)
+            if php_findings:
+                php_syntax_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_php_syntax_fix_prompt(php_findings),
+                    "PHP_SYNTAX_QUEUED:\n  " + "\n  ".join(php_findings),
+                )
+                return True
+
+        if tag_turns_used < MAX_TAG_TURNS:
+            tag_findings = _check_critical_tag_removals(patch)
+            if tag_findings:
+                tag_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_critical_tag_fix_prompt(tag_findings),
+                    "CRITICAL_TAG_QUEUED:\n  " + "\n  ".join(tag_findings),
                 )
                 return True
 
@@ -4455,156 +4272,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
-        # Cascade gap: fires when a callable's signature line was modified
-        # (matches in both - and + sides of a hunk) and other untouched files
-        # still call the old shape. Catches the "diverged with new
-        # field names/signatures without updating callers" failure mode.
-        if cascade_turns_used < MAX_CASCADE_TURNS:
-            cascade_findings = _check_cascade_gap(repo, patch)
-            if cascade_findings:
-                cascade_turns_used += 1
-                total_refinement_turns_used += 1
-                summary = " | ".join(
-                    f"{name}->{len(callers)} callers" for name, callers in cascade_findings
-                )
-                queue_refinement_turn(
-                    assistant_text,
-                    build_cascade_gap_fix_prompt(cascade_findings),
-                    f"CASCADE_QUEUED:\n  {summary}",
-                )
-                return True
-
-        # Extended-stub: catches `style={{}}`, `// TODO`, empty arrow bodies,
-        # placeholder `pass` — broader stub family that empty-arg misses.
-        # Catches "added a helper without integrating it" patterns.
-        if ext_stub_turns_used < MAX_EXT_STUB_TURNS:
-            ext_stub_findings = _check_extended_stubs(patch)
-            if ext_stub_findings:
-                ext_stub_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_extended_stub_fix_prompt(ext_stub_findings),
-                    "EXT_STUB_QUEUED:\n  " + "\n  ".join(ext_stub_findings),
-                )
-                return True
-
-        # Placeholder endpoints: hardcoded test URLs / credentials / localhost.
-        if placeholder_turns_used < MAX_PLACEHOLDER_TURNS:
-            placeholder_findings = _check_placeholder_endpoints(patch)
-            if placeholder_findings:
-                placeholder_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_placeholder_endpoint_fix_prompt(placeholder_findings),
-                    "PLACEHOLDER_QUEUED:\n  " + "\n  ".join(placeholder_findings),
-                )
-                return True
-
-        # Undersized patch: issue mentions ≥3 distinct files but patch
-        # touches <2. Different signal from coverage_nudge (which keys on
-        # specific paths) — keys on file-count breadth.
-        if undersized_turns_used < MAX_UNDERSIZED_TURNS:
-            undersized = _check_undersized_patch(patch, issue)
-            if undersized is not None:
-                mentioned, touched = undersized
-                undersized_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_undersized_patch_fix_prompt(mentioned, touched),
-                    f"UNDERSIZED_QUEUED: {len(mentioned)} mentioned, {len(touched)} touched",
-                )
-                return True
-
-        # Corruption: heredoc / `<command>` / `<plan>` / shell-prompt markers
-        # leaked into added lines. A patch carrying harness markup is a
-        # near-guaranteed parse failure — fire ahead of style gates.
-        if corruption_turns_used < MAX_CORRUPTION_TURNS:
-            corruption_findings = _check_corruption(patch)
-            if corruption_findings:
-                corruption_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_corruption_fix_prompt(corruption_findings),
-                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
-                )
-                return True
-
-        # Critical-tag removal: net deletion of </template>, </script>,
-        # </style>, </html>, </body>, </head> without re-adding leaves
-        # templates structurally broken.
-        if tag_turns_used < MAX_TAG_TURNS:
-            tag_findings = _check_critical_tag_removals(patch)
-            if tag_findings:
-                tag_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_critical_tag_fix_prompt(tag_findings),
-                    "CRITICAL_TAG_QUEUED:\n  " + "\n  ".join(tag_findings),
-                )
-                return True
-
-        # C-family brace balance: covers .c/.cpp/.h*/.java/.cs/.kt/.scala
-        # which the existing _check_brace_balance_one (TS/JSX/Swift) skips.
-        # Char-literal stripping ('a') avoids C-specific false positives.
-        if cstyle_brace_turns_used < MAX_CSTYLE_BRACE_TURNS:
-            cstyle_findings = _check_cstyle_brace_balance(repo, patch)
-            if cstyle_findings:
-                cstyle_brace_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_cstyle_brace_fix_prompt(cstyle_findings),
-                    "CSTYLE_BRACE_QUEUED:\n  " + "\n  ".join(cstyle_findings),
-                )
-                return True
-
-        # PHP / Blade syntax: `php -l` is fast and authoritative when php
-        # is installed. Fills the language gap left by _check_syntax.
-        if php_syntax_turns_used < MAX_PHP_SYNTAX_TURNS:
-            php_findings = _check_php_syntax(repo, patch)
-            if php_findings:
-                php_syntax_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_php_syntax_fix_prompt(php_findings),
-                    "PHP_SYNTAX_QUEUED:\n  " + "\n  ".join(php_findings),
-                )
-                return True
-
-        # Duplicate imports: a common artifact of repeated edits to the
-        # imports block. Different axis from lint (lint may be unavailable).
-        if dup_import_turns_used < MAX_DUP_IMPORT_TURNS:
-            dup_findings = _check_duplicate_imports(repo, patch)
-            if dup_findings:
-                dup_import_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_duplicate_imports_fix_prompt(dup_findings),
-                    "DUP_IMPORT_QUEUED:\n  " + "\n  ".join(dup_findings),
-                )
-                return True
-
-        # Required-file: issue says "create a new <Component>" but no
-        # `+++ b/...` line in the patch references that name.
-        if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
-            missing_files = _check_required_file(patch, issue)
-            if missing_files:
-                required_file_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_required_file_fix_prompt(missing_files, issue),
-                    "REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
-                )
-                return True
-
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
