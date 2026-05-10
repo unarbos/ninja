@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -90,10 +91,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
 # Anti-whiff knobs. Empty patches do not solve tasks, so any transient model
 # error or stuck loop is costly. Be aggressive about retrying instead of
@@ -103,7 +104,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 240.0  # leaves ~60s headroom for safety net + emergency fallback before the docker kill at 600s
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -738,6 +739,8 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
     "Cargo.toml",
     "jest.config.js",
     "vitest.config.ts",
+    "requirements.txt",
+    "requirements-dev.txt",
 )
 
 
@@ -788,13 +791,10 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
-
-    Two improvements over a vanilla rank-and-read loop:
+    Three improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -807,21 +807,28 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
 
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
+      3. Files that define issue-mentioned symbols use focused slices around
+         those definitions, so long files reveal the likely edit region.
+
+      4. Compact project hints expose test/build scripts without spending an
+         extra inspection turn.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return "", []
+        return ""
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
-    needles = _preload_needles(issue)
+    definer_files = _find_identifier_definers(repo, tracked_set, issue)
+    anchor_map: Dict[str, List[Tuple[int, int]]] = {}
+    region_anchors: List[Tuple[str, int, int]] = []
+    if definer_files:
+        region_anchors = _extract_region_anchors(repo, definer_files)
+        for anchor_path, anchor_start, anchor_end in region_anchors:
+            anchor_map.setdefault(anchor_path, []).append((anchor_start, anchor_end))
 
     parts: List[str] = []
-    included: List[str] = []
     used = 0
 
     if region_anchors:
@@ -837,14 +844,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        if relative_path in anchor_map:
+            snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
+        else:
+            snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
-        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo)
@@ -859,38 +868,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts), included
-
-
-def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: explicit identifiers (`_extract_issue_symbols`) first since they
-    are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
-    """
-    out: List[str] = []
-    seen: set = set()
-
-    def add(token: str) -> None:
-        if not token:
-            return
-        key = token.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(token)
-
-    for sym in _extract_issue_symbols(issue):
-        add(sym)
-    for mention in _extract_issue_path_mentions(issue):
-        stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
-    for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
-    return out
+    return "\n\n".join(parts)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1035,19 +1013,7 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(
-    repo: Path,
-    relative_path: str,
-    max_chars: int,
-    needles: Optional[List[str]] = None,
-) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows.
-
-    When `needles` is provided and the file is larger than `max_chars`, we
-    extract regions around lines that match any needle (case-insensitive
-    substring) plus a few lines of context, instead of head/tail truncation.
-    Falls back to `_truncate` when no needles match or the file already fits.
-    """
+def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1060,84 +1026,58 @@ def _read_context_file(
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    if needles:
-        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
-def _extract_relevant_regions(
-    text: str,
-    needles: List[str],
+def _read_context_file_focused(
+    repo: Path,
+    relative_path: str,
+    anchor_ranges: List[Tuple[int, int]],
     max_chars: int,
-    *,
-    ctx_before: int = 8,
-    ctx_after: int = 12,
 ) -> str:
-    """Return windows around lines matching any needle, capped at `max_chars`.
-
-    When the file already fits within `max_chars`, the whole file is returned
-    verbatim. When no needles match, fall back to `_truncate` (head/tail
-    summary). Otherwise produce a concatenation of merged windows around each
-    matching line, prefixed with line-range headers so the model can reason
-    about location.
-    """
-    if not text:
-        return text
-    if len(text) <= max_chars:
-        return text
-
-    needles_lower: List[str] = []
-    seen: set = set()
-    for n in needles:
-        if not n:
-            continue
-        key = n.lower()
-        if len(key) < 3 or key in seen:
-            continue
-        seen.add(key)
-        needles_lower.append(key)
-    if not needles_lower:
+    """Read a context file around definition anchors instead of only the head."""
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return ""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    if not anchor_ranges or total == 0:
         return _truncate(text, max_chars)
 
-    lines = text.splitlines()
-    matched: List[int] = []
-    for i, line in enumerate(lines):
-        ll = line.lower()
-        if any(n in ll for n in needles_lower):
-            matched.append(i)
+    intervals: List[Tuple[int, int]] = []
+    for start_line, end_line in anchor_ranges:
+        lo = max(0, start_line - 21)
+        hi = min(total, end_line + 20)
+        intervals.append((lo, hi))
+    intervals.sort()
 
-    if not matched:
-        return _truncate(text, max_chars)
-
-    windows: List[Tuple[int, int]] = []
-    for i in matched:
-        start = max(0, i - ctx_before)
-        end = min(len(lines), i + ctx_after + 1)
-        if windows and start <= windows[-1][1]:
-            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+    merged: List[Tuple[int, int]] = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
         else:
-            windows.append((start, end))
+            merged.append((lo, hi))
 
     parts: List[str] = []
-    used = 0
-    total_lines = len(lines)
-    omitted = 0
-    for idx, (start, end) in enumerate(windows):
-        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
-        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
-        block = header + "\n" + body
-        if parts and used + len(block) + 2 > max_chars:
-            omitted = len(windows) - idx
-            break
-        parts.append(block)
-        used += len(block) + 2
+    prev_hi = 0
+    for lo, hi in merged:
+        if lo > prev_hi:
+            parts.append(f"# ... (lines {prev_hi + 1}-{lo} elided)")
+        parts.extend(all_lines[lo:hi])
+        prev_hi = hi
+    if prev_hi < total:
+        parts.append(f"# ... (lines {prev_hi + 1}-{total} elided)")
 
-    if omitted > 0:
-        parts.append(
-            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
-        )
-
-    return "\n\n".join(parts)
+    return _truncate("\n".join(parts), max_chars)
 
 
 # -----------------------------
@@ -1593,6 +1533,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     in_str: Optional[str] = None
     in_line_comment = False
     in_block_comment = False
+    template_depth = 0  # nesting depth inside ${...} within a backtick template literal
     while i < n:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < n else ""
@@ -1612,8 +1553,20 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
             if ch == "\\" and nxt:
                 i += 2
                 continue
+            # Inside a backtick string, ${ opens a code interpolation region.
+            if in_str == "`" and ch == "$" and nxt == "{":
+                template_depth += 1
+                in_str = None  # inner ${...} is treated as code
+                i += 2
+                continue
             if ch == in_str:
                 in_str = None
+            i += 1
+            continue
+        # Not in string/comment: check if we are closing a template interpolation.
+        if template_depth > 0 and ch == "}":
+            template_depth -= 1
+            in_str = "`"  # resume the enclosing backtick string
             i += 1
             continue
         # Not in string/comment.
@@ -1987,6 +1940,69 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _run_companion_test_js_exec(
+    repo: Path,
+    test_path: str,
+    timeout_seconds: int = 10,
+) -> Optional[str]:
+    """Attempt real JS/TS test execution via jest or vitest before falling back
+    to parse-only node --check.
+
+    Detection order (first match wins):
+      1. jest.config.js present OR package.json lists jest → npx jest --testPathPattern
+      2. vitest.config.ts present OR package.json lists vitest → npx vitest run
+      3. Neither found → return None (caller falls through to node --check)
+
+    Returns failure output tail on failure, None on pass, None when no runner
+    detected (so the caller can fall through to the existing node --check path).
+    Caps at timeout_seconds (default 10s) to avoid eating wall-clock budget on
+    slow npm installs in unknown repos.
+    """
+    if not _has_executable("npx"):
+        return None
+
+    pkg_json_path = repo / "package.json"
+    pkg_text = ""
+    if pkg_json_path.exists():
+        try:
+            pkg_text = pkg_json_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    has_jest = (repo / "jest.config.js").exists() or '"jest"' in pkg_text
+    has_vitest = (repo / "vitest.config.ts").exists() or '"vitest"' in pkg_text
+
+    if not has_jest and not has_vitest:
+        return None
+
+    basename = Path(test_path).name
+    if has_jest:
+        cmd = ["npx", "jest", "--testPathPattern", basename, "--no-coverage",
+               "--passWithNoTests", "--forceExit"]
+    else:
+        cmd = ["npx", "vitest", "run", test_path]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            env=_command_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return None  # treat slow runner as unavailable to preserve budget
+    except Exception:
+        return None
+
+    if proc.returncode == 0:
+        return None
+    output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    return output[-2400:] if len(output) > 2400 else output
+
+
 def _run_companion_test(
     repo: Path,
     test_path: str,
@@ -2065,6 +2081,12 @@ def _run_companion_test(
 
     # ---- JS / TS ----
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        # Try jest/vitest before parse-only node --check: real failures are invisible
+        # to node --check and the syntax gate becomes a no-op for the whole language family.
+        js_exec = _run_companion_test_js_exec(repo, test_path, timeout_seconds)
+        if js_exec is not None:
+            return js_exec
+        # Fall through to parse-only node --check when no jest/vitest runner found.
         if not _has_executable("node"):
             return None
         try:
@@ -2508,19 +2530,7 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them makes the patch incomplete.
 
-<plan>
-- Requirement: restate every explicit issue requirement.
-- Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
-- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
-- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- No-stub rule: every new function/method/component you add must have a complete body — no `pass` / `TODO` / `raise NotImplementedError` / `// implementation goes here` / empty-bracket placeholders. Stub-and-defer is the most-dinged "incomplete" pattern; the diff judge ranks a partial-but-fully-implemented patch above a complete-shape-but-stubbed one.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
-- Strategy: smallest root-cause fix likely to satisfy the issue.
-- Verification: targeted test command expected after patching.
-</plan>
-<command>
-focused inspection command
-</command>
+**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
 
@@ -2536,7 +2546,7 @@ focused inspection command
 
 **Companion tests**: if a companion test file is preloaded alongside its source, update the test in the SAME response whenever your source change affects it.
 
-**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. When the issue names a specific test file or command, run that before experimenting with unrelated commands. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
+**Verify functionally**: after patching, run the most targeted real test available — NOT just a syntax check. Use `pytest tests/test_<module>.py -x -q`, `go test ./...`, `node <test_file>`, etc. A passing test is evidence of correctness. If tests fail, fix the root cause in the same response. Skip only when no test runner is available or the suite takes >30 s.
 
 **Finish**: once the patch is correct and complete, emit `<final>`. Do not re-read files.
 
@@ -2758,19 +2768,13 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
     return ""
 
 
-_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
-_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
-
-
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2793,43 +2797,6 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
-_PRELOAD_BLOCK_RE = re.compile(
-    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
-    re.DOTALL,
-)
-
-
-def _strip_preloaded_section(
-    initial_user_text: str,
-    preloaded_files: List[str],
-    modified_files: Optional[List[str]] = None,
-) -> str:
-    """Replace the bulky preloaded snippet block with a short breadcrumb.
-
-    Triggered after step 4 to free token budget for later iterations: the
-    model has already seen the snippets in earlier turns and only needs to
-    know which files were preloaded (and which it has already touched) so it
-    can re-open them on demand instead of re-reading the whole block on
-    every request.
-    """
-    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
-        return initial_user_text
-
-    lines: List[str] = []
-    if modified_files:
-        lines.append("You modified these files so far: " + ", ".join(modified_files))
-    if preloaded_files:
-        lines.append(
-            "You previously inspected these files (snippets dropped to save context — "
-            "re-open with `sed -n` or `cat` if a region is needed): "
-            + ", ".join(preloaded_files)
-        )
-    if not lines:
-        replacement = "[Preloaded context omitted to save token budget.]"
-    else:
-        replacement = "\n".join(lines)
-
-    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
     """Wraps build_initial_user_prompt with multi-file/lang strategy hints.
 
@@ -3148,148 +3115,6 @@ _EMERGENCY_COMMAND_TIMEOUT = 30
 _EMERGENCY_PROMPT_TARGET_CHARS = 2000
 
 
-def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """Pick the single most-likely-to-need-editing tracked file."""
-    mentioned_paths = _extract_issue_path_mentions(task_text)
-    tracked = set(_tracked_files(repo))
-    for mention in mentioned_paths:
-        normalized = mention.strip("./")
-        if normalized in tracked and _context_file_allowed(normalized):
-            return normalized
-    ranked = _rank_context_files(repo, task_text)
-    for relative_path in ranked:
-        if relative_path in tracked and _context_file_allowed(relative_path):
-            return relative_path
-    for relative_path in tracked:
-        if _context_file_allowed(relative_path):
-            return relative_path
-    return None
-
-
-def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """Stripped-down single-shot prompt: one command, one final, nothing else."""
-    task_view = task_text[:1500]
-    return (
-        "You are a one-shot patch generator. Time and tokens are extremely "
-        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
-        f"TASK:\n{task_view}\n\n"
-        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
-        "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in the target file consistent with the task. Use "
-        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
-        "only. Do NOT change file modes. Make a real code edit.\n\n"
-        "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
-    )
-
-
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """Single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-
-    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
-    repo: Optional[Path] = None
-    try:
-        repo = _repo_path(repo_path_value)
-        ensure_git_repo(repo)
-        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-
-        target = _emergency_pick_target(repo, task_text)
-        if target is None:
-            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict()
-
-        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-        prompt = _emergency_build_prompt(target, snippet, task_text)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response_text, _, _ = chat_completion(
-                messages=messages,
-                model=model_name,
-                api_base=base,
-                api_key=key,
-                max_tokens=_EMERGENCY_MAX_TOKENS,
-                timeout=_EMERGENCY_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-        except Exception as exc:
-            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
-            patch_text = get_patch(repo) if repo is not None else ""
-            return AgentResult(
-                patch=patch_text, logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=bool(patch_text.strip()),
-            ).to_dict()
-
-        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
-        commands = extract_commands(response_text)
-        if not commands:
-            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
-        for cmd in commands[:2]:
-            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
-            logs.append(format_observation(result))
-
-        patch_text = get_patch(repo)
-        return AgentResult(
-            patch=patch_text,
-            logs=_safe_join_logs(logs),
-            steps=1,
-            cost=0.0,
-            success=bool(patch_text.strip()),
-        ).to_dict()
-    except Exception:
-        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
-        patch_text = ""
-        if repo is not None:
-            try:
-                patch_text = get_patch(repo)
-            except Exception:
-                pass
-        return AgentResult(
-            patch=patch_text, logs=_safe_join_logs(logs),
-            steps=0, cost=None, success=False,
-        ).to_dict()
-
-
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test error output."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
-
 # v66: emergency single-shot constants (adapted from PR518)
 _EMERGENCY_MAX_TOKENS = 1024
 _EMERGENCY_TIMEOUT_SECONDS = 45
@@ -3502,6 +3327,30 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _validate_patch_applies(repo: Path, patch_text: str) -> bool:
+    """Dry-run git apply --check against the current tree; returns True when the patch
+    applies cleanly, False on context-line mismatch or other apply failure.
+
+    A returned patch whose text looks valid but fails to apply means the validator
+    scores 0 for the round. This check is a final safety belt before returning.
+    """
+    if not patch_text.strip():
+        return True
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn"],
+            cwd=str(repo),
+            input=patch_text,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return True  # if git apply --check itself fails, don't discard an otherwise good patch
+
+
 def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
     """Extract the last failing command from attempt logs for the retry memo."""
     logs_text = result.get("logs", "") or ""
@@ -3589,7 +3438,21 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         pass
 
     try:
-        return _multishot_driver(kwargs, _multishot_repo_obj)
+        result = _multishot_driver(kwargs, _multishot_repo_obj)
+        # Final apply-check: if the returned patch text can't be applied to a clean
+        # tree, swap it for the actual on-disk diff which is apply-clean by definition.
+        if _multishot_repo_obj is not None:
+            returned_patch = result.get("patch", "") or ""
+            if returned_patch.strip() and not _validate_patch_applies(_multishot_repo_obj, returned_patch):
+                on_disk = ""
+                try:
+                    on_disk = get_patch(_multishot_repo_obj)
+                except Exception:
+                    pass
+                if on_disk.strip():
+                    result["patch"] = on_disk
+                    result["logs"] = (result.get("logs") or "") + "\nPATCH_APPLY_FALLBACK: returned patch failed --check; using on-disk diff."
+        return result
     except Exception as exc:
         salvaged = ""
         try:
@@ -3618,7 +3481,7 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
 
     _multishot_started = time.monotonic()
-    _multishot_total_budget = 540.0  # reserves 60s headroom for safety net before docker kill at 600s
+    _multishot_total_budget = WALL_CLOCK_BUDGET_SECONDS * 2 + 60.0  # derived so tuning WALL_CLOCK_BUDGET_SECONDS stays coherent
     _multishot_args = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -3707,7 +3570,13 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     if _patch1:
-        _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        _apply_ok = _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        if not _apply_ok:
+            # Re-apply failed (context-line mismatch after revert); prefer the
+            # on-disk result from attempt 2 even though it scored lower by line count.
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry_apply_fallback"
+            return _result2
     _result1["multishot_attempts"] = 2
     _result1["multishot_winner"] = "primary"
     return _result1
@@ -3731,6 +3600,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
+    _recent_commands: collections.deque = collections.deque(maxlen=3)  # repetition guard
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
@@ -3816,8 +3686,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 syntax_fix_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors[:4]),
                 )
                 return True
 
@@ -3849,6 +3719,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing[:4]),
+                )
+                return True
+
         if (
             failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
             and last_failed_verification_command
@@ -3876,18 +3758,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_contract_preservation_prompt(contract_findings),
                     "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_integration_nudge_prompt(integration, issue),
-                    f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
                 )
                 return True
 
@@ -4101,16 +3971,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        _initial_user = _build_planning_user_message(repo, issue, repo_summary, preloaded_context)
         if _multishot_memo:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_planning_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
-        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
         # Emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS:
@@ -4121,28 +3990,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            # Past step 4 the preloaded snippets are no longer load-bearing —
-            # the model has either used them or moved on. Replace the bulky
-            # block in the initial user message with a short breadcrumb so
-            # the next request fits more recent context within the token cap.
-            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
-                original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
-                stripped = _strip_preloaded_section(
-                    original_initial,
-                    preloaded_files,
-                    modified_files=modified_files,
-                )
-                if stripped != original_initial:
-                    messages[1] = {**messages[1], "content": stripped}
-                    saved = max(0, len(original_initial) - len(stripped))
-                    logs.append(
-                        "INITIAL_PRELOAD_TRIMMED: "
-                        f"step={step} preloaded={len(preloaded_files)} "
-                        f"modified={len(modified_files)} saved_chars={saved}"
-                    )
-                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
@@ -4257,6 +4104,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                _cmd_norm = " ".join(command.lower().split())
+                _recent_commands.append(_cmd_norm)
+                if len(_recent_commands) == 3 and len(set(_recent_commands)) == 1:
+                    # All three most recent commands are identical — inject a note
+                    # and skip re-executing to avoid burning step budget in a tight loop.
+                    _rep_note = (
+                        "REPETITION_GUARD: last 3 commands were identical — "
+                        "switch tactic or commit a code change."
+                    )
+                    logs.append(_rep_note)
+                    observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{_rep_note}")
+                    _recent_commands.clear()
+                    continue
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
@@ -4367,6 +4227,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+# Word-boundary "ok" detection: bare "ok" in good_markers matched anywhere in the
+# lowered observation — "hooks", "clock", "docker" — tripping auto-stop early.
+# This regex requires "ok" as a standalone word at line-end or after a digit count.
+_OK_MARKER_RE = re.compile(r"\b\d+\s+ok\b|\bok\b\s*(?:[.,]|$)", re.MULTILINE)
+
+
+def _has_ok_marker(text: str) -> bool:
+    """True when text contains a pytest-style 'N ok' or standalone 'ok' line-end."""
+    return bool(_OK_MARKER_RE.search(text))
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -4386,14 +4257,13 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     good_markers = [
         " passed",
         " all passed",
-        "ok",
         "success",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(marker in lower for marker in good_markers) or _has_ok_marker(lower)
     has_bad = any(marker in lower for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
