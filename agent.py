@@ -90,10 +90,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
-MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_PRELOADED_CONTEXT_CHARS = 36000
+MAX_PRELOADED_FILES = 12
+MAX_NO_COMMAND_REPAIRS = 2
+MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches do not solve tasks, so any transient model
 # error or stuck loop is costly. Be aggressive about retrying instead of
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 240.0  # leaves ~60s headroom for safety net + emergency fallback before the docker kill at 600s
+WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -788,10 +788,13 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Returns `(context_text, included_files)` so the caller can later strip the
+    bulky snippet block but still keep the file-name breadcrumb.
+
+    Two improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -804,28 +807,21 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
 
-      3. Files that define issue-mentioned symbols use focused slices around
-         those definitions, so long files reveal the likely edit region.
-
-      4. Compact project hints expose test/build scripts without spending an
-         extra inspection turn.
+    Each file snippet is fetched via `_read_context_file` with issue-derived
+    needles so we keep only the regions relevant to the task instead of the
+    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return ""
+        return "", []
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
-    definer_files = _find_identifier_definers(repo, tracked_set, issue)
-    anchor_map: Dict[str, List[Tuple[int, int]]] = {}
-    region_anchors: List[Tuple[str, int, int]] = []
-    if definer_files:
-        region_anchors = _extract_region_anchors(repo, definer_files)
-        for anchor_path, anchor_start, anchor_end in region_anchors:
-            anchor_map.setdefault(anchor_path, []).append((anchor_start, anchor_end))
+    needles = _preload_needles(issue)
 
     parts: List[str] = []
+    included: List[str] = []
     used = 0
 
     if region_anchors:
@@ -841,16 +837,14 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        if relative_path in anchor_map:
-            snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
-        else:
-            snippet = _read_context_file(repo, relative_path, per_file_budget)
+        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
+        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo)
@@ -865,7 +859,38 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), included
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers (`_extract_issue_symbols`) first since they
+    are the strongest signal, then file-stem mentions (so `foo.py` in the
+    issue picks out lines referencing `foo`), then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1010,7 +1035,19 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
+    """Read a tracked file, optionally returning only issue-relevant windows.
+
+    When `needles` is provided and the file is larger than `max_chars`, we
+    extract regions around lines that match any needle (case-insensitive
+    substring) plus a few lines of context, instead of head/tail truncation.
+    Falls back to `_truncate` when no needles match or the file already fits.
+    """
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1023,58 +1060,84 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
-def _read_context_file_focused(
-    repo: Path,
-    relative_path: str,
-    anchor_ranges: List[Tuple[int, int]],
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
     max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
 ) -> str:
-    """Read a context file around definition anchors instead of only the head."""
-    path = (repo / relative_path).resolve()
-    try:
-        path.relative_to(repo.resolve())
-    except ValueError:
-        return ""
-    try:
-        data = path.read_bytes()
-    except Exception:
-        return ""
-    if b"\0" in data[:4096]:
-        return ""
-    text = data.decode("utf-8", errors="replace")
-    all_lines = text.splitlines()
-    total = len(all_lines)
-    if not anchor_ranges or total == 0:
+    """Return windows around lines matching any needle, capped at `max_chars`.
+
+    When the file already fits within `max_chars`, the whole file is returned
+    verbatim. When no needles match, fall back to `_truncate` (head/tail
+    summary). Otherwise produce a concatenation of merged windows around each
+    matching line, prefixed with line-range headers so the model can reason
+    about location.
+    """
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
         return _truncate(text, max_chars)
 
-    intervals: List[Tuple[int, int]] = []
-    for start_line, end_line in anchor_ranges:
-        lo = max(0, start_line - 21)
-        hi = min(total, end_line + 20)
-        intervals.append((lo, hi))
-    intervals.sort()
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
 
-    merged: List[Tuple[int, int]] = []
-    for lo, hi in intervals:
-        if merged and lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
         else:
-            merged.append((lo, hi))
+            windows.append((start, end))
 
     parts: List[str] = []
-    prev_hi = 0
-    for lo, hi in merged:
-        if lo > prev_hi:
-            parts.append(f"# ... (lines {prev_hi + 1}-{lo} elided)")
-        parts.extend(all_lines[lo:hi])
-        prev_hi = hi
-    if prev_hi < total:
-        parts.append(f"# ... (lines {prev_hi + 1}-{total} elided)")
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
 
-    return _truncate("\n".join(parts), max_chars)
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -2445,7 +2508,19 @@ brief summary of what changed
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them makes the patch incomplete.
 
-**Estimate scope before planning**: count file paths mentioned in the issue and acceptance-criteria bullets. 1-2 file paths = single-file fix. 3+ file paths OR 6+ criteria OR keywords like "refactor / delegate / split / cascade / migrate" = MULTI-FILE feature requiring 4-7 files of coordinated edits.
+<plan>
+- Requirement: restate every explicit issue requirement.
+- Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
+- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- No-stub rule: every new function/method/component you add must have a complete body — no `pass` / `TODO` / `raise NotImplementedError` / `// implementation goes here` / empty-bracket placeholders. Stub-and-defer is the most-dinged "incomplete" pattern; the diff judge ranks a partial-but-fully-implemented patch above a complete-shape-but-stubbed one.
+- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Verification: targeted test command expected after patching.
+</plan>
+<command>
+focused inspection command
+</command>
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
 
@@ -2683,13 +2758,19 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
     return ""
 
 
+_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
+_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
+{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
+{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2712,6 +2793,43 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
+_PRELOAD_BLOCK_RE = re.compile(
+    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
+    re.DOTALL,
+)
+
+
+def _strip_preloaded_section(
+    initial_user_text: str,
+    preloaded_files: List[str],
+    modified_files: Optional[List[str]] = None,
+) -> str:
+    """Replace the bulky preloaded snippet block with a short breadcrumb.
+
+    Triggered after step 4 to free token budget for later iterations: the
+    model has already seen the snippets in earlier turns and only needs to
+    know which files were preloaded (and which it has already touched) so it
+    can re-open them on demand instead of re-reading the whole block on
+    every request.
+    """
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+
+    lines: List[str] = []
+    if modified_files:
+        lines.append("You modified these files so far: " + ", ".join(modified_files))
+    if preloaded_files:
+        lines.append(
+            "You previously inspected these files (snippets dropped to save context — "
+            "re-open with `sed -n` or `cat` if a region is needed): "
+            + ", ".join(preloaded_files)
+        )
+    if not lines:
+        replacement = "[Preloaded context omitted to save token budget.]"
+    else:
+        replacement = "\n".join(lines)
+
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
     """Wraps build_initial_user_prompt with multi-file/lang strategy hints.
 
@@ -3983,7 +4101,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
         _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
         if _multishot_memo:
@@ -3992,6 +4110,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_planning_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
+        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
         # Emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS:
@@ -4002,6 +4121,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            # Past step 4 the preloaded snippets are no longer load-bearing —
+            # the model has either used them or moved on. Replace the bulky
+            # block in the initial user message with a short breadcrumb so
+            # the next request fits more recent context within the token cap.
+            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
+                original_initial = messages[1].get("content") or ""
+                modified_files = _patch_changed_files(get_patch(repo))
+                stripped = _strip_preloaded_section(
+                    original_initial,
+                    preloaded_files,
+                    modified_files=modified_files,
+                )
+                if stripped != original_initial:
+                    messages[1] = {**messages[1], "content": stripped}
+                    saved = max(0, len(original_initial) - len(stripped))
+                    logs.append(
+                        "INITIAL_PRELOAD_TRIMMED: "
+                        f"step={step} preloaded={len(preloaded_files)} "
+                        f"modified={len(modified_files)} saved_chars={saved}"
+                    )
+                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
