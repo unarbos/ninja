@@ -116,6 +116,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_LINT_TURNS = 1         # v76: ruff/eslint pass restored from ricichez v72; the LLM merge
+                           # into PR #605 dropped this gate. Re-introduces a refinement turn
+                           # that surfaces unused-import / undefined-name errors before final
+_LINT_TIMEOUT = 10         # v76: per-file ruff/eslint timeout
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -1329,6 +1333,90 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
+    """v76: run `ruff check` on a Python file, return first issue or None.
+
+    Restored from ricichez v72; was dropped by the LLM merge that produced
+    the current king (PR #605). Lint-clean code is a meaningful quality
+    signal alongside the existing syntax gate — it surfaces unused
+    imports, undefined names, and obvious bugs the syntax check misses.
+    Skips silently when ruff is not installed.
+    """
+    if not _has_executable("ruff"):
+        return None
+    proc = run_command(
+        f"ruff check --no-fix --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_LINT_TIMEOUT,
+    )
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or "").strip()
+    if not output:
+        return None
+    return f"{relative_path}: {output.splitlines()[0].strip()[:200]}"
+
+
+def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
+    """v76: run `eslint` on a JS/TS file when project ships eslint locally.
+
+    Skips when no eslint config or local install is present, so this is a
+    no-op on repos that don't use eslint. Same rationale as
+    `_check_lint_python`.
+    """
+    has_config = any(
+        (repo / name).exists()
+        for name in (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
+                     ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs")
+    )
+    if not has_config:
+        return None
+    has_local = (repo / "node_modules" / ".bin" / "eslint").exists()
+    if not (has_local or _has_executable("eslint")):
+        return None
+    if has_local:
+        cmd = f"./node_modules/.bin/eslint --no-color --format compact {_shell_quote(relative_path)}"
+    else:
+        cmd = f"eslint --no-color --format compact {_shell_quote(relative_path)}"
+    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT)
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or "").strip()
+    for line in output.splitlines():
+        if "Error" in line or "Warning" in line:
+            return f"{relative_path}: {line.strip()[:240]}"
+    return None
+
+
+def _check_lint(repo: Path, patch: str) -> List[str]:
+    """v76: lint every touched file with the appropriate tool. Up to 6 errors."""
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        err: Optional[str] = None
+        if suffix == ".py":
+            err = _check_lint_python(repo, relative_path)
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            err = _check_lint_js(repo, relative_path)
+        if err:
+            errors.append(err)
+            if len(errors) >= 6:
+                break
+    return errors
+
+
+def build_lint_fix_prompt(errors: List[str]) -> str:
+    """v76: prompt the model to fix lint issues without changing logic."""
+    body = "\n".join(f"  - {e}" for e in errors[:6])
+    return (
+        "Lint issues were found in your patch:\n\n"
+        f"{body}\n\n"
+        "Emit ONE bash command that fixes these specific issues only. Do NOT "
+        "change the patch's logic. Use `sed -i` or a small `python -c` script. "
+        "Then confirm with <final>lint clean</final>."
+    )
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -2481,6 +2569,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    lint_turns_used = 0  # v76: ruff/eslint refinement gate counter
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -2529,23 +2618,35 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
-        if not patch.strip():
+        #
+        # v82 extension — also fire hail-mary when the patch exists but is
+        # implausibly small (one-line tweak on an issue that clearly needs
+        # more). Counts substantive-content lines (excluding hunk headers,
+        # blank-only, comment-only, whitespace-only). Threshold of 2 means
+        # a hail-mary still fires when the model returned a single-line
+        # placeholder edit ("# fix" or one stray return). Prevents the
+        # common failure mode of returning a near-empty patch and losing
+        # automatically because the LLM judge scores trivial diffs at ~0.
+        substantive_lines = _multishot_count_substantive(patch)
+        if not patch.strip() or substantive_lines < 2:
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                    f"HAIL_MARY_QUEUED: patch empty/tiny ({substantive_lines} substantive lines)",
                 )
                 return True
-            return False
+            # Don't stop — fall through to other gates if available
+            if not patch.strip():
+                return False
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -2573,6 +2674,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # v76: lint pass restored from ricichez v72. Runs after the syntax
+        # gate (file parses) but before the companion-test gate (so a lint
+        # fix may unblock the test runner). Lint errors caught here are
+        # the kind that already-parses-but-still-buggy code emits: unused
+        # imports, undefined names, redefined symbols. Skipped silently
+        # when ruff/eslint are unavailable, so it's a no-op on minimal
+        # repos rather than a failure.
+        if lint_turns_used < MAX_LINT_TURNS:
+            lint_errors = _check_lint(repo, patch)
+            if lint_errors:
+                lint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_lint_fix_prompt(lint_errors),
+                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
                 )
                 return True
 
