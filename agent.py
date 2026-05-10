@@ -641,14 +641,6 @@ def get_repo_summary(repo: Path) -> str:
         res = run_command(cmd, repo, timeout=10)
         parts.append(format_observation(res))
 
-    # v12: append language-idiom hints (port PR#742)
-    try:
-        _v12_langs = _detect_target_languages(repo)
-        _v12_lang_hint = _build_language_idiom_block(_v12_langs)
-        if _v12_lang_hint:
-            parts.append(_v12_lang_hint)
-    except Exception:
-        pass
     return "\n\n".join(parts)
 
 
@@ -734,7 +726,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
-    files = _augment_with_integration_partners(files, tracked_set, issue)  # v12 port
 
     parts: List[str] = []
     used = 0
@@ -1892,6 +1883,19 @@ brief summary of what changed
 
 **Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row before issuing commands. Then immediately issue the command.
 
+**Plan format with status markers (CRITICAL for completeness scoring)**:
+Each plan row MUST start with `[pending]` and a number that mirrors the issue's bullet/criterion number. After each batch of commands, re-emit the plan and flip rows to `[done]` once the corresponding edit is in place. Example:
+
+```
+<plan>
+[pending] 1. Update `src/api.py` to add `compute_total(items)` (issue bullet 1)
+[pending] 2. Edit `src/views.py` to call `compute_total` from the order route (bullet 2)
+[pending] 3. Add unit test in `tests/test_api.py` covering the empty-items case (bullet 3)
+</plan>
+```
+
+**Do NOT emit `<final>` while ANY plan row is still `[pending]`.** If a row is intentionally not addressed (e.g., the criterion was already satisfied or doesn't apply), mark it `[skipped]` with a one-line reason, not left as `[pending]`. The judge weighs each numbered criterion separately — leaving one unaddressed loses completeness points proportionally.
+
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
 **Edit surgically**: change only the lines that implement the fix.
@@ -2481,221 +2485,6 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
-
-# ============================================================
-# v12 PORTS — SIM-focused (target: better file targeting)
-# ============================================================
-
-# === Integration surface discovery (port PR#737 Darksoul0814) ===
-_INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
-    "api",
-    "app",
-    "client",
-    "component",
-    "components",
-    "config",
-    "controller",
-    "controllers",
-    "context",
-    "db",
-    "form",
-    "handler",
-    "handlers",
-    "layout",
-    "migration",
-    "migrations",
-    "model",
-    "models",
-    "page",
-    "pages",
-    "repository",
-    "repositories",
-    "route",
-    "routes",
-    "router",
-    "schema",
-    "schemas",
-    "screen",
-    "screens",
-    "service",
-    "services",
-    "store",
-    "types",
-    "view",
-    "views",
-)
-
-_INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
-    "Dockerfile",
-    "Makefile",
-    "build.gradle",
-    "docker-compose.yml",
-    "package.json",
-    "pyproject.toml",
-    "settings.gradle",
-)
-
-
-
-def _split_path_tokens(relative_path: str) -> set:
-    """Lower-case path/name tokens used for cheap related-file discovery."""
-    tokens: set = set()
-    for part in Path(relative_path).parts:
-        for token in re.findall(r"[a-z0-9]+", part.lower()):
-            if len(token) >= 3:
-                tokens.add(token)
-    return tokens
-
-
-def _looks_like_integration_surface(relative_path: str) -> bool:
-    path = Path(relative_path)
-    if path.name in _INTEGRATION_ROOT_FILES:
-        return True
-    tokens = _split_path_tokens(relative_path)
-    return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
-
-
-def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
-    """Append a few likely integration files after direct hits and tests.
-
-    The agent was already good at finding the local function named by an issue,
-    but duel losses showed repeated misses in adjacent wiring: routes, API
-    clients, schemas, migrations, UI entry pages, and build metadata. This keeps
-    the direct ranking intact and only appends high-confidence neighbors.
-    """
-    if not files or not tracked:
-        return files
-
-    seen = set(files)
-    anchors = files[:6]
-    anchor_dirs = {
-        str(Path(p).parent).replace("\\", "/")
-        for p in anchors
-        if str(Path(p).parent) not in {"", "."}
-    }
-    anchor_top_dirs = {
-        Path(p).parts[0]
-        for p in anchors
-        if Path(p).parts
-    }
-    anchor_tokens = set()
-    for path in anchors:
-        anchor_tokens.update(_split_path_tokens(path))
-
-    issue_tokens = set(_issue_terms(issue))
-    issue_symbols = {s.lower() for s in _extract_issue_symbols(issue, max_symbols=16)}
-    signal_tokens = {t for t in (anchor_tokens | issue_tokens | issue_symbols) if len(t) >= 4}
-    root_file_wanted = bool(
-        issue_tokens
-        & {
-            "build", "cli", "config", "dependency", "dependencies", "docker",
-            "package", "script", "setup", "workflow",
-        }
-    )
-
-    candidates: List[Tuple[int, str]] = []
-    for relative_path in sorted(tracked):
-        if relative_path in seen or not _context_file_allowed(relative_path):
-            continue
-        if not _looks_like_integration_surface(relative_path):
-            continue
-
-        path = Path(relative_path)
-        path_lower = relative_path.lower()
-        parent = str(path.parent).replace("\\", "/")
-        parts = path.parts
-        score = 0
-
-        if parent in anchor_dirs:
-            score += 6
-        if parts and parts[0] in anchor_top_dirs:
-            score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
-        if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
-            score += 5
-        if "test" in path_lower or "spec" in path_lower:
-            score -= 2  # companion-test loading already handles tests.
-
-        if score >= 6:
-            candidates.append((score, relative_path))
-
-    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
-    augmented = list(files)
-    for _score, relative_path in candidates[:4]:
-        if relative_path not in seen:
-            augmented.append(relative_path)
-            seen.add(relative_path)
-    return augmented
-
-
-
-
-# === Language-idiom hints (port PR#742 ninjaking66) ===
-def _detect_target_languages(repo: Path) -> List[str]:
-    """Return the dominant file extensions in the repo (excluding common noise)."""
-    try:
-        tracked = _tracked_files(repo)
-    except Exception:
-        return []
-    counts: Dict[str, int] = {}
-    skip_exts = {".md", ".lock", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}
-    for path in tracked:
-        ext = Path(path).suffix.lower()
-        if not ext or ext in skip_exts:
-            continue
-        counts[ext] = counts.get(ext, 0) + 1
-    if not counts:
-        return []
-    ranked = sorted(counts.items(), key=lambda x: -x[1])
-    return [ext for ext, _ in ranked[:4]]
-
-
-def _build_language_idiom_block(target_languages: List[str]) -> str:
-    if not target_languages:
-        return ""
-    ts_like = {".ts", ".tsx", ".jsx"}
-    py_like = {".py"}
-    if any(ext in ts_like for ext in target_languages):
-        return (
-            "\nLanguage hint (TypeScript / TSX detected): use existing imports and aliases "
-            "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
-            "elements with onClick/onChange, useState with explicit types. Named function "
-            "exports preferred. Tailwind classes inline in className. shadcn/ui imports from "
-            "`@/components/ui/...`.\n"
-        )
-    if any(ext in py_like for ext in target_languages):
-        return (
-            "\nLanguage hint (Python detected): use type hints, `from __future__ import annotations` "
-            "if file already does, dataclasses for records, async/await over callbacks, and "
-            "stdlib over deps unless the codebase already imports otherwise.\n"
-        )
-    return ""
-
-
-# === Patch-applies validation (port PR#668 oleksandrhordiienko63-byte) ===
-def _validate_patch_applies(repo: Optional[Path], patch: str) -> bool:
-    """Dry-run `git apply --check` against the patch text. Returns True iff
-    the patch would apply cleanly. Surfaces the exact reject reason in logs
-    on failure (otherwise silent)."""
-    if not (patch or "").strip() or repo is None:
-        return False
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "apply", "--check", "--whitespace=nowarn", "-"],
-            input=patch, text=True, capture_output=True, timeout=10,
-        )
-        if proc.returncode != 0:
-            print(f"PATCH_APPLY_REJECTED: {(proc.stderr or '').strip()[:300]}", file=sys.stderr)
-            return False
-        return True
-    except Exception:
-        return False
-
-
-# ============================================================
-
 def solve(
     repo_path: str,
     issue: str,
