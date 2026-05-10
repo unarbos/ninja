@@ -1953,18 +1953,18 @@ def _check_corruption(patch: str) -> List[str]:
     return findings
 
 
-def build_corruption_fix_prompt(findings: List[str]) -> str:
+def _gate_repair_prompt(headline: str, findings: List[str], action: str, final_marker: str) -> str:
+    """Compose a one-shot repair prompt: headline, findings, action, `<final>` marker."""
     body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains markers that belong to your shell or agent "
-        "harness, NOT to the source file being edited:\n\n"
-        f"{body}\n\n"
-        "These leak into source typically when a heredoc edit ran past its "
-        "terminator or when the model's `<command>` / `<plan>` blocks were "
-        "captured verbatim into the file. Emit ONE bash command that either "
-        "(a) reverts the file to its original content for the affected "
-        "region, or (b) re-applies the intended edit cleanly without any "
-        "harness markup. Then end with `<final>corruption removed</final>`."
+    return f"{headline}\n\n{body}\n\nEmit ONE bash command that {action} Then end with `<final>{final_marker}</final>`."
+
+
+def build_corruption_fix_prompt(findings: List[str]) -> str:
+    return _gate_repair_prompt(
+        headline="Your patch contains shell/harness markers that don't belong in the source file:",
+        findings=findings,
+        action="re-applies the intended edit cleanly without any harness markup, or reverts the affected region.",
+        final_marker="corruption removed",
     )
 
 
@@ -1993,14 +1993,11 @@ def _check_critical_tag_removals(patch: str) -> List[str]:
 
 
 def build_critical_tag_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch removes top-level closing tags that templates rely on:"
-        f"\n\n{body}\n\n"
-        "These tags terminate template / script / style sections; removing "
-        "them silently breaks the file. Emit ONE bash command that re-adds "
-        "the missing closing tag(s) at the correct position(s). Then end "
-        "with `<final>tags restored</final>`."
+    return _gate_repair_prompt(
+        headline="Your patch removes top-level closing tags templates rely on:",
+        findings=findings,
+        action="re-adds the missing closing tag(s) at the correct position(s).",
+        final_marker="tags restored",
     )
 
 
@@ -2035,14 +2032,11 @@ def _check_php_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def build_php_syntax_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch produces a PHP / Blade syntax error in these files:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that fixes ONLY the syntax error (most often "
-        "a missing semicolon, mismatched `{` / `}`, unclosed `@if` / "
-        "`@foreach`, or stray `<?php` markers). Do NOT change unrelated "
-        "lines. Then end with `<final>php syntax fixed</final>`."
+    return _gate_repair_prompt(
+        headline="Your patch produces a PHP / Blade syntax error:",
+        findings=findings,
+        action="fixes ONLY the syntax error (missing semicolon, mismatched `{`/`}`, unclosed `@if`/`@foreach`, stray `<?php`). Do NOT touch unrelated lines.",
+        final_marker="php syntax fixed",
     )
 
 
@@ -2125,15 +2119,11 @@ def _check_cstyle_brace_balance(repo: Path, patch: str) -> List[str]:
 
 
 def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Brace imbalance detected in C-family files:\n\n"
-        f"{body}\n\n"
-        "These files now have unmatched `{` / `}`, `(` / `)`, or `[` / `]` "
-        "after your edit, which will fail to compile. Emit ONE bash command "
-        "that adds the missing closing token(s) or removes the extra "
-        "opener(s). Do NOT touch unrelated lines. Then end with "
-        "`<final>braces balanced</final>`."
+    return _gate_repair_prompt(
+        headline="Brace imbalance in C-family files — won't compile:",
+        findings=findings,
+        action="adds the missing closing token(s) or removes the extra opener(s). Do NOT touch unrelated lines.",
+        final_marker="braces balanced",
     )
 
 
