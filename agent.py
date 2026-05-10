@@ -2271,6 +2271,144 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
+# Emergency single-shot fallback: when attempt 1 returns an empty patch we still
+# have ~3-4 minutes of wall-clock left in the validator's per-round budget.
+# Empty patches score zero, so a focused single-call edit to ANY plausible target
+# is strictly better than returning nothing. The fallback is bounded to a small
+# token + time budget so it never starves the second multi-shot attempt.
+_EMERGENCY_MAX_TOKENS = 1024
+_EMERGENCY_TIMEOUT_SECONDS = 45
+_EMERGENCY_COMMAND_TIMEOUT = 30
+_EMERGENCY_PROMPT_TARGET_CHARS = 2000
+
+
+def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
+    """Pick the single most-likely-to-need-editing tracked file."""
+    mentioned_paths = _extract_issue_path_mentions(task_text)
+    tracked = set(_tracked_files(repo))
+    for mention in mentioned_paths:
+        normalized = mention.strip("./")
+        if normalized in tracked and _context_file_allowed(normalized):
+            return normalized
+    ranked = _rank_context_files(repo, task_text)
+    for relative_path in ranked:
+        if relative_path in tracked and _context_file_allowed(relative_path):
+            return relative_path
+    for relative_path in tracked:
+        if _context_file_allowed(relative_path):
+            return relative_path
+    return None
+
+
+def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
+    """Stripped-down single-shot prompt: one command, one final, nothing else."""
+    task_view = task_text[:1500]
+    return (
+        "You are a one-shot patch generator. Time and tokens are extremely "
+        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
+        f"TASK:\n{task_view}\n\n"
+        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
+        "Emit EXACTLY ONE bash command that makes the smallest substantive "
+        "code change in the target file consistent with the task. Use "
+        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
+        "only. Do NOT change file modes. Make a real code edit.\n\n"
+        "Format:\n<command>\nyour single command here\n</command>\n"
+        "<final>emergency edit</final>"
+    )
+
+
+def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
+    """Single-call fallback for empty-patch primary attempts.
+
+    Fires when the multi-shot driver detects that attempt 1 produced an empty
+    patch. Picks the most plausible target file, sends a stripped-down
+    single-shot prompt asking for ONE bash command, runs it, returns whatever
+    diff resulted. Bounded by _EMERGENCY_MAX_TOKENS / _EMERGENCY_TIMEOUT_SECONDS
+    so it never blows the wall-clock envelope.
+    """
+    repo_path_value = kwargs["repo_path"]
+    task_text = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+
+    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
+    repo: Optional[Path] = None
+    try:
+        repo = _repo_path(repo_path_value)
+        ensure_git_repo(repo)
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+
+        target = _emergency_pick_target(repo, task_text)
+        if target is None:
+            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
+            return AgentResult(
+                patch="", logs=_safe_join_logs(logs),
+                steps=0, cost=0.0, success=False,
+            ).to_dict()
+
+        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
+        prompt = _emergency_build_prompt(target, snippet, task_text)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a one-shot patch generator. Output exactly one "
+                    "bash command then <final>summary</final>. Nothing else."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response_text, _, _ = chat_completion(
+                messages=messages,
+                model=model_name,
+                api_base=base,
+                api_key=key,
+                max_tokens=_EMERGENCY_MAX_TOKENS,
+                timeout=_EMERGENCY_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        except Exception as exc:
+            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
+            patch_text = get_patch(repo) if repo is not None else ""
+            return AgentResult(
+                patch=patch_text, logs=_safe_join_logs(logs),
+                steps=0, cost=0.0, success=bool(patch_text.strip()),
+            ).to_dict()
+
+        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
+        commands = extract_commands(response_text)
+        if not commands:
+            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
+        for cmd in commands[:2]:
+            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
+            logs.append(format_observation(result))
+
+        patch_text = get_patch(repo)
+        return AgentResult(
+            patch=patch_text,
+            logs=_safe_join_logs(logs),
+            steps=1,
+            cost=0.0,
+            success=bool(patch_text.strip()),
+        ).to_dict()
+    except Exception:
+        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
+        patch_text = ""
+        if repo is not None:
+            try:
+                patch_text = get_patch(repo)
+            except Exception:
+                patch_text = ""
+        return AgentResult(
+            patch=patch_text,
+            logs=_safe_join_logs(logs),
+            steps=0, cost=0.0,
+            success=bool(patch_text.strip()),
+        ).to_dict()
+
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -2418,6 +2556,27 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
+
+        # Empty-patch fallback: when attempt 1 produced no usable diff we still
+        # have time for a focused single-call edit. Empirically (recent kings'
+        # primary duels) ~25% of attempts come back empty under hard tasks;
+        # an imperfect 1-line edit beats a 0-line forfeit. Only fires when
+        # attempt 1 was genuinely empty AND there is enough wall-clock left
+        # to also run the second multi-shot attempt afterwards.
+        if (
+            not _patch1.strip()
+            and _multishot_repo_obj is not None
+            and (_multishot_total_budget - _elapsed) > 60.0
+        ):
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            _result_emergency = _solve_emergency_single_shot(**kwargs)
+            _patch_emergency = _result_emergency.get("patch", "") or ""
+            if _multishot_count_substantive(_patch_emergency) > 0:
+                _result_emergency["multishot_attempts"] = 2
+                _result_emergency["multishot_winner"] = "emergency"
+                return _result_emergency
+            _elapsed = time.monotonic() - _multishot_started
+
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
