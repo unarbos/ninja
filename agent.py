@@ -135,6 +135,8 @@ MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags without mat
 MAX_PHP_SYNTAX_TURNS = 1   # PHP / Blade syntax error in a touched .php file
 MAX_CSTYLE_BRACE_TURNS = 1 # brace imbalance in C-family / Java-family files where ' is a char literal
 MAX_REQUIRED_FILE_TURNS = 1 # issue explicitly requires creating a new file but patch doesn't add it
+MAX_UNWIRED_TURNS = 1      # new exported component/hook/page never imported elsewhere in patch
+MAX_MISSING_ROUTE_TURNS = 1 # issue mentions /some/path but patch never registers it
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -2364,6 +2366,192 @@ def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
     )
 
 
+# Unwired-component gate (v46).
+# Catches the dominant v45 loss pattern (5 of 22 v45 losses, duel #4419):
+# we add a new component / hook / page / setting toggle but never mount or
+# call it from any other patched file. Reference patches always wire
+# what they introduce; the LLM judge rewards complete integration.
+#
+# Detection: scan patch for "+export const Foo" / "+export default function Foo"
+# / "+export class Foo" / "+function Foo(" added in the patch. For each new
+# export name, check whether ANY OTHER FILE in the same patch contains an
+# import statement, JSX usage, route registration, or function call that
+# references Foo. If we added Foo and zero other patched files reference it,
+# fire.
+
+_NEW_EXPORT_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\+(?!\+\+)\s*export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+default\s+([A-Z][A-Za-z0-9_]*)\s*[;\n]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+(?:const|let|var)\s+(use[A-Z][A-Za-z0-9_]*)\s*[=:]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+function\s+(use[A-Z][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+(?:const|let|var)\s+([A-Z][A-Za-z0-9_]+)\s*[=:]"),
+    re.compile(r"^\+(?!\+\+)\s*export\s+function\s+([A-Z][A-Za-z0-9_]+)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*export\s+class\s+([A-Z][A-Za-z0-9_]+)\s*[\{<]"),
+)
+
+
+def _extract_new_exports_per_file(patch: str) -> Dict[str, List[str]]:
+    """Return {filepath: [new exported symbol names]}."""
+    by_file: Dict[str, List[str]] = {}
+    current_file: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/"):].strip()
+            continue
+        if not current_file:
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for pat in _NEW_EXPORT_PATTERNS:
+            m = pat.match(line)
+            if m:
+                name = m.group(1)
+                # Skip TypeScript helper-type names that aren't really
+                # components (single-cap with all-caps follow-on tend to be
+                # constants like `MAX_FOO`; we already include those via
+                # the [A-Z][A-Za-z0-9_]+ match, so drop ALL_CAPS here).
+                if name.isupper():
+                    break
+                by_file.setdefault(current_file, []).append(name)
+                break
+    return by_file
+
+
+def _patch_full_text(patch: str) -> str:
+    """Return only the added-line bodies (post '+'), concatenated, for a fast
+    cross-file reference scan. We strip diff metadata so a `+import { Foo }`
+    becomes `import { Foo }` and matches our regexes cleanly."""
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append(line[1:])
+    return "\n".join(out)
+
+
+def _check_unwired_components(patch: str) -> List[str]:
+    new_exports_per_file = _extract_new_exports_per_file(patch)
+    if not new_exports_per_file:
+        return []
+    full_added = _patch_full_text(patch)
+    unwired: List[str] = []
+    for source_file, names in new_exports_per_file.items():
+        for name in names:
+            # Heuristic reference patterns the new symbol could appear in.
+            # We ALLOW self-reference inside the source file (a component
+            # might reference itself recursively), so we only count
+            # references in OTHER added lines outside the source file.
+            ref_count = 0
+            current_file: Optional[str] = None
+            for line in patch.splitlines():
+                if line.startswith("+++ b/"):
+                    current_file = line[len("+++ b/"):].strip()
+                    continue
+                if current_file == source_file:
+                    continue
+                if not line.startswith("+") or line.startswith("+++"):
+                    continue
+                body = line[1:]
+                # quick word-boundary check
+                if re.search(r"\b" + re.escape(name) + r"\b", body):
+                    ref_count += 1
+                    if ref_count >= 1:
+                        break
+            if ref_count == 0:
+                unwired.append(f"{name} (defined in {source_file}, not imported/used in any other patched file)")
+                if len(unwired) >= 4:
+                    return unwired
+    return unwired
+
+
+def build_unwired_component_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "You added new exports but no other file in the patch imports / uses them:\n\n"
+        f"{body}\n\n"
+        "Reference patches always WIRE what they introduce. A new component "
+        "must be rendered somewhere; a new hook must be called somewhere; "
+        "a new page/route must be registered; a new setting toggle must be "
+        "shown in the UI. Without wiring, the feature isn't actually "
+        "integrated and the patch reads as half-finished.\n\n"
+        "Emit ONE bash command that adds the wiring: import the symbol "
+        "where it's used, mount it in JSX, register it as a route, or call "
+        "the hook from the relevant component. Then end with "
+        "`<final>component wired</final>`."
+    )
+
+
+# Route-registration gate (v46).
+# Catches the "issue mentions /some/path but patch never registers a route
+# for it" case (3 v45 losses: missing /createacc, /express, /guide).
+
+_ISSUE_ROUTE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|[\s\(\[\"'`])(/[a-z][\w\-]*(?:/[a-z][\w\-]*){0,3})(?=[\s\.,\)\]\"'`?]|$)"),
+)
+_ROUTE_REGISTRATION_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r'<Route\s+[^>]*path=[\'"]([^\'"]+)[\'"]'),
+    re.compile(r'(?:app|router|api)\.(?:get|post|put|delete|patch|use)\([\'"`]([^\'"`]+)[\'"`]'),
+    re.compile(r'(?:Routes\.|router\.add\()[\'"`]([^\'"`]+)[\'"`]'),
+    re.compile(r'path:\s*[\'"`]([^\'"`]+)[\'"`]'),
+)
+
+
+def _check_missing_routes(patch: str, issue_text: str) -> List[str]:
+    if not patch.strip() or not issue_text:
+        return []
+    # Mentioned routes from the issue text
+    issue_routes: set = set()
+    for pat in _ISSUE_ROUTE_PATTERNS:
+        for match in pat.finditer(issue_text):
+            r = match.group(1)
+            # Ignore obvious non-routes (file extensions, plus version
+            # paths /v1 / /api alone).
+            if "." in r.rsplit("/", 1)[-1]:
+                continue
+            if len(r) <= 3:
+                continue
+            issue_routes.add(r)
+    if not issue_routes:
+        return []
+    full_added = _patch_full_text(patch)
+    registered: set = set()
+    for pat in _ROUTE_REGISTRATION_PATTERNS:
+        for m in pat.finditer(full_added):
+            registered.add(m.group(1))
+    missing: List[str] = []
+    for route in issue_routes:
+        # Loose match: registered path covers the issue route.
+        hit = any(
+            route == reg or route.startswith(reg + "/") or reg.startswith(route + "/")
+            or route.lstrip("/") == reg.lstrip("/")
+            for reg in registered
+        )
+        if not hit:
+            missing.append(route)
+    # Bound the noise — only fire on first 4 truly missing routes.
+    return missing[:4]
+
+
+def build_missing_route_fix_prompt(missing: List[str], issue_text: str) -> str:
+    items = "\n".join(f"  - {m}" for m in missing)
+    snippet = issue_text.strip()
+    if len(snippet) > 600:
+        snippet = snippet[:600].rstrip() + " [...]"
+    return (
+        "The issue references these routes / paths, but your patch does NOT "
+        "register them in any router / Express app / Next pages folder:\n\n"
+        f"{items}\n\n"
+        "When the issue says 'add a /foo page' or 'create a route at "
+        "/bar/baz', the reference patch wires that route in the project's "
+        "existing router (e.g. <Route path='/foo'>, app.get('/foo'), "
+        "Routes.add('/foo'), or a new file under pages/foo/). Without the "
+        "registration, the page is never reachable.\n\n"
+        "Emit ONE bash command that registers each missing route in the "
+        "right place for this codebase. Then end with `<final>routes "
+        "registered</final>`.\n\n"
+        f"Issue (for reference):\n{snippet}"
+    )
+
+
 _REMOVED_PUBLIC_SYMBOL_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^-(?!--)\s*export\s+(?:default\s+)?"
@@ -4249,6 +4437,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     php_syntax_turns_used = 0
     cstyle_brace_turns_used = 0
     required_file_turns_used = 0
+    unwired_turns_used = 0
+    missing_route_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -4303,7 +4493,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, unwired_turns_used, missing_route_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4715,6 +4905,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_required_file_fix_prompt(missing_files, issue),
                     "REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
+                )
+                return True
+
+        # Unwired-component gate (v46). New exports / hooks / pages added
+        # but never imported or used in any other patched file. Drives the
+        # most common loss pattern from v45 duel #4419 (5 of 22 losses):
+        # reference patches always integrate what they introduce.
+        if unwired_turns_used < MAX_UNWIRED_TURNS:
+            unwired = _check_unwired_components(patch)
+            if unwired:
+                unwired_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_unwired_component_fix_prompt(unwired),
+                    "UNWIRED_QUEUED:\n  " + "\n  ".join(unwired),
+                )
+                return True
+
+        # Missing-route gate (v46). Issue mentions /some/path but patch
+        # never registers a route for it. Catches the "added page but
+        # didn't wire route" pattern (3 of v45's 22 losses).
+        if missing_route_turns_used < MAX_MISSING_ROUTE_TURNS:
+            missing_routes = _check_missing_routes(patch, issue)
+            if missing_routes:
+                missing_route_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_route_fix_prompt(missing_routes, issue),
+                    "MISSING_ROUTE_QUEUED:\n  " + "\n  ".join(missing_routes),
                 )
                 return True
 
