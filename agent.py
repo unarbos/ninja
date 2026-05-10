@@ -1461,60 +1461,31 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 
-def _self_review_gate(patch: str, issue: str, repo: "Optional[Path]" = None) -> List[str]:  # type: ignore[name-defined]
-    """v10: Self-review patch before <final> - catch common failure patterns.
-
-    Returns a list of problems found (empty = patch is clean).
-    Maximum 1 repair turn is triggered on non-empty results.
-    """
-    problems: List[str] = []
-
-    # 1. chmod/file-mode changes - penalised by eval, easy to strip
-    if re.search(r'^(new mode|old mode|new file mode|deleted file mode)', patch, re.M):
-        problems.append("chmod/file-mode changes detected - strip them")
-
-    # 2. Placeholder URLs - templated URLs fail functional evaluation
-    for pattern in [
-        r'\[PROJECT_REF\]',
-        r'your-project-url',
-        r'\[YOUR_',
-        r'https://supabase\.co/functions',
-    ]:
-        if re.search(pattern, patch, re.I):
-            problems.append(f"placeholder URL detected: {pattern}")
-
-    # 3. Java stream mutation - won't compile, common regression
-    if re.search(r'\.forEach\s*\([^)]*->\s*[^)]*\+=', patch):
-        problems.append("Java stream mutation - use mapToDouble/sum instead")
-
+def _self_review_gate(patch: str, repo=None) -> list:
+    """v11: Pre-<final> self-check for common failure patterns."""
+    import re as _re
+    problems = []
+    if _re.search(r'^(new mode|old mode|new file mode|deleted file mode)', patch, _re.M):
+        problems.append("Remove file-mode changes from diff")
+    for bad in ['[PROJECT_REF]', 'your-project-url']:
+        if bad.lower() in patch.lower():
+            problems.append(f"Remove placeholder: {bad}")
+    if _re.search(r'\.forEach\s*\([^)]*->\s*\w+\s*\+=', patch):
+        problems.append("Java stream mutation; use stream().sum() instead")
     return problems
 
 
-
-def _build_multifile_plan_hint(issue: str, preloaded_files: List[str], repo: "Optional[Path]" = None) -> str:  # type: ignore[name-defined]
-    """v10: Emit a hint when the issue likely requires multi-file edits.
-
-    Fires when issue text contains >=2 architecture-signal words (excluding
-    'test' which is too broad). Returns empty string when not triggered.
-    """
-    multi_signals = [
-        'route', 'model', 'controller', 'view', 'component', 'service',
-        'migration', 'serializer', 'schema', 'hook', 'store',
-    ]
-    issue_lower = issue.lower()
-    signals = [s for s in multi_signals if s in issue_lower]
-    if len(signals) < 2:
+def _build_multifile_plan_hint(task_desc: str, file_list: list, repo=None) -> str:
+    """v11: Planning hint when issue spans multiple architectural concerns."""
+    signals = ['route', 'model', 'controller', 'view', 'component', 'service',
+               'migration', 'serializer', 'schema', 'hook', 'store']
+    count = sum(1 for s in signals if s in task_desc.lower())
+    if count < 2:
         return ""
-    file_names = [Path(f).name for f in preloaded_files[:6]]
-    hint = (
-        f"[Multi-file hint: issue likely affects {', '.join(signals[:4])} layers. "
-        f"Currently preloaded: {', '.join(file_names)}. "
-        "Check if other related files need coordinated changes too.]"
-    )
-    if len(signals) >= 4:
-        hint += " [Warning: 4+ signals - use find/grep to discover related files beyond preloaded set.]"
-    return hint
-
+    matched = [s for s in signals if s in task_desc.lower()][:4]
+    loaded = [p.split('/')[-1] for p in file_list[:6]]
+    return (f"\n[Multi-concern: {', '.join(matched)}. "
+            f"Preloaded: {', '.join(loaded)}. Enumerate every integration point.]\n")
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
@@ -2861,12 +2832,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v10/v11: self-review gate
         _srg_issues = _self_review_gate(patch)
         if _srg_issues and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
             queue_refinement_turn(assistant_text,
-                "Your patch has issues:\n" + "\n".join(f"- {p}" for p in _srg_issues) + "\n\nFix these.",
+                "Fix these issues:\n" + "\n".join(f"- {p}" for p in _srg_issues),
                 "SELF_REVIEW_QUEUED")
             return True
 
