@@ -2706,9 +2706,6 @@ def _patch_risk_findings(issue_text: str, patch: str) -> List[str]:
         if "requirements" in issue_lower and not any("requirements" in path for path in changed):
             findings.append("task asks for dependency requirements cleanup but requirements file is not changed")
 
-    if ("seed" in issue_lower and "script" in issue_lower) or "seed_demo_data.sql" in issue_lower:
-        if not any(("seed" in path and path.endswith(".sql")) for path in changed):
-            findings.append("task asks for a SQL seed script but no seed .sql artifact is changed")
     if "quiet" in issue_lower and ("rpc" in issue_lower or "do not disturb" in issue_lower):
         compact = added.replace(" ", "")
         if re.search(r"(not_in_quiet|quiethours|qhrows)[\s\S]{0,240}length>0", compact):
@@ -2798,105 +2795,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Main agent
 # -----------------------------
 
-# -----------------------------
-# v28 multi-shot helpers
-# -----------------------------
-
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 540.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
-
-
-def _multishot_count_substantive(patch: str) -> int:
-    if not patch.strip():
-        return 0
-    n = 0
-    for line in patch.splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-        body = line[1:].strip()
-        if not body:
-            continue
-        if _line_is_comment(body):
-            continue
-        n += 1
-    return n
-
-
-def _candidate_patch_quality(issue: str, patch: str) -> int:
-    if not patch.strip():
-        return -10_000
-    substantive = min(160, _multishot_count_substantive(patch))
-    risks = len(_patch_risk_findings(issue, patch))
-    missing_paths = len(_uncovered_required_paths(patch, issue))
-    missing_criteria = len(_unaddressed_criteria(patch, issue))
-    junk = 1 if _diff_low_signal_summary(patch) else 0
-    changed_files = len(_patch_changed_files(patch))
-    breadth_penalty = max(0, changed_files - 7) * 12
-    return substantive - (140 * risks) - (120 * missing_paths) - (30 * missing_criteria) - (50 * junk) - breadth_penalty
-
-
-def _candidate_patch_needs_retry(issue: str, patch: str) -> bool:
-    if _multishot_count_substantive(patch) < _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        return True
-    return False
-
-
-def _multishot_capture_head(repo: Path) -> Optional[str]:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo), capture_output=True, text=True, timeout=10, check=False,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.strip()
-    except Exception:
-        pass
-    return None
-
-
-def _multishot_revert(repo: Path, head: Optional[str]) -> None:
-    try:
-        if head:
-            subprocess.run(["git", "reset", "--hard", head],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-        else:
-            subprocess.run(["git", "checkout", "."],
-                           cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-        subprocess.run(["git", "clean", "-fd"],
-                       cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
-    except Exception:
-        pass
-
-
-def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
-    if not patch_text.strip():
-        return True
-    try:
-        proc = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn"],
-            cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
-        )
-        if proc.returncode != 0:
-            proc2 = subprocess.run(
-                ["git", "apply", "--3way", "--whitespace=nowarn"],
-                cwd=str(repo), input=patch_text, capture_output=True, text=True, timeout=30, check=False,
-            )
-            return proc2.returncode == 0
-        return True
-    except Exception:
-        return False
-
-
-# -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
-# -----------------------------
-
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
+# MINER-EDITABLE: validator entry point. Keep the public signature intact.
 def solve(
     repo_path: str,
     issue: str,
@@ -2910,12 +2809,10 @@ def solve(
     """
     Main portable interface for validators.
 
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
+    Wrapped in a patch-preserve safety net. If the solve loop raises after
+    editing files, return the on-disk patch instead of throwing away useful
+    work. No alternate sampling, patch-scoring, or validator-owned selection
+    hooks are used here.
     """
     return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
@@ -2925,94 +2822,23 @@ def solve(
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating.
-
-    Design notes for the next forker (these were called out in earlier
-    review rounds, recording them here so the choices are not silently
-    inherited):
-
-    1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
-       be either (a) so short it cannot produce a patch, or (b) push past
-       the validator's per-round soft cap and forfeit the round entirely.
-       The empty-patch case is already handled inside `_solve_attempt` by
-       the hail-mary refinement turn (see `maybe_queue_refinement`), and
-       any uncaught exception is caught by the `except Exception` arm
-       below which returns the on-disk patch verbatim.
-
-    2. The lint/syntax gate has not been removed; it lives inside
-       `maybe_queue_refinement` as the `syntax_fix` step (calling
-       `_check_syntax` -> `build_syntax_fix_prompt`). It runs after polish
-       and before the companion-test gate, capped by MAX_SYNTAX_FIX_TURNS
-       and MAX_TOTAL_REFINEMENT_TURNS so it cannot blow the budget. It is
-       deliberately scoped to the syntax-check refinement turn rather than
-       a hard pre-final block because real patches that touch unsupported
-       languages (Rust/Swift/etc.) would otherwise be gated incorrectly.
-    """
+    """Run one normal solve attempt, preserving any partial patch on failure."""
     repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
+    repo_obj = None
     try:
-        _multishot_repo_obj = _repo_path(repo_path)
+        repo_obj = _repo_path(repo_path)
     except Exception:
         pass
 
     try:
-        _multishot_started = time.monotonic()
-        _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
-        _issue = kwargs.get("issue", "") or ""
-
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
-        _score1 = _candidate_patch_quality(_issue, _patch1)
-
-        if not _candidate_patch_needs_retry(_issue, _patch1):
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_score"] = _score1
-            return _result1
-
-        _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            _result1["multishot_score"] = _score1
-            return _result1
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-        _score2 = _candidate_patch_quality(_issue, _patch2)
-
-        if (_score2, _n2) >= (_score1, _n1):
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            _result2["multishot_score"] = _score2
-            return _result2
-
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
-        _result1["multishot_score"] = _score1
-        return _result1
+        return _solve_attempt(**kwargs)
 
     except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
         salvaged = ""
         try:
-            if _multishot_repo_obj is not None:
-                _cleanup_patch_artifacts(_multishot_repo_obj)
-                salvaged = get_patch(_multishot_repo_obj)
+            if repo_obj is not None:
+                _cleanup_patch_artifacts(repo_obj)
+                salvaged = get_patch(repo_obj)
         except Exception:
             salvaged = ""
         return AgentResult(
