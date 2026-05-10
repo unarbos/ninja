@@ -1461,31 +1461,39 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 
+
 def _self_review_gate(patch: str, repo=None) -> list:
-    """v11: Pre-<final> self-check for common failure patterns."""
+    """v10: Pre-<final> self-check to catch common failure patterns.
+    Returns list of problems found (empty = proceed normally)."""
     import re as _re
     problems = []
+    # Check for file-mode/chmod changes
     if _re.search(r'^(new mode|old mode|new file mode|deleted file mode)', patch, _re.M):
         problems.append("Remove file-mode changes from diff")
-    for bad in ['[PROJECT_REF]', 'your-project-url']:
+    # Check for placeholder/template URLs
+    for bad in ['[PROJECT_REF]', 'your-project-url', '[YOUR_']:
         if bad.lower() in patch.lower():
-            problems.append(f"Remove placeholder: {bad}")
-    if _re.search(r'\.forEach\s*\([^)]*->\s*\w+\s*\+=', patch):
-        problems.append("Java stream mutation; use stream().sum() instead")
+            problems.append(f"Remove placeholder string: {bad}")
+    # Check for Java stream mutation
+    if _re.search(r'\.forEach\s*\([^)]*->\s*[a-z_]+\s*\+=', patch):
+        problems.append("Java stream mutation detected; use stream().sum() instead")
     return problems
 
 
-def _build_multifile_plan_hint(task_desc: str, file_list: list, repo=None) -> str:
-    """v11: Planning hint when issue spans multiple architectural concerns."""
+
+
+def _build_multifile_plan_hint(task_text: str, files: list, repo=None) -> str:
+    """v10: Emit a planning hint when issue spans multiple architectural concerns."""
     signals = ['route', 'model', 'controller', 'view', 'component', 'service',
                'migration', 'serializer', 'schema', 'hook', 'store']
-    count = sum(1 for s in signals if s in task_desc.lower())
+    count = sum(1 for s in signals if s in task_text.lower())
     if count < 2:
         return ""
-    matched = [s for s in signals if s in task_desc.lower()][:4]
-    loaded = [p.split('/')[-1] for p in file_list[:6]]
-    return (f"\n[Multi-concern: {', '.join(matched)}. "
-            f"Preloaded: {', '.join(loaded)}. Enumerate every integration point.]\n")
+    matched = [s for s in signals if s in task_text.lower()][:4]
+    loaded = [p.split('/')[-1] for p in files[:6]]
+    return (f"\n[Multi-concern task ({', '.join(matched)}). "
+            f"Preloaded: {', '.join(loaded)}. Enumerate every integration point in plan.]\n")
+
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
@@ -2832,12 +2840,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v10: self-review gate (catches chmod, placeholder URLs, Java stream mutations)
         _srg_issues = _self_review_gate(patch)
         if _srg_issues and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
-            queue_refinement_turn(assistant_text,
-                "Fix these issues:\n" + "\n".join(f"- {p}" for p in _srg_issues),
-                "SELF_REVIEW_QUEUED")
+            queue_refinement_turn(
+                assistant_text,
+                "Your patch has issues that will hurt your score:\n" + "\n".join(f"- {p}" for p in _srg_issues) + "\n\nFix these before finalizing.",
+                "SELF_REVIEW_QUEUED: " + " | ".join(_srg_issues[:2]),
+            )
             return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
@@ -2858,7 +2869,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
-        _mf_hint = _build_multifile_plan_hint(issue, list(preloaded_files))
+        _mf_hint = _build_multifile_plan_hint(issue, preloaded_files)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
