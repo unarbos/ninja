@@ -2522,7 +2522,7 @@ brief summary of what changed
 focused inspection command
 </command>
 
-**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures — even when the issue does not explicitly bullet them. Then immediately issue the command.
+**Plan**: in the SAME response as your first command, emit a short `<plan>` block listing each requirement and the target file/function for each. If multi-file, list every file. For multi-piece feature tasks, also enumerate every IMPLICIT integration point — package.json/manifest entries for new deps, route/nav wiring for new pages, migration/admin/serializer/url/view for new models, callsite cascades for renamed signatures, type/interface definitions that callers depend on, lock files (package-lock.json / yarn.lock / bun.lock / Cargo.lock / requirements.lock) for added deps, test fixtures and snapshot files that reference renamed symbols, and barrel re-exports (index.ts / __init__.py) that surface new modules — even when the issue does not explicitly bullet them. Then immediately issue the command.
 
 **Locate precisely**: use preloaded snippets or one or two focused greps to find the exact function or block. Do not loop on inspection.
 
