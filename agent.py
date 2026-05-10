@@ -122,6 +122,7 @@ MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check r
 MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_MISSING_CLASS_TURNS = 1  # create explicitly requested classes when the draft omitted them
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
@@ -2536,6 +2537,136 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Missing required class gate
+# -----------------------------
+
+_REQUIRED_CLASS_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"implement(?:\s+the|\s+a|\s+an)?\s+(?:missing\s+)?`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:create|add)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:missing|new)\s+`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"`?(?P<name>[A-Z][A-Za-z0-9_]*)`?\s+class\s+(?:is\s+)?(?:missing|required|needed)",
+        re.IGNORECASE,
+    ),
+)
+_REQUIRED_CLASS_BLOCKLIST = frozenset({
+    "The", "This", "That", "These", "Those", "When", "Where", "Why", "Who",
+    "What", "How", "Your", "Our", "Their", "First", "Second", "Third",
+    "New", "Old", "Test", "Tests", "Class", "Object", "String", "Integer",
+    "Boolean", "Function", "Method", "Field", "Interface",
+})
+_CLASS_SOURCE_SUFFIXES = (".java", ".kt", ".scala", ".cs", ".ts", ".tsx")
+
+
+def _required_classes_from_issue(issue_text: str) -> List[str]:
+    """Class declarations explicitly requested by the task text."""
+    seen: set[str] = set()
+    required: List[str] = []
+    for pattern in _REQUIRED_CLASS_PATTERNS:
+        for match in pattern.finditer(issue_text or ""):
+            name = match.group("name")
+            if not name or name in _REQUIRED_CLASS_BLOCKLIST or name in seen:
+                continue
+            seen.add(name)
+            required.append(name)
+    return required[:6]
+
+
+def _patch_declares_class(patch: str, class_name: str) -> bool:
+    declaration = re.compile(
+        r"^\+\s*(?:export\s+)?(?:default\s+)?"
+        r"(?:public\s+|private\s+|protected\s+|internal\s+)?"
+        r"(?:static\s+|abstract\s+|final\s+|sealed\s+|data\s+|open\s+)*"
+        r"class\s+" + re.escape(class_name) + r"\b",
+        re.MULTILINE,
+    )
+    return bool(declaration.search(patch))
+
+
+def _patch_touched_dirs(patch: str) -> List[str]:
+    dirs: List[str] = []
+    seen: set[str] = set()
+    for changed in _patch_changed_files(patch):
+        parent = str(Path(changed).parent)
+        if parent == "":
+            parent = "."
+        if parent not in seen:
+            seen.add(parent)
+            dirs.append(parent)
+    return dirs
+
+
+def _repo_declares_class_in_dirs(repo: Path, class_name: str, dirs: List[str]) -> bool:
+    """Check only touched directories, not recursive subpackages."""
+    if not dirs:
+        return False
+    repo_root = repo.resolve()
+    pattern = re.compile(r"\bclass\s+" + re.escape(class_name) + r"\b")
+    for rel_dir in dirs[:6]:
+        base = (repo / rel_dir).resolve() if rel_dir not in {"", "."} else repo_root
+        try:
+            base.relative_to(repo_root)
+        except (ValueError, RuntimeError):
+            continue
+        if not base.is_dir():
+            continue
+        for suffix in _CLASS_SOURCE_SUFFIXES:
+            for candidate in base.glob(f"*{suffix}"):
+                if not candidate.is_file():
+                    continue
+                try:
+                    if pattern.search(candidate.read_text(encoding="utf-8", errors="replace")):
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
+def _dominant_class_suffix(repo: Path, patch: str, dirs: List[str]) -> Optional[str]:
+    for changed in _patch_changed_files(patch):
+        suffix = Path(changed).suffix.lower()
+        if suffix in _CLASS_SOURCE_SUFFIXES:
+            return suffix
+    for rel_dir in dirs[:4]:
+        base = repo / rel_dir if rel_dir not in {"", "."} else repo
+        if not base.is_dir():
+            continue
+        for suffix in _CLASS_SOURCE_SUFFIXES:
+            if any(base.glob(f"*{suffix}")):
+                return suffix
+    return None
+
+
+def _missing_required_classes(repo: Path, patch: str, issue_text: str) -> List[Tuple[str, Optional[str]]]:
+    required = _required_classes_from_issue(issue_text)
+    if not required:
+        return []
+    touched_dirs = _patch_touched_dirs(patch)
+    suffix = _dominant_class_suffix(repo, patch, touched_dirs)
+    missing: List[Tuple[str, Optional[str]]] = []
+    for class_name in required:
+        if _patch_declares_class(patch, class_name):
+            continue
+        if _repo_declares_class_in_dirs(repo, class_name, touched_dirs):
+            continue
+        suggested: Optional[str] = None
+        if touched_dirs and suffix:
+            parent = touched_dirs[0]
+            suggested = f"{class_name}{suffix}" if parent in {"", "."} else f"{parent}/{class_name}{suffix}"
+        missing.append((class_name, suggested))
+    return missing[:4]
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -3115,6 +3246,29 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_missing_class_prompt(missing: List[Tuple[str, Optional[str]]], issue_text: str) -> str:
+    bullets = []
+    for class_name, suggested in missing[:4]:
+        if suggested:
+            bullets.append(f"- `class {class_name}` appears required but is not declared; likely path: `{suggested}`")
+        else:
+            bullets.append(f"- `class {class_name}` appears required but is not declared near the files you touched")
+    return (
+        "Missing required class check: the task explicitly appears to ask for "
+        "the class declaration(s) below, but the current patch does not add "
+        "them and the touched directory does not already declare them.\n\n"
+        + "\n".join(bullets)
+        + "\n\nIf this is a real requirement, create the minimal class file or "
+        "add the missing declaration in the existing owner file, matching the "
+        "nearby package/import/style conventions. If the class already exists "
+        "through an existing same-directory source file or the task wording is "
+        "only contextual, finish with <final>summary</final> and state why. "
+        "Do not add unrelated files or broad scaffolding.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
         "Integration check: your patch appears to add implementation code, but "
@@ -3677,6 +3831,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     patch_safety_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    missing_class_turns_used = 0
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
@@ -3712,15 +3867,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             1. patch-safety — remove unsafe review-process wording
             2. coverage-nudge — name issue-mentioned paths still untouched
             3. criteria-nudge — name issue acceptance bullets not addressed
-            4. test — actually run the companion test if one exists; if it
+            4. missing-class — create explicitly requested class declarations
+            5. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            5. failed-verification — repair the latest concrete failed check
-            6. contract — preserve public symbols still referenced by callers
-            7. integration/artifact/dependency — close common missing pieces
-            8. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            9. self-check — show the diff and ask "did you cover everything?"
+            6. failed-verification — repair the latest concrete failed check
+            7. contract — preserve public symbols still referenced by callers
+            8. integration/artifact/dependency — close common missing pieces
+            9. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
+            10. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3781,6 +3937,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if missing_class_turns_used < MAX_MISSING_CLASS_TURNS:
+            missing_classes = _missing_required_classes(repo, patch, issue)
+            if missing_classes:
+                missing_class_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_class_prompt(missing_classes, issue),
+                    "MISSING_CLASS_QUEUED:\n  "
+                    + ", ".join(name for name, _suggested in missing_classes),
                 )
                 return True
 
