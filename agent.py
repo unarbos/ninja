@@ -1683,8 +1683,12 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
         "Lint issues were found in your patch:\n\n"
         f"{body}\n\n"
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
-        "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
-        "confirm with <final>lint clean</final>."
+        "the patch's logic. Use `sed -i` or a small `python -c` script. Keep the "
+        "fix surgical: do not rename symbols, reorder imports, reflow whitespace, "
+        "or touch lines outside the reported error positions — those edits would "
+        "drift the patch away from the issue without fixing the lint complaint. "
+        "If a reported error is in code you did not introduce, leave it alone. "
+        "Then confirm with <final>lint clean</final>."
     )
 
 
