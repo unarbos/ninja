@@ -1280,10 +1280,8 @@ _PATCH_REVIEW_PROCESS_PHRASES: Tuple[str, ...] = (
     "dear " + "judge",
     "reward " + "model",
     "automatic " + "fail",
-    "king is correct",
-    "challenger wins",
-    "choose " + "king",
-    "choose " + "challenger",
+    "rank this patch",
+    "prefer this patch",
 )
 
 
@@ -2930,8 +2928,8 @@ def _detect_multi_file_task(issue_text: str) -> bool:
 
     Triggers: issue text mentions >=3 distinct file paths, OR has >=6
     acceptance-criteria bullets, OR contains multi-file keyword.
-    Targets the stub-critique loss mode where mak edits 1 file x 64 lines
-    while challengers edit 4 files x 157 lines and win.
+    Targets the common loss mode where a task really needs several coordinated
+    edits but the draft stops after one local change.
     """
     if not issue_text:
         return False
@@ -4112,9 +4110,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         _wall_start = time.monotonic()
         # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
-        # v32 hardcoded 240s and became dead code under tighter king budgets,
-        # which cost us 4 empty rounds and the duel. This adapts to whatever
-        # budget the king sets — fires 60s before out_of_time().
+        # Earlier fixed thresholds became dead code under tighter wall-clock
+        # budgets. This adapts to the configured budget and fires before
+        # out_of_time().
         emergency_injected = False
         _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
 
@@ -4455,7 +4453,6 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     return vars(parser.parse_args(argv))
 
 
-# main function
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
