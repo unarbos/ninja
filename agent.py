@@ -1356,7 +1356,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
+# Lint integration: project-style lint compliance
 # matters to the LLM judge — clean ruff/eslint output reads as "production code"
 # while warnings make the patch look unfinished.
 
@@ -1800,7 +1800,7 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
+# Stem-stripping suffix list. Natural-language
 # criteria words (e.g. "selecting", "loaded") often surface in identifier form
 # as `select`, `load`, etc. A literal substring `in` check misses these and
 # inflates the criteria-nudge false-positive rate. Stripping the suffix (with
@@ -1810,7 +1810,7 @@ _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es",
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
+    """Stem-stripped membership check."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -1836,7 +1836,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     surfacing the gap lets the model close it before <final>.
 
     v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
-    check, ported from UID49 PR#527 — closes the natural-language ↔ identifier
+    check — closes the natural-language ↔ identifier
     gap so criteria like "selecting items" match patches that contain `select`.
     """
     criteria = _extract_acceptance_criteria(issue_text)
@@ -2350,7 +2350,7 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
 
 def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
     """v66: single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
+    Adapted from a prior miner submission."""
     repo_path_value = kwargs["repo_path"]
     task_text = kwargs["issue"]
     model = kwargs.get("model")
@@ -2576,19 +2576,16 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 # v13 PORTS — LLM-judge focused (target: cleaner content)
 # ============================================================
 
-# v13: refinement caps for new gates
 MAX_VISIBLE_SURFACE_NUDGES = 1
-MAX_AUTOFORMAT_TURNS = 1
-_FORMAT_TIMEOUT = 10  # seconds; per-file ruff/eslint format timeout
 
-# === Visible-surface validation (port PR#733 VladaWebDev) ===
+# === Visible-surface validation ===
 def _visible_surface_missing(issue_text: str, patch: str) -> bool:
     """UI/task asks for rendered behavior but patch only touched support code."""
     issue_lower = issue_text.lower()
     if not re.search(
         r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
-        r"panel|control|slider|simulator|simulation|editor|appointment|booking|"
-        r"workshop|taller|resident|apartment)\b",
+        r"panel|control|slider|simulator|simulation|editor|widget|table|list|"
+        r"chart|menu|nav|sidebar|modal|toolbar)\b",
         issue_lower,
     ):
         return False
@@ -2636,60 +2633,6 @@ def build_visible_surface_nudge_prompt(issue_text: str) -> str:
 
 
 
-# === Autoformat (port PR#744 night-pal) ===
-def _organize_imports_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort import organization before linting a touched Python file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff check --select I --fix --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code in (0, 1)
-
-
-def _autoformat_python(repo: Path, relative_path: str) -> bool:
-    """Best-effort Python formatting before linting a touched file."""
-    if not _has_executable("ruff"):
-        return False
-    proc = run_command(
-        f"ruff format --quiet {_shell_quote(relative_path)}",
-        repo,
-        timeout=_FORMAT_TIMEOUT,
-    )
-    return proc.exit_code == 0
-
-
-def _autoformat_js(repo: Path, relative_path: str) -> bool:
-    """Best-effort JS/TS formatting when prettier is available."""
-    local_prettier = repo / "node_modules" / ".bin" / "prettier"
-    if local_prettier.exists():
-        cmd = f"./node_modules/.bin/prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    elif _has_executable("prettier"):
-        cmd = f"prettier --write --log-level=silent {_shell_quote(relative_path)}"
-    else:
-        return False
-    proc = run_command(cmd, repo, timeout=_FORMAT_TIMEOUT)
-    return proc.exit_code == 0
-
-
-def _autoformat_touched(repo: Path, patch: str) -> int:
-    """Run semantic-neutral cleanup on touched Python/JS files before lint."""
-    formatted = 0
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        ok = False
-        if suffix == ".py":
-            ok = _organize_imports_python(repo, relative_path) or ok
-            ok = _autoformat_python(repo, relative_path) or ok
-        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-            ok = _autoformat_js(repo, relative_path)
-        if ok:
-            formatted += 1
-    return formatted
-
-
 # ============================================================
 
 def solve(
@@ -2705,7 +2648,7 @@ def solve(
     """
     Main portable interface for validators.
 
-    v65: wrapped in patch-preserve safety net (from chain king PR486).
+    Wrapped in patch-preserve safety net.
     Any uncaught exception in the multishot body returns the on-disk patch
     state instead of propagating. The validator scores empty patches at
     zero — any non-empty diff beats empty.
@@ -2718,7 +2661,7 @@ def solve(
 
 
 def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """v65 safety-net wrapper. Adapted from chain king PR486."""
+    """Safety-net wrapper around the multishot driver."""
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -2745,7 +2688,7 @@ def _v65_solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
-    """The original UID195 multishot logic, separated so the safety-net try/except wraps it cleanly."""
+    """The original multishot driver logic, separated so the safety-net try/except wraps it cleanly."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -2848,7 +2791,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_no_command = 0
     polish_turns_used = 0
     visible_surface_nudges_used = 0  # v13
-    autoformat_turns_used = 0  # v13
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     lint_turns_used = 0  # v72
@@ -2893,7 +2835,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         cursor-half gates (polish, syntax) so the two-turn cap is spent on
         the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, visible_surface_nudges_used, autoformat_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, visible_surface_nudges_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -2947,14 +2889,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 'VISIBLE_SURFACE_NUDGE_QUEUED',
             )
             return True
-
-        # v13: autoformat — silent in-place format on touched files
-        if autoformat_turns_used < MAX_AUTOFORMAT_TURNS:
-            try:
-                if _autoformat_touched(repo, patch) > 0:
-                    autoformat_turns_used += 1
-            except Exception:
-                pass
 
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
