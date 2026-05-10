@@ -2674,36 +2674,6 @@ def _build_language_idiom_block(target_languages: List[str]) -> str:
     return ""
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
-    context_section = ""
-    if preloaded_context.strip():
-        context_section = f"""
-Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
-
-{preloaded_context}
-"""
-
-    return f"""Fix this issue:
-
-{issue}
-
-Repository summary:
-
-{repo_summary}
-{context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
-
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
-
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
-
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
-"""
-
-
-
 # === Patch-applies validation (port PR#668 oleksandrhordiienko63-byte) ===
 def _validate_patch_applies(repo: Optional[Path], patch: str) -> bool:
     """Dry-run `git apply --check` against the patch text. Returns True iff
