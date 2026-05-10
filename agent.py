@@ -1659,6 +1659,33 @@ def _check_lint_js(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+
+def _check_typecheck_ts(repo: Path, relative_path: str) -> Optional[str]:
+    """v73: run tsc --noEmit to catch TypeScript type errors eslint misses.
+    Skips when no tsconfig.json found (not a TypeScript project)."""
+    has_tsconfig = any(
+        (repo / name).exists()
+        for name in ("tsconfig.json", "tsconfig.base.json", "tsconfig.app.json")
+    )
+    if not has_tsconfig:
+        return None
+    if (repo / "node_modules" / ".bin" / "tsc").exists():
+        cmd = f"./node_modules/.bin/tsc --noEmit --skipLibCheck --pretty false"
+    elif _has_executable("tsc"):
+        cmd = "tsc --noEmit --skipLibCheck --pretty false"
+    else:
+        return None
+    proc = run_command(cmd, repo, timeout=_LINT_TIMEOUT * 3)
+    if proc.exit_code == 0:
+        return None
+    output = (proc.stdout or proc.stderr or "").strip()
+    if not output:
+        return None
+    for line in output.splitlines():
+        if "error TS" in line:
+            return f"tsc: {line.strip()[:200]}"
+    return None
+
 def _check_lint(repo: Path, patch: str) -> List[str]:
     """Lint every touched file with the appropriate tool. Up to 6 errors."""
     errors: List[str] = []
@@ -2504,6 +2531,7 @@ Do NOT create gratuitous helpers. Create files only when the task structurally r
 - Type annotations not already present in the changed function
 - Refactoring, renaming, or reordering the issue does not ask for
 - **File mode (chmod) changes** — never include `mode 100755`/`mode 100644` flips in your diff. If your edits touched the file mode accidentally, revert the mode and keep the substantive edits.
+- **Placeholder URLs**: never output `https://[PROJECT_REF].supabase.co` or bracket-template strings — use env vars or wire via `supabase/config.toml`. **Integration cascade**: on multi-concern features (page + route + nav + data fetch), enumerate EVERY required integration point as its own plan row.
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
 
@@ -2563,7 +2591,7 @@ of the surrounding structure. Preserve them unless the task requires removal.
 ## Language-specific completeness rules
 
 **Java:** Write complete method bodies — never use '// similar logic' stubs.
-Cascade all call-site changes when modifying signatures. Include all imports.
+Cascade all call-site changes when modifying signatures. Include all imports. **Stream ops**: never mutate a captured local inside a lambda/stream (not effectively final) — use `stream().mapToDouble(Cls::method).sum()` instead of `forEach(x -> total += x.val)`.
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed
 function. Include full signatures and all required #include changes.
@@ -2587,6 +2615,7 @@ When editing .ts/.tsx/.jsx files, use these conventions unless the local file sh
 - Imports: `import { useRouter } from 'next/navigation'` (not `next/router`), `import { create } from 'zustand'` for stores, `useEffect`/`useState`/`useMemo`/`useCallback` from `react`
 - Path aliases: prefer `@/components/X` over relative paths if the codebase uses them — check tsconfig.json or existing imports
 - React components: `export function Name() { ... return <JSX/> }` (named function exports, not default export, unless the file convention says otherwise)
+**CSS/animation tasks**: when the issue involves 3D transforms or tilt effects (keywords: rotateX, rotateY, perspective, gyroscope, mouse-tilt), preserve the transform property in BOTH the initial state AND all event handlers. Missing rotateX/rotateY from the wrapper element is the #1 failure mode.
 - State hooks: `const [x, setX] = useState<T>(initial)` with explicit type
 - Event handlers: `onClick={() => action()}`, `onChange={(e) => setX(e.target.value)}` — wire EVERY interactive element
 - Async: `async function` with try/catch, NOT `.then()` chains
