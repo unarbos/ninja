@@ -1461,7 +1461,7 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 
-def _self_review_gate(patch: str, issue: str, repo=None) -> list:
+def _self_review_gate(patch: str, task_text: str, repo=None) -> list:
     """v10: Self-review patch before <final> - catch common failure patterns.
 
     Returns a list of problems found (empty = patch is clean).
@@ -1491,7 +1491,7 @@ def _self_review_gate(patch: str, issue: str, repo=None) -> list:
 
 
 
-def _build_multifile_plan_hint(issue: str, preloaded_files: list, repo=None) -> str:
+def _build_multifile_plan_hint(task_text: str, preloaded_files: list, repo=None) -> str:
     """v10: Emit a hint when the issue likely requires multi-file edits.
 
     Fires when issue text contains >=2 architecture-signal words (excluding
@@ -2258,7 +2258,7 @@ No sudo. No file deletion. No network access outside the validator proxy. No hos
 FEATURE_BUILD: Implement ALL acceptance-criteria items end-to-end — wired state, event handlers, data binding, AND integration into parent template. Define a component AND place it in the correct slot. Never leave a component imported but unused.
 BUG_FIX: Fix root cause only. One targeted edit. No refactoring, no extra imports, no defensive checks the task didn't ask for.
 REFACTOR: Apply the change CASCADE-WIDE — every call site, every implementing class, every affected file. A refactor that only touches one file is almost always incomplete.
-MIGRATION: Provide ALL three artifact categories — (1) schema/data change, (2) updated lockfile or manifest, (3) fixture/seed/test update. Missing any one category scores as incomplete.
+MIGRATION: Provide ALL three artifact categories — (1) schema/data change, (2) updated lockfile or manifest, (3) fixture or data migration script. Missing any one category scores as incomplete.
 
 ## Judge alignment (GPT-5.4 scorer)
 The judge penalizes: (a) code that fails to compile or has undefined references, (b) placeholder strings like [PROJECT_REF] or [YOUR_URL], (c) unrelated style churn (chmod, orange→bold rewrites, whitespace normalization), (d) components defined but not wired into parent template, (e) SQL enum values not matching schema, (f) partial timeout with no output.
