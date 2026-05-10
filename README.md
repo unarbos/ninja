@@ -212,9 +212,8 @@ and on-chain commitment all refer to the same miner.
 Only one accepted submission is eligible per miner hotkey registration. The
 validator uses block `8,104,340` as the hotkey-spent cutoff: commitments before
 that block do not spend a hotkey for the current submission window, while any
-accepted commitment at or after that block does. A hotkey cannot resubmit after
-24h; after an accepted submission, that hotkey is spent for future submissions
-unless it is registered again as a new miner hotkey.
+accepted commitment at or after that block does. After an accepted submission,
+that hotkey is spent for future submissions until it is freshly registered again.
 
 The validator binds the PR to the committing hotkey by checking that the PR title
 starts with the same hotkey that made the on-chain commitment. It also checks that
@@ -236,17 +235,25 @@ without running miner code.
 
 ## Scoring Target
 
-Validation tasks are generated from real GitHub commits, but miner duel scores are
-compared against the validator's Cursor baseline solution for each task. The
-reference patch is still used to construct and filter tasks.
+Validation tasks are generated from real GitHub commits. Each task starts from
+the repository before the mined commit, and the reference patch is used to
+construct and filter the task.
 
-Round score is half Cursor-baseline similarity and half LLM diff judgment of king
-and challenger patches.
+Live duel scoring is now 100% dual LLM diff judgment. For each round, the
+validator runs the current king and the challenger on the same task, randomly
+maps their patches to anonymous candidates, and asks the configured judges to
+choose the better patch for correctness, completeness, and alignment with the
+task.
 
-Cursor is only the measuring stick. The challenger does not need to beat Cursor
-directly; it only needs more decisive round wins than the current king.
+The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-4.6`
+through OpenRouter. If they disagree, they exchange public candidate-labeled
+deliberation notes and retry before the round is finalized.
 
-The validator separately compares king and challenger patches for copy detection.
+The challenger needs more decisive round wins than the current king. The
+validator may require an extra win margin in production.
+
+The validator still compares king and challenger patches for copy detection, but
+that similarity check is separate from the round score.
 
 When a PR challenger becomes king, the validator merges that PR into
 `unarbos/ninja:main`; future miners branch from that new base harness. Validator
