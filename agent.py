@@ -123,6 +123,7 @@ MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_MISSING_CLASS_TURNS = 1  # create explicitly requested classes when the draft omitted them
+MAX_VISIBLE_SURFACE_NUDGES = 1  # ensure UI/page tasks touch the rendered surface
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
@@ -1345,6 +1346,44 @@ def _integration_gap_summary(patch: str, issue_text: str) -> str:
     return (
         "patch adds implementation-like files or code but no obvious route/nav/API "
         f"entrypoint was touched. Changed implementation paths: {examples}"
+    )
+
+
+_VISIBLE_SURFACE_KEYWORD_RE = re.compile(
+    r"\b(ui|screen|page|component|dashboard|form|dropdown|select|button|"
+    r"panel|control|view|layout|sidebar|navbar|menu|modal|dialog)\b",
+    re.IGNORECASE,
+)
+
+_VISIBLE_SURFACE_UI_PATH_RE = re.compile(
+    r"(^|/)(app|main|index)\.(jsx|tsx|js|ts)$|"
+    r"(^|/)(pages?|views?|components?|screens?)/.*\.(jsx|tsx|js|ts)$",
+    re.IGNORECASE,
+)
+
+_VISIBLE_SURFACE_SUPPORT_PATH_RE = re.compile(
+    r"(^|/)(stores?|hooks?|services?|api|lib|types?|models?|utils?)/",
+    re.IGNORECASE,
+)
+
+_VISIBLE_SURFACE_SUPPORT_SUFFIXES = (".json", ".sql", ".md", ".css")
+
+
+def _visible_surface_missing(issue_text: str, patch: str) -> bool:
+    """Detect UI tasks where the draft only edits supporting files."""
+    if not issue_text or not patch.strip():
+        return False
+    if not _VISIBLE_SURFACE_KEYWORD_RE.search(issue_text):
+        return False
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return False
+    if any(_VISIBLE_SURFACE_UI_PATH_RE.search(path) for path in changed):
+        return False
+    return all(
+        _VISIBLE_SURFACE_SUPPORT_PATH_RE.search(path)
+        or path.lower().endswith(_VISIBLE_SURFACE_SUPPORT_SUFFIXES)
+        for path in changed
     )
 
 
@@ -3285,6 +3324,22 @@ def build_integration_nudge_prompt(integration_summary: str, issue_text: str) ->
     )
 
 
+def build_visible_surface_nudge_prompt(issue_text: str) -> str:
+    return (
+        "Visible-surface check: the task describes rendered controls, a page, "
+        "dashboard, form, panel, modal, menu, or workflow, but the current patch "
+        "only changes supporting state/config/service files.\n\n"
+        "Before finalizing, inspect the component/page/view that renders the "
+        "requested behavior. If an existing rendered surface already consumes "
+        "the support change, finish with <final>summary</final> and name that "
+        "surface. Otherwise issue the minimal edit command(s) needed to wire "
+        "the visible control, list, empty state, submit flow, or layout change. "
+        "Do not rewrite unrelated components or expand scope beyond the task.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
     return (
         "Requested-artifact check: the task appears to ask for a supporting "
@@ -3830,6 +3885,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     missing_class_turns_used = 0
+    visible_surface_nudges_used = 0
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
@@ -3866,15 +3922,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             2. coverage-nudge — name issue-mentioned paths still untouched
             3. criteria-nudge — name issue acceptance bullets not addressed
             4. missing-class — create explicitly requested class declarations
-            5. test — actually run the companion test if one exists; if it
+            5. visible-surface — ensure UI/page tasks touch rendered surfaces
+            6. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            6. failed-verification — repair the latest concrete failed check
-            7. contract — preserve public symbols still referenced by callers
-            8. integration/artifact/dependency — close common missing pieces
-            9. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            10. self-check — show the diff and ask "did you cover everything?"
+            7. failed-verification — repair the latest concrete failed check
+            8. contract — preserve public symbols still referenced by callers
+            9. integration/artifact/dependency — close common missing pieces
+            10. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
+            11. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3950,6 +4007,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     + ", ".join(name for name, _suggested in missing_classes),
                 )
                 return True
+
+        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
+            visible_surface_nudges_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_visible_surface_nudge_prompt(issue),
+                "VISIBLE_SURFACE_NUDGE_QUEUED",
+            )
+            return True
 
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
