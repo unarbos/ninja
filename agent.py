@@ -1433,6 +1433,7 @@ _INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
     "route", "routing", "router", "page", "screen", "view", "sidebar",
     "navigation", "nav", "menu", "endpoint", "api", "controller", "service",
     "handler", "wire", "integrate", "dashboard",
+    "store", "form", "modal", "activity",
 )
 
 _INTEGRATION_ENTRYPOINT_RE = re.compile(
