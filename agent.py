@@ -118,20 +118,18 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v34: revert ruff/eslint diagnostics — recent rounds dock unlinted patches as "style"
-MAX_EMPTY_ARG_TURNS = 1    # v34: re-prompt when patch contains malformed `: ,`, `.push()`, `new Error()` patterns
-MAX_CONTRACT_TURNS = 1     # v35: re-prompt when a patch removes an exported symbol that other files still reference
-MAX_SETTER_TURNS = 1       # v35: re-prompt when `const [x, setX] = useState(...)` is added but `setX(...)` is never called
-MAX_CASCADE_TURNS = 1      # v36: re-prompt when patch modifies a function signature with unpatched callers in other files
-MAX_SURFACE_TURNS = 1      # v36: re-prompt when issue describes a UI surface but patch only touches support code
-MAX_STUB_TURNS = 1         # v36: re-prompt for extended stub patterns (`className={}`, `// TODO`, empty handlers)
+MAX_LINT_TURNS = 1         # ruff/eslint diagnostics — observed in CW post-revert lineage
+MAX_CASCADE_TURNS = 1      # marqcartasa post-revert: modified signature with unpatched callers
+MAX_SURFACE_TURNS = 1      # marqcartasa post-revert: UI keyword in issue + service-only patch
+MAX_STUB_TURNS = 1         # v35 #4334 post-revert critique: `className={}`, `// TODO`, empty arrow funcs
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 3  # v34: 2 -> 3. v35/v36 keep at 3 — the new gates fire only when they're
-                                # load-bearing. The total cap prevents refinement chains from blowing
-                                # the time budget under marq/CW competition where they have ~245s.
+# v39: 2 -> 3 was a v34 decision under dual-judge era; back to 3 since we have
+# fewer gates after removing dual-judge-derived ones, but the cap still matters
+# to avoid refinement chains blowing the time budget on borderline patches.
+MAX_TOTAL_REFINEMENT_TURNS = 3
 
 # v36: cascade-gap gate knobs.
 _CASCADE_GREP_TIMEOUT_SECONDS = 6
@@ -223,27 +221,6 @@ _V36_STUB_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
 # v34: lint integration knobs.
 _LINT_TIMEOUT_SECONDS = 10
 _LINT_MAX_ERRORS_REPORTED = 6
-
-# v35: contract-preservation gate knobs.
-# Cross-file usage check is grep-based and shouldn't take more than a couple
-# of seconds even on a large repo, but we cap individually to be safe.
-_CONTRACT_GREP_TIMEOUT_SECONDS = 8
-_CONTRACT_MAX_FINDINGS = 5
-# Names that look like removed exports but are noise (tests, locals, common
-# builder-style identifiers we don't want to chase).
-_CONTRACT_NAME_DENYLIST = {
-    "default",
-    "main",
-    "index",
-    "module",
-    "exports",
-    "describe",
-    "test",
-    "it",
-    "expect",
-    "beforeEach",
-    "afterEach",
-}
 
 # v34: emergency single-shot fallback. Fires when the main solve loop returns
 # an empty patch. Deliberately tight — one small file, one model call, one
@@ -1606,293 +1583,12 @@ def build_v34_lint_fix_prompt(findings: List[str]) -> str:
     )
 
 
-# v34: empty-arg / empty-value detector.
-#
-# Two of our 18 v33 losses traced to malformed expressions the patch produced
-# without ever crashing a parser:
-#   - `description: ,`  (empty value in an object literal)
-#   - `lines.push()` / `summaryParts.push()` (calls with no arguments)
-#   - `new Error()` (errors thrown without messages)
-# These pass syntax checks but downgrade the patch on the judge half. The
-# regexes below are intentionally narrow — they should not fire on any
-# well-formed code we're emitting today.
-
-_V34_EMPTY_ARG_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    (
-        "object-literal field with empty value",
-        re.compile(r"^\+(?!\+\+).*[A-Za-z_][\w$]*\s*:\s*,\s*$", re.MULTILINE),
-    ),
-    (
-        "method call with no arguments where args were intended",
-        re.compile(
-            r"^\+(?!\+\+).*\b(?:push|emit|send|append|write|add|set|"
-            r"console\.(?:log|error|warn|info|debug)|res\.send|res\.json"
-            r")\(\s*\)\s*[;,]?\s*$",
-            re.MULTILINE,
-        ),
-    ),
-    (
-        "thrown error with no message",
-        re.compile(
-            r"^\+(?!\+\+).*\b(?:throw\s+new\s+\w+\(\s*\)|new\s+Error\(\s*\))",
-            re.MULTILINE,
-        ),
-    ),
-)
-
-
-def _v34_check_empty_args(patch: str) -> List[str]:
-    findings: List[str] = []
-    if not patch.strip():
-        return findings
-    seen_lines: set = set()
-    for label, pattern in _V34_EMPTY_ARG_PATTERNS:
-        for match in pattern.finditer(patch):
-            line = match.group(0).strip()
-            key = (label, line[:80])
-            if key in seen_lines:
-                continue
-            seen_lines.add(key)
-            findings.append(f"{label}: {line[:160]}")
-            if len(findings) >= 4:
-                return findings
-    return findings
-
-
-def build_v34_empty_args_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains expressions that look syntactically valid but "
-        "are unfinished — the judge consistently penalises these as broken or "
-        "half-done code:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that fixes ONLY these specific lines: pass the "
-        "intended argument(s), supply a descriptive error message, or remove "
-        "the call entirely if it served no purpose. Do NOT add new behaviour "
-        "and do NOT touch unrelated lines. Then end with `<final>args fixed</final>`."
-    )
-
-
-# v35: contract-preservation gate.
-#
-# When v33 lost rounds in duel #4288, ~5 of those losses traced to the same
-# pattern: the patch removed (or fully rewrote) a public symbol that other
-# files in the repo still imported / called. Examples cited by the dual
-# judge:
-#   - skill-vocabulary.ts is completely rewritten and removes HUMANOID_SKILLS,
-#     HumanoidSkill type, and skillById/skillByName helpers referenced by
-#     other files
-#   - imports `DatasetMeta` from `dataset-browser.tsx`, but that module no
-#     longer exports it
-#   - Function rename (mqtt_task() to mqtt_app_main()) could break existing
-#     callers
-#
-# This gate scans the patch for removed export-like declarations and uses
-# `git grep` to verify each removed name is no longer referenced outside the
-# file it was removed from. If references survive, we surface them so the
-# refinement turn can re-add the export, restore the rename, or update the
-# call sites.
-
-# Patterns for "this line removes a declaration that other files might use"
-# (matches `-` lines in the patch only).
-_V35_REMOVED_EXPORT_PATTERNS: Tuple["re.Pattern[str]", ...] = (
-    # JS / TS: `export const X`, `export function X`, `export class X`,
-    # `export type X`, `export interface X`, `export enum X`, `export let X`,
-    # `export var X`. The name capture is intentionally narrow.
-    re.compile(
-        r"^-(?!--)\s*export\s+(?:default\s+)?"
-        r"(?:async\s+)?(?:const|let|var|function|class|type|interface|enum)"
-        r"\s+([A-Za-z_$][\w$]*)\b"
-    ),
-    # JS / TS named re-export: `export { X, Y as Z }`
-    re.compile(r"^-(?!--).*\bexport\s*\{\s*([^}]+?)\s*\}"),
-    # CommonJS: `module.exports.X = ...` or `exports.X = ...`
-    re.compile(r"^-(?!--).*\b(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*="),
-    # Python: `def NAME(` or `class NAME` removed at module level (4-space
-    # indent or no indent — best effort, ignores nested defs).
-    re.compile(r"^-(?!--)(?:    )?(?:def|class)\s+([A-Za-z_][\w]*)\s*[(:]"),
-    # Python: `NAME = ...` removed at module level (no leading whitespace).
-    re.compile(r"^-(?!--)([A-Z_][A-Z0-9_]{2,})\s*="),
-)
-
-
-def _v35_extract_removed_export_names(patch: str) -> List[str]:
-    """Return distinct candidate symbol names removed by this patch."""
-    seen: set = set()
-    out: List[str] = []
-    for line in patch.splitlines():
-        if not line.startswith("-") or line.startswith("---"):
-            continue
-        for pattern in _V35_REMOVED_EXPORT_PATTERNS:
-            m = pattern.match(line)
-            if not m:
-                continue
-            captured = m.group(1)
-            if captured is None:
-                continue
-            # Named-re-export pattern can capture a comma-separated list.
-            for name in re.split(r"[\s,]+", captured):
-                name = name.strip().split(" as ")[0].strip()
-                if not name or name in _CONTRACT_NAME_DENYLIST:
-                    continue
-                if not re.match(r"^[A-Za-z_$][\w$]*$", name):
-                    continue
-                if name in seen:
-                    continue
-                seen.add(name)
-                out.append(name)
-    return out
-
-
-def _v35_check_contract_preservation(repo: Path, patch: str) -> List[str]:
-    """For each removed export name, search the rest of the repo for usages.
-
-    Returns up to `_CONTRACT_MAX_FINDINGS` strings of the form
-    "<name>: still used in <file1>, <file2>" so the refinement turn can
-    name-and-shame each broken reference back to the model.
-    """
-    if not patch.strip():
-        return []
-    names = _v35_extract_removed_export_names(patch)
-    if not names:
-        return []
-    changed_paths = set(_patch_changed_files(patch))
-    findings: List[str] = []
-    for name in names:
-        try:
-            proc = subprocess.run(
-                [
-                    "git", "grep", "--name-only",
-                    "--word-regexp", "-F",
-                    "--", name,
-                ],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=_CONTRACT_GREP_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except Exception:
-            continue
-        if proc.returncode not in (0, 1):
-            continue
-        survivors: List[str] = []
-        for hit in proc.stdout.splitlines():
-            relative_path = hit.strip()
-            if not relative_path or relative_path in changed_paths:
-                continue
-            survivors.append(relative_path)
-            if len(survivors) >= 4:
-                break
-        if survivors:
-            preview = ", ".join(survivors[:4])
-            findings.append(f"{name}: still used in {preview}")
-            if len(findings) >= _CONTRACT_MAX_FINDINGS:
-                break
-    return findings
-
-
-def build_v35_contract_preservation_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch removes (or fully rewrites) symbols that other files in "
-        "the repo still reference. Recent dual-judge rounds penalise this "
-        "pattern as 'breaks existing exports / breaks callers' — about 1 in "
-        "4 multi-file losing patches loses on this exact issue.\n\n"
-        f"{body}\n\n"
-        "Pick ONE of these resolutions and emit a SINGLE bash command:\n"
-        "  (a) Re-add the removed export(s) so existing call sites keep "
-        "working;\n"
-        "  (b) Update every surviving call site (in the files listed above) "
-        "to use the new name / API.\n\n"
-        "Do NOT introduce new behaviour beyond restoring the contract. After "
-        "the command, end with `<final>contract restored</final>`."
-    )
-
-
-# v35: useState-without-setter gate.
-#
-# Recent loss critique: "Adds an isImporting state but never updates it,
-# leaving dead code and making the disabled-import UI logic ineffective."
-# When the patch declares `[x, setX] = useState(...)` but never calls
-# `setX(`, the state can't change and the feature is half-implemented.
-#
-# We restrict to React-style patterns since those are the dominant context
-# where this loss mode appears in the data.
-
-_V35_USE_STATE_DECL_RE = re.compile(
-    r"^\+(?!\+\+).*const\s*\[\s*([A-Za-z_$][\w$]*)\s*,\s*"
-    r"(set[A-Za-z_$][\w$]*)\s*\]\s*=\s*useState\b"
-)
-
-
-def _v35_check_setter_wired(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    declarations: List[Tuple[str, str]] = []
-    for line in patch.splitlines():
-        m = _V35_USE_STATE_DECL_RE.match(line)
-        if m:
-            declarations.append((m.group(1), m.group(2)))
-    if not declarations:
-        return []
-
-    # Pull all + lines as a single haystack of *added* code.
-    added_lines = [
-        line[1:]
-        for line in patch.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
-    haystack = "\n".join(added_lines)
-
-    findings: List[str] = []
-    for state_name, setter in declarations:
-        # A "real" setter call is `setX(` where it's not the destructuring
-        # line itself. Count occurrences across the added code minus the
-        # declaration line(s) that named it.
-        decl_re = re.compile(
-            rf"\b{re.escape(setter)}\s*\]"  # appears in the [_, setX] form
-        )
-        call_re = re.compile(rf"\b{re.escape(setter)}\s*\(")
-        decl_count = len(decl_re.findall(haystack))
-        call_count = len(call_re.findall(haystack))
-        # If we see the destructure but no call, flag it.
-        if call_count == 0:
-            findings.append(
-                f"useState `{state_name}` declared with setter `{setter}` "
-                f"but `{setter}(...)` is never called in the patch"
-            )
-        if len(findings) >= 4:
-            break
-    return findings
-
-
-def build_v35_setter_wired_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch adds React state hooks whose setters are never called. "
-        "An unupdated `useState` reads as half-implemented to the judge:\n\n"
-        f"{body}\n\n"
-        "Either wire the setter in the appropriate event/effect handler in "
-        "the same patch, or — if the state turned out to be unnecessary — "
-        "remove the `useState` declaration entirely. Emit ONE bash command "
-        "to make the change, then `<final>state wired</final>`."
-    )
-
-
-# v36: cascade-gap gate.
-#
-# Distinct from v35's contract-preservation gate, which only fires when an
-# export is REMOVED entirely. The cascade gate fires when the patch
-# *modifies* a function/class/method declaration (signature, body, or both)
-# AND consumers of that name in other files do not appear in the patch. The
-# refinement turn lets the model pick between (a) cascading the change to
-# every caller, or (b) preserving backwards compatibility on the original
-# signature.
-#
-# Inspired by the marqcartasa pattern observed in PR #756, but reimplemented
-# with our own naming, regex, and prompt body.
+# Cascade-gap gate. POST-REVERT origin: marqcartasa PR #756 used a similar
+# gate as their key wedge over Challenge-winner; reimplemented here with
+# our own naming, regex, and prompt body. Fires when the patch modifies a
+# function/class/method declaration and consumers in other files do NOT
+# appear in the patch — the refinement turn lets the model either cascade
+# the change to every caller or preserve backwards compatibility.
 
 def _v36_extract_modified_signatures(patch: str) -> List[str]:
     """Pull names of functions/classes whose declaration line was added,
@@ -2790,17 +2486,13 @@ Before finalizing, mentally check hidden-test edge cases relevant to the issue: 
 
 When the issue describes a rendered control, page, dashboard, form, modal, panel, or workflow, your patch MUST touch the component / page / view that renders it — not only the supporting state, hooks, services, or types. Patches that wire infrastructure but leave the rendered surface unchanged read as half-implemented.
 
-When you add a React `useState` declaration, also wire its setter call in the appropriate event / effect handler. Orphan state reads as scaffolded-but-not-finished.
-
 ====================================================================
 COMMON FAILURE PATTERNS THAT SCORE ZERO
 ====================================================================
 
-- Empty argument lists or unfinished expressions: `arr.push()`, `description: ,`, `new Error()`, `className={}`, `style={{}}`, `() => {}`, `// TODO`. Syntax-valid but read as half-done.
-- JS regex constants with `/g` flag + `.test()` — `/g` makes `.test()` stateful via `lastIndex`. Drop `/g` or build a fresh `RegExp(source).test(input)`.
-- Imports without call sites, or calls to undefined symbols. If you import `foo`, call `foo(...)` somewhere; if you call `foo(...)`, ensure it is imported or already defined.
-- Variable used before declaration (TDZ in JS, NameError in Python). Place hooks / destructured values BEFORE the lines that read them.
-- Removed / renamed exports that other files still import — either keep the old export alongside the new one, or update every call site in the same patch.
+- Empty / unfinished JSX expressions or stubs that pass syntax but read as half-done: `className={}`, `style={{}}`, `() => {}`, `// TODO` placeholder comments. The judge consistently reads these as "syntax/placeholder breakages".
+- Mode-only / chmod-only diffs and lockfile regenerations — these get stripped to empty by the validator's diff filter, scoring zero. Edit manifests directly and never run package-manager install commands.
+- Modified function/class signatures without updating every caller in the same patch (cascade gap). When you rename or change a signature, find every call site in the repo and update it — or keep the old signature alongside the new one for backwards compatibility.
 
 ====================================================================
 LANGUAGE NOTES (load-bearing only)
@@ -3596,13 +3288,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
-    lint_turns_used = 0          # v34
-    empty_arg_turns_used = 0     # v34
-    contract_turns_used = 0      # v35: removed-export-still-used detector
-    setter_turns_used = 0        # v35: useState-without-setter detector
-    cascade_turns_used = 0       # v36: modified signature with unpatched callers
-    surface_turns_used = 0       # v36: UI task with no UI edit
-    stub_turns_used = 0          # v36: extended stub-pattern detector
+    lint_turns_used = 0          # ruff/eslint pass — CW post-revert lineage
+    cascade_turns_used = 0       # marqcartasa post-revert: modified signature with unpatched callers
+    surface_turns_used = 0       # marqcartasa post-revert: UI task with no UI edit
+    stub_turns_used = 0          # v35 #4334 post-revert: className={}, // TODO, empty handlers
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3644,7 +3333,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, setter_turns_used, cascade_turns_used, surface_turns_used, stub_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, cascade_turns_used, surface_turns_used, stub_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3667,26 +3356,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # v35: contract-preservation gate (REMOVED-export still-used). Fires
-        # first among correctness gates because broken-callers were ~28% of
-        # v33's loss patterns.
-        if contract_turns_used < MAX_CONTRACT_TURNS:
-            contract_findings = _v35_check_contract_preservation(repo, patch)
-            if contract_findings:
-                contract_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_v35_contract_preservation_fix_prompt(contract_findings),
-                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
-                )
-                return True
-
-        # v36: cascade-gap gate (MODIFIED signature with unpatched callers).
-        # Distinct from contract preservation — fires when a declaration was
-        # changed (not removed) and other files still call the old shape.
-        # Targets the "wrong approach / breaks consumers" loss pattern that
-        # contract preservation does not catch on its own.
+        # Cascade-gap gate (MODIFIED signature with unpatched callers).
+        # POST-REVERT origin: marqcartasa PR #756. Targets the "wrong approach
+        # / breaks consumers" loss pattern when a declaration was changed and
+        # other files still call the old shape.
         if cascade_turns_used < MAX_CASCADE_TURNS:
             cascade_findings = _v36_check_cascade_gap(repo, patch)
             if cascade_findings:
@@ -3702,25 +3375,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v34: empty-arg/value gate (`description: ,`, `arr.push()`,
-        # `new Error()`). Cheap, high-leverage; covers the canonical
-        # malformed-args pattern.
-        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
-            empty_arg_findings = _v34_check_empty_args(patch)
-            if empty_arg_findings:
-                empty_arg_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_v34_empty_args_fix_prompt(empty_arg_findings),
-                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
-                )
-                return True
-
-        # v36: extended stub gate (`className={}`, `style={{}}`, `// TODO`,
-        # empty arrow functions, lone Python `pass`). Catches the broader
-        # family of stub patterns the empty-arg gate misses. v35 lost a
-        # round on `className={}` specifically — this gate fixes it.
+        # Extended stub gate (`className={}`, `style={{}}`, `// TODO`,
+        # empty arrow functions, lone Python `pass`). POST-REVERT origin:
+        # v35 #4334 had explicit critique "diff contains multiple obvious
+        # syntax/placeholder breakages (empty expressions like className={},
+        # background:, boxShado..." — this gate catches that pattern family.
         if stub_turns_used < MAX_STUB_TURNS:
             stub_findings = _v36_check_extended_stubs(patch)
             if stub_findings:
@@ -3784,21 +3443,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_v36_visible_surface_fix_prompt(issue),
                     "SURFACE_FIX_QUEUED: UI keywords in issue but no UI files in patch",
-                )
-                return True
-
-        # v35: useState-without-setter gate. React-specific, lower frequency
-        # than contract preservation. Fires after lint so the earlier slots
-        # prioritise universally applicable issues.
-        if setter_turns_used < MAX_SETTER_TURNS:
-            setter_findings = _v35_check_setter_wired(patch)
-            if setter_findings:
-                setter_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_v35_setter_wired_fix_prompt(setter_findings),
-                    "SETTER_FIX_QUEUED:\n  " + "\n  ".join(setter_findings),
                 )
                 return True
 
