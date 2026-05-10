@@ -1492,7 +1492,7 @@ def _simplify_issue_for_retry(issue_text: str, preloaded_files: list) -> str:
 
 
 
-def _build_multifile_plan_hint(issue: str, preloaded_files: List[str], repo: "Optional[Path]" = None) -> str:  # type: ignore[name-defined]
+def _build_multifile_plan_hint(task_text: str, preloaded_files: list, repo=None) -> str:  # type: ignore[name-defined]
     """v10: Emit a hint when the issue likely requires multi-file edits.
 
     Fires when issue text contains >=2 architecture-signal words (excluding
@@ -2895,7 +2895,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
-        _mf_hint = _build_multifile_plan_hint(issue, preloaded_files)
+        _mf_hint = _build_multifile_plan_hint(issue, list(preloaded_files))
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
