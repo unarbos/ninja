@@ -112,18 +112,13 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72: ruff/eslint when tooling exists — keeps patches convention-clean
+MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_VISIBLE_SURFACE_NUDGES = 1  # frontend/UI issues often need visible text/style hooks, not only logic
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-# With MAX_TOTAL_REFINEMENT_TURNS this low, each queued gate must earn its slot.
-# Artifact-coverage and visible-surface nudges were dropped from the hot loop:
-# they overlapped coverage (paths/files) and criteria (acceptance bullets) while
-# firing rarely under the cap. Helpers `_artifact_coverage_missing` /
-# `build_artifact_coverage_prompt` / `build_visible_surface_nudge_prompt` remain
-# for multishot diagnostics and fork experiments, not automatic refinement.
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -681,8 +676,8 @@ def _filter_inactive_duplicate_root_diffs(repo: Path, diff_output: str) -> str:
     """Drop root-level duplicate frontend files when src/ twin also changed.
 
     Several app templates contain stale root App.jsx/App.css/etc. plus the
-    active src/ copy. Models sometimes edit both; typically only the src/
-    copy matters for the running app. Keep deletions/new files, but drop non-delete root twins when
+    active src/ copy. Models sometimes edit both; the judge prefers only the
+    active copy. Keep deletions/new files, but drop non-delete root twins when
     src/<same-name> is also in the patch.
     """
     if not diff_output.strip():
@@ -799,80 +794,11 @@ SECRETISH_PARTS = {
     "secrets",
 }
 
-_PROJECT_HINT_FILES: Tuple[str, ...] = (
-    "package.json",
-    "pyproject.toml",
-    "pytest.ini",
-    "setup.cfg",
-    "tox.ini",
-    "Makefile",
-    "go.mod",
-    "Cargo.toml",
-    "jest.config.js",
-    "vitest.config.ts",
-)
-
-
-def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
-    """Compact manifest snippets so the model picks a realistic verify command.
-
-    Re-added after an experiment dropped it: without hints the agent often burns
-    a turn guessing `pytest` vs `npm test` vs `go test` wiring. This stays tiny,
-    separate from ranked source context, and is truncated aggressively.
-    """
-    tracked = set(_tracked_files(repo))
-    blocks: List[str] = []
-
-    for relative_path in _PROJECT_HINT_FILES:
-        if relative_path not in tracked:
-            continue
-        full = (repo / relative_path).resolve()
-        try:
-            full.relative_to(repo.resolve())
-            data = full.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-
-        if relative_path == "package.json":
-            try:
-                parsed = json.loads(data)
-            except Exception:
-                parsed = {}
-            scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
-            if isinstance(scripts, dict) and scripts:
-                interesting = {
-                    key: scripts[key]
-                    for key in sorted(scripts)
-                    if any(word in key.lower() for word in ("test", "check", "lint", "type", "build"))
-                }
-                if interesting:
-                    blocks.append(
-                        "### package.json scripts\n```json\n"
-                        + json.dumps(interesting, indent=2)[:900]
-                        + "\n```"
-                    )
-            continue
-
-        snippet = _truncate(data, 700)
-        if snippet.strip():
-            blocks.append(f"### {relative_path}\n```\n{snippet}\n```")
-
-        if len("\n\n".join(blocks)) >= max_chars:
-            break
-
-    if not blocks:
-        return ""
-    return _truncate(
-        "PROJECT TEST / BUILD HINTS (use these to pick the smallest real verification command):\n\n"
-        + "\n\n".join(blocks),
-        max_chars,
-    )
-
 
 def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Two improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -884,11 +810,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
-
-      3. Backtick-wrapped paths in the issue (`src/foo.tsx`) boost ranking when
-         they match a small, specific set of tracked files (see
-         `_BACKTICK_IDENT_RE`). Project-hint summaries (`_project_hint_block`)
-         append trusted test/build scripts without spending an inspection turn.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -911,11 +832,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(block)
         used += len(block)
 
-    project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
-    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
-        parts.append(project_hints)
-        used += len(project_hints)
-
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
@@ -924,13 +840,6 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         parts.append(recent_examples)
 
     return "\n\n".join(parts)
-
-
-# Backtick path mentions (`components/Foo.tsx`) are deliberate signals; when the
-# identifier matches only a handful of tracked paths, treat them like explicit
-# mentions. Skip when the match set is huge (generic tokens like `basic.py`).
-_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -946,15 +855,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
-
-    seen_mentioned = set(mentioned)
-    for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
-        matches = [path for path in tracked_set if ident in path and _context_file_allowed(path)]
-        if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
-            for match in sorted(matches):
-                if match not in seen_mentioned:
-                    mentioned.append(match)
-                    seen_mentioned.add(match)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1253,8 +1153,9 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task names but that haven't been touched yet — closing
-    that gap early avoids incomplete patches.
+    which files the task says to edit but that haven't been touched. The
+    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
+    the gap to the model directly is the cheapest way to close it.
     """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
@@ -1357,9 +1258,10 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    Catches the same class of mistakes parsers flag ("extra closing braces",
-    mismatched pairs). This naive counter ignores braces inside string and
-    comment context (best-effort) and reports an imbalance with file + count delta.
+    The LLM judge frequently dings patches for "extra closing braces" or
+    "duplicate brace" — issues a real compiler would catch. This naive
+    counter ignores braces inside string and comment context (best-effort)
+    and reports an imbalance with file + count delta.
     """
     full = (repo / relative_path).resolve()
     try:
@@ -1513,7 +1415,7 @@ def _relative_import_exists(base_dir: Path, spec: str) -> bool:
 
 
 def _check_added_semantic_tripwires(repo: Path, relative_path: str, patch: str) -> List[str]:
-    """Cheap checks for plausible-looking generated code that tends to fail review."""
+    """Cheap checks for plausible-looking but judge-fatal generated code."""
     errors: List[str] = []
     suffix = Path(relative_path).suffix.lower()
     if suffix not in {".js", ".jsx", ".ts", ".tsx", ".py", ".json", ".sql", ".md", ".txt"}:
@@ -1630,14 +1532,15 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_ts_structure_one(repo, relative_path)
             if result is None:
                 result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; gross errors usually surface in tests or review.
+        # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
     return errors
 
 
-# v72: lint integration ported from PR559 (UID 154). Clean ruff/eslint output signals
-# a finished, convention-aligned patch; noisy lint reads like sloppy churn.
+# v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
+# matters to the LLM judge — clean ruff/eslint output reads as "production code"
+# while warnings make the patch look unfinished.
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     """v72: run `ruff check` on a Python file. Returns the first issue or None."""
@@ -1707,7 +1610,7 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
     """v72: prompt the model to fix lint issues."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
-        "Lint issues were found in your patch. Resolve them so the change stays style-clean:\n\n"
+        "Lint issues were found in your patch. The judge prefers lint-clean code:\n\n"
         f"{body}\n\n"
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
         "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
@@ -1742,7 +1645,7 @@ def _shell_quote(value: str) -> str:
 #
 # When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
 # repo, running that test before <final> catches a class of regressions the
-# static refinement gates can't see. Cursor's baseline diffs almost always update
+# scope/judge gates can't see. Cursor's baseline diffs almost always update
 # tests in lockstep with source edits, and a fast pytest -k catches "I broke
 # the test I was supposed to fix."
 
@@ -2111,7 +2014,8 @@ def _patch_added_text(patch: str) -> str:
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. Surfacing multi-bullet gaps early reduces incomplete patches before <final>.
+    lines. The judge frequently dings the king for missing N of M criteria;
+    surfacing the gap lets the model close it before <final>.
 
     v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
     check, ported from UID49 PR#527 — closes the natural-language ↔ identifier
@@ -2168,7 +2072,6 @@ def _artifact_coverage_missing(issue_text: str, patch: str) -> List[str]:
     return deduped[:8]
 
 
-# Not auto-queued when MAX_TOTAL_REFINEMENT_TURNS is tight; see refinement constants.
 def build_artifact_coverage_prompt(missing: List[str], issue_text: str) -> str:
     bullets = "\n  ".join(f"- {m}" for m in missing[:8]) or "(none)"
     return (
@@ -2183,6 +2086,37 @@ def build_artifact_coverage_prompt(missing: List[str], issue_text: str) -> str:
         "\n\nTask:\n"
         f"{issue_text[:1600]}\n"
     )
+
+
+def _visible_surface_missing(issue_text: str, patch: str) -> bool:
+    """Frontend-visible tasks need at least one visible UI/style delta.
+
+    A recurring loss pattern is a correct-looking state/helper edit that never
+    changes rendered text, styles, markup, or event wiring. This lightweight
+    gate asks for one more pass only when the issue is visibly UI-facing and
+    the patch has no obvious UI-surface additions.
+    """
+    issue_lower = issue_text.lower()
+    ui_terms = {
+        "button", "screen", "page", "modal", "card", "form", "dropdown",
+        "select", "input", "label", "sidebar", "menu", "layout", "style",
+        "color", "theme", "animation", "hover", "responsive", "mobile",
+        "desktop", "visible", "display", "show", "hide", "render", "text",
+        "copy", "appointment", "booking", "workshop", "resident", "apartment",
+    }
+    if not any(term in issue_lower for term in ui_terms):
+        return False
+    changed = _patch_changed_files(patch)
+    if not any(Path(path).suffix.lower() in {".css", ".scss", ".html", ".jsx", ".tsx", ".vue", ".svelte", ".js", ".ts"} for path in changed):
+        return False
+    added = _patch_added_text(patch)
+    surface_terms = (
+        "class", "classname", "style", "aria", "role", "placeholder", "label",
+        "button", "input", "select", "option", "onchange", "onclick",
+        "href", "src", "data-", "px", "rem", "grid", "flex", "color",
+        "background", "display", "visibility", "render", "return (",
+    )
+    return not any(term in added for term in surface_terms)
 
 
 _STORE_SELECTOR_RE = re.compile(
@@ -2483,7 +2417,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — partial fixes read as incomplete work.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2555,9 +2489,10 @@ def _oversized_context_dump_reason(command: str) -> Optional[str]:
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
-    Unrelated churn, cosmetic edits, and whitespace-only hunks weaken patch
-    quality. Be explicit about which classes count as scope creep so the model
-    knows what to revert and what to keep.
+    The LLM judge frequently penalises patches for "unrelated changes",
+    "unnecessary churn", and "cosmetic edits". Be explicit about which
+    classes of changes count as scope creep so the model knows what to
+    revert and what to keep.
     """
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
@@ -2566,7 +2501,8 @@ def build_polish_prompt(junk_summary: str) -> str:
         "lines). Do not add new edits, do not refactor, do not reorder "
         "imports, do not touch unrelated lines.\n\n"
         "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (these read as unrelated noise in review):\n"
+        "your draft (the diff judge consistently penalises these as "
+        "'unrelated' or 'unnecessary churn'):\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
         "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
@@ -2583,8 +2519,9 @@ def build_polish_prompt(junk_summary: str) -> str:
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
-    When the issue names specific files and the draft skips them, surface that
-    gap directly — cheaper than hoping a later self-review catches it.
+    The LLM diff judge most often docks king for incomplete coverage. When the
+    issue names specific files and the draft skips them, surface that gap
+    directly — much cheaper than hoping the self-check catches it.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
@@ -2609,18 +2546,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass — review your patch for correctness, completeness, and alignment "
-        "with the task:\n\n"
-        "CORRECTNESS (high priority):\n"
+        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
+        "with the reference — review your patch against all three:\n\n"
+        "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is strong evidence of correctness.\n\n"
-        "COMPLETENESS (high priority):\n"
+        "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (keep the patch minimal):\n"
+        "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2663,8 +2600,9 @@ def build_semantic_fix_prompt(errors: List[str]) -> str:
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
-    Multi-bullet issues often lose one criterion while the rest look fine.
-    The path-coverage gate sees files; this gate surfaces the criterion text.
+    The LLM judge frequently dings the king for "missing N of M criteria" on
+    multi-bullet issues. The path-coverage gate sees files; this gate sees the
+    criterion checkpoints themselves and surfaces them with the original text.
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
@@ -2683,7 +2621,6 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
-# Not auto-queued when MAX_TOTAL_REFINEMENT_TURNS is tight; see refinement constants.
 def build_visible_surface_nudge_prompt(issue_text: str) -> str:
     return (
         "Visible-surface gap — this appears to be a UI/user-visible task, but "
@@ -2726,8 +2663,9 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
         "EMERGENCY: after all refinement attempts your patch is still empty. "
-        "An empty patch scores nothing on similarity and reads as no implementation "
-        "on qualitative review — you need real code edits on disk.\n\n"
+        "An empty patch scores 0% on the validator's similarity AND on the LLM "
+        "judge — both rubrics expect actual code edits. Every other miner in "
+        "this round will beat you on this task by default if you submit empty.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE plausible code edit consistent with the issue. Pick the most "
@@ -3266,6 +3204,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    visible_surface_nudges_used = 0
+    artifact_nudges_used = 0
     semantic_fix_turns_used = 0
     dependency_fix_turns_used = 0
     hail_mary_turns_used = 0
@@ -3293,23 +3233,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         """If the current patch warrants a refinement turn, queue it.
 
         Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. Order (each step respects
-        MAX_TOTAL_REFINEMENT_TURNS; hail-mary on empty patch is exempt):
-            0. hail-mary — patch still empty: force one real edit
-            1. coverage-nudge — issue-mentioned paths still untouched
-            2. syntax — parser errors on touched files
-            3. criteria-nudge — acceptance bullets not reflected in added lines
-            4. semantic — tripwire patterns in added code
-            5. dependency — store/API consistency gaps
-            6. test — companion test failure tail via build_test_fix_prompt
-            7. polish — drop low-signal hunks
-            8. lint — ruff/eslint when tooling exists
-            9. self-check — diff + task checklist
-
-        Earlier gates skew toward correctness and task coverage; polish and lint
-        run after substantive signals when budget remains.
+        means the caller can declare success. The order is:
+            0. hail-mary — patch empty after everything: force one real edit
+            1. coverage-nudge — name issue-mentioned paths still untouched
+            2. criteria-nudge — name issue acceptance bullets not addressed
+            3. test — actually run the companion test if one exists; if it
+                      fails, feed the failure tail back via build_test_fix_prompt
+            4. polish — drop low-signal hunks the model still emitted
+            5. syntax — quote any parser error back at the model
+            6. self-check — show the diff and ask "did you cover everything?"
+        Judge-half gates (coverage, criteria, companion test) fire before
+        cursor-half gates (polish, syntax) so the two-turn cap is spent on
+        the highest-leverage signals first.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, semantic_fix_turns_used, dependency_fix_turns_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, artifact_nudges_used, semantic_fix_turns_used, dependency_fix_turns_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -3377,6 +3314,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if artifact_nudges_used < 1:
+            missing_artifacts = _artifact_coverage_missing(issue, patch)
+            if missing_artifacts:
+                artifact_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_artifact_coverage_prompt(missing_artifacts, issue),
+                    "ARTIFACT_COVERAGE_QUEUED:\n  " + "\n  ".join(missing_artifacts),
+                )
+                return True
+
+        if visible_surface_nudges_used < MAX_VISIBLE_SURFACE_NUDGES and _visible_surface_missing(issue, patch):
+            visible_surface_nudges_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_visible_surface_nudge_prompt(issue),
+                "VISIBLE_SURFACE_NUDGE_QUEUED",
+            )
+            return True
+
         if dependency_fix_turns_used < 1:
             dependency_errors = _external_state_api_errors(repo, patch)
             if dependency_errors:
@@ -3416,7 +3375,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # v72: lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
-        # catches style issues that make a patch look unfinished.
+        # catches style issues the LLM judge dings as "unfinished code".
         if lint_turns_used < MAX_LINT_TURNS:
             lint_errors = _check_lint(repo, patch)
             if lint_errors:
@@ -3618,7 +3577,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — passing tests are strong evidence the fix works.\n"
+                        "to verify correctness — the LLM judge rewards passing tests.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
