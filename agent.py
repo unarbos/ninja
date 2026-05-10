@@ -90,6 +90,12 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "32000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
+
+# v3.2.1: minimal wall-clock guard restored. Single inner attempt with a soft
+# cap so the loop yields its current on-disk patch instead of OOM/timeout
+# under validator-side hard cutoffs.
+WALL_CLOCK_BUDGET_SECONDS = 270.0
+WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_PRELOADED_CONTEXT_CHARS = 32000
 MAX_PRELOADED_FILES = 10
 MAX_NO_COMMAND_REPAIRS = 3
@@ -2641,10 +2647,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_model_errors = 0
     has_patch_ever = False  # v2.1: latched once any patch lands; silences edit-nudge schedule
 
-    # v2.1: wall-clock guard removed. The inner step loop now ends only on
-    # success conditions, ``max_steps`` exhaustion, persistent
-    # ``MODEL_ERROR``s, or ``MAX_NO_COMMAND_REPAIRS``. See module-level
-    # comment near ``HTTP_MAX_RETRIES`` for the rationale.
+    # v3.2.1: minimal wall-clock guard restored. ``solve_started_at`` is
+    # captured here and consulted at the top of the step loop so the harness
+    # always returns the current on-disk patch before the validator's hard
+    # cutoff fires (instead of dying mid-LLM call with no patch).
+    solve_started_at = time.monotonic()
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -2728,6 +2735,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
 
         for step in range(1, max_steps + 1):
+            elapsed = time.monotonic() - solve_started_at
+            if elapsed >= WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_RESERVE_SECONDS:
+                logs.append(
+                    f"\n\nWALL_CLOCK_BUDGET_SECONDS={WALL_CLOCK_BUDGET_SECONDS:.1f}s "
+                    f"reached at step {step} (elapsed {elapsed:.1f}s, reserve "
+                    f"{WALL_CLOCK_RESERVE_SECONDS:.1f}s). Returning current on-disk patch."
+                )
+                break
             logs.append(f"\n\n===== STEP {step} =====\n")
 
             response_text: Optional[str] = None
