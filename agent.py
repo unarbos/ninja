@@ -1907,6 +1907,7 @@ First response format:
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- Visible surface: if the issue mentions rendered UI (button, page, form, modal, view, layout, navigation entry) but your candidate target list only contains support code (services, types, hooks, state, schemas, JSON/SQL config, CSS-only), add the page/component/view file that actually renders the requested behaviour as a plan row — patches that edit only support code without the surface lose to ones that wire the visible UI.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
