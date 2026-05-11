@@ -796,6 +796,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+    # Files whose path is literally mentioned in the issue body get a 2x
+    # per-file budget. The issue almost always names its primary target by
+    # path; under equal-budget allocation that file gets squeezed alongside
+    # incidentally-ranked neighbours and we lose precise context on the
+    # exact file the task is about.
+    path_mentioned = {
+        p.strip("./") for p in _extract_issue_path_mentions(issue)
+    }
 
     parts: List[str] = []
     included: List[str] = []
@@ -803,7 +811,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        file_budget = per_file_budget * 2 if relative_path in path_mentioned else per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -853,10 +862,40 @@ def _preload_needles(issue: str) -> List[str]:
         stem = Path(mention).stem
         if stem and len(stem) >= 3:
             add(stem)
+    # Quoted strings (4-80 chars, contain at least one letter, no more than
+    # 8 whitespace-separated tokens). Issues frequently quote error messages,
+    # log lines, or short code snippets — these are exact substrings to grep
+    # for and become high-signal needles for windowed extraction. Without
+    # this, an issue like fix the "Permission denied" error never causes a
+    # needle for that exact string, so windows miss the actual emission site.
+    for quoted in _QUOTED_NEEDLE_RE.findall(issue):
+        if not any(c.isalpha() for c in quoted):
+            continue
+        if len(quoted.split()) > 8:
+            continue
+        add(quoted.strip())
+    # Lines from fenced code blocks in the issue. Many issues paste current
+    # or desired code as ```python ... ``` blocks; each meaningful line is a
+    # literal target string the agent should be able to grep for in the
+    # repo. Filter out tiny lines, pure comments, and pure-punctuation noise.
+    for block in _FENCED_CODE_RE.findall(issue):
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if len(line) < 8 or len(line) > 120:
+                continue
+            if not any(c.isalnum() for c in line):
+                continue
+            if line.startswith(("#", "//", "/*", "*")):
+                continue
+            add(line)
     for term in _issue_terms(issue):
         if len(term) >= 4:
             add(term)
     return out
+
+
+_QUOTED_NEEDLE_RE = re.compile(r'["\']([^"\']{4,80})["\']')
+_FENCED_CODE_RE = re.compile(r"```[A-Za-z]*\n(.*?)```", re.DOTALL)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -2829,8 +2868,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
