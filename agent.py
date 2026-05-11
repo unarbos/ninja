@@ -117,17 +117,17 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
-MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
+MAX_ARTIFACT_NUDGES = 0    # disabled: over-adds when reference is minimal (caused 064674 forced createdBy:null regression)
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_CONTRACT_TURNS = 1
 MAX_PATCH_SAFETY_TURNS = 1
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1
-MAX_STRICT_CRITERIA_TURNS = 1
+MAX_STRICT_CRITERIA_TURNS = 0  # disabled: redundant with MAX_CRITERIA_NUDGES; strict variant adds scope-drift pressure
 MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
-MAX_DELIVERABLE_TURNS = 1
+MAX_DELIVERABLE_TURNS = 0  # disabled: over-builds vs reference (caused 064689 wrong section structure regression)
 MAX_FRONTEND_GAP_TURNS = 1
-MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted). Lower cap reduces churn-vs-reference divergence cited in 064658/064672/064677 rationales.
 _STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -3574,14 +3574,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. MAX_TEST_FIX_TURNS,
-        # build_test_fix_prompt, and the _TEST_PARTNER_TEMPLATES preloading
-        # list existed previously but were not invoked from solve(). This
-        # wires them in for runtime correctness: if any edited file has a
-        # partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
+        # Companion-test execution gate. MAX_TEST_FIX_TURNS, build_test_fix_prompt,
+        # and the _TEST_PARTNER_TEMPLATES preloading list existed in the file but
+        # were not invoked from solve(), so a partner-test failure was never used
+        # as a refinement signal. This wires them in: if any edited file has a
+        # partner test that actually fails, surface the failure tail to the
+        # model as one fix turn. This is the only refinement step in the chain
+        # backed by a real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
