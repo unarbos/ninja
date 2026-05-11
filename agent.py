@@ -1238,9 +1238,25 @@ def _diff_low_signal_summary(patch: str) -> str:
         return ""
 
     notes: List[str] = []
+    current_block: List[str] = []
     current_file = "?"
     current_added: List[str] = []
     current_removed: List[str] = []
+
+    def flush_block() -> None:
+        if not current_block:
+            return
+        block = "\n".join(current_block)
+        if (
+            "\nold mode " in "\n" + block
+            and "\nnew mode " in "\n" + block
+            and "\n@@ " not in "\n" + block
+            and "\nGIT binary patch" not in "\n" + block
+            and "\nBinary files " not in "\n" + block
+            and "\nnew file mode " not in "\n" + block
+            and "\ndeleted file mode " not in "\n" + block
+        ):
+            notes.append(f"{current_file}: file-mode-only diff")
 
     def flush() -> None:
         if not current_added and not current_removed:
@@ -1254,12 +1270,17 @@ def _diff_low_signal_summary(patch: str) -> str:
 
     for line in patch.splitlines():
         if line.startswith("diff --git "):
+            flush_block()
             flush()
+            current_block = [line]
             current_added, current_removed = [], []
             tokens = line.split()
             if len(tokens) >= 4 and tokens[3].startswith("b/"):
                 current_file = tokens[3][2:]
-        elif line.startswith("@@"):
+            continue
+
+        current_block.append(line)
+        if line.startswith("@@"):
             flush()
             current_added, current_removed = [], []
         elif line.startswith("+") and not line.startswith("+++"):
@@ -1267,6 +1288,7 @@ def _diff_low_signal_summary(patch: str) -> str:
         elif line.startswith("-") and not line.startswith("---"):
             current_removed.append(line[1:])
 
+    flush_block()
     flush()
 
     deduped: List[str] = []
@@ -2397,10 +2419,16 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
         "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
+        "  - Every newly used identifier is declared, imported, destructured, or in scope in the touched file.\n"
+        "  - Every removed/moved function, route, component, or helper leaves no stale import/export/registration behind.\n"
+        "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
+        "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
+        "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No file-mode-only chmod churn, generated caches, compiled artifacts, or unrelated script permission flips\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
