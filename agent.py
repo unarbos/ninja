@@ -87,7 +87,7 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
@@ -824,6 +824,23 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+
+    # Resolve paths named in the issue that don't exist at their literal
+    # location — search by basename across the repo.
+    if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
+        missing = resolve_missing_paths(repo, issue, set(included))
+        for mp in missing:
+            if mp in included:
+                continue
+            snippet = _read_context_file(repo, mp, per_file_budget, needles=needles)
+            if not snippet.strip():
+                continue
+            block = f"### {mp}\n```\n{snippet}\n```"
+            if used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+                break
+            parts.append(block)
+            included.append(mp)
+            used += len(block)
 
     # Append a compact file tree so the agent can navigate without an extra
     # discovery bash call. Gathers source files only (skips node_modules,
@@ -2199,6 +2216,43 @@ If a test fails, check whether it is genuinely caused by your change or is a pre
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+
+
+def resolve_missing_paths(repo: Path, issue: str, known_paths: set[str]) -> list[str]:
+    """Find issue-named files that don't exist at their literal path.
+
+    Parses backtick-quoted paths from the issue text, checks each against
+    *known_paths* and the filesystem, then falls back to a basename search
+    via ``find``. Returns newly discovered paths so the caller can add them
+    to the preloaded context.
+    """
+    discovered: list[str] = []
+    for match in re.finditer(r"`([^`]{3,160})`", issue):
+        raw = match.group(1).strip().replace("./", "")
+        if not raw or len(raw) < 3 or "/" not in raw:
+            continue
+        if not re.search(r"\.[a-zA-Z][a-zA-Z0-9]{0,9}$", raw):
+            continue
+        if raw in known_paths:
+            continue
+        if (repo / raw).exists():
+            continue
+        basename = raw.rsplit("/", 1)[-1] if "/" in raw else raw
+        try:
+            result = subprocess.run(
+                ["find", str(repo), "-type", "f", "-name", basename,
+                 "-not", "-path", "*/node_modules/*",
+                 "-not", "-path", "*/.git/*"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().splitlines():
+                    rel = str(Path(line).relative_to(repo))
+                    if rel not in known_paths and rel not in discovered:
+                        discovered.append(rel)
+        except Exception:
+            pass
+    return discovered
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
