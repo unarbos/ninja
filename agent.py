@@ -36,12 +36,9 @@ Miner editing guide:
     context gathering, command selection, tool/result parsing, stopping logic,
     patch generation, safety checks, and how the agent uses its step budget.
 
-    Behavioral extras in this harness (for review: logic vs comment-only diffs):
-    multishot revert/retry with optional memo prefix; emergency single-shot when
-    attempt 1 is empty; TLE nudge inside the inner loop; preload block strip after
-    step 4; lint pass (ruff/eslint) in refinement; companion-test failure turn;
-    error-location lines appended to observations; observation truncation biased
-    to tracebacks.
+    Extras vs compact reference harness: multishot+memo, empty-attempt emergency
+    single-shot, TLE user nudge, preload HTML-marked block strip after step 4,
+    lint refinement gate, stderr path:line hints on observations.
 
     Keep these validator-owned boundaries intact:
     - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
@@ -129,7 +126,7 @@ MAX_TEST_FIX_TURNS = 1     # actually run the companion test if one exists
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # cap chained refinements (hail-mary exempt; see maybe_queue_refinement)
+MAX_TOTAL_REFINEMENT_TURNS = 2  # refinement cap per cycle (hail-mary exempt)
 
 # Cap for `_project_hint_block` text inside preloaded context.
 _STYLE_HINT_BUDGET = 600
@@ -544,36 +541,11 @@ ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOT
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
-# Models occasionally drop `<command>` tags entirely and use plain markdown
-# code fences for multi-step edits. Original fallback grabbed only the first
-# fenced block, so the rest of a multi-edit response was silently dropped and
-# the agent had to spend extra steps re-emitting the same edits. We now
-# collect every explicitly bash/sh-tagged fence, then fall back to a single
-# untagged fence (with shell-shape sanity check) for one-edit responses.
+# Fallback only for ```bash / ```sh fences (explicit tag required — no bare ``` ).
 _FENCED_BASH_RE = re.compile(
     r"```(?:bash|sh)\s*\n(.*?)```",
     flags=re.IGNORECASE | re.DOTALL,
 )
-_FENCED_ANY_RE = re.compile(
-    r"```([A-Za-z0-9_+-]*)\s*\n(.*?)```",
-    flags=re.DOTALL,
-)
-# Untagged fence is only treated as a command when the body starts with a
-# shell-shaped token. This avoids running pasted Python/JSON/diff snippets.
-_SHELL_SHAPE_PREFIXES = (
-    "sed ", "grep ", "rg ", "ls", "cat ", "echo ", "printf ", "git ",
-    "python ", "python3 ", "pip ", "pytest", "npm ", "pnpm ", "yarn ",
-    "node ", "go ", "cargo ", "make ", "ruff", "eslint", "tsc",
-    "mv ", "cp ", "mkdir ", "find ", "head ", "tail ", "awk ",
-    "diff ", "test ", "[ ", "if ", "for ", "while ",
-)
-
-
-def _looks_like_shell(body: str) -> bool:
-    head = body.lstrip()
-    if not head:
-        return False
-    return head.startswith(_SHELL_SHAPE_PREFIXES) or head.startswith("./")
 
 
 def extract_commands(model_text: str) -> List[str]:
@@ -590,23 +562,7 @@ def extract_commands(model_text: str) -> List[str]:
         for m in _FENCED_BASH_RE.finditer(model_text)
         if m.group(1).strip() and len(m.group(1)) <= 2000
     ]
-    if fenced_bash:
-        return fenced_bash
-
-    for m in _FENCED_ANY_RE.finditer(model_text):
-        lang = (m.group(1) or "").lower()
-        body = m.group(2).strip()
-        if not body or len(body) > 2000:
-            continue
-        if lang in {"diff", "patch", "json", "yaml", "yml", "xml", "html"}:
-            continue
-        if lang and lang not in {"", "bash", "sh", "shell", "console"}:
-            continue
-        if _looks_like_shell(body):
-            return [body]
-        return []
-
-    return []
+    return fenced_bash
 
 
 def extract_command(model_text: str) -> Optional[str]:
@@ -873,24 +829,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Preload the highest-ranked tracked files plus their companion tests.
-
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
-
-    Two improvements over a vanilla rank-and-read loop:
-
-      1. Companion tests are inserted next to source partners when tracked.
-
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
-    """
+    """Ranked source+partner tests with issue needles; returns text and paths for preload strip."""
     files = _rank_context_files(repo, issue)
     if not files:
         return "", []
@@ -1510,23 +1449,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# `_delimiter_balance_error` skips // and /* */ comments and treats ", ', and `
-# strings with \\ escapes. It is intentionally conservative: we only attach the
-# brace gate to C/Go/Java-style text where we have doc-level "unit" spot-checks
-# showing common char/rune literals do not false-positive.
-#
-# Hand corpus (spot-checked 2026-05-11 by importing this module and calling
-# `_delimiter_balance_error` on each snippet — all returned None):
-#   - Java char literal:     char c = '}'; class T { int x; }          -> None
-#   - Go escaped rune:     x := '\''                                  -> None
-#   - Go rune with brace:  func f() { x := '}' }                      -> None
-#   - C apostrophe in str: printf("can't"); void g() {}                -> None
-#   - C char literals:     char a = '{'; char b = '}'; void h() {}     -> None
-# Comment-only apostrophe: // don't break }                          -> None
-#
-# Not covered (suffixes intentionally omitted from the frozenset): C# verbatim
-# strings, Kotlin, Scala, ObjC, Rust (`'a` lifetimes), C++11 raw strings (R"( )")
-# — those can confuse the naive single-quote scan, so we do not claim support.
+# Brace-balance probe for touched C/C++/Java/Go (naive lexer; omit suffixes with raw strings/lifetimes).
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".java",
@@ -1914,42 +1837,12 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
-# -----------------------------
-# Companion-test runtime gate
-# -----------------------------
-#
-# Heuristic gates (coverage / criteria / self-check) catch the wrong target.
-# A real test runner is the only refinement signal that's grounded in actual
-# behaviour. When the patch edits `src/foo.py` and the repo has
-# `tests/test_foo.py`, run that test for ~8s and feed the failure tail back
-# to the model. Skip silently when the runner isn't installed, the test
-# isn't found, or the language has no fast static check available.
-
 def _run_companion_test(
     repo: Path,
     test_path: str,
     timeout_seconds: int = 8,
 ) -> Optional[str]:
-    """Run a single companion test and return failure tail, or None on pass.
-
-    Returns None when the test passes, the runner is unavailable, or the
-    language isn't supported. Returns a failure-output tail (string) on FAIL
-    so build_test_fix_prompt can quote it back at the model.
-
-    Languages handled:
-      - Python: prefer `pytest -x --tb=short -q --no-header <path>`. Fall
-        back to `python3 -m pytest ...` so a pip-installed pytest without
-        the entry script still works. If both runs report the runner is
-        unimportable (ModuleNotFoundError etc.), treat as unrunnable, not
-        a test failure.
-      - JS/TS: best-effort `node --check <path>`. Real jest/vitest needs
-        project config we can't synthesise in 8s on an unknown repo.
-      - Other languages: skipped (returns None).
-
-    Errors (timeout/runner-missing/exception) intentionally degrade to None
-    so the refinement chain doesn't queue a fix for something the agent
-    can't act on. The whole gate is best-effort.
-    """
+    """pytest (py) or node --check (JS); failure tail or None. Subprocess uses ``timeout_seconds``."""
     full = repo / test_path
     if not full.exists() or not full.is_file():
         return None
@@ -2397,7 +2290,7 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """Replace the marked preloaded block with short file breadcrumbs."""
+    """Substitute HTML-marked preload block with file name list."""
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -3285,27 +3178,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """If the current patch warrants a refinement turn, queue it.
+        """Return True if a refinement user turn was queued.
 
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success.
-
-        Order (unchanged from prior harness; rationale with MAX_TOTAL_REFINEMENT_TURNS=2):
-            Completeness before cosmetics: coverage/criteria nudges (paths and
-            acceptance text missing from the diff) fire before polish/syntax/lint
-            so capped turns address task gaps first. Companion test runs after
-            those nudges to avoid spending a runner turn on a patch still missing
-            stated paths/bullets. Self-check is last as a coarse diff review.
-
-        Sequence:
-            0. hail-mary — empty patch only; exempt from MAX_TOTAL_REFINEMENT_TURNS
-            1. coverage-nudge — issue-mentioned paths still untouched
-            2. criteria-nudge — acceptance bullets still unaddressed
-            3. companion-test failure tail (real runner)
-            4. polish — low-signal diff hunks
-            5. syntax — parser errors
-            6. lint — ruff/eslint when available
-            7. self-check — diff vs issue checklist
+        Same order as upstream single-file harness (polish → syntax → companion test →
+        coverage → criteria → self-check), plus **lint** after syntax. Companion test
+        uses `subprocess.run(..., timeout=timeout_seconds)` (default 8 — see
+        `_run_companion_test` / `_select_companion_test_failure`); coverage/criteria are
+        synchronous string scans only. Syntax runs before that subprocess so parse errors
+        skip the timed run.
+        Empty patch: hail-mary bypasses MAX_TOTAL_REFINEMENT_TURNS.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
@@ -3325,44 +3206,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
-        # Companion test: run partner test when present; queue one fix turn from real output.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -3388,6 +3231,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # New gate vs `2.py` reference: optional ruff/eslint after parse passes.
         if lint_turns_used < MAX_LINT_TURNS:
             lint_errors = _check_lint(repo, patch)
             if lint_errors:
@@ -3397,6 +3241,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_lint_fix_prompt(lint_errors),
                     "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -3436,7 +3317,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            # After step 4: drop preloaded snippet body from message[1] (see _strip_preloaded_section).
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
                 modified_files = _patch_changed_files(get_patch(repo))
