@@ -1537,39 +1537,41 @@ def _detect_frontend_gap(task_text: str, patch: str) -> str:
 
 
 # -----------------------------
-# v15: Post-generation domain blocklist sanitizer
-# -----------------------------
-
-    r'^\+[ \t]*[\w.-]+\.(?:com|net|org|co\.\w{2,3}|io|ai|uk|de|fr|ru|cn)\b'
-    r'[^\n]*(?:[-\u2013]\s*[\d,]{4,}|[\t ]+[\d,]{4,})',
-    re.IGNORECASE,
-)
-
-
-
-
-
 @dataclass
 class UISpec:
-    kind: str
-    description: str
-    search_tokens: list
+    kind: str             # 'column_count' | 'button_type' | 'section_id' | 'widget' | 'format' | 'image_size'
+    description: str      # Human-readable label for nudge prompt
+    search_tokens: list   # Token variants to look for in patch +lines (any match = covered)
 
 
-_COL_RE = re.compile(r'\b(\d+)[\s-]col(?:umn)?s?\b', re.I)
-_PAGINATION_RE = re.compile(r'\bpaginat\w*\b', re.I)
+_COL_RE = re.compile(r'\b(\d+)[- ]col(?:umn)?s?\b', re.I)
+
 _BTN_RE = re.compile(
-    r'\b(refresh|submit|delete|cancel|save|add|create|update|export|import|search|filter|reset)\s*button\b',
+    r'\b(primary|secondary|danger|warning|success|outline|ghost|'
+    r'submit|cancel|refresh|delete|add|save|export)\s+button\b',
     re.I,
 )
-_SECTION_ID_RE = re.compile(r'[#\s]([a-zA-Z][a-zA-Z0-9_-]{3,30})\s*section', re.I)
-_FORMAT_RE = re.compile(r'\b(YYYY[-/]MM[-/]DD|DD[-/]MM[-/]YYYY|ISO\s*8601|RFC\s*\d+|JSON|XML|CSV|TSV)\b', re.I)
-_IMAGE_SIZE_RE = re.compile(r'\b(\d+)\s*[xX×]\s*(\d+)\b')
+
+_SECTION_ID_RE = re.compile(
+    r'\bid\s*[=:]\s*["\']?([\w][\w-]{2,})["\']?'   # id="foo-bar"
+    r'|#([\w][\w-]{2,})\b(?!\s*\{)',               # #section-id (not CSS selector block)
+    re.I,
+)
+
+_PAGINATION_RE = re.compile(r'\b(paginat(?:e|ed|ion|ing)|paginator|page[- ]control)\b', re.I)
+
+_FORMAT_RE = re.compile(r'\b(png|jpg|jpeg|webp|svg|pdf|csv|xlsx|json)\b(?:\s+format|\s+file)?\b', re.I)
+
+_IMAGE_SIZE_RE = re.compile(r'\b(\d{2,4})\s*[x\xd7]\s*(\d{2,4})(?:\s*px)?\b')
+
 _LAYOUT_WIDGET_RE = re.compile(
-    r'\b(sidebar|modal|drawer|dropdown|accordion|carousel|tab|tooltip|toast|badge|breadcrumb|chip|avatar)\b',
+    r'\b(sidebar|drawer|modal|dialog|tooltip|popover|accordion|'
+    r'tab(?:s|panel)?|carousel|breadcrumb|stepper|timeline|chip|badge|avatar|'
+    r'skeleton|toast|snackbar|navbar|header|footer|hero|banner|card|panel)\b',
     re.I,
 )
-_GRID_RE = re.compile(r'\b(\d+)[\s-]row\s+grid\b|\bgrid[\s-](\d+)\b', re.I)
+
+_GRID_RE = re.compile(r'\b(\d)\s*[x\xd7]\s*(\d)\s+(?:grid|layout)\b', re.I)
 
 
 def _extract_ui_specs(task_text: str) -> list:
@@ -3037,6 +3039,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    fe_gap_nudges_used = 0         # v15: frontend gap gate
     deliverable_nudges_used = 0   # v14: named-file deliverable gate
     ui_spec_nudges_used = 0       # v15: UI structural spec gate
     chain_coverage_nudges_used = 0  # v15: backend chain coverage gate
