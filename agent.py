@@ -115,9 +115,10 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_HAIL_MARY_TURNS = 1       # last-resort: force a real edit when patch is empty after everything
+MAX_ENTERPRISE_HINTS = 1      # v14: enterprise framework conservative-mode nudge
+MAX_TOTAL_REFINEMENT_TURNS = 5  # v14: raised from 2 → 5 so new gates (pre-gen criteria, scope,
+                                # enterprise) are reachable; ninjaking66 PR#268 cap still preserved
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1045,7 +1046,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1906,6 +1907,103 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# v14: Pre-generation criteria check
+# -----------------------------
+
+def _pre_gen_criteria_check(issue: str, preloaded_context: str) -> str:  # noqa: ARG001
+    """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
+
+    Injects a pre-flight checklist into the initial prompt so the agent
+    addresses all criteria systematically rather than 60-80%.
+    Evidence: RC report Root Cause #3 — systematic 1-2 criteria misses on
+    atomic/retest tasks with explicitly numbered requirements.
+    """
+    criteria = _extract_acceptance_criteria(issue)
+    if not criteria or len(criteria) < 2:
+        return ""
+    items = "\n".join(f"  {i + 1}. {c}" for i, c in enumerate(criteria[:8]))
+    return (
+        f"\n[Pre-flight: {len(criteria)} acceptance criteria detected. "
+        f"Address ALL before finalizing:\n{items}\n"
+        f"Check each criterion is reflected in your diff.]\n"
+    )
+
+
+# -----------------------------
+# v14: Task scope classifier
+# -----------------------------
+
+_ATOMIC_SYSTEM_ADDENDUM = (
+    "\n[Scope: ATOMIC — single-file, focused change. "
+    "Produce the MINIMAL diff that satisfies the spec exactly. "
+    "Do NOT refactor, expand, or add features beyond the stated criteria.]\n"
+)
+_COMPLEX_SYSTEM_ADDENDUM = (
+    "\n[Scope: COMPLEX — multi-concern change. "
+    "Enumerate EVERY required integration point (routes, models, views, components) "
+    "in your plan BEFORE writing code.]\n"
+)
+
+
+def _classify_task_scope_v14(issue: str, ctx_lines: int) -> str:
+    """v14: Classify task scope using ACTUAL context size (not hardcoded 200).
+
+    Returns a scope addendum string injected into the initial user prompt.
+    Evidence: v13 B1 bug — hardcoded 200 made atomic mode never fire.
+    Retest pool has 60%+ atomic tasks where king scores 0.70+, we score 0.50.
+    """
+    task_len = len(issue)
+    file_mentions = len(re.findall(
+        r'\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b', issue, re.I
+    ))
+    complex_signals = ["redesign", "refactor entire", "architecture", "migrate", "rewrite"]
+
+    is_complex = (
+        task_len > 600
+        or file_mentions >= 4
+        or any(s in issue.lower() for s in complex_signals)
+    )
+    is_atomic = task_len < 250 and file_mentions <= 1 and ctx_lines < 80
+
+    if is_complex:
+        return _COMPLEX_SYSTEM_ADDENDUM
+    if is_atomic:
+        return _ATOMIC_SYSTEM_ADDENDUM
+    return ""
+
+
+# -----------------------------
+# v14: Enterprise framework detector
+# -----------------------------
+
+_ENTERPRISE_FRAMEWORKS = (
+    "spring boot", "laravel", "django", "rails", "asp.net", "fastapi",
+    "flask", "express", "nest.js", "strapi",
+)
+
+
+def _detect_enterprise_framework(issue: str, patch: str) -> str:  # noqa: ARG001
+    """v14: Detect enterprise framework tasks requiring strict spec-following.
+
+    Returns a hint string to inject as a refinement nudge, or empty string.
+    Evidence: retest pool has more Spring Boot/Laravel tasks where king scores
+    0.70+; these tasks require ALL acceptance criteria addressed precisely.
+    """
+    issue_lower = issue.lower()
+    if not any(fw in issue_lower for fw in _ENTERPRISE_FRAMEWORKS):
+        return ""
+    criteria = _extract_acceptance_criteria(issue)
+    if len(criteria) < 3:
+        return ""
+    matched_fw = next(fw for fw in _ENTERPRISE_FRAMEWORKS if fw in issue_lower)
+    return (
+        f"[Enterprise framework task detected ({matched_fw}). "
+        f"Be PRECISE: address all {len(criteria)} criteria exactly as specified. "
+        f"No extra changes beyond the spec.]\n"
+    )
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2184,8 +2282,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    return f"""Fix this issue:
+    # v14: Pre-flight criteria checklist (inject before issue text when criteria found)
+    _pgc = _pre_gen_criteria_check(issue, preloaded_context)
+    # v14: Scope addendum (atomic vs complex classification)
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
 
+    return f"""Fix this issue:{_pgc}
 {issue}
 
 Repository summary:
@@ -2201,7 +2303,7 @@ If the preloaded snippets show the target code, edit them directly — do not re
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
-"""
+{_scope}"""
 
 
 _PRELOAD_BLOCK_RE = re.compile(
@@ -2661,6 +2763,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    enterprise_hints_used = 0  # v14: enterprise framework conservative-mode nudge
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2706,7 +2809,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, enterprise_hints_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2805,6 +2908,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v14 gate: enterprise framework conservative-mode nudge.
+        # Fires after criteria-nudge on Spring/Laravel/Django/etc. tasks
+        # where strict spec-following is the dominant success factor.
+        if enterprise_hints_used < MAX_ENTERPRISE_HINTS:
+            ent_hint = _detect_enterprise_framework(issue, patch)
+            if ent_hint:
+                enterprise_hints_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    ent_hint,
+                    "ENTERPRISE_HINT_QUEUED",
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2830,7 +2948,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()  # wall-clock ref
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
