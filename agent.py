@@ -94,10 +94,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
-MAX_NO_COMMAND_REPAIRS = 3
-MAX_COMMANDS_PER_RESPONSE = 12
+MAX_PRELOADED_CONTEXT_CHARS = 36000
+MAX_PRELOADED_FILES = 12
+MAX_NO_COMMAND_REPAIRS = 2
+MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -107,10 +107,7 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# Inner `_solve_attempt` loop: abort when elapsed time exceeds this (minus reserve).
-# Emergency-inject threshold uses `max(WALL_CLOCK_BUDGET_SECONDS - 60, 60)`.
-# Overall multishot / retry budgeting is `_MULTISHOT_TOTAL_BUDGET`, not this value.
-WALL_CLOCK_BUDGET_SECONDS = 270.0
+WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -871,15 +868,21 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Returns ``(context_text, included_files)`` for later preload stripping (breadcrumb list).
+    Returns `(context_text, included_files)` so the caller can later strip the
+    bulky snippet block but still keep the file-name breadcrumb.
+
+    Two improvements over a vanilla rank-and-read loop:
 
       1. Companion tests are inserted next to source partners when tracked.
 
-      2. `_symbol_grep_hits` boosts rank for files containing issue-derived symbols.
+      2. Files that match identifier-shaped symbols extracted from the issue
+         text get a substantial rank boost via `_symbol_grep_hits`. This
+         catches the common case where the bug is described by function or
+         class name without mentioning the file path.
 
-    Issue-derived needles window large files around matching lines instead of truncating blindly.
-
-    Appends `_project_hint_block` when budget allows.
+    Each file snippet is fetched via `_read_context_file` with issue-derived
+    needles so we keep only the regions relevant to the task instead of the
+    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -889,6 +892,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+
     parts: List[str] = []
     included: List[str] = []
     used = 0
@@ -915,6 +919,37 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers (`_extract_issue_symbols`) first since they
+    are the strongest signal, then file-stem mentions (so `foo.py` in the
+    issue picks out lines referencing `foo`), then general issue terms.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1185,42 +1220,19 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: issue symbols, then path stems, then general terms.
-    """
-    out: List[str] = []
-    seen: set = set()
-
-    def add(token: str) -> None:
-        if not token:
-            return
-        key = token.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(token)
-
-    for sym in _extract_issue_symbols(issue):
-        add(sym)
-    for mention in _extract_issue_path_mentions(issue):
-        stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
-    for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
-    return out
-
-
 def _read_context_file(
     repo: Path,
     relative_path: str,
     max_chars: int,
     needles: Optional[List[str]] = None,
 ) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows."""
+    """Read a tracked file, optionally returning only issue-relevant windows.
+
+    When `needles` is provided and the file is larger than `max_chars`, we
+    extract regions around lines that match any needle (case-insensitive
+    substring) plus a few lines of context, instead of head/tail truncation.
+    Falls back to `_truncate` when no needles match or the file already fits.
+    """
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1246,7 +1258,14 @@ def _extract_relevant_regions(
     ctx_before: int = 8,
     ctx_after: int = 12,
 ) -> str:
-    """Return windows around lines matching any needle, capped at max_chars."""
+    """Return windows around lines matching any needle, capped at `max_chars`.
+
+    When the file already fits within `max_chars`, the whole file is returned
+    verbatim. When no needles match, fall back to `_truncate` (head/tail
+    summary). Otherwise produce a concatenation of merged windows around each
+    matching line, prefixed with line-range headers so the model can reason
+    about location.
+    """
     if not text:
         return text
     if len(text) <= max_chars:
@@ -2565,6 +2584,10 @@ You are producing the smallest complete patch most likely to match the hidden re
 '''
 
 
+_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
+_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2596,30 +2619,43 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 """
 
 
-def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """Initial user message plus multi-file / language strategy lines."""
-    base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
-    multi_file = _detect_multi_file_task(issue_text)
-    lang_block = ""
-    try:
-        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
-    except Exception:
-        lang_block = ""
+_PRELOAD_BLOCK_RE = re.compile(
+    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
+    re.DOTALL,
+)
 
-    if multi_file:
-        strategy = (
-            "Strategy override: this task likely spans MULTIPLE files. Identify every affected file, then "
-            "emit ALL edit commands for ALL files in ONE response. When you change a signature, type, or "
-            "interface, cascade to every caller. A coherent multi-file implementation beats a single-file stub."
+
+def _strip_preloaded_section(
+    initial_user_text: str,
+    preloaded_files: List[str],
+    modified_files: Optional[List[str]] = None,
+) -> str:
+    """Replace the bulky preloaded snippet block with a short breadcrumb.
+
+    Triggered after step 4 to free token budget for later iterations: the
+    model has already seen the snippets in earlier turns and only needs to
+    know which files were preloaded (and which it has already touched) so it
+    can re-open them on demand instead of re-reading the whole block on
+    every request.
+    """
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+
+    lines: List[str] = []
+    if modified_files:
+        lines.append("You modified these files so far: " + ", ".join(modified_files))
+    if preloaded_files:
+        lines.append(
+            "You previously inspected these files (snippets dropped to save context — "
+            "re-open with `sed -n` or `cat` if a region is needed): "
+            + ", ".join(preloaded_files)
         )
+    if not lines:
+        replacement = "[Preloaded context omitted to save token budget.]"
     else:
-        strategy = (
-            "Strategy override: find the ROOT CAUSE precisely, then implement completely. "
-            "If the task describes new functionality not already present, create the needed file(s) and wire "
-            "real behaviour — not TODOs or pass-through props. Skeleton patches lose to smaller working patches."
-        )
+        replacement = "\n".join(lines)
 
-    return base + lang_block + "\n" + strategy + "\n"
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def build_no_command_repair_prompt() -> str:
@@ -3396,10 +3432,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
-        _initial_user = _build_planning_user_message(repo, issue, repo_summary, preloaded_context)
-        if _multishot_memo:
-            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
-
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _initial_user},
@@ -3413,6 +3445,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            # Past step 4 the preloaded snippets are no longer load-bearing —
+            # the model has either used them or moved on. Replace the bulky
+            # block in the initial user message with a short breadcrumb so
+            # the next request fits more recent context within the token cap.
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
                 modified_files = _patch_changed_files(get_patch(repo))
