@@ -145,7 +145,7 @@ MAX_FRONTEND_GAP_TURNS = 1
 # and the worst-case chain length; if cap=5 routinely consumes the budget,
 # revert to cap=2 or cap=3. Until then this value is a judgement call, not
 # a measurement, and should be treated as such.
-MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 5  # TODO: validate empirically — see REFINEMENT_TURN_TIMING logs before raising
 _STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -3562,6 +3562,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
+    def _emit_refinement_summary() -> None:
+        """One-line summary of refinement-gate usage at solve() end. Pairs
+        with REFINEMENT_TURN_TIMING per-turn entries to validate the cap."""
+        _per_gate = {
+            "polish": polish_turns_used,
+            "self_check": self_check_turns_used,
+            "syntax": syntax_fix_turns_used,
+            "test": test_fix_turns_used,
+            "coverage": coverage_nudges_used,
+            "criteria": criteria_nudges_used,
+            "hail_mary": hail_mary_turns_used,
+            "integration": integration_nudges_used,
+            "artifact": artifact_nudges_used,
+            "dependency": dependency_nudges_used,
+            "contract": contract_turns_used,
+            "patch_safety": patch_safety_turns_used,
+            "failed_verification": failed_verification_turns_used,
+            "strict_criteria": strict_criteria_turns_used,
+            "dead_helper": dead_helper_turns_used,
+            "lint": lint_turns_used,
+            "deliverable": deliverable_turns_used,
+            "frontend_gap": frontend_gap_turns_used,
+        }
+        _fired = " ".join(f"{k}={v}" for k, v in _per_gate.items() if v > 0)
+        logs.append(
+            f"\nREFINEMENT_SUMMARY: total_turns={total_refinement_turns_used} "
+            f"elapsed_total_s={time.monotonic() - solve_started_at:.2f}"
+            + ((" " + _fired) if _fired else "")
+            + "\n"
+        )
+
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
     # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 580s`), but
     # that wrapper only checks elapsed time *between* attempts. Without an
@@ -4143,6 +4174,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+        _emit_refinement_summary()
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
@@ -4160,6 +4192,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 patch = get_patch(repo)
             except Exception:
                 pass
+        try:
+            _emit_refinement_summary()
+        except Exception:
+            pass
 
         return AgentResult(
             patch=patch,
