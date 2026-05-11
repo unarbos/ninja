@@ -208,6 +208,53 @@ def _truncate(text: str, max_chars: int) -> str:
     )
 
 
+_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "RuntimeError",
+    "FAIL ",
+    "FAILED ",
+    "error:",
+    "Error:",
+    "panic:",
+)
+
+
+def _truncate_around_error(text: str, max_chars: int) -> str:
+    """Like _truncate() but centers the window on the first known error marker
+    when one would otherwise be lost in the middle of a long observation.
+
+    Long test output (pytest, compiler errors) places the actual error between
+    the "collected N tests" header and the summary footer — both ends visible
+    under head/tail splitting, but the failure body itself dropped. Centering
+    on the first marker preserves the actionable signal. Falls through to
+    plain head/tail when no marker is found or when the marker already falls
+    within the head half.
+    """
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker < half or first_marker > len(text) - half:
+        return _truncate(text, max_chars)
+    start = max(0, first_marker - max_chars // 3)
+    end = min(len(text), start + max_chars)
+    prefix = "" if start == 0 else f"...[head {start} chars]...\n"
+    suffix = "" if end == len(text) else f"\n...[tail {len(text) - end} chars]..."
+    return prefix + text[start:end] + suffix
+
+
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
@@ -425,8 +472,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -441,8 +488,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(
+                stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS
+            ),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -582,6 +631,34 @@ def get_patch(repo: Path) -> str:
     return _strip_low_signal_hunks(cleaned)
 
 
+def _validate_patch_applies(repo: Path, patch: str) -> Optional[str]:
+    """Return None if the unified diff is a valid description of the current
+    working-tree delta vs HEAD; else return a short error tail.
+
+    Uses `git apply --check --reverse` which is read-only and bounded to 8s.
+    Empty patches are treated as valid — the hail-mary path owns that case.
+    Any infrastructure failure degrades to None so this never blocks shipping.
+    """
+    if not patch.strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--reverse", "-"],
+            cwd=str(repo),
+            input=patch,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    return err[-600:] if err else "git apply --check returned non-zero"
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -616,6 +693,105 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     if path.suffix == ".pyc":
         return True
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+
+
+def _prune_offtopic_hunks(
+    repo: Path,
+    patch: str,
+    issue_text: str,
+    max_drop_ratio: float = 0.30,
+) -> Tuple[str, List[str]]:
+    """Return (filtered_patch, dropped_file_summaries).
+
+    Scores each file block in the patch by overlap with issue content:
+      +8 if the file's path appears in the issue's explicit path mentions.
+      +5 per backtick-wrapped identifier from the issue found in the block.
+      +3 per issue term (from _issue_terms) found in the block's added lines.
+    File blocks scoring 0 across all their hunks are dropped. To avoid gutting
+    a legitimately sweeping refactor, at most floor(max_drop_ratio * total_files)
+    files are dropped. If dropping would leave an empty patch the original is
+    returned unchanged.
+
+    Dropped files are reverted in the working tree via `git checkout` so the
+    on-disk state matches the returned filtered patch. Pure text processing —
+    no LLM call, negligible wall-clock cost.
+    """
+    if not patch.strip():
+        return patch, []
+
+    issue_paths = set(_extract_issue_path_mentions(issue_text))
+    issue_idents = set(_BACKTICK_IDENT_RE.findall(issue_text))
+    issue_terms_list = _issue_terms(issue_text)
+
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    file_blocks: List[Tuple[str, str]] = []  # (relative_path, block_text)
+    for block in blocks:
+        if not block:
+            continue
+        m = re.match(r"diff --git a/(.+?) b/(.+?)(?:\n|$)", block)
+        if not m:
+            file_blocks.append(("", block))
+            continue
+        file_blocks.append((m.group(2), block))
+
+    total_files = len(file_blocks)
+    max_drop = max(0, int(total_files * max_drop_ratio))
+
+    def _score_file_block(relative_path: str, block_text: str) -> int:
+        score = 0
+        normalized = relative_path.strip("./")
+        if any(normalized == p or normalized.endswith("/" + p) or p.endswith("/" + normalized)
+               for p in issue_paths):
+            score += 8
+        block_lower = block_text.lower()
+        added_lines = " ".join(
+            line[1:] for line in block_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ).lower()
+        for ident in issue_idents:
+            if ident.lower() in block_lower:
+                score += 5
+        for term in issue_terms_list:
+            if term in added_lines:
+                score += 3
+        return score
+
+    scored_blocks = [
+        (_score_file_block(rp, bt), rp, bt)
+        for rp, bt in file_blocks
+    ]
+
+    zero_score = [(rp, bt) for s, rp, bt in scored_blocks if s == 0 and rp]
+    to_drop = zero_score[:max_drop]
+    if not to_drop:
+        return patch, []
+
+    drop_set = {rp for rp, _ in to_drop}
+    kept_blocks = [bt for _s, rp, bt in scored_blocks if rp not in drop_set]
+    if not kept_blocks:
+        return patch, []
+
+    filtered = "".join(kept_blocks)
+    if not filtered.strip():
+        return patch, []
+
+    # Revert dropped files in working tree so git diff matches filtered patch.
+    for relative_path in drop_set:
+        try:
+            subprocess.run(
+                ["git", "checkout", "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    dropped_summaries = [f"{rp} (score=0)" for rp, _ in to_drop]
+    return filtered, dropped_summaries
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -2419,6 +2595,33 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_missing_paths_hail_mary_prompt(
+    missing_paths: List[str], issue_text: str,
+) -> str:
+    """Last-resort prompt for a non-empty patch that skips issue-mentioned paths.
+
+    The hail-mary slot (exempt from MAX_TOTAL_REFINEMENT_TURNS) is normally
+    used only when the patch is empty. This re-uses it for the orthogonal case
+    where the patch is non-empty but systematically misses files the issue
+    names. An escape hatch (<final>NO-OP</final>) lets the model skip the extra
+    edit when the paths are referenced rather than targeted by the issue.
+    """
+    paths_block = "\n".join(f"  - {p}" for p in missing_paths[:6])
+    return (
+        "FINAL TARGETING CHECK. The current diff edits some files, "
+        "but the issue explicitly names these paths and your patch "
+        "does not touch any of them:\n"
+        f"{paths_block}\n\n"
+        "If the issue's intent genuinely requires changes in those "
+        "files, add the necessary edits NOW in one final turn. If "
+        "you are confident the issue's text is naming those paths "
+        "only as references (not as edit targets), reply with "
+        "<final>NO-OP</final> and we will ship the current diff. "
+        "Do not produce a verbose plan — produce the patch or the "
+        "no-op.\n"
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2446,6 +2649,20 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
+_SAFE_MULTISHOT_TOTAL_BUDGET = 420.0
+
+
+def _compute_solve_deadline() -> float:
+    """Return the effective end-to-end wall-clock budget for the whole solve().
+
+    Uses a tighter static budget than the legacy _MULTISHOT_TOTAL_BUDGET to
+    prevent the multi-shot driver from launching a second attempt when the
+    validator's per-round timeout is already close. The validator's timeout is
+    variable (120–600s depending on task difficulty); a fixed 580s envelope
+    overshoots on easy tasks and causes mid-attempt external kills that return
+    nothing instead of attempt-1's on-disk patch.
+    """
+    return _SAFE_MULTISHOT_TOTAL_BUDGET
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2582,7 +2799,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         _multishot_started = time.monotonic()
-        _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
+        _multishot_total_budget = _compute_solve_deadline()
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
         _result1 = _solve_attempt(**kwargs)
@@ -2594,7 +2811,13 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _remaining = _multishot_total_budget - _elapsed
+        _patch1_nonempty = bool(_patch1.strip())
+        if _patch1_nonempty and _remaining < 2 * WALL_CLOCK_RESERVE_SECONDS:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "patch1_nonempty_low_budget"
+            return _result1
+        if _remaining < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
@@ -2723,6 +2946,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
             return False
+
+        # Re-use the hail-mary slot for the orthogonal case: patch is non-empty
+        # but skips files the issue explicitly named. The coverage-nudge gate
+        # fires under MAX_TOTAL_REFINEMENT_TURNS and can be crowded out by
+        # polish+syntax; this path is exempt from that cap so the gap always
+        # gets surfaced to the model at least once.
+        if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+            _missing_hm = _uncovered_required_paths(patch, issue)
+            if _missing_hm:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_paths_hail_mary_prompt(_missing_hm, issue),
+                    "MISSING_PATHS_HAIL_MARY_QUEUED:\n  " + ", ".join(_missing_hm[:4]),
+                )
+                return True
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -3019,6 +3258,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+
+        # Prune off-topic hunks: drop file diffs that score zero overlap with
+        # the issue. Caps at 30% of files so sweeping refactors are preserved.
+        if patch.strip():
+            _pruned, _dropped = _prune_offtopic_hunks(repo, patch, issue_text=issue)
+            if _dropped:
+                patch = get_patch(repo)  # re-read after working-tree revert
+                logs.append(
+                    "PRUNE_OFFTOPIC_HUNKS: dropped=" + str(len(_dropped))
+                    + " " + "; ".join(_dropped[:4])
+                )
+
+        # Verify the final diff is coherent. Re-try once with a fresh read
+        # in case the diff drifted during refinement. On persistent failure,
+        # log the error and clear success so the safety net records the issue.
+        if patch.strip():
+            _apply_err = _validate_patch_applies(repo, patch)
+            if _apply_err is not None:
+                patch = get_patch(repo)
+                _apply_err2 = _validate_patch_applies(repo, patch)
+                if _apply_err2 is not None:
+                    logs.append(
+                        "PATCH_APPLY_CHECK_FAILED:\n" + _apply_err2
+                    )
+                    success = False
+
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
