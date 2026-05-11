@@ -793,6 +793,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         return "", []
 
     tracked_set = set(_tracked_files(repo))
+    issue_tests = _find_issue_tests(repo, issue, tracked_set)
+    files = _merge_priority_files(files, issue_tests)
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
@@ -975,6 +977,20 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
         if value and value not in mentions:
             mentions.append(value)
     return mentions
+
+
+def _merge_priority_files(files: List[str], priority: List[str]) -> List[str]:
+    """Put high-confidence issue-mentioned files first without duplicates."""
+    if not priority:
+        return files
+    merged: List[str] = []
+    seen: set = set()
+    for relative_path in [*priority, *files]:
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        merged.append(relative_path)
+    return merged
 
 
 def _issue_terms(issue: str) -> List[str]:
@@ -1563,6 +1579,41 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _looks_like_test_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    lowered = str(path).lower()
+    name = path.name.lower()
+    return (
+        "test" in name
+        or "spec" in name
+        or "/tests/" in f"/{lowered}"
+        or lowered.startswith("tests/")
+        or lowered.startswith("spec/")
+    )
+
+
+def _find_issue_tests(repo: Path, issue_text: str, tracked: Optional[set] = None) -> List[str]:
+    """Return existing test files explicitly named in the issue text."""
+    tracked_set = tracked if tracked is not None else set(_tracked_files(repo))
+    if not tracked_set:
+        return []
+    found: List[str] = []
+    for mention in _extract_issue_path_mentions(issue_text):
+        if not _looks_like_test_path(mention):
+            continue
+        matches = [
+            candidate
+            for candidate in tracked_set
+            if (candidate == mention or candidate.endswith("/" + mention))
+            and _context_file_allowed(candidate)
+        ]
+        for candidate in sorted(matches, key=len):
+            if candidate not in found:
+                found.append(candidate)
+                break
+    return found[:3]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -1685,6 +1736,7 @@ def _run_companion_test(
 def _select_companion_test_failure(
     repo: Path,
     patch: str,
+    issue_text: str = "",
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
     """For files touched by the patch, find the first companion test that fails.
@@ -1699,6 +1751,10 @@ def _select_companion_test_failure(
     tracked = set(_tracked_files(repo))
     if not tracked:
         return None
+    for test_path in _find_issue_tests(repo, issue_text, tracked):
+        output = _run_companion_test(repo, test_path, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (test_path, output)
     for relative_path in edited:
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
@@ -2339,6 +2395,8 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
+        "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
@@ -2763,7 +2821,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_companion_test_failure(repo, patch, issue)
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
