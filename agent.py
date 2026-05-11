@@ -3652,14 +3652,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
 
-        # Final off-topic prune: drop file diffs scoring zero overlap with the
-        # issue. Capped at 30% of files so sweeping refactors are preserved.
-        # Runs AFTER PATCH_RETURN's success flip so an empty result here cannot
-        # accidentally regress success — the prune helper itself short-circuits
-        # on empty input and won't reduce the patch to empty.
+        # Off-topic prune helper stays available for local tuning; max_drop_ratio=0
+        # keeps production behavior identical to the returned git diff (no post-hoc
+        # patch shaping for downstream judges).
         if patch.strip():
             try:
-                _, _dropped = _prune_offtopic_hunks(repo, patch, issue_text=issue)
+                _, _dropped = _prune_offtopic_hunks(
+                    repo, patch, issue_text=issue, max_drop_ratio=0.0
+                )
             except Exception as _prune_exc:
                 _, _dropped = patch, []
                 logs.append("PRUNE_OFFTOPIC_HUNKS_ERROR:\n" + repr(_prune_exc)[:300])
