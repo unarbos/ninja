@@ -116,7 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 5  # v14: 5 gates need 5 turns to be reachable
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1045,7 +1045,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1563,6 +1563,105 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _find_issue_tests(repo: Path, task_text: str) -> List[str]:
+    """Find test files explicitly mentioned or implied by the task description.
+    Different from _find_test_partner which works from source files.
+    Returns list of relative paths (max 2), empty if none found."""
+    import re as _re
+    candidates: List[str] = []
+    # Match explicit test file patterns in the task
+    for m in _re.finditer(
+        r"(test[\w/\-]*\.(?:js|ts|py|rb|go|java)|[\w/\-]*\.test\.\w+|[\w/\-]*_test\.\w+|[\w/\-]*spec\.\w+)",
+        task_text, _re.I
+    ):
+        path = m.group(1).strip("./")
+        full = repo / path
+        if full.exists():
+            candidates.append(path)
+    # Deduplicate and return
+    seen: set = set()
+    valid: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            valid.append(c)
+    return valid[:2]
+
+
+# ─── CL-GPT-v14 additions ─────────────────────────────────────────────────
+
+_ATOMIC_SYSTEM_ADDENDUM = (
+    "\n[Scope: ATOMIC — single-file, focused change. "
+    "Produce the MINIMAL diff that satisfies the spec exactly. "
+    "Do NOT refactor, expand, or add features beyond the stated criteria.]\n"
+)
+_COMPLEX_SYSTEM_ADDENDUM = (
+    "\n[Scope: COMPLEX — multi-concern change. "
+    "Enumerate EVERY required integration point in your plan BEFORE writing code.]\n"
+)
+_ENTERPRISE_FRAMEWORKS = (
+    "spring boot", "laravel", "django", "rails", "asp.net",
+    "fastapi", "flask", "express", "nestjs", "nest.js",
+)
+
+
+def _pre_gen_criteria_check(issue: str) -> str:
+    """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
+    Injects a pre-flight checklist into the initial prompt.
+    Evidence: RC report Root Cause #3 — systematic 1-2 criteria misses each duel.
+    """
+    criteria = _extract_acceptance_criteria(issue)  # king's existing function
+    if not criteria or len(criteria) < 2:
+        return ""
+    items = chr(10).join(f"  {i+1}. {c}" for i, c in enumerate(criteria[:8]))
+    return (
+        f"\n[Pre-flight: {len(criteria)} acceptance criteria detected. "
+        f"Address ALL before finalizing:\n{items}\n"
+        f"Verify each criterion is reflected in your diff before submitting.]\n"
+    )
+
+
+def _classify_task_scope_v14(issue: str, ctx_lines: int) -> str:
+    """v14: Classify task scope using ACTUAL preloaded context line count.
+    v13 had B1 bug: hardcoded 200 made atomic mode never fire.
+    Evidence: retest pool has 60%+ atomic tasks. King scores 0.70+ on these.
+    """
+    task_len = len(issue)
+    file_mentions = len(re.findall(
+        r"\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b", issue, re.I
+    ))
+    complex_signals = ["redesign", "refactor entire", "architecture", "migrate", "rewrite"]
+    is_complex = (
+        task_len > 600
+        or file_mentions >= 4
+        or any(s in issue.lower() for s in complex_signals)
+    )
+    is_atomic = task_len < 250 and file_mentions <= 1 and ctx_lines < 80
+    if is_complex:
+        return _COMPLEX_SYSTEM_ADDENDUM
+    if is_atomic:
+        return _ATOMIC_SYSTEM_ADDENDUM
+    return ""
+
+
+def _detect_enterprise_framework(issue: str) -> str:
+    """v14: Detect enterprise framework tasks requiring precise spec-following.
+    Evidence: retest pool has more Spring Boot/Laravel tasks → king 0.70+ there.
+    """
+    issue_lower = issue.lower()
+    for fw in _ENTERPRISE_FRAMEWORKS:
+        if fw in issue_lower:
+            criteria = _extract_acceptance_criteria(issue)
+            if len(criteria) < 3:
+                return ""
+            return (
+                f"[Enterprise framework ({fw}): Be PRECISE. "
+                f"Address all {len(criteria)} criteria exactly. "
+                f"No extra changes beyond the spec.]\n"
+            )
+    return ""
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -1905,6 +2004,44 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+# Tuples of frontend framework signals and file extensions
+_FE_TASK_SIGNALS = (
+    ".vue", "vue component", "react component", "next.js", "nextjs",
+    "page.tsx", "page.jsx", "svelte", "angular component",
+    "nuxt", "remix route", "gatsby page",
+)
+_FE_ONLY_EXTS = frozenset({".vue", ".jsx", ".tsx", ".svelte"})
+_BE_ONLY_EXTS = frozenset({".py", ".java", ".rb", ".go", ".php", ".rs", ".cs", ".kt"})
+
+
+def _detect_frontend_gap(task_text: str, patch: str) -> str:
+    """Return a coaching hint when the task requires frontend changes but the
+    patch only touches backend files. Empty string means no gap detected.
+
+    Rationale: ~3 rounds per duel lost because we implement Spring Boot / FastAPI
+    but miss the required Vue/React/Next.js page. King catches this; we don't.
+    """
+    task_lower = task_text.lower()
+    fe_signals = sum(1 for sig in _FE_TASK_SIGNALS if sig in task_lower)
+    if fe_signals < 1:
+        return ""
+    # Check the diff header lines
+    import re as _re
+    diff_files = _re.findall(r"^(?:\+\+\+|---)\s+[ab]/(\S+)", patch, _re.M)
+    changed_ext_set = {os.path.splitext(f)[1].lower() for f in diff_files}
+    # If any frontend extension is changed, no gap
+    if changed_ext_set & _FE_ONLY_EXTS:
+        return ""
+    # If all changed files are backend, report gap
+    if changed_ext_set and changed_ext_set.issubset(_BE_ONLY_EXTS):
+        return (
+            f"[Frontend gap detected: task mentions '{next(s for s in _FE_TASK_SIGNALS if s in task_lower)}' "
+            f"but patch only touches backend files ({', '.join(sorted(changed_ext_set))}). "
+            f"Ensure required frontend pages/components are also created or modified.]"
+        )
+    return ""
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2184,7 +2321,10 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    return f"""Fix this issue:
+    _pgc = _pre_gen_criteria_check(issue)
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
+    _prefix = _pgc + _scope
+    return _prefix + f"""Fix this issue:
 
 {issue}
 
@@ -2804,6 +2944,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
+        # v14: enterprise framework precision hint
+        _ef_hint = _detect_enterprise_framework(issue)
+        if _ef_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(assistant_text, _ef_hint, "ENTERPRISE_FW_HINT")
+            return True
+
+
+        # v11: frontend gap detection
+        _fe_hint = _detect_frontend_gap(issue, patch)
+        if _fe_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                _fe_hint,
+                "FE_GAP_DETECTED",
+            )
+            return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -2829,8 +2987,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
