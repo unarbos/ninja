@@ -2115,8 +2115,10 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
+- Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
 </plan>
@@ -2134,6 +2136,8 @@ ISSUE CONTRACT
 
 Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
 
+Exact detail fidelity matters: if the issue names a path, route, env key, response field, UI label, CSS class owner, numeric scale, image size, provider list, or validation case, preserve it exactly unless nearby code proves a canonical local spelling. Do not replace a specific requirement with an approximate implementation.
+
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
 Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
@@ -2145,6 +2149,13 @@ INSPECTION STRATEGY
 Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+
+Owner discovery before editing:
+- UI/layout tasks: inspect the parent page/container plus existing theme/style/layout owner before editing only a leaf component. If the task asks for shared layout, inspect at least one consumer page.
+- Route/command/navigation tasks: inspect both the registration table and the destination handler/component. A link or route without its target is incomplete.
+- Backend/refactor tasks: inspect the executor/router/service owner and one caller/callee in each direction before changing signatures or dependency injection.
+- Parser/protocol tasks: inspect parser, command/model type, and executor/handler together; changing only one layer often compiles poorly or misses behavior.
+- Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
 
 ====================================================================
 ROOT CAUSE RULE
