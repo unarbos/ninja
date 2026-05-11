@@ -119,6 +119,7 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
+MAX_HAZARD_REVIEW_TURNS = 1  # catch diff hazards that are cheap to repair pre-final
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1063,7 +1064,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1311,6 +1312,95 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+def _patch_added_removed_by_file(patch: str) -> Dict[str, Tuple[List[str], List[str]]]:
+    """Collect added/removed source lines by file from a unified diff."""
+    out: Dict[str, Tuple[List[str], List[str]]] = {}
+    current: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current = tokens[3][2:]
+                out.setdefault(current, ([], []))
+            continue
+        if current is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            out[current][0].append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            out[current][1].append(line[1:])
+    return out
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"\b(?:TODO_URL|YOUR_[A-Z0-9_]+|PROJECT_REF|example\.com|localhost:\d+)\b|"
+    r"\[(?:YOUR|PROJECT|REPLACE)[^\]]*\]|"
+    r"https?://(?:your-|replace-|example\.)[^\s'\"<>]+",
+    re.IGNORECASE,
+)
+_ROUTE_PARAM_RE = re.compile(r"[:{<]([A-Za-z_][A-Za-z0-9_]*)[>}]?")
+_REQ_PARAM_RE = re.compile(r"(?:req|request)\.params(?:\.|\[['\"])([A-Za-z_][A-Za-z0-9_]*)")
+_JS_HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]*\s*\(")
+
+
+def _hazard_review_summary(patch: str) -> str:
+    """Spot cheap-to-fix patch hazards before the final self-check."""
+    if not patch.strip():
+        return ""
+
+    notes: List[str] = []
+    if re.search(r"^(?:old mode|new mode|new file mode|deleted file mode)\s+", patch, re.MULTILINE):
+        notes.append("file mode or permission metadata changed; remove it unless the issue explicitly asks")
+    if "GIT binary patch" in patch or re.search(r"^Binary files ", patch, re.MULTILINE):
+        notes.append("binary/generated-file diff detected; avoid binary/cache churn unless explicitly required")
+    if re.search(r"\.(?:pyc|pyo|class|o|so|dll|dylib|png|jpg|jpeg|gif|webp|zip|tar|gz)$", patch, re.MULTILINE):
+        notes.append("generated/cache/binary-looking file touched; confirm it is required or revert it")
+    if _PLACEHOLDER_RE.search(patch):
+        notes.append("placeholder URL/token text appears in the diff; replace with real existing config or remove it")
+
+    for path, (added, removed) in _patch_added_removed_by_file(patch).items():
+        added_text = "\n".join(added)
+        removed_text = "\n".join(removed)
+        if re.search(r"\b(useState|useEffect|useMemo|useCallback|useRef|useReducer)\b", added_text):
+            if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
+                notes.append(f"{path}: removed 'use client' while adding/keeping React hooks")
+        if path.endswith((".tsx", ".jsx")) and _JS_HOOK_RE.search(added_text):
+            if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
+                notes.append(f"{path}: client component directive may be missing for hook usage")
+
+        removed_exports = set(re.findall(r"^\s*(?:export\s+)?(?:class|function|const|let|var|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)", removed_text, re.MULTILINE))
+        if removed_exports:
+            stale_imports = [
+                name for name in removed_exports
+                if re.search(rf"^\s*import\b.*\b{name}\b", added_text, re.MULTILINE)
+            ]
+            if stale_imports:
+                notes.append(f"{path}: added import references removed symbol(s): {', '.join(stale_imports[:3])}")
+
+        route_params = set()
+        req_params = set()
+        for line in added:
+            if "route" in line.lower() or "path" in line.lower() or "router" in line.lower():
+                route_params.update(_ROUTE_PARAM_RE.findall(line))
+            req_params.update(_REQ_PARAM_RE.findall(line))
+        filtered_route_params = {p for p in route_params if p not in {"http", "https"}}
+        if filtered_route_params and req_params and filtered_route_params.isdisjoint(req_params):
+            notes.append(
+                f"{path}: route parameter names {sorted(filtered_route_params)[:3]} "
+                f"do not match request params {sorted(req_params)[:3]}"
+            )
+
+    deduped: List[str] = []
+    seen: set = set()
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "\n".join(f"- {note}" for note in deduped[:6])
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2450,6 +2540,8 @@ If the preloaded snippets show the target code, edit them directly — do not re
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
+If the issue spans multiple architectural concerns (route/router/API/endpoint, model/schema/migration, controller/service, page/view/component/form, hook/store), enumerate each required owner and integration point in your <plan> before editing.
+
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
 
@@ -2714,6 +2806,19 @@ def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> s
         "finish with <final>summary</final> and say why. Otherwise add the "
         "minimal manifest entry needed for the import to work. Do not add "
         "unused dependencies.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
+    return (
+        "Pre-final hazard review: the current diff has one or more common "
+        "patch hazards that often lose review or hidden tests.\n\n"
+        f"{hazard_summary}\n\n"
+        "Inspect the relevant lines and either fix/revert the hazard, or if it "
+        "is intentionally required by the issue, finish with <final>summary</final> "
+        "and name why it is required. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -2992,6 +3097,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
+    hazard_review_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3034,12 +3140,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             6. integration-nudge — make new code reachable from routes/nav/API
             7. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
             8. dependency-nudge — add metadata for new external packages
-            9. self-check — show the diff and ask "did you cover everything?"
+            9. hazard-review — catch cheap diff hazards before broad self-check
+            10. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3171,6 +3278,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_dependency_nudge_prompt(dependency_summary, issue),
                     "DEPENDENCY_NUDGE_QUEUED:\n  " + dependency_summary[:120],
+                )
+                return True
+
+        if hazard_review_turns_used < MAX_HAZARD_REVIEW_TURNS:
+            hazard_summary = _hazard_review_summary(patch)
+            if hazard_summary:
+                hazard_review_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hazard_review_prompt(hazard_summary, issue),
+                    "HAZARD_REVIEW_QUEUED:\n  " + hazard_summary.replace("\n", " ")[:160],
                 )
                 return True
 
