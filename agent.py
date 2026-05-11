@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0
+WALL_CLOCK_BUDGET_SECONDS = 280.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -2207,12 +2207,14 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 
 ====================================================================
-EDITING TIP — FOCUSED DIFF
+EDITING TIP — COMPLETE COVERAGE FIRST
 ====================================================================
 
-Prefer the smallest focused change that satisfies the literal issue wording. Narrow edits over broad rewrites. Match surrounding style (indentation, quotes, braces). If extra files beyond what the issue names are not strictly required, prefer not to touch them.
+Read the entire issue and count every acceptance criterion. Each criterion typically needs at least one code change in at least one file. Cover ALL criteria — an incomplete patch loses against the king even if the edits you made are correct.
 
-If a test fails, check whether it is genuinely caused by your change or is a pre-existing failure before expanding the patch.'''
+Strategy: breadth-first. Make one edit per required file, then verify all criteria are addressed. Do not stop after editing one file when the task names multiple files, features, or acceptance criteria.
+
+Match surrounding style (indentation, quotes, braces). Prefer narrow edits that exactly satisfy the literal wording. If a file is explicitly named in the issue, it must be edited.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2528,7 +2530,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
+_MULTISHOT_TOTAL_BUDGET = 620.0  # 2 x 280 = 560, leaves 60s reserve
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
@@ -2639,8 +2641,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-        Two attempts at WALL_CLOCK_BUDGET_SECONDS=255 already saturate the
-        _MULTISHOT_TOTAL_BUDGET=580s envelope (2 x 255 = 510, leaving 70s reserve). A third attempt would have to
+        Two attempts at WALL_CLOCK_BUDGET_SECONDS=280 already saturate the
+        _MULTISHOT_TOTAL_BUDGET=620s envelope (2 x 280 = 560, leaving 60s reserve). A third attempt would have to
        be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
        The empty-patch case is already handled inside `_solve_attempt` by
