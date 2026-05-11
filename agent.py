@@ -817,7 +817,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> str:
+def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
     Three improvements over a vanilla rank-and-read loop:
@@ -844,7 +844,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return ""
+        return "", []
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
@@ -858,6 +858,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
             anchor_map.setdefault(anchor_path, []).append((anchor_start, anchor_end))
 
     parts: List[str] = []
+    included: List[str] = []
     used = 0
 
     if region_anchors:
@@ -876,13 +877,14 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
         if relative_path in anchor_map:
             snippet = _read_context_file_focused(repo, relative_path, anchor_map[relative_path], per_file_budget)
         else:
-            snippet = _read_context_file(repo, relative_path, per_file_budget)
+            snippet = _read_context_file(repo, relative_path, per_file_budget, needles=_preload_needles(issue))
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
+        included.append(relative_path)
         used += len(block)
 
     create_hint = _files_to_create_hint(issue, tracked_set)
@@ -902,7 +904,7 @@ def build_preloaded_context(repo: Path, issue: str) -> str:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), included
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -939,6 +941,33 @@ def _files_to_create_hint(issue_text: str, tracked_set: set) -> str:
         "among tracked files; create only if the task actually requires them):\n"
         + "\n".join(f"  - {candidate}" for candidate in candidates)
     )
+
+
+def _preload_needles(issue: str) -> List[str]:
+    """Build issue-derived needles for focused slices of large context files."""
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        token = (token or "").strip()
+        if len(token) < 3:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for symbol in _extract_issue_symbols(issue):
+        add(symbol)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem:
+            add(stem)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1079,7 +1108,12 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1092,7 +1126,69 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    """Return windows around issue-matching lines in a large context file."""
+    if not text or len(text) <= max_chars:
+        return text
+
+    needle_keys: List[str] = []
+    seen: set[str] = set()
+    for needle in needles:
+        key = (needle or "").lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needle_keys.append(key)
+    if not needle_keys:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for idx, line in enumerate(lines):
+        line_lower = line.lower()
+        if any(key in line_lower for key in needle_keys):
+            matched.append(idx)
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for idx in matched:
+        start = max(0, idx - ctx_before)
+        end = min(len(lines), idx + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total = len(lines)
+    omitted = 0
+    for window_idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total} ---"
+        body = "\n".join(f"{line_no + 1:5d}| {lines[line_no]}" for line_no in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - window_idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted:
+        parts.append(f"... [{omitted} more relevant region(s) omitted to stay within budget] ...")
+    return "\n\n".join(parts)
 
 
 def _read_context_file_focused(
@@ -3252,13 +3348,23 @@ def _build_task_type_block(issue_text: str) -> str:
     return f"\n{addendum}\n" if addendum else ""
 
 
+_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
+_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
+_PRELOAD_BLOCK_RE = re.compile(
+    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
+    re.DOTALL,
+)
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
+{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
+{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -3279,6 +3385,27 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+def _strip_preloaded_section(
+    initial_user_text: str,
+    preloaded_files: List[str],
+    modified_files: Optional[List[str]] = None,
+) -> str:
+    """Replace bulky preloaded snippets with short breadcrumbs after early turns."""
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+
+    lines: List[str] = []
+    if modified_files:
+        lines.append("Files changed so far: " + ", ".join(modified_files))
+    if preloaded_files:
+        lines.append(
+            "Preloaded snippets were omitted to save context. Previously shown files: "
+            + ", ".join(preloaded_files)
+        )
+    replacement = "\n".join(lines) if lines else "[Preloaded snippets omitted to save context.]"
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
@@ -4466,7 +4593,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context = build_preloaded_context(repo, issue)
+        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
         _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
         if _multishot_memo:
@@ -4475,6 +4602,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
+        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
         # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
@@ -4486,6 +4614,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
+                original_initial = messages[1].get("content") or ""
+                modified_files = _patch_changed_files(get_patch(repo))
+                stripped = _strip_preloaded_section(
+                    original_initial,
+                    preloaded_files,
+                    modified_files=modified_files,
+                )
+                if stripped != original_initial:
+                    messages[1] = {**messages[1], "content": stripped}
+                    logs.append(
+                        "INITIAL_PRELOAD_TRIMMED: "
+                        f"step={step} preloaded={len(preloaded_files)} "
+                        f"modified={len(modified_files)} "
+                        f"saved_chars={max(0, len(original_initial) - len(stripped))}"
+                    )
+                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
