@@ -1063,7 +1063,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -2423,7 +2423,36 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def _build_multifile_plan_hint(issue: str, preloaded_files: List[str]) -> str:
+    """Nudge initial planning when the task names multiple architectural layers."""
+    issue_lower = issue.lower()
+    signals = [
+        "route", "router", "model", "controller", "view", "component",
+        "service", "migration", "serializer", "schema", "hook", "store",
+        "api", "endpoint", "form", "page",
+    ]
+    matched: List[str] = []
+    for signal in signals:
+        if signal in issue_lower and signal not in matched:
+            matched.append(signal)
+    if len(matched) < 2:
+        return ""
+
+    loaded = ", ".join(preloaded_files[:6]) if preloaded_files else "none"
+    return (
+        "Multi-concern planning hint: this issue appears to span "
+        f"{', '.join(matched[:5])}. In your <plan>, enumerate each owner/"
+        "integration point that must change, then make all related edits in "
+        f"one pass. Preloaded files: {loaded}.\n"
+    )
+
+
+def build_initial_user_prompt(
+    issue: str,
+    repo_summary: str,
+    preloaded_context: str = "",
+    plan_hint: str = "",
+) -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -2442,6 +2471,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
+{plan_hint}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
@@ -3192,10 +3222,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        plan_hint = _build_multifile_plan_hint(issue, preloaded_files)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context, plan_hint)},
         ]
         initial_preload_stripped = False
 
