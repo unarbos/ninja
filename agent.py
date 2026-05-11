@@ -2285,7 +2285,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
     # v14: Pre-flight criteria checklist (inject before issue text when criteria found)
     _pgc = _pre_gen_criteria_check(issue, preloaded_context)
     # v14: Scope addendum (atomic vs complex classification)
-    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))  # pass issue to task_text
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
 
     return f"""Fix this issue:{_pgc}
 {issue}
@@ -2912,7 +2912,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Fires after criteria-nudge on Spring/Laravel/Django/etc. tasks
         # where strict spec-following is the dominant success factor.
         if enterprise_hints_used < MAX_ENTERPRISE_HINTS:
-            ent_hint = _detect_enterprise_framework(issue, patch)
+            ent_hint = _detect_enterprise_framework(issue)
             if ent_hint:
                 enterprise_hints_used += 1
                 total_refinement_turns_used += 1
