@@ -3214,6 +3214,7 @@ brief summary of what changed
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- No-stub rule: every new function/method/component you add must have a complete body — no `pass` / `TODO` / `raise NotImplementedError` / `// implementation goes here` / empty-bracket placeholders. Stub-and-defer is the most-dinged "incomplete" pattern; the diff judge ranks a partial-but-fully-implemented patch above a complete-shape-but-stubbed one.
 - Visible surface: if the issue mentions rendered UI (button, page, form, modal, view, layout, navigation entry) but your candidate target list only contains support code (services, types, hooks, state, schemas, JSON/SQL config, CSS-only), add the page/component/view file that actually renders the requested behaviour as a plan row — patches that edit only support code without the surface lose to ones that wire the visible UI.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -4139,13 +4140,21 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     #   (b) too few substantive lines AND missed an issue-mentioned path —
     #       the patch is both small and off-target. A surgical 1-2 line fix
     #       that DOES cover the required paths is correct; don't discard it.
-    #   (c) many extracted acceptance bullets unaddressed — the patch may be
-    #       large but is missing the headline scope (e.g. a 4000-line patch
-    #       that omits the requested header/composer/component). Line count
-    #       alone hides this; the criteria signal catches it.
+    #   (c) many extracted acceptance bullets unaddressed AND primary did
+    #       NOT cover every issue-mentioned path — the patch may be large
+    #       but is missing the headline scope (e.g. a 4000-line patch that
+    #       omits the requested header/composer/component). Line count
+    #       alone hides this; the criteria signal catches it. The
+    #       _covered_required gate guards against over-extraction false
+    #       positives: when _unaddressed_criteria spuriously flags many
+    #       bullets but the primary touched every required path, the
+    #       primary is correct surgical work and must not be reverted.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
     _unaddressed1 = _unaddressed_criteria(_patch1, issue) if _patch1.strip() else []
-    _criteria_starved = len(_unaddressed1) >= _MULTISHOT_INCOMPLETE_CRITERIA_THRESHOLD
+    _criteria_starved = (
+        len(_unaddressed1) >= _MULTISHOT_INCOMPLETE_CRITERIA_THRESHOLD
+        and not _covered_required
+    )
     _should_retry = (
         (not _patch1.strip())
         or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
@@ -4197,10 +4206,19 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     # adding the missing component) and would otherwise lose to a larger,
     # off-target attempt 1. Falls back to the line-count rule when the issue
     # has no extractable bullet structure (both unaddressed counts are 0).
+    #
+    # Coverage guard: when the primary already covered every issue-mentioned
+    # path, the retry must strictly beat it on bullets (_u2 < _u1) to win.
+    # A bullet-count tie with the same false-positive over-extraction would
+    # otherwise let a chattier retry displace a correct surgical patch — see
+    # _criteria_starved guard above.
     _unaddressed2 = _unaddressed_criteria(_patch2, issue) if _patch2.strip() else []
     _u1 = len(_unaddressed1)
     _u2 = len(_unaddressed2)
-    _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
+    if _covered_required:
+        _retry_wins = _u2 < _u1
+    else:
+        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
 
     if _retry_wins:
         _result2["multishot_attempts"] = 2
