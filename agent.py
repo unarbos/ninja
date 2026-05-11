@@ -85,7 +85,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 350.0  # GLM-5.1 needs 30-90s per step; 350s = ~6 steps minimum
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -2569,7 +2569,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
+       Two attempts at WALL_CLOCK_BUDGET_SECONDS=350s already saturate the
        _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
        be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
