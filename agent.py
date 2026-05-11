@@ -122,7 +122,12 @@ MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_CONTRACT_TURNS = 1
 MAX_PATCH_SAFETY_TURNS = 1
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1
-MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_STRICT_CRITERIA_TURNS = 1
+MAX_DEAD_HELPER_TURNS = 1
+MAX_LINT_TURNS = 1
+MAX_DELIVERABLE_TURNS = 1
+MAX_FRONTEND_GAP_TURNS = 1
+MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -130,6 +135,7 @@ _CONTRACT_NAME_DENYLIST = frozenset({
     "default", "main", "index", "module", "exports",
     "describe", "test", "it", "expect", "beforeEach", "afterEach",
     "True", "False", "None", "self", "cls",
+    "as", "from", "type", "import", "return", "function",
 })
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1622,6 +1628,271 @@ def _last_failed_verification_in_logs(logs_buffer: List[str]) -> Optional[Tuple[
     return last_match
 
 
+def _patch_added_text_raw(patch: str) -> str:
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append(line[1:])
+    return "\n".join(out)
+
+
+def _classify_task_scope(task_text: str, baseline_lines: int) -> str:
+    if not task_text:
+        return "moderate"
+    task_len = len(task_text)
+    file_mentions = _extract_issue_path_mentions(task_text)
+    num_files = len(file_mentions)
+    has_complexity_keyword = bool(
+        re.search(
+            r'\b(redesign|refactor|architecture|migration|migrate|overhaul|rewrite)\b',
+            task_text,
+            re.IGNORECASE,
+        )
+    )
+    if task_len > 600 or num_files >= 4 or has_complexity_keyword:
+        return "complex"
+    if baseline_lines < 100 and task_len < 200 and num_files <= 1:
+        return "atomic"
+    return "moderate"
+
+
+_HOOK_RE = re.compile(
+    r'\b(useState|useEffect|useRef|useCallback|useMemo|useContext|useReducer)\b'
+)
+_DSLASH_RE = re.compile(r'["\'][^"\']*//[^"\'/]')
+_ASSIGN_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*(?!=)', re.MULTILINE)
+
+
+def _quick_patch_lint(patch: str, repo_path: Optional[Path]) -> List[str]:
+    issues: List[str] = []
+    if not patch.strip():
+        return issues
+    current_file: Optional[str] = None
+    file_added: Dict[str, List[str]] = {}
+    file_removed: Dict[str, List[str]] = {}
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+            file_added.setdefault(current_file, [])
+            file_removed.setdefault(current_file, [])
+        elif current_file is not None:
+            if line.startswith("+") and not line.startswith("++"):
+                file_added[current_file].append(line[1:])
+            elif line.startswith("-") and not line.startswith("--"):
+                file_removed[current_file].append(line[1:])
+    for fname, added in file_added.items():
+        suffix = Path(fname).suffix.lower()
+        added_text = "\n".join(added)
+        if suffix in {".tsx", ".jsx"} and ("app/" in fname or fname.startswith("src/app/")):
+            if _HOOK_RE.search(added_text):
+                combined = added_text + "\n" + "\n".join(file_removed.get(fname, []))
+                existing_has_directive = False
+                if repo_path is not None:
+                    try:
+                        fp = (repo_path / fname).resolve()
+                        ec = fp.read_text(encoding="utf-8", errors="replace")
+                        existing_has_directive = "'use client'" in ec or '"use client"' in ec
+                    except Exception:
+                        pass
+                if not existing_has_directive and (
+                    "'use client'" not in combined and '"use client"' not in combined
+                ):
+                    issues.append(
+                        f"{fname}: adds React hooks but 'use client' directive not found"
+                    )
+        for line in added:
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*")):
+                continue
+            clean = re.sub(r'https?://', 'PROTO', line)
+            if _DSLASH_RE.search(clean):
+                issues.append(f"{fname}: possible double-slash in URL (check string concatenation)")
+                break
+    all_removed = "\n".join(l for lines in file_removed.values() for l in lines)
+    all_added = "\n".join(l for lines in file_added.values() for l in lines)
+    removed_vars = {m.group(1) for m in _ASSIGN_RE.finditer(all_removed)}
+    added_vars = {m.group(1) for m in _ASSIGN_RE.finditer(all_added)}
+    for var in removed_vars & added_vars:
+        usage_re = re.compile(r'\b' + re.escape(var) + r'\b')
+        usages = [l for l in all_added.splitlines() if usage_re.search(l)]
+        assign_re = re.compile(r'^\s*' + re.escape(var) + r'\s*=\s*(?!=)')
+        assigns = [l for l in usages if assign_re.match(l)]
+        if usages and len(assigns) == len(usages):
+            issues.append(
+                f"Variable '{var}' from deleted code re-assigned in patch but never used"
+            )
+    return issues
+
+
+def _helpers_defined_but_uncalled(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    added = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    added_text = "\n".join(added)
+    py_defs = re.findall(r"^def ([A-Za-z_][A-Za-z0-9_]*)\s*\(", added_text, re.M)
+    js_defs = re.findall(r"(?:async\s+function|function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", added_text)
+    js_arrow = re.findall(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", added_text)
+    all_defs = set(py_defs + js_defs + js_arrow)
+    common = {"main", "test", "setUp", "tearDown", "handler", "callback", "render", "init"}
+    all_defs -= common
+    unwired: List[str] = []
+    for fn in sorted(all_defs):
+        escaped = re.escape(fn)
+        call_re = "(?<![a-zA-Z_])" + escaped + r"\s*\("
+        calls = len(re.findall(call_re, added_text))
+        defs = len(re.findall(r"(?:def|function|const)\s+" + escaped, added_text))
+        if calls <= defs:
+            unwired.append(fn)
+    return unwired[:3]
+
+
+_NAMED_DELIVERABLE_RE = re.compile(
+    r'(?:^|[\s`\'",(\[])([A-Za-z0-9_.\-/]+\.[a-zA-Z]{2,5})(?:$|[\s`\'",.)])',
+    re.MULTILINE,
+)
+
+
+def _extract_named_deliverables(task_text: str) -> List[str]:
+    if not task_text:
+        return []
+    seen: set = set()
+    deliverables: List[str] = []
+    for match in _NAMED_DELIVERABLE_RE.finditer(task_text):
+        name = match.group(1).strip().strip("`'\"")
+        if not name:
+            continue
+        if name.startswith(("http", "www.", "//", "ftp")):
+            continue
+        if len(name) > 80 or name.count("/") > 4:
+            continue
+        ext = Path(name).suffix.lower()
+        if ext not in TEXT_FILE_EXTENSIONS and ext not in {".sh", ".env", ".cfg", ".lock"}:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deliverables.append(name)
+        if len(deliverables) >= 8:
+            break
+    return deliverables
+
+
+def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
+    if not patch or not deliverables:
+        return []
+    header_paths: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            header_paths.add(line[6:].strip().lower())
+        elif line.startswith("+++ "):
+            raw = line[4:].strip().lower()
+            if raw != "/dev/null":
+                header_paths.add(raw)
+    uncovered: List[str] = []
+    for item in deliverables:
+        item_lower = item.lower()
+        item_stem = Path(item).stem.lower()
+        covered = any(
+            item_lower == hp or hp.endswith("/" + item_lower) or item_lower in hp
+            for hp in header_paths
+        )
+        if not covered and len(item_stem) >= 3:
+            covered = any(item_stem in hp for hp in header_paths)
+        if not covered:
+            uncovered.append(item)
+    return uncovered
+
+
+_FRONTEND_TASK_SIGNALS = (
+    ".vue", "vue component", "react component", "next.js", "nextjs",
+    "page.tsx", "page.jsx", "svelte", "angular component",
+    "nuxt", "remix route", "gatsby page",
+)
+_FRONTEND_FILE_EXTS = frozenset({".vue", ".jsx", ".tsx", ".svelte"})
+_BACKEND_ONLY_EXTS = frozenset({".py", ".java", ".rb", ".go", ".php", ".rs", ".cs", ".kt"})
+
+
+def _frontend_coverage_gap(task_text: str, patch: str) -> str:
+    if not task_text or not patch:
+        return ""
+    task_lower = task_text.lower()
+    signal = next((sig for sig in _FRONTEND_TASK_SIGNALS if sig in task_lower), None)
+    if not signal:
+        return ""
+    diff_files = re.findall(r"^(?:\+\+\+|---)\s+[ab]/(\S+)", patch, re.M)
+    if not diff_files:
+        return ""
+    changed_exts = {os.path.splitext(f)[1].lower() for f in diff_files if f != "/dev/null"}
+    changed_exts.discard("")
+    if not changed_exts:
+        return ""
+    if changed_exts & _FRONTEND_FILE_EXTS:
+        return ""
+    if not changed_exts.issubset(_BACKEND_ONLY_EXTS):
+        return ""
+    return (
+        f"task signals '{signal}' but diff touches only backend extensions "
+        f"({', '.join(sorted(changed_exts))})"
+    )
+
+
+def _structured_acceptance_items(issue_text: str) -> List[Dict[str, Any]]:
+    items = _extract_acceptance_criteria(issue_text)
+    structured: List[Dict[str, Any]] = []
+    for item in items:
+        paths = _extract_issue_path_mentions(item)
+        backticked = re.findall(r"`([A-Za-z_$][\w.$]*)`", item)
+        camel = re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){1,})\b", item)
+        snake = re.findall(r"\b([a-z][a-z0-9]*_[a-z][a-z0-9_]+)\b", item)
+        identifiers: List[str] = []
+        for src in (backticked, camel, snake):
+            for tok in src:
+                if tok and tok not in identifiers:
+                    identifiers.append(tok)
+        structured.append({
+            "text": item,
+            "paths": paths[:3],
+            "identifiers": identifiers[:5],
+        })
+    return structured
+
+
+def _strict_unaddressed_items(patch: str, issue_text: str) -> List[str]:
+    items = _structured_acceptance_items(issue_text)
+    if not items:
+        return []
+    changed = set(_patch_changed_files(patch))
+    added_lower = _patch_added_text(patch)
+    missing: List[str] = []
+    for entry in items:
+        text = entry["text"]
+        paths = entry["paths"]
+        identifiers = entry["identifiers"]
+        addressed = False
+        if paths and any(
+            (p in changed) or any(cf == p or cf.endswith("/" + p) for cf in changed)
+            for p in paths
+        ):
+            addressed = True
+        if not addressed and identifiers:
+            for idn in identifiers:
+                if idn.lower() in added_lower:
+                    addressed = True
+                    break
+        if not addressed:
+            keywords = _criterion_keywords(text)
+            if keywords:
+                hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
+                if hits * 10 >= len(keywords) * 7:
+                    addressed = True
+        if not addressed:
+            missing.append(text[:200])
+        if len(missing) >= 5:
+            break
+    return missing
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -2806,6 +3077,60 @@ def build_failed_verification_prompt(command: str, output_tail: str) -> str:
     )
 
 
+def build_strict_criteria_prompt(missing: List[str]) -> str:
+    body = "\n  ".join(f"- {m}" for m in missing[:5])
+    return (
+        "Final coverage check — these items from the task are still NOT "
+        "reflected in any file you touched or any specific identifier you "
+        "added:\n  "
+        f"{body}\n\n"
+        "For each item, either add the minimal change to address it (cite "
+        "the file and the concrete edit) or explicitly justify why it is "
+        "intentionally out of scope. End with <final>done</final>. Do not "
+        "leave any item unaddressed without explanation."
+    )
+
+
+def build_dead_helper_prompt(names: List[str]) -> str:
+    body = "\n  ".join(f"- {n}(...)" for n in names[:5])
+    return (
+        "Your patch defines new helpers/functions/classes but does NOT call "
+        "them from any other added line:\n  "
+        f"{body}\n\n"
+        "Either integrate each helper at its expected call site, or remove "
+        "the unused definition. Dead helpers usually mean the original call "
+        "site (e.g. an event handler or route) was not updated to use the "
+        "new helper. End with <final>done</final>."
+    )
+
+
+def build_quick_lint_prompt(issues: List[str]) -> str:
+    body = "\n  ".join(f"- {i}" for i in issues[:5])
+    return (
+        "Quick lint check flagged issues in your patch:\n  "
+        f"{body}\n\n"
+        "Fix each listed issue with the smallest possible edit. End with "
+        "<final>done</final>."
+    )
+
+
+def build_deliverable_prompt(uncovered: List[str]) -> str:
+    body = ", ".join(uncovered[:5])
+    return (
+        f"The task explicitly names these files that are NOT touched by your "
+        f"patch: {body}. Create or modify each of them, then end with "
+        f"<final>done</final>."
+    )
+
+
+def build_frontend_gap_prompt(summary: str) -> str:
+    return (
+        f"Frontend gap: {summary}. Add or modify the required frontend "
+        f"component/page/route so the user-visible flow described in the task "
+        f"actually works. End with <final>done</final>."
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -3004,6 +3329,19 @@ def solve(
     )
 
 
+def _solve_attempt_safe(**kwargs: Any) -> Dict[str, Any]:
+    try:
+        return _solve_attempt(**kwargs)
+    except Exception as exc:
+        return {
+            "patch": "",
+            "logs": f"ATTEMPT_CRASH:\n{type(exc).__name__}: {str(exc)[:400]}",
+            "steps": 0,
+            "cost": 0.0,
+            "success": False,
+        }
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """The actual multi-shot driver, wrapped so any exception still returns
     the on-disk patch state instead of propagating.
@@ -3043,7 +3381,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        _result1 = _solve_attempt_safe(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -3060,18 +3398,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _issue = kwargs.get("issue", "")
-        _unaddressed1 = _unaddressed_criteria(_patch1, _issue) if _patch1.strip() else []
-        _result2 = _solve_attempt(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
+        _unaddressed1 = _unaddressed_criteria(_patch1, _issue)
+        _result2 = _solve_attempt_safe(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
-        _unaddressed2 = _unaddressed_criteria(_patch2, _issue) if _patch2.strip() else []
+        _unaddressed2 = _unaddressed_criteria(_patch2, _issue)
 
         # Quality-aware tiebreak: prefer attempt 2 when it addresses MORE issue
         # bullets, or when bullets tie and it has at least as many substantive
         # lines. Falls back to line-count rule when no extractable bullets.
         _u1 = len(_unaddressed1)
         _u2 = len(_unaddressed2)
-        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
+        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 > _n1 and _u1 > 0)
 
         if _retry_wins:
             _result2["multishot_attempts"] = 2
@@ -3137,6 +3475,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     contract_turns_used = 0
     patch_safety_turns_used = 0
     failed_verification_turns_used = 0
+    strict_criteria_turns_used = 0
+    dead_helper_turns_used = 0
+    lint_turns_used = 0
+    deliverable_turns_used = 0
+    frontend_gap_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3181,7 +3524,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, strict_criteria_turns_used, dead_helper_turns_used, lint_turns_used, deliverable_turns_used, frontend_gap_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3304,6 +3647,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if (
+            strict_criteria_turns_used < MAX_STRICT_CRITERIA_TURNS
+            and criteria_nudges_used > 0
+        ):
+            strict_missing = _strict_unaddressed_items(patch, issue)
+            if len(strict_missing) >= 2:
+                strict_criteria_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_strict_criteria_prompt(strict_missing),
+                    "STRICT_CRITERIA_QUEUED:\n  " + " | ".join(c[:60] for c in strict_missing[:3]),
+                )
+                return True
+
         if integration_nudges_used < MAX_INTEGRATION_NUDGES:
             integration_summary = _integration_gap_summary(patch, issue)
             if integration_summary:
@@ -3353,6 +3711,56 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if lint_turns_used < MAX_LINT_TURNS:
+            lint_issues = _quick_patch_lint(patch, repo)
+            if lint_issues:
+                lint_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_quick_lint_prompt(lint_issues),
+                    "LINT_QUEUED:\n  " + " | ".join(i[:80] for i in lint_issues[:3]),
+                )
+                return True
+
+        if dead_helper_turns_used < MAX_DEAD_HELPER_TURNS:
+            dead_helpers = _helpers_defined_but_uncalled(patch)
+            if dead_helpers:
+                dead_helper_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dead_helper_prompt(dead_helpers),
+                    "DEAD_HELPER_QUEUED:\n  " + ", ".join(dead_helpers[:4]),
+                )
+                return True
+
+        if deliverable_turns_used < MAX_DELIVERABLE_TURNS:
+            _deliverables = _extract_named_deliverables(issue)
+            if _deliverables:
+                _uncovered_del = _check_deliverable_coverage(patch, _deliverables)
+                if _uncovered_del:
+                    deliverable_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_deliverable_prompt(_uncovered_del),
+                        "DELIVERABLE_QUEUED:\n  " + ", ".join(_uncovered_del[:4]),
+                    )
+                    return True
+
+        if frontend_gap_turns_used < MAX_FRONTEND_GAP_TURNS:
+            fe_gap = _frontend_coverage_gap(issue, patch)
+            if fe_gap:
+                frontend_gap_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_frontend_gap_prompt(fe_gap),
+                    "FRONTEND_GAP_QUEUED:\n  " + fe_gap[:120],
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -3372,7 +3780,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        _scope = _classify_task_scope(issue, len(preloaded_context.splitlines()))
+        _scope_hint = ""
+        if _scope == "atomic":
+            _scope_hint = (
+                "\n[Scope: ATOMIC task. Prefer the minimal diff that satisfies the spec. "
+                "Do not refactor surrounding code.]\n"
+            )
+        elif _scope == "complex":
+            _scope_hint = (
+                "\n[Scope: COMPLEX multi-concern task. Enumerate all required changes "
+                "in your plan before coding.]\n"
+            )
+        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context) + _scope_hint
         if _multishot_memo:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
 
