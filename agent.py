@@ -119,8 +119,18 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_CONTRACT_TURNS = 1
+MAX_PATCH_SAFETY_TURNS = 1
+MAX_FAILED_VERIFICATION_FIX_TURNS = 1
+MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+_CONTRACT_GREP_TIMEOUT_SECONDS = 8
+_CONTRACT_MAX_FINDINGS = 4
+_CONTRACT_NAME_DENYLIST = frozenset({
+    "default", "main", "index", "module", "exports",
+    "describe", "test", "it", "expect", "beforeEach", "afterEach",
+    "True", "False", "None", "self", "cls",
+})
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1432,6 +1442,186 @@ def _dependency_metadata_gap_summary(patch: str) -> str:
     return "patch appears to introduce external package usage without touching a dependency manifest. Package root(s): " + ", ".join(roots[:8])
 
 
+_REMOVED_PUBLIC_SYMBOL_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(
+        r"^-(?!--)\s*export\s+(?:default\s+)?"
+        r"(?:async\s+)?(?:const|let|var|function|class|type|interface|enum)"
+        r"\s+([A-Za-z_$][\w$]*)\b"
+    ),
+    re.compile(r"^-(?!--).*\bexport\s*\{\s*([^}]+?)\s*\}"),
+    re.compile(r"^-(?!--).*\b(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*="),
+    re.compile(r"^-(?!--)(?:    )?(?:def|class)\s+([A-Za-z_][\w]*)\s*[(:]"),
+    re.compile(r"^-(?!--)([A-Z_][A-Z0-9_]{2,})\s*="),
+)
+
+
+def _extract_removed_public_symbol_names(patch: str) -> List[str]:
+    seen: set = set()
+    names: List[str] = []
+    for line in patch.splitlines():
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        for pattern in _REMOVED_PUBLIC_SYMBOL_PATTERNS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            captured = match.group(1)
+            for raw_name in re.split(r"[\s,]+", captured or ""):
+                name = raw_name.strip().split(" as ")[0].strip()
+                if not name or name in _CONTRACT_NAME_DENYLIST:
+                    continue
+                if not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+_IMPORT_LINE_RE = re.compile(
+    r"^\+(?!\+\+)\s*("
+    r"import\s+(?:type\s+)?(?:[^;]+?from\s+)?['\"][^'\"]+['\"]\s*;?"
+    r"|from\s+\S+\s+import\s+[^#\n]+"
+    r"|(?:const|let|var)\s+[^=]+=\s*require\(['\"][^'\"]+['\"]\)\s*;?"
+    r")\s*$"
+)
+
+
+def _added_blocks_by_file(patch: str) -> Dict[str, List[str]]:
+    blocks: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in patch.splitlines():
+        m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+        if m:
+            current = m.group(1)
+            blocks.setdefault(current, [])
+            continue
+        if current is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            blocks[current].append(line)
+    return blocks
+
+
+def _extract_duplicate_imports(patch: str) -> List[str]:
+    findings: List[str] = []
+    for path, added in _added_blocks_by_file(patch).items():
+        seen: Dict[str, int] = {}
+        for line in added:
+            m = _IMPORT_LINE_RE.match(line)
+            if not m:
+                continue
+            key = m.group(1).strip()
+            seen[key] = seen.get(key, 0) + 1
+        for stmt, count in seen.items():
+            if count >= 2:
+                findings.append(f"{path}: duplicate `{stmt[:120]}` x{count}")
+                if len(findings) >= _CONTRACT_MAX_FINDINGS:
+                    return findings
+    return findings
+
+
+def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = list(_extract_duplicate_imports(patch))
+    if len(findings) >= _CONTRACT_MAX_FINDINGS:
+        return findings
+    names = _extract_removed_public_symbol_names(patch)
+    if not names:
+        return findings
+    changed_paths = set(_patch_changed_files(patch))
+    for name in names:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "--word-regexp", "-F", "--", name],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CONTRACT_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        survivors: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            survivors.append(relative_path)
+            if len(survivors) >= 4:
+                break
+        if survivors:
+            findings.append(f"{name}: still referenced in {', '.join(survivors[:4])}")
+            if len(findings) >= _CONTRACT_MAX_FINDINGS:
+                break
+    return findings
+
+
+_PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"^\+(?!\+\+).*grader", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*scoring\s+rubric", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*reference\s+patch", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*oracle\s+(?:answer|solution|patch)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*judge\s+(?:model|prompt|rubric)", re.IGNORECASE | re.MULTILINE),
+)
+
+
+def _patch_safety_gap_summary(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    hits: List[str] = []
+    for pattern in _PATCH_SAFETY_PATTERNS:
+        for match in pattern.finditer(patch):
+            snippet = match.group(0).strip()[:160]
+            hits.append(snippet)
+            if len(hits) >= 4:
+                return hits
+    return hits
+
+
+_FAILED_VERIFICATION_CMD_RE = re.compile(
+    r"\b(pytest|npm\s+(?:run\s+)?(?:test|build|lint|typecheck)|"
+    r"yarn\s+(?:test|build|lint|typecheck)|jest|vitest|mocha|"
+    r"tsc(?:\s|$)|node\s+--check|"
+    r"python\s+-m\s+(?:pytest|unittest|mypy|compileall)|"
+    r"ruff\s+check|eslint|prettier\s+--check|"
+    r"go\s+(?:test|build|vet)|cargo\s+(?:test|build|check)|"
+    r"make\s+(?:test|check)|mvn\s+test|gradle\s+(?:test|build))\b"
+)
+
+
+def _last_failed_verification_in_logs(logs_buffer: List[str]) -> Optional[Tuple[str, str]]:
+    joined = "".join(logs_buffer)
+    last_match: Optional[Tuple[str, str]] = None
+    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", joined):
+        cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
+        exit_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
+        if not cmd_match or not exit_match:
+            continue
+        if exit_match.group(1) == "0":
+            continue
+        cmd = cmd_match.group(1).strip()
+        if not _FAILED_VERIFICATION_CMD_RE.search(cmd):
+            continue
+        stdout_match = re.search(r"STDOUT:\n(.*?)(?=\n[A-Z_]+:\n|\Z)", chunk, re.DOTALL)
+        stderr_match = re.search(r"STDERR:\n(.*?)(?=\n[A-Z_]+:\n|\Z)", chunk, re.DOTALL)
+        tail_parts: List[str] = []
+        if stdout_match:
+            tail_parts.append(stdout_match.group(1).strip())
+        if stderr_match:
+            tail_parts.append(stderr_match.group(1).strip())
+        tail = "\n".join(p for p in tail_parts if p)[-1800:]
+        last_match = (cmd[:200], tail)
+    return last_match
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -2529,17 +2719,15 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
 
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
-        "Integration check: your patch appears to add implementation code, but "
-        "it may not wire that code into the app/API entrypoints that make it "
-        "reachable.\n\n"
+        "Your patch adds implementation code but does not appear to touch "
+        "the app/API entrypoints that make it reachable.\n\n"
         f"{integration_summary}\n\n"
-        "Before finalizing, inspect or update the relevant integration point: "
-        "App/routes/router, sidebar/navigation/menu, urls.py/routes, controller/"
-        "service registration, main/index entry, or dashboard/layout wiring. "
-        "If the new code is already reachable through an existing convention, "
-        "finish with <final>summary</final> and name that convention. Otherwise "
-        "issue the minimal edit command(s) to wire it in. Do not broaden the "
-        "feature beyond the task.\n\n"
+        "Wire the new code into the relevant entrypoint: routes/router, "
+        "sidebar/navigation/menu, urls.py/routes, controller/service "
+        "registration, main/index entry, or dashboard/layout. Issue the "
+        "minimal edit command(s) now. Only skip if you can name the exact "
+        "existing convention that already exposes the new code — then say so "
+        "in <final>summary</final>. Do not broaden the feature beyond the task.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -2547,16 +2735,15 @@ def build_integration_nudge_prompt(integration_summary: str, issue_text: str) ->
 
 def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
     return (
-        "Requested-artifact check: the task appears to ask for a supporting "
-        "artifact, but the current patch does not touch a matching file.\n\n"
+        "The task asks for a supporting artifact (tests, docs, version bump, "
+        "schema/migration, locale, or fixtures), and your current patch does "
+        "not touch a matching file.\n\n"
         f"{artifact_summary}\n\n"
-        "Before finalizing, inspect the repository conventions for the requested "
-        "artifact type: tests/specs, docs/README/changelog, package/version "
-        "metadata, migrations/schema, locale files, or fixtures/examples. If the "
-        "artifact is truly unnecessary because the task text only mentioned it "
-        "as context, finish with <final>summary</final> and say why. Otherwise "
-        "issue the minimal edit command(s) needed to add or update the requested "
-        "artifact. Do not add unrelated artifacts.\n\n"
+        "Add or update the requested artifact. Inspect the repo convention "
+        "for that artifact type and issue the minimal edit command(s). Only "
+        "skip if the issue text mentioned the artifact purely as background "
+        "context (not as a requirement) — then say so in <final>summary</final>. "
+        "Do not add unrelated artifacts.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -2564,18 +2751,58 @@ def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
 
 def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> str:
     return (
-        "Dependency metadata check: your patch appears to import or require a "
-        "package that may not be declared in the repository metadata.\n\n"
+        "Your patch imports or requires a package that is not declared in "
+        "the repository's dependency manifest.\n\n"
         f"{dependency_summary}\n\n"
-        "Before finalizing, inspect the repo's dependency manifest convention "
-        "(package.json, pyproject.toml/requirements, Cargo.toml, go.mod, pom.xml, "
-        "Gradle, composer.json, Gemfile, pubspec.yaml, etc.). If the package is "
-        "already provided by the platform or existing transitive code convention, "
-        "finish with <final>summary</final> and say why. Otherwise add the "
-        "minimal manifest entry needed for the import to work. Do not add "
-        "unused dependencies.\n\n"
+        "Add the minimal manifest entry needed for the import to work "
+        "(package.json, pyproject.toml/requirements, Cargo.toml, go.mod, "
+        "pom.xml, Gradle, composer.json, Gemfile, pubspec.yaml, etc.). Only "
+        "skip if you can name the exact existing convention that already "
+        "provides the package transitively — then say so in "
+        "<final>summary</final>. Do not add unused dependencies.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_contract_preservation_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch either removed a public symbol still referenced "
+        "elsewhere in the repo, or added a duplicate import statement:\n\n"
+        f"{body}\n\n"
+        "Choose the smallest safe fix: restore the removed symbol as a "
+        "compatibility wrapper/export, update every listed call site to the "
+        "new name/API, or delete the duplicate import. Do not introduce "
+        "unrelated behavior. Emit the minimal <command> block(s), then end "
+        "with <final>done</final>."
+    )
+
+
+def build_patch_safety_prompt(hits: List[str]) -> str:
+    body = "\n".join(f"  - {h}" for h in hits)
+    return (
+        "Your patch added lines containing the following phrases:\n\n"
+        f"{body}\n\n"
+        "Rewrite each listed line so the matched phrase does not appear in "
+        "any added line. If the line was leftover scaffolding from prior "
+        "reasoning, remove it entirely. Then end with <final>done</final>."
+    )
+
+
+def build_failed_verification_prompt(command: str, output_tail: str) -> str:
+    tail = output_tail[-1500:] if len(output_tail) > 1500 else output_tail
+    return (
+        "A command you ran earlier in this attempt exited non-zero, and your "
+        "current patch is non-empty:\n\n"
+        f"COMMAND: {command}\n\n"
+        "OUTPUT (tail):\n"
+        f"{tail}\n\n"
+        "Emit ONE targeted <command> that fixes the specific failure shown "
+        "above — a missing import, wrong identifier, undefined reference, "
+        "broken parameter passing, etc. Do not rewrite unrelated code and do "
+        "not run the same verification again. Then end with "
+        "<final>done</final>."
     )
 
 
@@ -2907,6 +3134,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
+    contract_turns_used = 0
+    patch_safety_turns_used = 0
+    failed_verification_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2951,7 +3181,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3020,6 +3250,30 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if patch_safety_turns_used < MAX_PATCH_SAFETY_TURNS:
+            safety_hits = _patch_safety_gap_summary(patch)
+            if safety_hits:
+                patch_safety_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_patch_safety_prompt(safety_hits),
+                    "PATCH_SAFETY_QUEUED:\n  " + " | ".join(h[:60] for h in safety_hits[:3]),
+                )
+                return True
+
+        if contract_turns_used < MAX_CONTRACT_TURNS:
+            contract_findings = _contract_preservation_gap_summary(repo, patch)
+            if contract_findings:
+                contract_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_contract_preservation_prompt(contract_findings),
+                    "CONTRACT_QUEUED:\n  " + " | ".join(f[:80] for f in contract_findings[:3]),
+                )
+                return True
+
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
             if missing:
@@ -3083,6 +3337,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_dependency_nudge_prompt(dependency_summary, issue),
                     "DEPENDENCY_NUDGE_QUEUED:\n  " + dependency_summary[:120],
+                )
+                return True
+
+        if failed_verification_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS:
+            failed = _last_failed_verification_in_logs(logs)
+            if failed is not None:
+                failed_cmd, failed_tail = failed
+                failed_verification_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_failed_verification_prompt(failed_cmd, failed_tail),
+                    "FAILED_VERIFICATION_QUEUED:\n  " + failed_cmd[:120],
                 )
                 return True
 
