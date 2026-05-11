@@ -195,16 +195,36 @@ class AgentResult:
 # Utility
 # -----------------------------
 
+def _looks_like_traceback(text: str) -> bool:
+    """True when the text appears to contain a Python or similar traceback."""
+    if "Traceback (most recent call last)" in text:
+        return True
+    frame_lines = sum(
+        1 for line in text.splitlines()
+        if re.match(r'^\s*File "[^"]+", line \d+', line)
+    )
+    return frame_lines >= 3
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     half = max_chars // 2
+    head, tail = text[:half], text[-half:]
+    error_signal = ""
+    if _looks_like_traceback(text):
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            if re.match(r"^[A-Z][A-Za-z0-9_.]+(Error|Exception|Warning):", stripped):
+                error_signal = f"[error_signal] {stripped}\n"
+                break
     return (
-        text[:half]
+        error_signal
+        + head
         + "\n\n...[truncated "
         + str(len(text) - max_chars)
         + " chars]...\n\n"
-        + text[-half:]
+        + tail
     )
 
 
@@ -865,6 +885,32 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+_BACKTICK_FILE_EXT_RE = re.compile(
+    r"`([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|go|rs|rb|java|c|cpp|h|cs|sh|md|json|yaml|yml|toml|sql|css|scss|html|vue|svelte))`",
+    re.IGNORECASE,
+)
+
+
+def _backtick_path_files(issue_text: str, repo_files: List[str]) -> "set[str]":
+    """Return tracked repo paths whose path suffix matches a backtick-quoted
+    file literal in the issue. These are direct authorial signals about which
+    files to edit, so they warrant a large rank boost.
+    """
+    candidates: List[str] = []
+    for m in _BACKTICK_FILE_EXT_RE.finditer(issue_text):
+        raw = m.group(1).lstrip("./")
+        if raw and raw not in candidates:
+            candidates.append(raw)
+    if not candidates:
+        return set()
+    result: set = set()
+    for repo_path in repo_files:
+        for cand in candidates:
+            if repo_path == cand or repo_path.endswith("/" + cand):
+                result.add(repo_path)
+                break
+    return result
+
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
@@ -898,6 +944,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    backtick_exact = _backtick_path_files(issue, list(tracked_set))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -906,6 +953,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         name_lower = Path(relative_path).name.lower()
         stem_lower = Path(relative_path).stem.lower()
         score = 0
+        if relative_path in backtick_exact:
+            score += 250
         if relative_path in mentioned:
             score += 100
         if path_lower in issue_lower:
@@ -2368,7 +2417,82 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
     )
 
 
-def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
+_ANCHOR_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_./\-]{2,39})`")
+_ANCHOR_NEW_FILE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".yaml", ".yml"}
+_ANCHOR_NEW_FILE_VERBS_RE = re.compile(
+    r"\b(create|add|extract|introduce|new file)\b", re.IGNORECASE
+)
+
+
+def _extract_required_anchors(issue_text: str) -> Tuple[List[str], List[str]]:
+    """Extract backtick literals and new-file paths expected from the issue.
+
+    Returns (literals, new_file_paths):
+      literals      — backtick-delimited identifiers/paths length 3-40
+      new_file_paths — literals whose extension suggests a new file AND the
+                       issue contains a creation verb within 80 chars of the literal
+    """
+    literals: List[str] = []
+    new_file_paths: List[str] = []
+    for m in _ANCHOR_IDENT_RE.finditer(issue_text):
+        raw = m.group(1)
+        if raw in literals:
+            continue
+        literals.append(raw)
+        if len(literals) >= 8:
+            break
+    for lit in literals:
+        ext = Path(lit).suffix.lower()
+        if ext not in _ANCHOR_NEW_FILE_EXTS:
+            continue
+        start = max(0, issue_text.find(f"`{lit}`") - 80)
+        end = issue_text.find(f"`{lit}`") + len(lit) + 80
+        context_window = issue_text[start:end]
+        if _ANCHOR_NEW_FILE_VERBS_RE.search(context_window):
+            new_file_paths.append(lit)
+    return literals, new_file_paths
+
+
+def _required_anchors_missing(
+    literals: List[str],
+    new_file_paths: List[str],
+    patch: str,
+) -> str:
+    """Return a bulleted list of anchors not yet present in the patch.
+
+    Checks literals against + lines and new_file_paths against diff headers.
+    Returns empty string when everything is covered.
+    """
+    if not literals and not new_file_paths:
+        return ""
+    added_lines = [
+        line[1:]
+        for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    added_text = "\n".join(added_lines)
+    diff_headers = "\n".join(
+        line for line in patch.splitlines()
+        if line.startswith("diff --git ")
+    )
+    missing: List[str] = []
+    for lit in literals:
+        if lit not in added_text:
+            missing.append(f"literal `{lit}` not found in any added line")
+    for nf in new_file_paths:
+        if nf not in diff_headers and ("b/" + nf) not in diff_headers:
+            missing.append(f"new file `{nf}` not present in diff")
+    if not missing:
+        return ""
+    bullets = "\n".join(f"  - {item}" for item in missing[:8])
+    return f"\nRequired code anchors still missing:\n{bullets}\n"
+
+
+def build_criteria_nudge_prompt(
+    unaddressed: List[str],
+    issue_text: str,
+    anchor_feedback: str = "",
+) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
     The LLM judge frequently dings the king for "missing N of M criteria" on
@@ -2376,7 +2500,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     criterion checkpoints themselves and surfaces them with the original text.
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
-    return (
+    body = (
         "Criterion-coverage gap — these acceptance-criterion checkpoints from "
         "the task are NOT clearly reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
@@ -2390,6 +2514,9 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
+    if anchor_feedback:
+        body += anchor_feedback
+    return body
 
 
 def build_hail_mary_prompt(issue_text: str) -> str:
@@ -2446,6 +2573,98 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
+
+
+def _merge_compatible_hunks(p1: str, p2: str) -> str:
+    """Union non-conflicting hunks from two unified diff strings.
+
+    Hunks from both patches are merged per file. Two hunks conflict when they
+    target the same file with overlapping new-file line ranges and different
+    content. On any parse failure the function returns "" so the caller falls
+    back to the existing primary/retry selection.
+    """
+    if not p1.strip() and not p2.strip():
+        return ""
+    if not p1.strip():
+        return p2
+    if not p2.strip():
+        return p1
+    try:
+        def _parse_diff(diff_text: str) -> "Dict[str, Tuple[str, List[Tuple[str, int, int]]]]":
+            result: Dict[str, Tuple[str, List[Tuple[str, int, int]]]] = {}
+            blocks = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+            for block in blocks:
+                if not block.startswith("diff --git "):
+                    continue
+                m = re.match(r"diff --git a/.+? b/(.+?)\n", block)
+                if not m:
+                    continue
+                file_path = m.group(1)
+                parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+                header = parts[0]
+                hunks: List[Tuple[str, int, int]] = []
+                for hunk_text in parts[1:]:
+                    hm = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", hunk_text)
+                    if not hm:
+                        continue
+                    new_start = int(hm.group(1))
+                    new_len = int(hm.group(2)) if hm.group(2) is not None else 1
+                    hunks.append((hunk_text, new_start, new_len))
+                result[file_path] = (header, hunks)
+            return result
+
+        def _overlaps(s1: int, l1: int, s2: int, l2: int) -> bool:
+            return not (s1 + max(l1, 1) <= s2 or s2 + max(l2, 1) <= s1)
+
+        d1 = _parse_diff(p1)
+        d2 = _parse_diff(p2)
+        all_files = list(d1.keys()) + [f for f in d2 if f not in d1]
+        result_blocks: List[str] = []
+        for file_path in all_files:
+            if file_path in d1 and file_path not in d2:
+                header, hunks = d1[file_path]
+                result_blocks.append(header + "".join(h[0] for h in hunks))
+            elif file_path in d2 and file_path not in d1:
+                header, hunks = d2[file_path]
+                result_blocks.append(header + "".join(h[0] for h in hunks))
+            else:
+                header1, hunks1 = d1[file_path]
+                _h2, hunks2 = d2[file_path]
+                merged = list(hunks1)
+                for h2_text, h2_start, h2_len in hunks2:
+                    conflict = any(
+                        _overlaps(h1_start, h1_len, h2_start, h2_len) and h1_text != h2_text
+                        for h1_text, h1_start, h1_len in hunks1
+                    )
+                    if not conflict:
+                        merged.append((h2_text, h2_start, h2_len))
+                merged.sort(key=lambda x: x[1])
+                result_blocks.append(header1 + "".join(h[0] for h in merged))
+        return "".join(result_blocks)
+    except Exception:
+        return ""
+
+
+def _solve_focused_salvage(**kwargs: Any) -> Dict[str, Any]:
+    """Targeted salvage attempt when both multishot attempts return empty patches.
+
+    Runs _solve_attempt with refinement disabled and a brief focus note that
+    names the backtick-mentioned files from the issue, helping the model skip
+    exploration and go straight to editing.
+    """
+    issue = kwargs.get("issue", "")
+    focus_files = [m.group(1) for m in _BACKTICK_FILE_EXT_RE.finditer(issue)][:5]
+    focus_note = ""
+    if focus_files:
+        listed = ", ".join(f"`{f}`" for f in focus_files)
+        focus_note = (
+            f"Focus first on: {listed} — edit these files directly to address the issue.\n"
+        )
+    salvage_kwargs = dict(kwargs)
+    salvage_kwargs["max_steps"] = 10
+    salvage_kwargs["_skip_refinement"] = True
+    salvage_kwargs["_focus_note"] = focus_note
+    return _solve_attempt(**salvage_kwargs)
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2605,6 +2824,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
+        _merged = _merge_compatible_hunks(_patch1, _patch2)
+        _nm = _multishot_count_substantive(_merged)
+        if _nm > max(_n1, _n2):
+            if _multishot_repo_obj is not None:
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+                if _multishot_apply_patch(_multishot_repo_obj, _merged):
+                    _result_merged = dict(_result2)
+                    _result_merged["patch"] = _merged
+                    _result_merged["multishot_attempts"] = 2
+                    _result_merged["multishot_winner"] = "merged"
+                    return _result_merged
+
         if _n2 >= _n1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
@@ -2616,6 +2847,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_apply_patch(_multishot_repo_obj, _patch1)
         _result1["multishot_attempts"] = 2
         _result1["multishot_winner"] = "primary"
+
+        _elapsed_total = time.monotonic() - _multishot_started
+        if _n1 == 0 and _n2 == 0 and _nm == 0 and (_MULTISHOT_TOTAL_BUDGET - _elapsed_total) > 50.0:
+            if _multishot_repo_obj is not None:
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            _result_salvage = _solve_focused_salvage(**kwargs)
+            _result_salvage["multishot_attempts"] = 3
+            _result_salvage["multishot_winner"] = "salvage"
+            return _result_salvage
+
         return _result1
 
     except Exception as exc:
@@ -2649,6 +2890,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    _skip_refinement = bool(kwargs.get("_skip_refinement", False))
+    _focus_note = str(kwargs.get("_focus_note", ""))
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2707,6 +2950,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (those are heuristic; test is ground truth from a real runner).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        if _skip_refinement:
+            return False
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2795,12 +3040,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
+            _anchors_lits, _anchors_files = _extract_required_anchors(issue)
+            _anchor_fb = _required_anchors_missing(_anchors_lits, _anchors_files, patch)
+            if unaddressed or _anchor_fb:
                 criteria_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
+                    build_criteria_nudge_prompt(unaddressed or [], issue, anchor_feedback=_anchor_fb),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
@@ -2824,9 +3071,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
+        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if _focus_note:
+            _initial_user = _focus_note + "\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
         initial_preload_stripped = False
 
