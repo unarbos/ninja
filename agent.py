@@ -116,7 +116,7 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 0     # disabled: sandbox rule forbids running tests / project code
+MAX_TEST_FIX_TURNS = 1     # one refinement slot; run_command blocks real test/build execution
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
@@ -163,13 +163,9 @@ DANGEROUS_PATTERNS = [
 
 
 # Sandbox-policy blocks. Distinct from DANGEROUS_PATTERNS (which targets real
-# security threats) — these block commands that would attempt outbound network
-# access (package installs, remote git ops). Non-network categories (running
-# tests / builds / project code) are NOT pre-blocked here: the regex matches
-# the whole shell command string, so blocking `\btsc\b` (etc.) also kills any
-# heredoc that *writes a file* containing those literals (package.json,
-# Makefile, CI yaml, README examples). The SYSTEM_PROMPT still tells the model
-# not to run those — we just don't enforce it programmatically.
+# security threats). Patterns use (?:^|[;&|]\\s*) anchors so simple file-write
+# commands that merely mention `pytest`/`npm test` inside quoted/heredoc payloads
+# are less likely to false-positive than a bare \\b word match on the whole line.
 SANDBOX_FORBIDDEN_RULES: Tuple[Tuple[str, str], ...] = (
     # ---- INSTALL (package managers / network installs) ----
     (r"\bpip3?\s+install\b", "install"),
@@ -198,6 +194,24 @@ SANDBOX_FORBIDDEN_RULES: Tuple[Tuple[str, str], ...] = (
     (r"\bgit\s+pull\b", "remote_git"),
     (r"\bgit\s+push\b", "remote_git"),
     (r"\bgit\s+remote\s+(update|add|set-url)\b", "remote_git"),
+    # ---- PROJECT EXECUTION (tests/builds — must match SYSTEM_PROMPT no-run policy) ----
+    (r"(?:^|[;&|]\s*)pytest\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)python3?\s+-m\s+pytest\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)py\.test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)npm\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)npm\s+run\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)yarn\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)pnpm\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)cargo\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)go\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)make\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)\./configure\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)cmake\s+--build\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)tsc\b(?!\s*--init)", "project_exec"),
+    (r"(?:^|[;&|]\s*)jest\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)vitest\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)mvn\s+test\b", "project_exec"),
+    (r"(?:^|[;&|]\s*)gradle\s+test\b", "project_exec"),
 )
 
 
@@ -210,6 +224,11 @@ _SANDBOX_HINTS: Dict[str, str] = {
     "remote_git": (
         "Sandbox has no network. Use local-only git: `git status`, `git diff`, "
         "`git log`, `git show`. The repo is already cloned for you."
+    ),
+    "project_exec": (
+        "Running tests, builds, or project entrypoints is blocked in this harness "
+        "(matches SYSTEM_PROMPT). Verify changes with static reads: cat/sed/git diff — "
+        "do not execute pytest/npm test/make/tsc/etc."
     ),
 }
 
@@ -749,22 +768,52 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
 
 
+_JUNK_PRUNE_PATH_PARTS = frozenset(
+    {
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        "dist",
+        "build",
+        "coverage",
+        ".next",
+        "vendor",
+        ".turbo",
+    }
+)
+
+
+def _prune_drop_eligible(relative_path: str, _block_text: str) -> bool:
+    """Whether a zero-issue-overlap file may be dropped.
+
+    Source trees often diverge lexically from the issue text; reverting those
+    hunks was too aggressive. Only drop obvious artifact/vendor paths.
+    """
+    parts = Path(relative_path).parts
+    if any(p in _JUNK_PRUNE_PATH_PARTS for p in parts):
+        return True
+    low = relative_path.lower()
+    if low.endswith((".lock", ".map", ".min.js", ".bundle.js", ".chunk.js")):
+        return True
+    return False
+
+
 def _prune_offtopic_hunks(
     repo: Path,
     patch: str,
     issue_text: str,
     max_drop_ratio: float = 0.30,
 ) -> Tuple[str, List[str]]:
-    """Drop file diffs scoring zero overlap with the issue.
+    """Drop file diffs scoring zero overlap with the issue (conservative).
 
     Scoring per file block:
       +8 if its path appears in the issue's explicit path mentions
       +5 per backtick-wrapped identifier from the issue found in the block
       +3 per issue term found in the block's added lines
-    Only files scoring 0 across the whole block are candidates. At most
-    floor(max_drop_ratio * total_files) are dropped, preserving sweeping
-    refactors. Dropped files are reverted via `git checkout --` so the on-disk
-    state matches the returned filtered patch. Returns (filtered, dropped).
+    Only files scoring 0 across the whole block are candidates, and only if the
+    path looks like build/vendor/lockfile noise (_prune_drop_eligible). At most
+    floor(max_drop_ratio * total_files) are dropped. Dropped files are reverted
+    via `git checkout --`. Returns (filtered, dropped).
     """
     if not patch.strip():
         return patch, []
@@ -816,6 +865,7 @@ def _prune_offtopic_hunks(
         for rp, bt in file_blocks
     ]
     zero_score = [(rp, bt) for s, rp, bt in scored if s == 0 and rp]
+    zero_score = [(rp, bt) for rp, bt in zero_score if _prune_drop_eligible(rp, bt)]
     to_drop = zero_score[:max_drop]
     if not to_drop:
         return patch, []
