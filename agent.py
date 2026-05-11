@@ -92,7 +92,7 @@ MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
 MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
+MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -127,9 +127,9 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 # codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
-_RECENT_COMMIT_MAX_INSERTIONS = 30
-_RECENT_COMMIT_MAX_DIFF_CHARS = 3500
-_RECENT_COMMIT_BLOCK_BUDGET = 4500
+_RECENT_COMMIT_MAX_INSERTIONS = 40
+_RECENT_COMMIT_MAX_DIFF_CHARS = 4500
+_RECENT_COMMIT_BLOCK_BUDGET = 6000
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -802,8 +802,12 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+    # Give highest-ranked file(s) extra budget so the model sees a richer
+    # targeted snippet for the most likely edit location. This increases the
+    # chance of a one-shot, precise patch.
+    for idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget = per_file_budget * (2 if idx == 0 else 1)
+        snippet = _read_context_file(repo, relative_path, budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1200,12 +1204,26 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
                     added.append(line[1:])
                 elif line.startswith("-") and not line.startswith("---"):
                     removed.append(line[1:])
+            # Drop hunks that are blank/comment/whitespace-only.
             if (
                 _hunk_is_blank_only(added, removed)
                 or _hunk_is_whitespace_only(added, removed)
                 or _hunk_is_comment_only(added, removed)
             ):
                 continue
+            # Heuristic: if the hunk contains mostly comments/blank lines and
+            # only a small fraction of substantive code, treat it as low-signal
+            # and drop it. This helps avoid drive-by comment or docstring edits
+            # that hurt diff-similarity scores.
+            nonblank = [ln for ln in (added + removed) if ln.strip()]
+            if nonblank:
+                non_comment = [ln for ln in nonblank if not _line_is_comment(ln)]
+                try:
+                    ratio = len(non_comment) / len(nonblank)
+                except ZeroDivisionError:
+                    ratio = 0.0
+                if ratio < 0.25:
+                    continue
             substantive.append(hunk_text)
         if substantive:
             out.append(header + "".join(substantive))
@@ -1652,7 +1670,30 @@ def _run_companion_test(
                 continue  # try next runner / give up if all fail
             if proc.returncode == 0:
                 return None  # test passed
-            return output[-2400:] if len(output) > 2400 else output
+            tail = output[-2400:] if len(output) > 2400 else output
+            # Try to summarise failing test targets to prioritise fixes.
+            failed = []
+            try:
+                failed = re.findall(r"FAILED\s+([^\s:]+(?:::[^\s:]+)?)", output)
+            except Exception:
+                failed = []
+            if failed:
+                # Normalize to file-level names where possible.
+                files_failed: List[str] = []
+                for f in failed:
+                    if "::" in f:
+                        files_failed.append(f.split("::")[0])
+                    else:
+                        files_failed.append(f)
+                files_failed = list(dict.fromkeys(files_failed))
+                summary = "FAILED TESTS: " + ", ".join(files_failed[:3]) + "\n\n"
+                return summary + tail
+            # Pytest summary pattern like 'FAILED (failures=1, errors=0)'
+            m = re.search(r"=+\s*FAILED\s*\(([^)]+)\)", output)
+            if m:
+                summary = "FAILED SUMMARY: " + m.group(1) + "\n\n"
+                return summary + tail
+            return tail
 
         return None  # no runner produced a usable signal
 
@@ -1775,6 +1816,12 @@ def _recent_commit_examples(repo: Path) -> str:
             diff_text = diff_proc.stdout.strip()
             if len(diff_text) < 100 or len(diff_text) > _RECENT_COMMIT_MAX_DIFF_CHARS:
                 continue
+            # Prefer commits that touch high-signal source files (.py/.ts/.js/etc.)
+            touched = re.findall(r"\+\+\+ b/(\S+)", diff_text)
+            if touched:
+                if not any(t.endswith(('.py', '.ts', '.js', '.tsx', '.jsx')) for t in touched):
+                    # skip low-signal commits that don't touch typical source files
+                    continue
             block = f"```diff\n{diff_text[:_RECENT_COMMIT_MAX_DIFF_CHARS]}\n```"
             if budget_used + len(block) > _RECENT_COMMIT_BLOCK_BUDGET:
                 break
@@ -2443,7 +2490,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 5
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
@@ -3012,7 +3059,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 4, 6}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -3062,20 +3109,20 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "exception",
     ]
 
-    good_markers = [
-        " passed",
-        " all passed",
-        "ok",
-        "success",
-    ]
+    good_patterns = [
+        r"\d+\s+passed",
+        r"\ball\s+passed\b",
+        r"\bsuccess\b",
+        r"\bok\b",
+        r"\btest\s+passed\b",
+        r"\btests\s+passed\b",
+     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(re.search(pattern, lower) for pattern in good_patterns)
     has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
-        has_bad = True
 
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
@@ -3101,6 +3148,10 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bmake\s+(test|check|lint)\b",
         r"\bruff\b",
         r"\beslint\b",
+        r"\bbundle\s+exec\s+rspec\b",
+        r"\brspec\b",
+        r"\bdotnet\s+test\b",
+        r"\bphp\s+artisan\s+test\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
