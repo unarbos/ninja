@@ -2173,6 +2173,17 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
+def _format_initial_acceptance_checklist(issue: str) -> str:
+    criteria = _extract_acceptance_criteria(issue)
+    if not criteria:
+        return ""
+    lines = ["Acceptance checklist inferred from the issue:"]
+    for index, criterion in enumerate(criteria, 1):
+        cleaned = " ".join(criterion.split())
+        lines.append(f"{index}. {cleaned}")
+    return "\n".join(lines)
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2184,6 +2195,11 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
+    checklist = _format_initial_acceptance_checklist(issue)
+    checklist_section = f"""
+{checklist}
+""" if checklist else ""
+
     return f"""Fix this issue:
 
 {issue}
@@ -2191,7 +2207,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
+{context_section}{checklist_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
