@@ -1910,7 +1910,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # v14: Pre-generation criteria check
 # -----------------------------
 
-def _pre_gen_criteria_check(issue: str, preloaded_context: str) -> str:  # noqa: ARG001
+def _pre_gen_criteria_check(task_text: str) -> str:  # noqa: ARG001
     """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
 
     Injects a pre-flight checklist into the initial prompt so the agent
@@ -1918,7 +1918,7 @@ def _pre_gen_criteria_check(issue: str, preloaded_context: str) -> str:  # noqa:
     Evidence: RC report Root Cause #3 — systematic 1-2 criteria misses on
     atomic/retest tasks with explicitly numbered requirements.
     """
-    criteria = _extract_acceptance_criteria(issue)
+    criteria = _extract_acceptance_criteria(task_text)
     if not criteria or len(criteria) < 2:
         return ""
     items = "\n".join(f"  {i + 1}. {c}" for i, c in enumerate(criteria[:8]))
@@ -1945,23 +1945,23 @@ _COMPLEX_SYSTEM_ADDENDUM = (
 )
 
 
-def _classify_task_scope_v14(issue: str, ctx_lines: int) -> str:
+def _classify_task_scope_v14(task_text: str, ctx_lines: int) -> str:
     """v14: Classify task scope using ACTUAL context size (not hardcoded 200).
 
     Returns a scope addendum string injected into the initial user prompt.
     Evidence: v13 B1 bug — hardcoded 200 made atomic mode never fire.
     Retest pool has 60%+ atomic tasks where king scores 0.70+, we score 0.50.
     """
-    task_len = len(issue)
+    task_len = len(task_text)
     file_mentions = len(re.findall(
-        r'\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b', issue, re.I
+        r'\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b', task_text, re.I
     ))
     complex_signals = ["redesign", "refactor entire", "architecture", "migrate", "rewrite"]
 
     is_complex = (
         task_len > 600
         or file_mentions >= 4
-        or any(s in issue.lower() for s in complex_signals)
+        or any(s in task_text.lower() for s in complex_signals)
     )
     is_atomic = task_len < 250 and file_mentions <= 1 and ctx_lines < 80
 
@@ -1982,17 +1982,17 @@ _ENTERPRISE_FRAMEWORKS = (
 )
 
 
-def _detect_enterprise_framework(issue: str, patch: str) -> str:  # noqa: ARG001
+def _detect_enterprise_framework(task_text: str) -> str:  # noqa: ARG001
     """v14: Detect enterprise framework tasks requiring strict spec-following.
 
     Returns a hint string to inject as a refinement nudge, or empty string.
     Evidence: retest pool has more Spring Boot/Laravel tasks where king scores
     0.70+; these tasks require ALL acceptance criteria addressed precisely.
     """
-    issue_lower = issue.lower()
+    issue_lower = task_text.lower()
     if not any(fw in issue_lower for fw in _ENTERPRISE_FRAMEWORKS):
         return ""
-    criteria = _extract_acceptance_criteria(issue)
+    criteria = _extract_acceptance_criteria(task_text)
     if len(criteria) < 3:
         return ""
     matched_fw = next(fw for fw in _ENTERPRISE_FRAMEWORKS if fw in issue_lower)
@@ -2285,7 +2285,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
     # v14: Pre-flight criteria checklist (inject before issue text when criteria found)
     _pgc = _pre_gen_criteria_check(issue, preloaded_context)
     # v14: Scope addendum (atomic vs complex classification)
-    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))  # pass issue to task_text
 
     return f"""Fix this issue:{_pgc}
 {issue}
