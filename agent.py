@@ -115,7 +115,9 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_HAIL_MARY_TURNS = 2    # last-resort: force a real edit when patch is empty (or near-empty) after everything
+MIN_SUBSTANTIVE_ADDED_LINES = 3  # below this, patch counts as near-empty and gets hail-mary
+MISSING_PATHS_HAIL_MARY_USES_SLOT = True  # re-use hail-mary slot for non-empty patches that skip issue-mentioned paths
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -206,6 +208,51 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+# Long test/compiler output puts the actionable failure body between a header
+# ("collected N tests") and a summary footer; symmetric head/tail truncation
+# preserves both ends but drops the body. Centering the keep-window on the
+# first known error marker keeps the failure body visible while still capping
+# total chars. Falls through to plain head/tail when no marker is found.
+_OBS_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "NameError",
+    "KeyError",
+    "RuntimeError",
+    "panic:",
+    "error[E",
+    "error TS",
+    "FAILED ",
+    "FAIL ",
+)
+
+
+def _truncate_observation(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _OBS_ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker <= half or first_marker >= len(text) - half:
+        return _truncate(text, max_chars)
+    window_start = max(0, first_marker - max_chars // 3)
+    window_end = min(len(text), window_start + max_chars)
+    head_dropped = window_start
+    tail_dropped = len(text) - window_end
+    prefix = "" if head_dropped == 0 else f"...[head {head_dropped} chars]...\n"
+    suffix = "" if tail_dropped == 0 else f"\n...[tail {tail_dropped} chars]..."
+    return prefix + text[window_start:window_end] + suffix
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -425,8 +472,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_observation(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_observation(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -441,8 +488,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_observation(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_observation(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -580,6 +627,62 @@ def get_patch(repo: Path) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     return _strip_low_signal_hunks(cleaned)
+
+
+def _validate_patch_applies(repo: Path, patch: str) -> Optional[str]:
+    """Check the unified diff reverses cleanly against the current working tree.
+
+    Uses `git apply --check --reverse` which is read-only and bounded to 8s.
+    Empty patches are treated as valid (the hail-mary path owns that case).
+    Returns None when the patch is coherent; otherwise an error tail. Any
+    infrastructure failure also returns None — we never want this gate to
+    block shipping a real patch.
+    """
+    if not patch.strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--reverse", "-"],
+            cwd=str(repo),
+            input=patch,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    return err[-600:] if err else "git apply --check returned non-zero"
+
+
+def _patch_substantive_added_lines(patch: str) -> int:
+    """Count added lines that aren't blank, whitespace-only, or comment-only.
+
+    Patches that are technically non-empty but consist of only blank lines and
+    comments score zero on cursor-similarity and barely register with the LLM
+    judge. The refinement gate uses this to recognise near-empty patches that
+    escape the literal-empty check but still carry almost no signal.
+    """
+    if not patch.strip():
+        return 0
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if body.startswith("#") or body.startswith("//"):
+            continue
+        if body.startswith("/*") or body.endswith("*/") or body == "*":
+            continue
+        if body in ('"""', "'''"):
+            continue
+        count += 1
+    return count
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1271,6 +1374,99 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+_OFFTOPIC_DROP_RATIO_MAX = 0.30
+
+
+def _prune_offtopic_hunks(
+    repo: Path,
+    patch: str,
+    issue_text: str,
+) -> Tuple[str, List[str]]:
+    """Score per-file diff blocks against issue overlap; drop zero-score blocks.
+
+    Score for each file block:
+      +8 if the file's path appears in the issue's explicit path mentions
+      +5 per backtick-wrapped identifier from the issue found in the block
+      +3 per issue term (from `_issue_terms`) found in added lines
+
+    Blocks scoring 0 across all signals are dropped. Capped at 30% of total
+    files so a legitimately sweeping refactor is preserved. Dropped files are
+    reverted in the working tree via `git checkout --` so the on-disk state
+    matches the returned filtered patch. Empty patch and edge cases pass
+    through unchanged. Pure text + one git command per dropped file.
+    """
+    if not patch.strip():
+        return patch, []
+
+    issue_paths = {p.strip("./") for p in _extract_issue_path_mentions(issue_text) if p}
+    issue_idents = set(_BACKTICK_IDENT_RE.findall(issue_text))
+    issue_terms_list = list(_issue_terms(issue_text))
+
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    file_entries: List[Tuple[str, str]] = []
+    for block in blocks:
+        if not block.strip():
+            continue
+        m = re.match(r"diff --git a/(.+?) b/(.+?)(?:\n|$)", block)
+        rel = m.group(2) if m else ""
+        file_entries.append((rel, block))
+
+    if not file_entries:
+        return patch, []
+
+    max_drop = int(len(file_entries) * _OFFTOPIC_DROP_RATIO_MAX)
+    if max_drop < 1:
+        return patch, []
+
+    def _score(relative_path: str, block_text: str) -> int:
+        score = 0
+        norm = relative_path.strip("./")
+        if norm:
+            for ip in issue_paths:
+                if norm == ip or norm.endswith("/" + ip) or ip.endswith("/" + norm):
+                    score += 8
+                    break
+        block_lower = block_text.lower()
+        added = " ".join(
+            line[1:] for line in block_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ).lower()
+        for ident in issue_idents:
+            if ident.lower() in block_lower:
+                score += 5
+        for term in issue_terms_list:
+            if term in added:
+                score += 3
+        return score
+
+    scored = [(_score(rp, bt), rp, bt) for rp, bt in file_entries]
+    to_drop = [(rp, bt) for s, rp, bt in scored if s == 0 and rp][:max_drop]
+    if not to_drop:
+        return patch, []
+
+    drop_paths = {rp for rp, _ in to_drop}
+    kept = [bt for s, rp, bt in scored if rp not in drop_paths]
+    if not kept:
+        return patch, []
+
+    for relative_path in drop_paths:
+        try:
+            subprocess.run(
+                ["git", "checkout", "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    summaries = [f"{rp} (score=0)" for rp, _ in to_drop]
+    return "".join(kept), summaries
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2419,6 +2615,35 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_missing_paths_hail_mary_prompt(missing_paths: List[str], issue_text: str) -> str:
+    """Re-use the hail-mary slot for non-empty patches that skip issue-named files.
+
+    The hail-mary slot is exempt from MAX_TOTAL_REFINEMENT_TURNS, so this is the
+    only refinement step guaranteed to fire when polish/syntax have already
+    consumed the regular cap. A `<final>NO-OP</final>` escape lets the model
+    bail out of the extra edit when the paths are merely referenced (not
+    targeted) in the issue.
+    """
+    paths_block = "\n".join(f"  - {p}" for p in missing_paths[:6])
+    short = issue_text[:1200].rstrip()
+    return (
+        "FINAL TARGETING CHECK. Your patch is non-empty, but the issue "
+        "explicitly names these paths and your diff does not touch any of "
+        "them:\n"
+        f"{paths_block}\n\n"
+        "If the issue's intent genuinely requires changes in those files, "
+        "issue the additional <command> block(s) NOW in one final turn. "
+        "Match the existing surrounding style and add only what the issue "
+        "requires.\n\n"
+        "If you are confident the issue mentions those paths only as "
+        "references (NOT as edit targets), reply with exactly "
+        "<final>NO-OP</final> and we will ship the current diff. Do not "
+        "explain at length — produce either the targeted edits or the "
+        "no-op response.\n\n"
+        f"Issue (for reference):\n{short}\n"
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2444,7 +2669,12 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
+# v51: tighter than the legacy 580s envelope. The validator's per-round
+# timeout is variable (120-600s depending on task difficulty); a fixed 580s
+# overshoots on easy tasks and triggers external kills that return nothing
+# instead of attempt-1's on-disk patch. 420s leaves clear headroom on every
+# task class while still allowing one strong retry on hard tasks.
+_MULTISHOT_TOTAL_BUDGET = 420.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
@@ -2594,7 +2824,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _remaining = _multishot_total_budget - _elapsed
+        # v51: when attempt 1 produced a NON-EMPTY (but low-signal) patch and
+        # the remaining budget is below twice the inner wall-clock reserve,
+        # ship the attempt-1 patch instead of risking a partial-retry that
+        # might be killed mid-attempt and return nothing.
+        if _patch1.strip() and _remaining < 2 * WALL_CLOCK_RESERVE_SECONDS:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "patch1_nonempty_low_budget"
+            return _result1
+        if _remaining < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
@@ -2723,6 +2962,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
             return False
+
+        # v51: near-empty patches (technically non-empty but only
+        # blank/whitespace/comment additions) escape the literal-empty check
+        # but score zero on cursor-similarity. Treat them like empty: fire
+        # hail-mary (exempt from the total-refinement cap).
+        if _patch_substantive_added_lines(patch) < MIN_SUBSTANTIVE_ADDED_LINES:
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hail_mary_prompt(issue),
+                    "HAIL_MARY_QUEUED: patch near-empty (< MIN_SUBSTANTIVE_ADDED_LINES)",
+                )
+                return True
+
+        # v51: orthogonal hail-mary case — patch is non-empty AND has
+        # substantive content but skips files the issue explicitly names.
+        # Re-use the hail-mary slot (exempt from MAX_TOTAL_REFINEMENT_TURNS)
+        # so this gate fires even when polish/syntax already ate the regular
+        # cap. The model can escape via <final>NO-OP</final> when the paths
+        # are referenced rather than targeted.
+        if MISSING_PATHS_HAIL_MARY_USES_SLOT and hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+            _missing_hm = _uncovered_required_paths(patch, issue)
+            if _missing_hm:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_paths_hail_mary_prompt(_missing_hm, issue),
+                    "MISSING_PATHS_HAIL_MARY_QUEUED:\n  " + ", ".join(_missing_hm[:4]),
+                )
+                return True
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -3019,6 +3289,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+
+        # v51: drop file diffs whose content has zero overlap with the issue's
+        # paths / identifiers / terms. Caps at 30% of files so sweeping
+        # refactors are not gutted. Reverts dropped files in the working
+        # tree so a follow-up `git diff` matches what we return.
+        if patch.strip():
+            _, _dropped = _prune_offtopic_hunks(repo, patch, issue)
+            if _dropped:
+                patch = get_patch(repo)
+                logs.append(
+                    "PRUNE_OFFTOPIC_HUNKS: dropped="
+                    + str(len(_dropped)) + " " + "; ".join(_dropped[:4])
+                )
+
+        # v51: validate the final diff applies cleanly against the working
+        # tree. Read-only `git apply --check --reverse`; ~8s timeout. On
+        # persistent failure we surface the error tail in logs and clear
+        # success so the safety net sees the failure rather than shipping
+        # a broken patch.
+        if patch.strip():
+            _apply_err = _validate_patch_applies(repo, patch)
+            if _apply_err is not None:
+                patch = get_patch(repo)  # re-read in case refinement left state stale
+                _apply_err2 = _validate_patch_applies(repo, patch)
+                if _apply_err2 is not None:
+                    logs.append("PATCH_APPLY_CHECK_FAILED:\n" + _apply_err2)
+                    success = False
+
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
