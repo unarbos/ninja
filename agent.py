@@ -1045,7 +1045,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1709,6 +1709,55 @@ def _select_companion_test_failure(
     return None
 
 
+# CL-GPT-v12: test verification first (PR#897 pattern)
+def _find_issue_tests(repo: Path, task_text: str) -> List[str]:
+    """v12: Find test files likely relevant to the task description.
+    Returns list of relative paths capped at 3 to avoid timeout."""
+    import re as _re
+    candidates: List[str] = []
+    # Match explicit test file mentions in the task text
+    for m in _re.finditer(
+        r'(test[\w/]*\.(?:js|ts|py|rb|go|java)|[\w/]*\.test\.\w+|[\w/]*_test\.\w+|[\w/]*spec\.\w+)',
+        task_text, _re.I
+    ):
+        candidates.append(m.group(1))
+    # Look for camelCase/mixed symbols that might have corresponding tests
+    symbols = _re.findall(
+        r'\b([A-Z][a-zA-Z0-9]{3,}|[a-z][a-z0-9_]{3,}[A-Z][a-zA-Z0-9]*)\b',
+        task_text
+    )
+    for sym in symbols[:5]:
+        try:
+            result = run_command(
+                f'grep -rl "{sym}" --include="*test*" --include="*spec*" . 2>/dev/null | head -3',
+                repo,
+                timeout=5,
+            )
+            if result.stdout.strip():
+                candidates.extend(result.stdout.strip().splitlines())
+        except Exception:
+            pass
+    # Deduplicate and verify files exist
+    seen: set = set()
+    valid: List[str] = []
+    for c in candidates:
+        c = c.strip('./')
+        if c not in seen and (repo / c).exists():
+            seen.add(c)
+            valid.append(c)
+    return valid[:3]
+
+
+def _pick_test_command(repo: Path, test_file: str) -> str:
+    """v12: Pick the right test runner command for a given test file."""
+    if test_file.endswith('.py'):
+        return f"python3 -m pytest {test_file} -x -q --tb=short 2>&1 | head -20"
+    if test_file.endswith(('.ts', '.js')):
+        if (repo / 'node_modules' / '.bin' / 'jest').exists():
+            return f"./node_modules/.bin/jest {test_file} --no-coverage 2>&1 | head -20"
+    return ""
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -1903,6 +1952,61 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
+
+
+def _verify_criteria_coverage(patch: str, criteria: List[str]) -> List[str]:
+    """v12-v2: Check which criteria have no keyword coverage in the patch's
+    added lines. Returns list of unaddressed criteria strings.
+    Pure Python, no subprocess. Fast (< 0.1s)."""
+    if not patch or not criteria:
+        return []
+    added_lower = _patch_added_text(patch)
+    if not added_lower:
+        return list(criteria)
+    missing: List[str] = []
+    for crit in criteria:
+        keywords = _criterion_keywords(crit)
+        if not keywords:
+            continue
+        hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
+        if hits * 2 < len(keywords):
+            missing.append(crit)
+    return missing
+
+
+def _detect_frontend_gap(task_text: str, patch: str) -> str:
+    """v12-v2: If the task mentions frontend files (.vue, Next.js pages,
+    React components) but the patch only touches backend files, return a
+    coaching hint string. Returns '' when no gap is detected.
+    Pure Python, no subprocess. Fast (< 0.1s)."""
+    if not task_text or not patch:
+        return ""
+    task_lower = task_text.lower()
+    frontend_signals = (
+        ".vue", "next.js", "nextjs", "react component", ".tsx", ".jsx",
+        "pages/", "components/", "frontend", "ui component", "page component",
+    )
+    has_frontend_task = any(sig in task_lower for sig in frontend_signals)
+    if not has_frontend_task:
+        return ""
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return ""
+    frontend_exts = {".vue", ".tsx", ".jsx", ".svelte"}
+    frontend_dirs = {"pages", "components", "frontend", "src/pages", "src/components"}
+    has_frontend_patch = any(
+        Path(p).suffix.lower() in frontend_exts
+        or any(part in frontend_dirs for part in Path(p).parts)
+        for p in changed
+    )
+    if has_frontend_patch:
+        return ""
+    return (
+        "Frontend gap detected: the task mentions UI/frontend changes "
+        "(.vue / Next.js pages / React components) but your patch only touches "
+        "backend files. Check whether frontend files also need updating and, "
+        "if so, apply those edits now before finalizing."
+    )
 
 
 # -----------------------------
@@ -2753,6 +2857,50 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v12: test verification first (PR#897 pattern) — run tests named in
+        # or implied by the issue before falling back to companion-test scan.
+        # This mirrors what PR#897 (throne winner) did: verify issue-named
+        # tests to avoid submitting patches that break existing tests.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            _v12_issue_tests = _find_issue_tests(repo, issue)
+            if _v12_issue_tests:
+                for _v12_tf in _v12_issue_tests[:1]:
+                    _v12_tc = _pick_test_command(repo, _v12_tf)
+                    if _v12_tc:
+                        _v12_tr = run_command(_v12_tc, repo, timeout=25)
+                        if _v12_tr.exit_code != 0 and (_v12_tr.stdout or _v12_tr.stderr):
+                            test_fix_turns_used += 1
+                            total_refinement_turns_used += 1
+                            queue_refinement_turn(
+                                assistant_text,
+                                build_test_fix_prompt(
+                                    _v12_tf,
+                                    (_v12_tr.stdout or "") + (_v12_tr.stderr or ""),
+                                ),
+                                f"V12_TEST_VERIFY: {_v12_tf}",
+                            )
+                            return True
+
+        # v12-v2: acceptance criteria gap — check issue criteria vs patch added lines
+        _ac_crit = _extract_acceptance_criteria(issue)
+        if _ac_crit:
+            _missing = _verify_criteria_coverage(patch, _ac_crit)
+            if _missing and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    "Missing criteria:\n" + "\n".join(f"- {c}" for c in _missing[:3]) + "\n\nAddress these.",
+                    f"AC_MISSING:{len(_missing)}",
+                )
+                return True
+
+        # v12-v2: frontend gap — task wants frontend edits but patch has none
+        _fe = _detect_frontend_gap(issue, patch)
+        if _fe and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(assistant_text, _fe, "FE_GAP")
+            return True
+
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
         # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
         # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
@@ -2830,7 +2978,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()  # wall-clock reference (unused)
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
