@@ -116,7 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 4  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1994,6 +1994,237 @@ def _symbol_grep_hits(
 
 
 # -----------------------------
+# v13 inline patch-quality helpers
+# -----------------------------
+
+def _quick_patch_lint(patch: str, repo_path: Path) -> List[str]:
+    """Fast inline linter for common patch anti-patterns.
+
+    Three pure-string/regex checks, each <10ms:
+    1. Missing 'use client' in Next.js tsx/jsx app-dir files that use React hooks.
+    2. Double-slash URL concatenation (e.g. base_url + '//path').
+    3. Assignments to variables that were only deleted (not retained) in the patch.
+
+    Returns a list of issue strings (empty = clean).
+    """
+    issues: List[str] = []
+    if not patch.strip():
+        return issues
+
+    # Parse added/removed lines per file
+    current_file: Optional[str] = None
+    file_added: Dict[str, List[str]] = {}
+    file_removed: Dict[str, List[str]] = {}
+
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+            file_added.setdefault(current_file, [])
+            file_removed.setdefault(current_file, [])
+        elif current_file is not None:
+            if line.startswith("+") and not line.startswith("++"):
+                file_added[current_file].append(line[1:])
+            elif line.startswith("-") and not line.startswith("--"):
+                file_removed[current_file].append(line[1:])
+
+    _HOOK_RE = re.compile(
+        r'\b(useState|useEffect|useRef|useCallback|useMemo|useContext|useReducer)\b'
+    )
+
+    for fname, added in file_added.items():
+        suffix = Path(fname).suffix.lower()
+        added_text = "\n".join(added)
+
+        # Check 1: missing 'use client' in Next.js tsx/jsx app-dir files
+        if suffix in {".tsx", ".jsx"} and ("app/" in fname or fname.startswith("src/app/")):
+            if _HOOK_RE.search(added_text):
+                combined = added_text + "\n" + "\n".join(file_removed.get(fname, []))
+                existing_has_directive = False
+                if repo_path is not None:
+                    try:
+                        fp = (repo_path / fname).resolve()
+                        ec = fp.read_text(encoding="utf-8", errors="replace")
+                        existing_has_directive = "'use client'" in ec or '"use client"' in ec
+                    except Exception:
+                        pass
+                if not existing_has_directive and (
+                    "'use client'" not in combined and '"use client"' not in combined
+                ):
+                    issues.append(
+                        f"{fname}: adds React hooks but 'use client' directive not found"
+                    )
+
+        # Check 2: double-slash in URL string concatenation
+        _DSLASH_RE = re.compile(r'["\'][^"\']*//[^"\'/]')
+        for line in added:
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*")):
+                continue
+            clean = re.sub(r'https?://', 'PROTO', line)
+            if _DSLASH_RE.search(clean):
+                issues.append(f"{fname}: possible double-slash in URL (check string concatenation)")
+                break
+
+    # Check 3: assignments to variables only present in deleted lines
+    all_removed = "\n".join(l for lines in file_removed.values() for l in lines)
+    all_added = "\n".join(l for lines in file_added.values() for l in lines)
+    _ASSIGN_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*(?!=)', re.MULTILINE)
+    removed_vars = {m.group(1) for m in _ASSIGN_RE.finditer(all_removed)}
+    added_vars = {m.group(1) for m in _ASSIGN_RE.finditer(all_added)}
+    for var in removed_vars & added_vars:
+        usage_re = re.compile(r'\b' + re.escape(var) + r'\b')
+        usages = [l for l in all_added.splitlines() if usage_re.search(l)]
+        assign_re = re.compile(r'^\s*' + re.escape(var) + r'\s*=\s*(?!=)')
+        assigns = [l for l in usages if assign_re.match(l)]
+        if usages and len(assigns) == len(usages):
+            issues.append(
+                f"Variable '{var}' from deleted code re-assigned in patch but never used"
+            )
+
+    return issues
+
+
+def _detect_unwired_helpers(patch: str) -> List[str]:
+    """Detect helpers defined in patch but never called in patch.
+    Catches Python, JS/TS async, and arrow function patterns.
+    Evidence: duel #4452 R5 deleteWithConcurrency defined but old loop never replaced.
+    """
+    added = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    added_text = chr(10).join(added)
+
+    # Python: def fn_name(
+    py_defs = re.findall(r"^def ([A-Za-z_][A-Za-z0-9_]*)\s*\(", added_text, re.M)
+    # JS/TS: async function fnName( or function fnName(
+    js_defs = re.findall(r"(?:async\s+function|function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", added_text)
+    # JS/TS const arrows: const fnName = async (...) or const fnName = (...)
+    js_arrow = re.findall(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", added_text)
+    all_defs = set(py_defs + js_defs + js_arrow)
+
+    common = {"main", "test", "setUp", "tearDown", "handler", "callback", "render", "init"}
+    all_defs -= common
+
+    unwired = []
+    for fn in sorted(all_defs):
+        escaped = re.escape(fn)
+        call_re = "(?<![a-zA-Z_])" + escaped + r"\s*\("
+        calls = len(re.findall(call_re, added_text))
+        defs = len(re.findall(r"(?:def|function|const)\s+" + escaped, added_text))
+        if calls <= defs:
+            unwired.append(fn)
+    return unwired[:3]
+
+
+def _extract_named_deliverables(task_text: str) -> List[str]:
+    """Extract explicitly named files and scripts from the task specification.
+
+    Matches backtick/quote-wrapped filenames and bare extension-bearing references.
+    Filters out URLs and common false positives. Caps at 8 results.
+
+    Returns list of named deliverable paths/names.
+    """
+    if not task_text:
+        return []
+
+    seen: set = set()
+    deliverables: List[str] = []
+
+    _FILE_RE = re.compile(
+        r'(?:^|[\s`\'",(\[])([A-Za-z0-9_.\-/]+\.[a-zA-Z]{2,5})(?:$|[\s`\'",.)])',
+        re.MULTILINE,
+    )
+
+    for match in _FILE_RE.finditer(task_text):
+        name = match.group(1).strip().strip("`'\"")
+        if not name:
+            continue
+        if name.startswith(("http", "www.", "//", "ftp")):
+            continue
+        if len(name) > 80 or name.count("/") > 4:
+            continue
+        ext = Path(name).suffix.lower()
+        if ext not in TEXT_FILE_EXTENSIONS and ext not in {".sh", ".env", ".cfg", ".lock"}:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deliverables.append(name)
+        if len(deliverables) >= 8:
+            break
+
+    return deliverables
+
+
+def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
+    """Return deliverables that do NOT appear in the patch's diff header paths.
+
+    Checks `+++ b/<path>` lines so file creations (which have `/dev/null` as
+    source) are still detected as long as the new path is in the header.
+
+    Returns list of uncovered deliverable names.
+    """
+    if not patch or not deliverables:
+        return []
+
+    header_paths: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            header_paths.add(line[6:].strip().lower())
+        elif line.startswith("+++ "):
+            raw = line[4:].strip().lower()
+            if raw != "/dev/null":
+                header_paths.add(raw)
+
+    uncovered: List[str] = []
+    for item in deliverables:
+        item_lower = item.lower()
+        item_stem = Path(item).stem.lower()
+        covered = any(
+            item_lower == hp or hp.endswith("/" + item_lower) or item_lower in hp
+            for hp in header_paths
+        )
+        if not covered and len(item_stem) >= 3:
+            covered = any(item_stem in hp for hp in header_paths)
+        if not covered:
+            uncovered.append(item)
+
+    return uncovered
+
+
+def _classify_task_scope(task_text: str, baseline_lines: int) -> str:
+    """Classify the scope of a task as 'atomic', 'moderate', or 'complex'.
+
+    - atomic:   baseline_lines < 100 AND task < 200 chars AND <=1 file mention
+    - complex:  task > 600 chars OR 4+ file mentions OR redesign/architecture keyword
+    - moderate: everything else
+
+    Used to inject a framing hint into the initial user message.
+    """
+    if not task_text:
+        return "moderate"
+
+    task_len = len(task_text)
+    file_mentions = _extract_issue_path_mentions(task_text)
+    num_files = len(file_mentions)
+
+    has_complexity_keyword = bool(
+        re.search(
+            r'\b(redesign|refactor|architecture|migration|migrate|overhaul|rewrite)\b',
+            task_text,
+            re.IGNORECASE,
+        )
+    )
+
+    if task_len > 600 or num_files >= 4 or has_complexity_keyword:
+        return "complex"
+
+    if baseline_lines < 100 and task_len < 200 and num_files <= 1:
+        return "atomic"
+
+    return "moderate"
+
+
+# -----------------------------
 # Prompting
 # -----------------------------
 
@@ -2805,6 +3036,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v13: Named-deliverable coverage — after criteria nudge, before lint gate
+        _deliverables = _extract_named_deliverables(issue)
+        if _deliverables:
+            _uncovered_del = _check_deliverable_coverage(patch, _deliverables)
+            if _uncovered_del and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    f"Task explicitly names these files that are missing from your patch: "
+                    f"{', '.join(_uncovered_del[:3])}. Create or modify them.",
+                    "MISSING_DELIVERABLES",
+                )
+                return True
+
+        # v13: Lightweight inline lint gate — before self-check
+        _lint_issues = _quick_patch_lint(patch, repo)
+        if _lint_issues and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                "Lint issues:\n" + "\n".join(f"- {i}" for i in _lint_issues[:3]) + "\nFix these.",
+                "LINT_GATE",
+            )
+            return True
+
+        # v13: Async call-site wiring detector — after lint gate
+        _unwired = _detect_unwired_helpers(patch)
+        if _unwired and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                f"New function(s) defined but never called: {', '.join(_unwired)}. "
+                "Wire them into the existing flow.",
+                "UNWIRED_FN",
+            )
+            return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2824,13 +3092,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
+        # v13: classify task scope and inject framing hint into initial message
+        _scope = _classify_task_scope(issue, len(preloaded_context.splitlines()))
+        _scope_hint = ""
+        if _scope == "atomic":
+            _scope_hint = (
+                "\n[Scope: ATOMIC task. Prefer the minimal diff that satisfies the spec. "
+                "Do not refactor surrounding code.]\n"
+            )
+        elif _scope == "complex":
+            _scope_hint = (
+                "\n[Scope: COMPLEX multi-concern task. Enumerate all required changes "
+                "in your plan before coding.]\n"
+            )
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context) + _scope_hint},
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()  # wall-clock ref
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
