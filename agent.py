@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -105,6 +106,14 @@ HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Dynamic wall-clock guard. The constant above is the *baseline*; the actual
+# budget for a given (repo, issue) is computed by `_estimate_wall_clock_budget`
+# and clamped to [BASELINE - FLEX, BASELINE + FLEX], with absolute safety bounds
+# of [HARD_MIN, HARD_MAX] so a runaway estimate cannot starve or oversubscribe
+# the multi-shot envelope. Inspired by `_agents/time_limit_estimate.py`.
+WALL_CLOCK_BUDGET_HARD_MIN = 120.0
+WALL_CLOCK_BUDGET_HARD_MAX = 600.0
+WALL_CLOCK_BUDGET_FLEX_SECONDS = 60.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -491,6 +500,185 @@ def format_observation(result: CommandResult) -> str:
 
 
 # -----------------------------
+# Dynamic wall-clock budget estimation
+# -----------------------------
+#
+# Ported from `_agents/time_limit_estimate.py` (least-squares fit to the
+# `max(min(600, 2*cursor+1), 120)` ceiling, blended with a structural repo
+# score). Differences vs the offline tool:
+#   * No reference patch is available at solve-time, so the patch-shape
+#     features (patch bytes / patch lines / `diff --git` count) are zero.
+#     The model coefficients tolerate this via `log1p(max(x, 1))` clamps.
+#   * The "task text" is the live `issue` string passed into `solve()`; we
+#     count its UTF-8 byte length in Python instead of `wc -c`-ing a file.
+#   * The bash probe is launched with the same style as the agent's
+#     `run_command` (`shell=True, executable="/bin/bash", env=_command_env()`)
+#     and inherits the same hardened PATH/HOME/etc, so it behaves identically
+#     to the rest of the agent's shell surface.
+#
+# The output is intentionally clamped: the dynamic estimate is wrapped to
+# `[BASELINE - FLEX, BASELINE + FLEX]` (and then to `[HARD_MIN, HARD_MAX]`)
+# so the per-attempt wall clock cannot drift far from the proven baseline.
+
+_WALL_CLOCK_PROBE_BASH = r"""set -euo pipefail
+cd "${REPO:?}"
+files=$(find . -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+dirs=$(find . -type d 2>/dev/null | wc -l | tr -d "[:space:]")
+code=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) 2>/dev/null | wc -l | tr -d "[:space:]")
+line_stat=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+lines=${line_stat:-0}
+case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+printf '%s\t%s\t%s\t%s\n' "$files" "$dirs" "$code" "$lines"
+"""
+
+# Coefficients verbatim from `time_limit_estimate.py`. Order matches
+# `_wall_clock_feature_vector`: bias, log(files), log(dirs), log(code_files),
+# log(lines), log(prompt_bytes), log(patch_bytes), patch_bytes^0.25,
+# log(patch_lines), log(diff_git_count).
+_WALL_CLOCK_CAP_BETA: Tuple[float, ...] = (
+    -1502.280905,
+    17.15374,
+    24.155525,
+    -25.281183,
+    15.948134,
+    129.154837,
+    -5.283372,
+    -11.022089,
+    109.164775,
+    7.151717,
+)
+_WALL_CLOCK_LIN_BLEND = 0.488
+_WALL_CLOCK_STRUCT_BLEND = 1.06
+_WALL_CLOCK_RATIO_TARGET_SCALE = 1.68
+_WALL_CLOCK_PROBE_TIMEOUT_SEC = 30
+
+
+def _wall_clock_feature_vector(probe: Tuple[int, int, int, int, int, int, int, int]) -> List[float]:
+    f, d, c, ln, p, pb, pl, dg = probe
+    return [
+        1.0,
+        math.log1p(f),
+        math.log1p(d),
+        math.log1p(max(c, 1)),
+        math.log1p(max(ln, 1)),
+        math.log1p(max(p, 1)),
+        math.log1p(max(pb, 1)),
+        (max(pb, 0) ** 0.25),
+        math.log1p(max(pl, 1)),
+        math.log1p(max(dg, 1)),
+    ]
+
+
+def _wall_clock_linear_cap_hat(features: List[float]) -> float:
+    pred = sum(b * x for b, x in zip(_WALL_CLOCK_CAP_BETA, features))
+    return float(max(WALL_CLOCK_BUDGET_HARD_MIN, min(WALL_CLOCK_BUDGET_HARD_MAX, pred)))
+
+
+def _wall_clock_structural_score(probe: Tuple[int, int, int, int, int, int, int, int]) -> float:
+    """Repo-only complexity score; same caps as the offline estimator."""
+    f, d, c, ln, p, pb, _pl, _dg = probe
+    f_cap = min(max(f, 0), 400_000)
+    d_cap = min(max(d, 0), 100_000)
+    c_cap = min(max(c, 0), 120_000)
+    ln_cap = min(max(ln, 0), 3_000_000)
+    p_cap = min(max(p, 0), 2_000_000)
+    pb_cap = min(max(pb, 0), 8_000_000)
+
+    tree = min(math.log1p(f_cap) * 3.0 + math.log1p(d_cap) * 1.6, 70.0)
+    code = min(math.log1p(c_cap) * 5.8 + math.sqrt(max(c_cap, 1)) * 0.65, 75.0)
+    vol = min(math.log1p(max(ln_cap, 1)) * 4.3 + (ln_cap ** 0.25) * 0.25, 95.0)
+    patch = min(math.log1p(max(pb_cap, 1)) * 3.6 + (pb_cap ** 0.20) * 0.22, 80.0)
+    prompt = min(math.log1p(max(p_cap, 1)) * 2.3 + (p_cap / 110_000.0), 28.0)
+    avg_loc = (ln_cap / c_cap) if c_cap > 0 else 0.0
+    dens = 1.0 + max(-0.08, min(0.12, (avg_loc - 120.0) / 2300.0))
+    base = 22.0 + tree + code + vol + patch + prompt
+    raw = base * dens
+    if c_cap == 0 and ln_cap == 0:
+        raw = 22.0 + tree * 0.90 + patch * 0.80 + prompt * 0.70
+    return float(raw)
+
+
+def _estimate_seconds_from_probe(probe: Tuple[int, int, int, int, int, int, int, int]) -> int:
+    """Combine patch-/tree-informed cap estimate with structural score; integer seconds."""
+    feats = _wall_clock_feature_vector(probe)
+    cap_hat = _wall_clock_linear_cap_hat(feats)
+    struct = _wall_clock_structural_score(probe)
+    blended = min(_WALL_CLOCK_LIN_BLEND * cap_hat, _WALL_CLOCK_STRUCT_BLEND * struct)
+    scaled = blended * _WALL_CLOCK_RATIO_TARGET_SCALE
+    est = int(round(scaled))
+    return max(int(WALL_CLOCK_BUDGET_HARD_MIN), min(est, int(WALL_CLOCK_BUDGET_HARD_MAX) - 1))
+
+
+def _run_wall_clock_probe(repo_dir: Path) -> Tuple[int, int, int, int]:
+    """Run the bash complexity probe (770-style invocation)."""
+    env = {**_command_env(), "REPO": str(repo_dir.resolve())}
+    proc = subprocess.run(
+        _WALL_CLOCK_PROBE_BASH,
+        cwd=str(repo_dir),
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_WALL_CLOCK_PROBE_TIMEOUT_SEC,
+        executable="/bin/bash",
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "").strip() or f"probe exit {proc.returncode}")
+    line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+    parts = line.split("\t")
+    if len(parts) != 4:
+        raise RuntimeError(f"unexpected probe output: {line!r}")
+    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+
+
+def _estimate_wall_clock_budget(repo_dir: Path, issue: str) -> float:
+    """Dynamically size the per-attempt wall-clock budget for this (repo, issue).
+
+    Returns a value clamped to ``[BASELINE - FLEX, BASELINE + FLEX]`` and to
+    the absolute safety bounds ``[HARD_MIN, HARD_MAX]``. Falls back to the
+    baseline `WALL_CLOCK_BUDGET_SECONDS` if anything goes wrong (probe fails,
+    bash unavailable, math overflow, etc.) — never raises.
+    """
+    lo = max(WALL_CLOCK_BUDGET_HARD_MIN, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    hi = min(WALL_CLOCK_BUDGET_HARD_MAX, WALL_CLOCK_BUDGET_SECONDS + WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    try:
+        files, dirs, code_files, lines = _run_wall_clock_probe(repo_dir)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    prompt_bytes = len(issue.encode("utf-8")) if issue else 0
+    # Patch features unavailable during live solve; supplied as zeros.
+    probe = (files, dirs, code_files, lines, prompt_bytes, 0, 0, 0)
+    try:
+        estimated = _estimate_seconds_from_probe(probe)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    return float(max(lo, min(hi, float(estimated))))
+
+
+# -----------------------------
 # Action parsing
 # -----------------------------
 
@@ -603,6 +791,21 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         )
         if mode_only:
             continue
+        # v48: when a file has real content edits AND a mode change,
+        # the chmod is incidental and the judge consistently flags it as
+        # "unrelated file mode churn." Drop the `old mode` / `new mode`
+        # lines so only the substantive content edit remains.
+        # Only do this when the block also contains a real content hunk
+        # (`@@ ` or `new file mode ` or binary marker).
+        has_content = "\n@@ " in block or "\nnew file mode " in block or "\nGIT binary patch" in block or "\nBinary files " in block
+        if has_content and ("\nold mode " in block or "\nnew mode " in block):
+            cleaned_lines: List[str] = []
+            for line in block.splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+                    continue
+                cleaned_lines.append(line)
+            block = "".join(cleaned_lines)
         kept.append(block)
 
     result = "".join(kept)
@@ -2555,9 +2758,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
-       be either (a) so short it cannot produce a patch, or (b) push past
+       Two attempts at the per-attempt wall-clock budget (baseline 270s,
+       dynamically sized in [BASELINE-FLEX, BASELINE+FLEX] = [210s, 330s]
+       per (repo, issue) by `_estimate_wall_clock_budget`) already saturate
+       the _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have
+       to be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
        The empty-patch case is already handled inside `_solve_attempt` by
        the hail-mary refinement turn (see `maybe_queue_refinement`), and
@@ -2673,8 +2878,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     # model loop and starve the retry of any time. We stop the inner loop
     # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
     # return whatever patch is already on disk.
+    #
+    # The budget itself is sized dynamically per (repo, issue) by the
+    # `_estimate_wall_clock_budget` helper after `repo` is resolved; until
+    # that runs we use the baseline `WALL_CLOCK_BUDGET_SECONDS` so this
+    # closure is safe to call before the refinement happens.
+    wall_clock_budget = float(WALL_CLOCK_BUDGET_SECONDS)
+
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return wall_clock_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2820,6 +3032,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     try:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
+        # Dynamically size the per-attempt wall-clock budget based on repo
+        # complexity (bash probe) and issue length. Stays within ±FLEX of the
+        # baseline and absolute [HARD_MIN, HARD_MAX] so a misestimate cannot
+        # starve or oversubscribe the multi-shot envelope. Falls back to the
+        # baseline silently if the probe or estimator fails.
+        wall_clock_budget = _estimate_wall_clock_budget(repo, issue)
+        logs.append(
+            "WALL_CLOCK_BUDGET_DYNAMIC:\n"
+            f"  baseline={WALL_CLOCK_BUDGET_SECONDS:.1f}s "
+            f"flex=±{WALL_CLOCK_BUDGET_FLEX_SECONDS:.0f}s "
+            f"hard=[{WALL_CLOCK_BUDGET_HARD_MIN:.0f},{WALL_CLOCK_BUDGET_HARD_MAX:.0f}]s "
+            f"chosen={wall_clock_budget:.1f}s"
+        )
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
