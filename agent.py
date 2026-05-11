@@ -796,6 +796,13 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+    # Files whose path is literally named in the issue body get 2x the per-file
+    # context budget. The issue almost always names its primary edit target by
+    # path; under equal-budget allocation that file is squeezed alongside
+    # incidentally-ranked neighbours and we lose precise context on the exact
+    # file the task is about. The total `MAX_PRELOADED_CONTEXT_CHARS` cap still
+    # bounds the whole block — worst case, lower-ranked files spill out.
+    path_mentioned = {p.strip("./") for p in _extract_issue_path_mentions(issue)}
 
     parts: List[str] = []
     included: List[str] = []
@@ -803,7 +810,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        file_budget = per_file_budget * 2 if relative_path in path_mentioned else per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -828,12 +836,71 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     return "\n\n".join(parts), included
 
 
+# URL-shaped path tokens (e.g. `/api/users/:id`, `/v1/auth/login`,
+# `/employees/:staffCode`). These DO NOT match `_extract_issue_path_mentions`
+# (no file extension) nor `_extract_issue_symbols` (regex rejects `/` and `:`).
+# Issues commonly reference REST routes, frontend route paths, or API endpoints
+# the agent has to wire up; surfacing them as needles puts windowed-extraction
+# windows on the exact route-registration lines (e.g.
+# `app.put('/employees/:staffCode', handler)`) instead of leaving the agent
+# to guess which file holds the route table.
+_URL_ROUTE_RE = re.compile(r"(?<![\w./-])(/[a-zA-Z][\w/\-:]*[a-zA-Z0-9])(?![\w./-])")
+
+# Issues frequently quote literal text the agent should be grepping verbatim
+# — error messages, log lines, JSON keys, short code snippets. Without
+# these as needles, windowed extraction can't put a window on the actual
+# emission/declaration line for that exact string.
+_QUOTED_NEEDLE_RE = re.compile(r'["\']([^"\']{4,80})["\']')
+
+# Lines from fenced code blocks (```...```). Each meaningful line is a
+# literal target string the agent should be able to grep for in the repo.
+_FENCED_CODE_RE = re.compile(r"```[A-Za-z]*\n(.*?)```", re.DOTALL)
+
+
+def _extract_issue_routes(issue_text: str, *, max_routes: int = 10) -> List[str]:
+    """Extract URL-path-shaped tokens (REST/frontend routes) from issue text.
+
+    Filters out short prose fragments like `a/b/c` and paths that already
+    look like file paths handled by `_extract_issue_path_mentions`.
+    """
+    seen: set = set()
+    out: List[str] = []
+    skip_suffixes = (
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt",
+        ".rb", ".php", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".swift",
+        ".dart", ".ex", ".exs", ".md", ".rst", ".txt", ".json", ".yaml",
+        ".yml", ".toml", ".sql", ".sh", ".bash", ".html", ".css", ".scss",
+        ".svelte", ".vue", ".xml",
+    )
+    for match in _URL_ROUTE_RE.finditer(issue_text):
+        token = match.group(1)
+        key = token.lower()
+        if key in seen:
+            continue
+        if len(token) < 4 or token.count("/") < 1:
+            continue
+        # Skip when every segment is < 3 chars (prose like `/a/b/c`)
+        segments = [s for s in token.split("/") if s]
+        if not any(len(s) >= 3 for s in segments):
+            continue
+        # Skip pure file-extension paths — already covered by path-mention extractor
+        if any(key.endswith(ext) for ext in skip_suffixes):
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= max_routes:
+            break
+    return out
+
+
 def _preload_needles(issue: str) -> List[str]:
     """Build a deduped needle list for issue-aware partial file loading.
 
     Order: explicit identifiers (`_extract_issue_symbols`) first since they
     are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
+    issue picks out lines referencing `foo`), then URL-route paths, then
+    literally-quoted strings, then lines from fenced code blocks, then
+    general issue terms.
     """
     out: List[str] = []
     seen: set = set()
@@ -853,6 +920,29 @@ def _preload_needles(issue: str) -> List[str]:
         stem = Path(mention).stem
         if stem and len(stem) >= 3:
             add(stem)
+    # URL-shaped routes (e.g. `/api/events/:slug`) — handle the dominant
+    # cross-cutting failure mode from recent loss rationales where the
+    # agent has the right files but misses the specific named route.
+    for route in _extract_issue_routes(issue):
+        add(route)
+    # Quoted strings (error messages, log lines, short snippets).
+    for quoted in _QUOTED_NEEDLE_RE.findall(issue):
+        if not any(c.isalpha() for c in quoted):
+            continue
+        if len(quoted.split()) > 8:
+            continue
+        add(quoted.strip())
+    # Lines from fenced code blocks — literal grep targets.
+    for block in _FENCED_CODE_RE.findall(issue):
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if len(line) < 8 or len(line) > 120:
+                continue
+            if not any(c.isalnum() for c in line):
+                continue
+            if line.startswith(("#", "//", "/*", "*")):
+                continue
+            add(line)
     for term in _issue_terms(issue):
         if len(term) >= 4:
             add(term)
@@ -2829,8 +2919,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
