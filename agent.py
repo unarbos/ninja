@@ -1570,12 +1570,13 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
     return findings
 
 
+# Narrow to phrases that only appear as system-prompt leakage. Broader words
+# (grader, scoring rubric, judge model/prompt/rubric) false-positive on
+# legitimate user code touching grading/judging systems and would force the
+# model to scrub valid identifiers out of its own patch.
 _PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
-    re.compile(r"^\+(?!\+\+).*grader", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\+(?!\+\+).*scoring\s+rubric", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*reference\s+patch", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*oracle\s+(?:answer|solution|patch)", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\+(?!\+\+).*judge\s+(?:model|prompt|rubric)", re.IGNORECASE | re.MULTILINE),
 )
 
 
