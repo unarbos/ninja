@@ -116,8 +116,15 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_CONSISTENCY_TURNS = 1  # surface signature changes whose callers in the repo
+                           # were not updated in the same patch — direct cause of
+                           # the "king changes Disconnect to require clientId
+                           # but does not update SqlParser" class of compile breaks
+MAX_WIREUP_TURNS = 1       # surface NEW files the patch created that nothing in
+                           # the tracked repo imports — direct cause of the
+                           # "challenger added page, king added only API methods"
+                           # class of half-implemented features
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1578,6 +1585,160 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+# Regex for `def foo(...)` / `function foo(...)` / `fn foo(...)` lines in
+# a unified diff. Captures function name + parameter list. Single line only;
+# multi-line signatures are common in TS/Java but require AST parsing to
+# resolve, which is out of scope for a cheap heuristic gate.
+_SIG_DEF_RE = re.compile(
+    r"^[-+]\s*"
+    r"(?:async\s+|public\s+|private\s+|protected\s+|static\s+|export\s+|default\s+)*"
+    r"(?:def|function|fn|func)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"\(([^)]*)\)"
+)
+
+
+def _changed_signatures(patch: str) -> List[str]:
+    """Find function names whose signature (parameter list) changed in the patch.
+
+    Looks for matching `-def foo(...)` / `+def foo(...)` pairs (or
+    `function foo(...)`, `fn foo(...)`). If the param list differs, the
+    function's callers in the rest of the repo are likely calling the OLD
+    arity — surface the name so a refinement turn can grep and fix.
+    """
+    removed: Dict[str, str] = {}
+    added: Dict[str, str] = {}
+    for line in patch.splitlines():
+        m = _SIG_DEF_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        params = m.group(2).strip()
+        if line.startswith("-") and not line.startswith("---"):
+            removed[name] = params
+        elif line.startswith("+") and not line.startswith("+++"):
+            added[name] = params
+    changed: List[str] = []
+    for name, new_params in added.items():
+        old_params = removed.get(name)
+        if old_params is None or old_params == new_params:
+            continue
+        # Skip dunder methods + names < 4 chars (too generic to grep usefully)
+        if name.startswith("__") or len(name) < 4:
+            continue
+        changed.append(name)
+    return changed
+
+
+def _find_caller_mismatches(repo: Path, signatures: List[str], patch: str) -> List[Tuple[str, str, str]]:
+    """For each changed signature, grep tracked files for callers OUTSIDE the patch.
+
+    Returns (function_name, caller_path, caller_line_snippet) tuples — at
+    most 6 entries — for callers the patch didn't update. Cheap word-boundary
+    grep; doesn't attempt to verify arity precisely (model can see the line
+    in the prompt and decide).
+    """
+    if not signatures:
+        return []
+    patch_files = set(_patch_changed_files(patch))
+    mismatches: List[Tuple[str, str, str]] = []
+    for name in signatures[:6]:  # cap to avoid pathological prompts
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-w", "-F", "--", name],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for raw in proc.stdout.splitlines():
+            # `path:line_no:content` format — we only use path + content
+            parts = raw.split(":", 2)
+            if len(parts) < 3:
+                continue
+            path, content = parts[0], parts[2]
+            if path in patch_files:
+                continue
+            # Only flag CALLS, not definitions/comments. Heuristic: `name(`
+            # appears in the line and the line is not a comment.
+            stripped = content.strip()
+            if stripped.startswith(("#", "//", "/*", "*")):
+                continue
+            if f"{name}(" not in content:
+                continue
+            mismatches.append((name, path, stripped[:160]))
+            if len(mismatches) >= 6:
+                return mismatches
+    return mismatches
+
+
+# Regex for header lines of a new-file block in a unified diff:
+# `diff --git a/<path> b/<path>` immediately followed within the block by
+# `new file mode 100644` (or similar). `_NEW_FILE_BLOCK_RE` captures the
+# `b/` path so we know the new file's relative path.
+_NEW_FILE_BLOCK_RE = re.compile(
+    r"^diff --git\s+a/\S+\s+b/(\S+)\s*\n"
+    r"(?:[^d].*\n)*?"  # non-diff-block lines (file mode, index, etc.)
+    r"new file mode \d+",
+    re.MULTILINE,
+)
+
+
+def _orphaned_new_files(repo: Path, patch: str) -> List[str]:
+    """Detect files the patch CREATED that nothing in the rest of the repo
+    imports. Skips obvious top-level entries (tests, configs, READMEs).
+
+    A new file with no importer is the dominant "half-implemented feature"
+    signature in king-loss rationales: agent adds the new component/page/
+    module but forgets to wire it into the parent route, nav, or registry.
+    """
+    if not patch.strip():
+        return []
+    patch_files = set(_patch_changed_files(patch))
+    new_files: List[str] = []
+    for match in _NEW_FILE_BLOCK_RE.finditer(patch):
+        path = match.group(1)
+        low = path.lower()
+        # Skip files that legitimately need no importer
+        if any(kw in low for kw in ("test", "spec", "readme", "changelog", "license", ".github/", "docs/", "examples/")):
+            continue
+        # Skip docs/markdown/config files that aren't imported in the JS sense
+        ext = Path(path).suffix.lower()
+        if ext in {".md", ".rst", ".txt", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini", ".env", ".lock"}:
+            continue
+        new_files.append(path)
+
+    orphans: List[str] = []
+    for path in new_files:
+        stem = Path(path).stem  # e.g. "PodHistoryButton" from "PodHistoryButton.svelte"
+        if len(stem) < 3:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-w", "-F", "--", stem],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        referencing = [f for f in proc.stdout.splitlines() if f != path and f not in patch_files]
+        if not referencing:
+            orphans.append(path)
+            if len(orphans) >= 4:
+                break
+    return orphans
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2525,6 +2686,59 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_consistency_fix_prompt(mismatches: List[Tuple[str, str, str]], issue_text: str) -> str:
+    """Tell the model which call sites are still using the OLD signature.
+
+    `mismatches` is a list of (function_name, caller_path, caller_line_snippet).
+    Each entry came from a `git grep -w` for the changed function name in tracked
+    files OUTSIDE the patch. The call sites have not been updated to match the
+    new arity / parameter list — direct cause of compile/runtime regressions.
+    """
+    lines = ["Your patch changed the signature of the following function(s), "
+             "but tracked files OUTSIDE your patch still call the old signature. "
+             "These call sites will break at compile/runtime if not updated."]
+    by_name: Dict[str, List[Tuple[str, str]]] = {}
+    for name, path, snippet in mismatches:
+        by_name.setdefault(name, []).append((path, snippet))
+    for name, locs in by_name.items():
+        lines.append("")
+        lines.append(f"  `{name}` — still called by:")
+        for path, snippet in locs[:4]:
+            lines.append(f"    - {path}: {snippet}")
+    lines.append("")
+    lines.append(
+        "Update each call site so the arguments match the new signature, "
+        "OR revert the signature change and adapt internally. Emit the necessary "
+        "<command> blocks now, then end with <final>summary</final>."
+    )
+    return "\n".join(lines)
+
+
+def build_wireup_fix_prompt(orphans: List[str], issue_text: str) -> str:
+    """Tell the model which new files it created have no importers in the repo.
+
+    `orphans` is a list of newly-created file paths whose stem doesn't appear
+    in any tracked file outside the patch. The file likely needs to be wired
+    into a parent route, nav, registry, or import.
+    """
+    lines = ["Your patch creates the following file(s), but nothing in the rest "
+             "of the tracked repo imports or references their basename. A new "
+             "component/page/module that nothing imports is the dominant "
+             "half-implemented-feature pattern. Wire each one into the appropriate "
+             "parent file (route table, nav, index, page that uses it)."]
+    for path in orphans[:6]:
+        stem = Path(path).stem
+        lines.append(f"  - `{path}` (basename `{stem}`) is not imported anywhere yet")
+    lines.append("")
+    lines.append(
+        "For each orphan, identify the parent file that SHOULD import it "
+        "(usually the page/route/registry where the feature is consumed), "
+        "and add the import + usage in the SAME response. Emit the necessary "
+        "<command> blocks now, then end with <final>summary</final>."
+    )
+    return "\n".join(lines)
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -2752,6 +2966,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    consistency_turns_used = 0
+    wireup_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2796,7 +3012,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, consistency_turns_used, wireup_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2843,6 +3059,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Cross-file consistency gate: if the patch changed a function
+        # signature and the rest of the tracked repo still calls the old
+        # signature, the callers will break at compile/runtime. Catches the
+        # observed king-loss pattern: "king changes Disconnect to require
+        # clientId but does not update SqlParser, likely breaks compilation".
+        if consistency_turns_used < MAX_CONSISTENCY_TURNS:
+            changed_sigs = _changed_signatures(patch)
+            if changed_sigs:
+                mismatches = _find_caller_mismatches(repo, changed_sigs, patch)
+                if mismatches:
+                    consistency_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_consistency_fix_prompt(mismatches, issue),
+                        "CONSISTENCY_NUDGE_QUEUED:\n  " + ", ".join(f"{n}@{p}" for n, p, _ in mismatches[:4]),
+                    )
+                    return True
+
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
         # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
         # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
@@ -2862,6 +3097,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_test_fix_prompt(test_path, output),
                     f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        # Wire-up gate: if the patch creates new files (component/page/module)
+        # but nothing in the rest of the tracked repo imports them by basename,
+        # the feature is half-implemented — the new file exists but isn't
+        # wired into the parent route/nav/registry. Catches the observed
+        # king-loss pattern: "king adds API hooks/route/nav but does not
+        # include the actual page implementation".
+        if wireup_turns_used < MAX_WIREUP_TURNS:
+            orphans = _orphaned_new_files(repo, patch)
+            if orphans:
+                wireup_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_wireup_fix_prompt(orphans, issue),
+                    "WIREUP_NUDGE_QUEUED:\n  " + ", ".join(orphans),
                 )
                 return True
 
