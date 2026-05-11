@@ -3561,7 +3561,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 if consecutive_no_command >= MAX_NO_COMMAND_REPAIRS:
-                    logs.append("\nSTOPPED:\nModel repeatedly failed to produce a command or final answer.")
+                    logs.append("\nSTOPPED: \nModel repeatedly failed to produce a command or final answer.")
                     break
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": build_no_command_repair_prompt()})
