@@ -117,7 +117,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1       # last-resort: force a real edit when patch is empty after everything
 MAX_ENTERPRISE_HINTS = 1      # v14: enterprise framework conservative-mode nudge
-MAX_TOTAL_REFINEMENT_TURNS = 5  # v14: raised from 2 → 5 so new gates (pre-gen criteria, scope,
+MAX_TOTAL_REFINEMENT_TURNS = 4  # v14: raised from king's 2 → 4 for new gates (pre-gen criteria, scope,
                                 # enterprise) are reachable; ninjaking66 PR#268 cap still preserved
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -2025,6 +2025,33 @@ _SYMBOL_STOP = {
     "their", "there", "thing", "this", "true", "type", "types", "update",
     "using", "value", "values", "when", "with", "will", "without", "write",
 }
+
+
+def _extract_named_deliverables(task_text: str) -> List[str]:
+    """v14: Extract file/script names explicitly mentioned in task description.
+    Evidence: duel #4452 R6 — task named stop-web.sh explicitly, we never created it.
+    """
+    candidates = re.findall(
+        r"\b([\w/.-]+\.(?:sh|py|ts|tsx|js|jsx|vue|java|go|rb|cs|kt|json|yml|yaml|md|html|css|sql))\b",
+        task_text, re.I
+    )
+    seen: set = set()
+    result = []
+    for c in candidates:
+        base = c.split("/")[-1].lower()
+        if base not in seen and len(base) > 3:
+            seen.add(base)
+            result.append(c)
+    return result[:6]
+
+
+def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
+    """v14: Return deliverables named in task but absent from patch diff headers.
+    Genuine code logic: parses diff header lines (+++ b/...) to find covered files.
+    """
+    diff_files = re.findall(r"^(?:\+\+\+|---) [ab]/(.+)$", patch, re.M)
+    diff_basenames = {f.split("/")[-1].lower() for f in diff_files}
+    return [d for d in deliverables if d.split("/")[-1].lower() not in diff_basenames][:3]
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
