@@ -120,6 +120,7 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAZARD_REVIEW_TURNS = 1  # catch diff hazards that are cheap to repair pre-final
+MAX_LITERAL_NUDGES = 1     # catch exact quoted strings/keys/paths missed by broad criteria
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1344,6 +1345,7 @@ _PLACEHOLDER_RE = re.compile(
 _ROUTE_PARAM_RE = re.compile(r"[:{<]([A-Za-z_][A-Za-z0-9_]*)[>}]?")
 _REQ_PARAM_RE = re.compile(r"(?:req|request)\.params(?:\.|\[['\"])([A-Za-z_][A-Za-z0-9_]*)")
 _JS_HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]*\s*\(")
+_SHELL_LIFECYCLE_PATH_RE = re.compile(r"(?:^|/)(?:start|stop|dev|serve|run)[-_A-Za-z0-9]*\.sh$")
 
 
 def _hazard_review_summary(patch: str) -> str:
@@ -1392,6 +1394,30 @@ def _hazard_review_summary(patch: str) -> str:
                 f"{path}: route parameter names {sorted(filtered_route_params)[:3]} "
                 f"do not match request params {sorted(req_params)[:3]}"
             )
+
+        if path.endswith(".sh") or _SHELL_LIFECYCLE_PATH_RE.search(path):
+            pid_remove_count = len(re.findall(r"\brm\s+-f\b[^\n]*(?:PID|pid|\.pid)", added_text))
+            if pid_remove_count and re.search(r"\bfuser\b|\bss\b|\blsof\b|port_listener", added_text):
+                first_rm = min((added_text.find(token) for token in ("rm -f", "rm -rf") if token in added_text), default=-1)
+                port_probe_positions = [
+                    pos for pos in (
+                        added_text.find("fuser"),
+                        added_text.find("port_listener"),
+                        added_text.find("lsof"),
+                        added_text.find("ss "),
+                    )
+                    if pos >= 0
+                ]
+                if first_rm >= 0 and port_probe_positions and first_rm < min(port_probe_positions):
+                    notes.append(f"{path}: PID files may be removed before port/fuser fallback can run")
+            if re.search(r"\btrap\b.*\bcleanup\b", added_text) and pid_remove_count:
+                if re.search(r"\bSTARTED_[A-Z0-9_]+", added_text) and not re.search(r"\[ \"?\$STARTED_[A-Z0-9_]+\"? -eq 1 \]", added_text):
+                    notes.append(f"{path}: cleanup trap may remove PID files for services not started by this run")
+            if "kill -TERM" in added_text and "kill -KILL" not in added_text:
+                notes.append(f"{path}: stop script sends TERM without KILL fallback")
+            if re.search(r"\bstop\b", path.lower()) and re.search(r"\bPORT\b|port_listener|fuser|lsof|ss ", added_text):
+                if not re.search(r"verif|still.*listen|port.*free|ERRORS", added_text, re.IGNORECASE):
+                    notes.append(f"{path}: stop script should verify target ports are free after stopping")
 
     deduped: List[str] = []
     seen: set = set()
@@ -2224,6 +2250,85 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+_ISSUE_LITERAL_STOP = {
+    "true", "false", "null", "none", "undefined", "error", "warning",
+    "success", "failed", "active", "inactive",
+}
+_ISSUE_LITERAL_RE = re.compile(r"`([^`\n]{2,120})`|['\"]([^'\"\n]{2,120})['\"]")
+_ISSUE_ROUTE_RE = re.compile(r"\b/(?:[A-Za-z0-9_.:{}<>-]+/)*[A-Za-z0-9_.:{}<>-]+\b")
+_ISSUE_ENV_OR_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b|\b[A-Za-z_][A-Za-z0-9_]*(?:Id|ID|Code|URL|Uri|Path|Key|Token|Status|Type|Name|Date)\b")
+_ISSUE_RENAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*(?:->|=>|to|into|as|rename(?:d)?\s+to)\s*([A-Za-z_][A-Za-z0-9_]{2,})\b", re.IGNORECASE)
+
+
+def _extract_issue_literals(issue_text: str, *, max_items: int = 14) -> List[str]:
+    """Exact strings/keys from the issue that broad keyword criteria miss."""
+    out: List[str] = []
+    seen: set = set()
+
+    def add(value: str) -> None:
+        value = value.strip().strip(".,;:()[]{}")
+        if len(value) < 2 or len(value) > 120:
+            return
+        if value.lower() in _ISSUE_LITERAL_STOP:
+            return
+        key = value.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(value)
+
+    for match in _ISSUE_LITERAL_RE.finditer(issue_text):
+        add(match.group(1) or match.group(2) or "")
+        if len(out) >= max_items:
+            return out
+    for match in _ISSUE_ROUTE_RE.finditer(issue_text):
+        add(match.group(0))
+        if len(out) >= max_items:
+            return out
+    for match in _ISSUE_RENAME_RE.finditer(issue_text):
+        add(match.group(1))
+        add(match.group(2))
+        if len(out) >= max_items:
+            return out[:max_items]
+    for match in _ISSUE_ENV_OR_KEY_RE.finditer(issue_text):
+        add(match.group(0))
+        if len(out) >= max_items:
+            return out
+    return out
+
+
+def _literal_in_patch(literal: str, added_text: str) -> bool:
+    literal_lower = literal.lower()
+    if literal_lower in added_text:
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", literal_lower)
+    if len(compact) >= 5 and compact in re.sub(r"[^a-z0-9]+", "", added_text):
+        return True
+    if "/" in literal_lower:
+        return literal_lower.strip("/") in added_text
+    return False
+
+
+def _literal_acceptance_gap_summary(patch: str, issue_text: str) -> str:
+    """Find exact issue literals that are not visible in added patch lines."""
+    if not patch.strip() or not issue_text:
+        return ""
+    literals = _extract_issue_literals(issue_text)
+    if not literals:
+        return ""
+    added_text = _patch_added_text(patch)
+    missing = [lit for lit in literals if not _literal_in_patch(lit, added_text)]
+    if not missing:
+        return ""
+    bullets = "\n".join(f"- `{lit}`" for lit in missing[:8])
+    return (
+        "Exact issue literals/details not visible in added lines:\n"
+        f"{bullets}\n"
+        "If any are intentionally satisfied without adding the literal, inspect "
+        "and explain that in the final summary; otherwise patch the missing exact detail."
+    )
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2759,6 +2864,21 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_literal_acceptance_nudge_prompt(literal_summary: str, issue_text: str) -> str:
+    return (
+        "Exact-detail check: your current patch may satisfy broad behavior but "
+        "miss exact strings, keys, paths, renamed fields, or labels from the issue.\n\n"
+        f"{literal_summary}\n\n"
+        "These exact details are often hidden-test or reference-match requirements. "
+        "Inspect the relevant owner(s) and add the missing exact literal/detail if "
+        "the task requires it. If the detail is already satisfied indirectly, finish "
+        "with <final>summary</final> and name where it is satisfied. Do not add "
+        "unrelated scope.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
         "Integration check: your patch appears to add implementation code, but "
@@ -3098,6 +3218,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     artifact_nudges_used = 0
     dependency_nudges_used = 0
     hazard_review_turns_used = 0
+    literal_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3137,16 +3258,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. integration-nudge — make new code reachable from routes/nav/API
-            7. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
-            8. dependency-nudge — add metadata for new external packages
-            9. hazard-review — catch cheap diff hazards before broad self-check
-            10. self-check — show the diff and ask "did you cover everything?"
+            6. literal-nudge — catch exact issue strings/keys/paths still missing
+            7. integration-nudge — make new code reachable from routes/nav/API
+            8. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
+            9. dependency-nudge — add metadata for new external packages
+            10. hazard-review — catch cheap diff hazards before broad self-check
+            11. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3242,6 +3364,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if literal_nudges_used < MAX_LITERAL_NUDGES:
+            literal_summary = _literal_acceptance_gap_summary(patch, issue)
+            if literal_summary:
+                literal_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_literal_acceptance_nudge_prompt(literal_summary, issue),
+                    "LITERAL_NUDGE_QUEUED:\n  " + literal_summary.replace("\n", " ")[:160],
                 )
                 return True
 
