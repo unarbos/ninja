@@ -116,10 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_DELIVERABLE_NUDGES = 1
-# v14: enterprise hints cap already in king as MAX_ENTERPRISE_HINTS
-
-MAX_TOTAL_REFINEMENT_TURNS = 4  # v14: bumped from king's 2; 4 covers 4 new gates without blowing time budget
+MAX_TOTAL_REFINEMENT_TURNS = 4  # v14: raised to 4 for deliverable + frontend gates
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1462,6 +1459,23 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
 
+def _extract_named_deliverables(task_text: str) -> list:
+    import re as _re
+    candidates = _re.findall(r'([\w/.-]+\.(?:sh|py|ts|tsx|js|jsx|vue|java|go|rb|json|yml|yaml|md|html|css|sql))', task_text, _re.I)
+    seen, result = set(), []
+    for c in candidates:
+        base = c.split('/')[-1].lower()
+        if base not in seen and len(base) > 3:
+            seen.add(base); result.append(c)
+    return result[:6]
+
+
+def _check_deliverable_coverage(patch: str, deliverables: list) -> list:
+    import re as _re
+    diff_files = _re.findall(r'^(?:\+\+\+|---) [ab]/(.+)$', patch, _re.M)
+    bases = {f.split('/')[-1].lower() for f in diff_files}
+    return [d for d in deliverables if d.split('/')[-1].lower() not in bases][:3]
+
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
@@ -1566,104 +1580,29 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
-
-def _pre_gen_criteria_check(task_text: str) -> str:
-    """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
-    Injects a pre-flight checklist into the initial prompt.
-    Evidence: RC report Root Cause #3 — systematic 1-2 criteria misses each duel.
-    """
-    criteria = _extract_acceptance_criteria(task_text)  # king's existing function
-    if not criteria or len(criteria) < 2:
-        return ""
-    items = chr(10).join(f"  {i+1}. {c}" for i, c in enumerate(criteria[:8]))
-    return (
-        f"\n[Pre-flight: {len(criteria)} acceptance criteria detected. "
-        f"Address ALL before finalizing:\n{items}\n"
-        f"Verify each criterion is reflected in your diff before submitting.]\n"
-    )
-
-
-_ATOMIC_SYSTEM_ADDENDUM = (
-    "\n[Scope: ATOMIC — single-file, focused change. "
-    "Produce the MINIMAL diff that satisfies the spec exactly. "
-    "Do NOT refactor, expand, or add features beyond the stated criteria.]\n"
-)
-_COMPLEX_SYSTEM_ADDENDUM = (
-    "\n[Scope: COMPLEX — multi-concern change. "
-    "Enumerate EVERY required integration point in your plan BEFORE writing code.]\n"
-)
-_ENTERPRISE_FRAMEWORKS = (
-    "spring boot", "laravel", "django", "rails", "asp.net",
-    "fastapi", "flask", "express", "nestjs", "nest.js",
-)
-
-
-def _classify_task_scope_v14(task_text: str, ctx_lines: int) -> str:
-    """v14: Classify task scope using ACTUAL preloaded context line count.
-    v13 had B1 bug: hardcoded 200 made atomic mode never fire.
-    Evidence: retest pool has 60%+ atomic tasks. King scores 0.70+ on these.
-    """
-    task_len = len(task_text)
-    file_mentions = len(re.findall(
-        r"\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b", task_text, re.I
-    ))
-    complex_signals = ["redesign", "refactor entire", "architecture", "migrate", "rewrite"]
-    is_complex = (
-        task_len > 600
-        or file_mentions >= 4
-        or any(s in task_text.lower() for s in complex_signals)
-    )
-    is_atomic = task_len < 250 and file_mentions <= 1 and ctx_lines < 80
-    if is_complex:
-        return _COMPLEX_SYSTEM_ADDENDUM
-    if is_atomic:
-        return _ATOMIC_SYSTEM_ADDENDUM
-    return ""
-
-
-def _detect_enterprise_framework(task_text: str) -> str:
-    """v14: Detect enterprise framework tasks requiring precise spec-following.
-    Evidence: retest pool has more Spring Boot/Laravel tasks → king 0.70+ there.
-    """
-    issue_lower = task_text.lower()
-    for fw in _ENTERPRISE_FRAMEWORKS:
-        if fw in issue_lower:
-            criteria = _extract_acceptance_criteria(task_text)
-            if len(criteria) < 3:
-                return ""
-            return (
-                f"[Enterprise framework ({fw}): Be PRECISE. "
-                f"Address all {len(criteria)} criteria exactly. "
-                f"No extra changes beyond the spec.]\n"
-            )
-    return ""
-
-
-def _extract_named_deliverables(task_text: str) -> List[str]:
-    """v14: Extract file/script names explicitly mentioned in task description.
-    Evidence: duel #4452 R6 — task named stop-web.sh explicitly, we never created it.
-    """
-    candidates = re.findall(
-        r"\b([\w/.-]+\.(?:sh|py|ts|tsx|js|jsx|vue|java|go|rb|cs|kt|json|yml|yaml|md|html|css|sql))\b",
-        task_text, re.I
-    )
+def _find_issue_tests(repo: Path, task_text: str) -> List[str]:
+    """Find test files explicitly mentioned or implied by the task description.
+    Different from _find_test_partner which works from source files.
+    Returns list of relative paths (max 2), empty if none found."""
+    import re as _re
+    candidates: List[str] = []
+    # Match explicit test file patterns in the task
+    for m in _re.finditer(
+        r"(test[\w/\-]*\.(?:js|ts|py|rb|go|java)|[\w/\-]*\.test\.\w+|[\w/\-]*_test\.\w+|[\w/\-]*spec\.\w+)",
+        task_text, _re.I
+    ):
+        path = m.group(1).strip("./")
+        full = repo / path
+        if full.exists():
+            candidates.append(path)
+    # Deduplicate and return
     seen: set = set()
-    result = []
+    valid: List[str] = []
     for c in candidates:
-        base = c.split("/")[-1].lower()
-        if base not in seen and len(base) > 3:
-            seen.add(base)
-            result.append(c)
-    return result[:6]
-
-
-def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
-    """v14: Return deliverables named in task but absent from patch diff headers.
-    Genuine code logic: parses diff header lines (+++ b/...) to find covered files.
-    """
-    diff_files = re.findall(r"^(?:\+\+\+|---) [ab]/(.+)$", patch, re.M)
-    diff_basenames = {f.split("/")[-1].lower() for f in diff_files}
-    return [d for d in deliverables if d.split("/")[-1].lower() not in diff_basenames][:3]
+        if c not in seen:
+            seen.add(c)
+            valid.append(c)
+    return valid[:2]
 
 
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
@@ -2325,10 +2264,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    _pgc = _pre_gen_criteria_check(issue)
-    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
-    _prefix = _pgc + _scope
-    return _prefix + f"""Fix this issue:
+    return f"""Fix this issue:
 
 {issue}
 
@@ -2805,7 +2741,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     deliverable_nudges_used = 0
-    fe_gap_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
@@ -2852,7 +2787,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, deliverable_nudges_used, fe_gap_used
+        nonlocal polish_turns_used, deliverable_nudges_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2951,34 +2886,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v14: named-deliverable coverage check
-        _task_dels = _extract_named_deliverables(issue)
-        if _task_dels and deliverable_nudges_used < MAX_DELIVERABLE_NUDGES:
-            _missing_dels = _check_deliverable_coverage(patch, _task_dels)
-            if _missing_dels and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+        # v14: named-deliverable coverage gate
+        _delvs = _extract_named_deliverables(issue)
+        if _delvs and deliverable_nudges_used < 1:
+            _missing = _check_deliverable_coverage(patch, _delvs)
+            if _missing and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
                 deliverable_nudges_used += 1
                 total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    "Task explicitly names these files missing from your patch: "
-                    + ", ".join(_missing_dels[:3])
-                    + ". Create or modify them.",
-                    f"MISSING_DELIVERABLES:{len(_missing_dels)}",
-                )
+                queue_refinement_turn(assistant_text, 'Task names these files not in your patch: ' + ', '.join(_missing[:3]) + '. Add them.', 'MISSING_DELIVERABLES')
                 return True
 
-                # v14: enterprise framework precision hint
-        _ef_hint = _detect_enterprise_framework(issue)
-        if _ef_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
-            total_refinement_turns_used += 1
-            queue_refinement_turn(assistant_text, _ef_hint, "ENTERPRISE_FW_HINT")
-            return True
-
-
-        # v11: frontend gap detection
+                # v11: frontend gap detection
         _fe_hint = _detect_frontend_gap(issue, patch)
-        if _fe_hint and fe_gap_used < 1 and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
-            fe_gap_used += 1
+        if _fe_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
