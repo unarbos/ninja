@@ -90,10 +90,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -765,11 +765,8 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
-
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
 
     Two improvements over a vanilla rank-and-read loop:
 
@@ -783,34 +780,38 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return "", []
+        return ""
+
+    # A: LLM-assisted rerank of top candidates when model context is available.
+    # _PRELOAD_RERANK_CTX is set by _solve_attempt before this call; cleared
+    # after. Fail-open: any error returns heuristic ordering unchanged.
+    if _PRELOAD_RERANK_CTX.get("mdl") and files:
+        files = _llm_rerank_candidate_files(
+            repo, issue, files,  # `issue` passed as task_desc
+            model=_PRELOAD_RERANK_CTX["mdl"],
+            api_base=_PRELOAD_RERANK_CTX.get("base"),
+            api_key=_PRELOAD_RERANK_CTX.get("tok"),
+            deadline=_PRELOAD_RERANK_CTX.get("ddl"),
+        )
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
-    needles = _preload_needles(issue)
-
     parts: List[str] = []
-    included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
-        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
@@ -825,38 +826,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts), included
-
-
-def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: explicit identifiers (`_extract_issue_symbols`) first since they
-    are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
-    """
-    out: List[str] = []
-    seen: set = set()
-
-    def add(token: str) -> None:
-        if not token:
-            return
-        key = token.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(token)
-
-    for sym in _extract_issue_symbols(issue):
-        add(sym)
-    for mention in _extract_issue_path_mentions(issue):
-        stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
-    for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
-    return out
+    return "\n\n".join(parts)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -864,6 +834,105 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+_LLM_RERANK_CANDIDATE_CAP = 25  # max paths to send in the rerank call
+
+# Threading context for LLM file rerank. Set by _solve_attempt before calling
+# build_preloaded_context, cleared immediately after. Single-threaded per-round.
+_PRELOAD_RERANK_CTX: Dict[str, Any] = {}
+
+
+def _llm_rerank_candidate_files(
+    repo: Path,
+    task_desc: str,
+    heuristic_top: List[str],
+    *,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    deadline: Optional[float] = None,
+) -> List[str]:
+    """Rerank heuristic-top candidate files with a small, time-capped LLM call.
+
+    Fail-open: any error or timeout returns heuristic_top unchanged so the
+    caller always has a valid ranked list regardless of proxy latency.
+    Hallucinated paths (not in heuristic_top) are ignored.
+    Unreturned heuristic entries are appended to preserve the full set.
+    """
+    if not heuristic_top:
+        return heuristic_top
+
+    cap = min(_LLM_RERANK_CANDIDATE_CAP, len(heuristic_top))
+    snippets: List[str] = []
+    for p in heuristic_top[:cap]:
+        full = (repo / p).resolve()
+        try:
+            raw = full.read_bytes()[:320]
+            head = raw.decode("utf-8", errors="replace").replace("\n", " ")[:80]
+        except Exception:
+            head = ""
+        snippets.append(f"- {p}: {head}")
+
+    desc_head = task_desc[:1200]
+    candidate_block = "\n".join(snippets)
+
+    rerank_messages: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "You are a code-search assistant. "
+                "Given a GitHub issue and candidate file list, output ONLY a "
+                "numbered list of the paths ranked by relevance (most relevant first). "
+                "Use only paths from the provided list. Format: one path per line.\n"
+                "Example:\n1. src/foo.py\n2. tests/test_foo.py"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Issue:\n{desc_head}\n\n"
+                f"Candidate files:\n{candidate_block}\n\n"
+                "Rank by relevance:"
+            ),
+        },
+    ]
+
+    timeout_s = 5
+    if deadline is not None:
+        timeout_s = max(2, min(5, int(deadline - time.monotonic())))
+
+    try:
+        response, _cost, _raw = chat_completion(
+            messages=rerank_messages,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=200,
+            timeout=timeout_s + 1,
+        )
+    except Exception:
+        return heuristic_top
+
+    heuristic_set = set(heuristic_top[:cap])
+    reranked: List[str] = []
+    seen_rerank: set = set()
+    for line in response.splitlines():
+        line = line.strip()
+        m = re.match(r"^\d+[.)]\s*(.+)$", line)
+        path = m.group(1).strip() if m else line
+        path = path.strip("`\"' ")
+        if path in heuristic_set and path not in seen_rerank:
+            reranked.append(path)
+            seen_rerank.add(path)
+
+    if not reranked:
+        return heuristic_top
+
+    for p in heuristic_top:
+        if p not in seen_rerank:
+            reranked.append(p)
+
+    return reranked
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -1009,19 +1078,7 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(
-    repo: Path,
-    relative_path: str,
-    max_chars: int,
-    needles: Optional[List[str]] = None,
-) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows.
-
-    When `needles` is provided and the file is larger than `max_chars`, we
-    extract regions around lines that match any needle (case-insensitive
-    substring) plus a few lines of context, instead of head/tail truncation.
-    Falls back to `_truncate` when no needles match or the file already fits.
-    """
+def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1034,84 +1091,7 @@ def _read_context_file(
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    if needles:
-        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
-
-
-def _extract_relevant_regions(
-    text: str,
-    needles: List[str],
-    max_chars: int,
-    *,
-    ctx_before: int = 8,
-    ctx_after: int = 12,
-) -> str:
-    """Return windows around lines matching any needle, capped at `max_chars`.
-
-    When the file already fits within `max_chars`, the whole file is returned
-    verbatim. When no needles match, fall back to `_truncate` (head/tail
-    summary). Otherwise produce a concatenation of merged windows around each
-    matching line, prefixed with line-range headers so the model can reason
-    about location.
-    """
-    if not text:
-        return text
-    if len(text) <= max_chars:
-        return text
-
-    needles_lower: List[str] = []
-    seen: set = set()
-    for n in needles:
-        if not n:
-            continue
-        key = n.lower()
-        if len(key) < 3 or key in seen:
-            continue
-        seen.add(key)
-        needles_lower.append(key)
-    if not needles_lower:
-        return _truncate(text, max_chars)
-
-    lines = text.splitlines()
-    matched: List[int] = []
-    for i, line in enumerate(lines):
-        ll = line.lower()
-        if any(n in ll for n in needles_lower):
-            matched.append(i)
-
-    if not matched:
-        return _truncate(text, max_chars)
-
-    windows: List[Tuple[int, int]] = []
-    for i in matched:
-        start = max(0, i - ctx_before)
-        end = min(len(lines), i + ctx_after + 1)
-        if windows and start <= windows[-1][1]:
-            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-        else:
-            windows.append((start, end))
-
-    parts: List[str] = []
-    used = 0
-    total_lines = len(lines)
-    omitted = 0
-    for idx, (start, end) in enumerate(windows):
-        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
-        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
-        block = header + "\n" + body
-        if parts and used + len(block) + 2 > max_chars:
-            omitted = len(windows) - idx
-            break
-        parts.append(block)
-        used += len(block) + 2
-
-    if omitted > 0:
-        parts.append(
-            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
-        )
-
-    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -2169,19 +2149,13 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
 
-_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
-_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
-
-
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2202,45 +2176,6 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
-
-
-_PRELOAD_BLOCK_RE = re.compile(
-    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
-    re.DOTALL,
-)
-
-
-def _strip_preloaded_section(
-    initial_user_text: str,
-    preloaded_files: List[str],
-    modified_files: Optional[List[str]] = None,
-) -> str:
-    """Replace the bulky preloaded snippet block with a short breadcrumb.
-
-    Triggered after step 4 to free token budget for later iterations: the
-    model has already seen the snippets in earlier turns and only needs to
-    know which files were preloaded (and which it has already touched) so it
-    can re-open them on demand instead of re-reading the whole block on
-    every request.
-    """
-    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
-        return initial_user_text
-
-    lines: List[str] = []
-    if modified_files:
-        lines.append("You modified these files so far: " + ", ".join(modified_files))
-    if preloaded_files:
-        lines.append(
-            "You previously inspected these files (snippets dropped to save context — "
-            "re-open with `sed -n` or `cat` if a region is needed): "
-            + ", ".join(preloaded_files)
-        )
-    if not lines:
-        replacement = "[Preloaded context omitted to save token budget.]"
-    else:
-        replacement = "\n".join(lines)
-
-    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2448,6 +2383,146 @@ _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
+def _compute_attempt_budget(
+    attempt_idx: int,
+    elapsed: float,
+    total_budget: float = _MULTISHOT_TOTAL_BUDGET,
+    return_reserve: float = 30.0,
+) -> float:
+    """Return wall-clock budget for attempt_idx (1-based).
+
+    Attempt 1: returns WALL_CLOCK_BUDGET_SECONDS unchanged.
+    Attempt 2: adapts to remaining time so a slow attempt 1 yields a
+    smaller (but still useful) attempt 2 instead of pre-committing to
+    the full WALL_CLOCK_BUDGET_SECONDS and silently TLE-ing.
+    """
+    if attempt_idx == 1:
+        return WALL_CLOCK_BUDGET_SECONDS
+    remaining = total_budget - elapsed - return_reserve
+    return max(_MULTISHOT_MIN_ATTEMPT_RESERVE, min(WALL_CLOCK_BUDGET_SECONDS, remaining))
+
+
+def _build_attempt1_memo(prior_patch: str, prior_result: Dict[str, Any]) -> str:
+    """Build a brief memo from attempt 1 to anchor attempt 2's file selection.
+
+    Appended to attempt 2's initial user prompt so the model stays on the
+    same files rather than re-shuffling on a blank-slate second pass.
+    Returns empty string when prior_patch is empty (no useful signal).
+    """
+    if not prior_patch.strip():
+        return ""
+
+    lines = prior_patch.splitlines()
+
+    edited_files: List[str] = []
+    for line in lines:
+        if line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if path and path not in edited_files:
+                edited_files.append(path)
+            if len(edited_files) >= 5:
+                break
+
+    if not edited_files:
+        return ""
+
+    parts = ["PRIOR ATTEMPT EDITED:"]
+    for f in edited_files:
+        parts.append(f"  - {f}")
+
+    diff_head = "\n".join(lines[:80])
+    parts.append("PRIOR ATTEMPT FIRST-80-LINES:")
+    parts.append(diff_head)
+    parts.append("STAY ON THESE FILES UNLESS THE ISSUE EXPLICITLY REQUIRES OTHERS.")
+
+    return "\n".join(parts)
+
+
+def _narrowed_retry_from_attempt1(
+    repo: Path,
+    task_text: str,
+    prior_patch: str,
+    prior_logs: str,
+    *,
+    max_tokens: int = 2048,
+    deadline_s: float = 60.0,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+) -> str:
+    """Single-shot tightly-focused retry when attempt 1 returned an empty patch.
+
+    Does NOT reset the repo; preserves whatever working-tree state attempt 1
+    left. Picks the heuristic rank-1 file (or the last file touched in the
+    attempt-1 log), builds a tight prompt, and applies any resulting command.
+    Structurally distinct from a full reset attempt 2: no git reset --hard,
+    different token budget (2048 vs DEFAULT_MAX_TOKENS), different timeout (60 s).
+    """
+    try:
+        ranked = _rank_context_files(repo, task_text)
+    except Exception:
+        ranked = []
+
+    # Prefer the last file the agent actually attempted to edit in attempt 1.
+    target_file: Optional[str] = None
+    for line in reversed(prior_logs.splitlines()):
+        m = re.search(r"\+\+\+\s+b/(\S+)", line)
+        if m:
+            candidate = m.group(1).strip()
+            if _context_file_allowed(candidate):
+                target_file = candidate
+                break
+
+    if target_file is None and ranked:
+        target_file = ranked[0]
+
+    if target_file is None:
+        return ""
+
+    file_content = _read_context_file(repo, target_file, 2500)
+    task_head = task_text[:1500]
+    log_tail = prior_logs[-200:] if len(prior_logs) > 200 else prior_logs
+
+    narrow_messages: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Fix this issue:\n\n{task_head}\n\n"
+                f"Target file: {target_file}\n\n"
+                f"### {target_file}\n```\n{file_content}\n```\n\n"
+                f"Prior attempt context (tail):\n{log_tail}\n\n"
+                "Make ONE targeted edit to the file above. "
+                "Emit exactly ONE <command> block containing a bash heredoc or "
+                "sed/python edit, then <final>done</final>."
+            ),
+        },
+    ]
+
+    narrow_started = time.monotonic()
+    try:
+        response, _cost, _raw = chat_completion(
+            messages=narrow_messages,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            timeout=min(int(deadline_s), 55),
+        )
+    except Exception:
+        return ""
+
+    command = extract_command(response)
+    if not command:
+        return ""
+
+    elapsed_narrow = time.monotonic() - narrow_started
+    cmd_timeout = max(10, int(deadline_s - elapsed_narrow - 5))
+    run_command(command, repo, timeout=cmd_timeout)
+
+    return get_patch(repo)
+
+
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
         return 0
@@ -2594,14 +2669,55 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
+
+        # B: attempt-1-residue narrowed retry when attempt 1 returned empty
+        # and enough budget remains. Preserves working-tree state; does NOT
+        # reset. Different mechanism from PR 807's emergency fallback.
+        if _patch1.strip() == "" and (_multishot_total_budget - _elapsed) >= 75 and _multishot_repo_obj is not None:
+            try:
+                _nr_model, _nr_base, _nr_key = _resolve_inference_config(
+                    kwargs.get("model"), kwargs.get("api_base"), kwargs.get("api_key")
+                )
+                _narrow_patch = _narrowed_retry_from_attempt1(
+                    _multishot_repo_obj,
+                    kwargs["issue"],  # passed as task_text
+                    _patch1,
+                    _result1.get("logs", "") or "",
+                    model=_nr_model,
+                    api_base=_nr_base,
+                    api_key=_nr_key,
+                )
+            except Exception:
+                _narrow_patch = ""
+            if _narrow_patch.strip():
+                _result1["patch"] = _narrow_patch
+                _result1["multishot_attempts"] = 1
+                _result1["multishot_narrowed_retry"] = True
+                return _result1
+            _elapsed = time.monotonic() - _multishot_started
+
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
+        # D: compute adaptive budget for attempt 2 so a slow attempt 1 doesn't
+        # pre-commit attempt 2 to a budget it can no longer fit.
+        _elapsed = time.monotonic() - _multishot_started
+        _attempt2_budget = _compute_attempt_budget(2, _elapsed)
+
+        # C: build memo from attempt 1 to anchor attempt 2's file selection.
+        _attempt1_memo = _build_attempt1_memo(_patch1, _result1)
+
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+
+        _attempt2_kwargs = dict(kwargs)
+        _attempt2_kwargs["wall_clock_override"] = _attempt2_budget
+        if _attempt1_memo:
+            _attempt2_kwargs["prior_attempt_memo"] = _attempt1_memo
+
+        _result2 = _solve_attempt(**_attempt2_kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2649,6 +2765,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    wall_clock_override: Optional[float] = kwargs.get("wall_clock_override")
+    prior_attempt_memo: Optional[str] = kwargs.get("prior_attempt_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2673,8 +2791,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     # model loop and starve the retry of any time. We stop the inner loop
     # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
     # return whatever patch is already on disk.
+    # D: when the outer wrapper computes an adaptive budget for attempt 2,
+    # it passes wall_clock_override here so a time-starved attempt 2 exits
+    # earlier rather than over-committing and silently TLE-ing.
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        budget = wall_clock_override if wall_clock_override is not None else WALL_CLOCK_BUDGET_SECONDS
+        return budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2822,40 +2944,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+
+        # A: populate _PRELOAD_RERANK_CTX so build_preloaded_context can call
+        # _llm_rerank_candidate_files for the top candidate files.
+        _budget = wall_clock_override if wall_clock_override is not None else WALL_CLOCK_BUDGET_SECONDS
+        _rerank_deadline = solve_started_at + _budget - WALL_CLOCK_RESERVE_SECONDS
+        _PRELOAD_RERANK_CTX.update({
+            "mdl": model_name,
+            "base": api_base,
+            "tok": api_key,
+            "ddl": _rerank_deadline,
+        })
+        try:
+            preloaded_context = build_preloaded_context(repo, issue)
+        finally:
+            _PRELOAD_RERANK_CTX.clear()
+
+        initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        # C: when attempt 2 receives a memo from attempt 1, append it so the
+        # model stays on the same files rather than re-shuffling from scratch.
+        if prior_attempt_memo:
+            initial_user = initial_user + "\n\n" + prior_attempt_memo
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": initial_user},
         ]
-        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            # Past step 4 the preloaded snippets are no longer load-bearing —
-            # the model has either used them or moved on. Replace the bulky
-            # block in the initial user message with a short breadcrumb so
-            # the next request fits more recent context within the token cap.
-            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
-                original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
-                stripped = _strip_preloaded_section(
-                    original_initial,
-                    preloaded_files,
-                    modified_files=modified_files,
-                )
-                if stripped != original_initial:
-                    messages[1] = {**messages[1], "content": stripped}
-                    saved = max(0, len(original_initial) - len(stripped))
-                    logs.append(
-                        "INITIAL_PRELOAD_TRIMMED: "
-                        f"step={step} preloaded={len(preloaded_files)} "
-                        f"modified={len(modified_files)} saved_chars={saved}"
-                    )
-                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
