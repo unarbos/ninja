@@ -1483,6 +1483,24 @@ def _hazard_review_summary(patch: str) -> str:
         added_text = "\n".join(added)
         removed_text = "\n".join(removed)
         all_text = "\n".join(added + removed)
+        if re.search(r"^\s*return\s*\(", added_text, re.MULTILINE) and len(re.findall(r"^\s*return\s*\(", added_text, re.MULTILINE)) > 1:
+            notes.append(f"{path}: multiple added return blocks may indicate duplicate/misplaced component insertion")
+        if re.search(r"\}\)\s*\{|\}\s*\)\s*\{", added_text):
+            notes.append(f"{path}: suspicious close-paren/open-brace insertion may leave a malformed component/function boundary")
+        if re.search(r"\bsplit\s*\(\s*/\\\\n\+\?\\\\n\+/", added_text) or re.search(r"\bsplit\s*\(\s*['\"]\\\\n\\\\n['\"]", added_text):
+            notes.append(f"{path}: line parser appears to require blank-line separators; verify normal single-newline records still parse")
+        if re.search(r"\b(error|err)\.message\b", added_text) and re.search(r"\b(res\.json|json\s*\(|return\s+)", added_text):
+            notes.append(f"{path}: raw internal error message appears in an API/client response")
+        if re.search(r"\b(default|eps|dtype|config)\b", added_text, re.IGNORECASE):
+            if re.search(r"\bself\._[A-Za-z_][A-Za-z0-9_]*\b", added_text) and re.search(r"\bself\._[A-Za-z_][A-Za-z0-9_]*\s*=", added_text):
+                reads = re.findall(r"\bself\.(_[A-Za-z_][A-Za-z0-9_]*)\b", added_text)
+                writes = re.findall(r"\bself\.(_[A-Za-z_][A-Za-z0-9_]*)\s*=", added_text)
+                for name in set(reads) & set(writes):
+                    if added_text.find(f"self.{name}") < added_text.find(f"self.{name} ="):
+                        notes.append(f"{path}: `{name}` may be read before initialization while computing defaults")
+                        break
+        if re.search(r"\b(?:next|iter)\s*\(", added_text) and re.search(r"\b(?:plus|minus|pos|neg|forward|backward|eps)\b", added_text, re.IGNORECASE):
+            notes.append(f"{path}: paired computation may advance an iterator between the two sides; reuse the same batch/state")
         if re.search(r"\b(useState|useEffect|useMemo|useCallback|useRef|useReducer)\b", added_text):
             if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
                 notes.append(f"{path}: removed 'use client' while adding/keeping React hooks")
@@ -1570,6 +1588,9 @@ def _hazard_review_summary(patch: str) -> str:
                 notes.append(f"{path}: password hash-like field appears in client/response code")
             if re.search(r"\bwindow\.google\b", added_text) and not re.search(r"\btypeof\s+window\b|\buseEffect\b|onLoad|isLoaded", added_text):
                 notes.append(f"{path}: browser SDK global used without visible load/client guard")
+            if re.search(r"\bpages\s*[:=]\s*\[|\btabBar\b|\broutes\s*[:=]\s*\[", added_text) and re.search(r"^\s*[-+]\s*\{", "\n".join(added + removed), re.MULTILINE):
+                if not re.search(r"\bredirect|initial|default|first|home|index\b", added_text, re.IGNORECASE):
+                    notes.append(f"{path}: route/page list changed; preserve existing initial/default ordering unless required")
 
     deduped: List[str] = []
     seen: set = set()
@@ -2597,6 +2618,12 @@ def _contract_propagation_gap_summary(patch: str, issue_text: str, repo: Optiona
             notes.append(f"{path}: placeholder asset path added; ensure the asset exists or use existing empty-state pattern")
         if re.search(r"font\s*\([^)\n]+,\s*['\"]https?://", added_text):
             notes.append(f"{path}: package/framework API gained URL argument; verify local API supports that signature")
+        if re.search(r"\b(?:emit|send|dispatch|trigger)\s*\(\s*['\"][A-Za-z0-9:_-]+['\"]", added_text):
+            event_names = sorted(set(re.findall(r"\b(?:emit|send|dispatch|trigger)\s*\(\s*['\"]([A-Za-z0-9:_-]+)['\"]", added_text)))
+            for event_name in event_names[:3]:
+                if event_name not in removed_text and not re.search(rf"\b(?:on|listen|handler|case)\b[^\n]*['\"]{re.escape(event_name)}['\"]", added_text):
+                    notes.append(f"{path}: new event `{event_name}` is emitted without a visible receiver/handler update")
+                    break
 
         removed_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(removed_text)}
         added_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(added_text)}
@@ -3323,7 +3350,8 @@ def build_contract_propagation_prompt(contract_summary: str, issue_text: str) ->
         "renamed fields must leave no stale read/write/test path behind. Verify "
         "new external API URLs, package APIs, and dependency names against local "
         "docs/usages before finalizing; do not guess unofficial endpoints, "
-        "asset prefixes, placeholder files, response fields, or method names. If the warning is a false positive, finish with "
+        "asset prefixes, placeholder files, response fields, event names, or method names. "
+        "For end-to-end work, check the producer, transport, receiver, type/schema, UI state, and tests as one chain. If the warning is a false positive, finish with "
         "<final>summary</final> and name why. Otherwise "
         "issue the minimal edit command(s) to repair the propagation gap.\n\n"
         "Task (for reference):\n"
@@ -3357,7 +3385,7 @@ def build_ui_binding_nudge_prompt(ui_summary: str, issue_text: str) -> str:
         "options when display filters/categories change, and touch the frontend "
         "owner when the task explicitly asks for visible UI. Define any new "
         "arrays, style keys, or handler names used by the rendered JSX/template. "
-        "Preserve existing form availability, local-date behavior, mobile/responsive parity, and route/nav/page chains while adding the requested UI. If the warning is "
+        "Preserve existing form availability, component boundaries, default route/page ordering, local-date behavior, mobile/responsive parity, and route/nav/page chains while adding the requested UI. If the warning is "
         "a false positive, finish with <final>summary</final> and name why. "
         "Do not rewrite unrelated layout or styling.\n\n"
         "Task (for reference):\n"
@@ -3427,7 +3455,8 @@ def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
         "and name why it is required. For scripts preserve \"$@\", exit codes, "
         "PID/port fallbacks, and timeout semantics. For frontend/browser code "
         "guard browser globals, avoid exposing secret/hash fields, and avoid "
-        "timezone-shifting local date logic. Do not add unrelated scope.\n\n"
+        "timezone-shifting local date logic. For data algorithms preserve "
+        "initialization order, paired-input state, and normal single-record parsing. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
