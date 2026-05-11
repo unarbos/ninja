@@ -36,9 +36,18 @@ Miner editing guide:
     context gathering, command selection, tool/result parsing, stopping logic,
     patch generation, safety checks, and how the agent uses its step budget.
 
+    PR hygiene (helps reviewers and forks): ship one behavioral mechanism per PR
+    (e.g. lint gate, preload strip, fenced-parser change) rather than bundled rewrites.
+
+    Preserve existing docstrings and historical comments unless something is wrong
+    — cosmetic churn across the whole file hides what actually moved.
+
     Extras vs compact reference harness: multishot+memo, empty-attempt emergency
     single-shot, TLE user nudge, preload HTML-marked block strip after step 4,
     lint refinement gate, stderr path:line hints on observations.
+
+    Brace-balance self-check fixtures live in ``brace_balance_fixtures_verify.py``
+    alongside this repo (optional local run before mining).
 
     Keep these validator-owned boundaries intact:
     - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
@@ -829,7 +838,16 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Ranked source+partner tests with issue needles; returns text and paths for preload strip."""
+    """Preload the highest-ranked tracked files plus companion tests.
+
+    Returns ``(context_text, included_paths)`` for later preload stripping while
+    keeping file-name breadcrumbs.
+
+    Companion tests slot in immediately after partners via `_augment_with_test_partners`;
+    `_symbol_grep_hits` boosts files that contain issue-derived identifiers even when
+    the issue omits paths. Snippets come from `_read_context_file(..., needles=...)`
+    so large files expose issue-relevant windows instead of only the head slice.
+    """
     files = _rank_context_files(repo, issue)
     if not files:
         return "", []
@@ -1449,18 +1467,23 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Brace-balance probe for touched C/C++/Java/Go (naive lexer; omit suffixes with raw strings/lifetimes).
+# Brace / bracket / paren balance hint for `_check_syntax`. Naive lexer: tracks
+# // line comments, /* */ blocks, "", '', and Go/Java-style `` ` `` raw-ish spans,
+# plus standard escapes inside quotes.
+#
+# C++ raw user literals (`R"delim(...)delim"` etc.) trip this scanner — regression
+# checked 2026-05-11 in ``brace_balance_fixtures_verify.py`` — so *.cpp *.hpp *.cc
+# … are deliberately excluded below; use compiler-backed checks when you add them.
+#
+# Fixtures passed there for: Java char '\'' / JSON-ish double-quoted escapes, Go runes/
+# raw literals with `{}` bodies, C char + escaped doubles, benign `}` inside // comments,
+# synthetic unbalanced-positive cases.
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".java",
         ".go",
         ".c",
         ".h",
-        ".cpp",
-        ".cc",
-        ".cxx",
-        ".hpp",
-        ".hh",
     }
 )
 
@@ -1837,12 +1860,28 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+# ----------------------------- Companion-test refinement gate ----------------------------
+#
+# Bounded subprocess signal: when edits touch ``src/foo`` and tracked ``tests/test_foo``
+# exists (heuristic `_find_test_partner`), run pytest (Python) or ``node --check``
+# (JS/TS-ish) within ``timeout_seconds`` and hand failure tails to the refinement
+# turn. Quietly skips missing runners/timeouts/errors so the solver does not deadlock.
 def _run_companion_test(
     repo: Path,
     test_path: str,
     timeout_seconds: int = 8,
 ) -> Optional[str]:
-    """pytest (py) or node --check (JS); failure tail or None. Subprocess uses ``timeout_seconds``."""
+    """Run one companion artifact with a capped ``subprocess.run`` deadline.
+
+    - ``.py``: try ``pytest`` then ``python3 -m pytest`` (short flags, quiet TB).
+      Unimportable pytest / missing interpreters surface as unrunnable markers
+      returning ``None`` so we do not confuse infra noise with regressions.
+
+    - ``.ts|.tsx|.js|.jsx|.cjs|.mjs``: ``node --check`` when ``node`` is on PATH.
+
+    On pass or skip: ``None``. On genuine failure / timeout: condensed tail suitable
+    for ``build_test_fix_prompt``.
+    """
     full = repo / test_path
     if not full.exists() or not full.is_file():
         return None
@@ -2290,7 +2329,11 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """Substitute HTML-marked preload block with file name list."""
+    """Shrink the preload chunk between `_PRELOAD_BEGIN_MARKER` and `_PRELOAD_END_MARKER`.
+
+    Keeps breadcrumbs (which snippets existed + which paths were already edited)
+    after step four so downstream turns reclaim token budget without purging recall.
+    """
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
