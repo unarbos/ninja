@@ -106,6 +106,9 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 REFINEMENT_PATCH_RETURN_RESERVE_SECONDS = 45.0
+_LLM_HEADROOM_SECONDS = 5.0
+_LLM_TIMEOUT_FLOOR = 5
+_LLM_TIMEOUT_CEILING = 120
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -146,6 +149,16 @@ _CONTRACT_NAME_DENYLIST = {
     "beforeEach",
     "afterEach",
 }
+
+
+def _remaining_wall_clock(started_at: float) -> float:
+    return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - started_at)
+
+
+def _adaptive_llm_timeout(started_at: float, default: int = _LLM_TIMEOUT_CEILING) -> int:
+    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _LLM_HEADROOM_SECONDS
+    return max(_LLM_TIMEOUT_FLOOR, min(default, int(remaining)))
+
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -4223,12 +4236,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
+                    step_llm_timeout = _adaptive_llm_timeout(solve_started_at)
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=step_llm_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
