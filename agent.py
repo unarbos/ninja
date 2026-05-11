@@ -4346,26 +4346,13 @@ def _solve_attempt(
         messages.append({"role": "user", "content": prompt_text})
 
     def _maybe_queue_refinement_unsafe(assistant_text: str) -> bool:
-        """If the current patch warrants a refinement turn, queue it.
+        """Dispatch one refinement turn if the current patch warrants it.
 
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            0. hail-mary — patch empty after everything: force one real edit
-            1. syntax-fix — repair Python/TS/JS SyntaxError (exempt from cap)
-            2. patch-safety — remove unsafe review-process wording
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. criteria-nudge — name issue acceptance bullets not addressed
-            5. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
-            6. failed-verification — repair the latest concrete failed check
-            7. contract — preserve public symbols still referenced by callers
-            8. integration/artifact/dependency — close common missing pieces
-            9. polish/empty-arg/lint — remove churn and tool errors
-           10. self-check — show the diff and ask "did you cover everything?"
-
-        syntax-fix runs before the cap because non-parsing patches are
-        guaranteed losses; the LLM judge often penalises broken code harder
-        than missing scope (see duel 004362, ~half of losses).
+        Returns True when a turn was queued (the caller should continue the
+        loop); False when nothing fires (the caller can declare success).
+        Each gate runs at most once per attempt. The canonical gate order
+        and cap rules are documented on `_solve_with_safety_net` — keep
+        the two in sync when reordering.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
@@ -4530,7 +4517,7 @@ def _solve_attempt(
                 )
                 return True
 
-        # v72: lint pass — runs ruff/eslint when project tooling is available.
+        # Lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
         if lint_turns_used < MAX_LINT_TURNS:
@@ -4677,10 +4664,11 @@ def _solve_attempt(
                 )
                 return True
 
-        # Required-file: issue says "create a new <Component>" but the
-        # patch's `+++ b/...` lines reference no path matching that name.
-        # Different signal from undersized — keyed on creation phrasing,
-        # not on path-mention count.
+        # Required-file: issue uses creation phrasing ("add", "create",
+        # "new <Component>") but no `+++ b/...` path in the patch matches
+        # the named artifact. Keys on creation-verb + named-noun, distinct
+        # from coverage-nudge (which keys on issue-mentioned PATHS) and
+        # from undersized (which keys on COUNT of touched files).
         if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
             missing_files = _check_required_file(patch, issue)
             if missing_files:
@@ -4693,13 +4681,10 @@ def _solve_attempt(
                 )
                 return True
 
-        # Lint pass — runs ruff/eslint when project tooling is available.
-        # Different axis from syntax (which proves the file parses); lint
-        # catches style issues that make the patch look unfinished.
-        # Undersized-patch: when the issue mentions ≥3 distinct file paths
-        # but the patch only touches <2 files. Different signal from the
-        # coverage_nudge path-mention check — keys on file count rather
-        # than specific path coverage.
+        # Undersized: issue mentions ≥3 distinct paths but the patch
+        # touches <2 files. Keys on COUNT of the gap, distinct from
+        # coverage-nudge (which keys on WHICH specific paths are missed)
+        # and from required-file (which keys on creation-verb phrasing).
         if undersized_turns_used < MAX_UNDERSIZED_TURNS:
             undersized = _check_undersized_patch(patch, issue)
             if undersized is not None:
