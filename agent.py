@@ -903,7 +903,11 @@ _BACKTICK_PATH_HITS_MAX = 5
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
-    """Rank tracked source files by relevance; tests added later in preload."""
+    """Rank tracked implementation files for relevance to the issue.
+
+    Companion tests are merged in later by `build_preloaded_context` so this
+    ranker stays source-centric and top-K is not dominated by test paths.
+    """
     tracked = _tracked_files(repo)
     if not tracked:
         return []
@@ -1141,7 +1145,11 @@ def _read_context_file(
     max_chars: int,
     needles: Optional[List[str]] = None,
 ) -> str:
-    """Read tracked text; with needles and large files, windows around matches."""
+    """Read a tracked text file from `repo`.
+
+    With `needles` and large files, returns merged windows around hits; otherwise
+    head/tail truncation via `_truncate`.
+    """
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -2243,22 +2251,90 @@ def _detect_target_languages(repo: Path) -> List[str]:
     return [ext for ext, _ in ranked[:4]]
 
 
-def _build_language_idiom_block(target_languages: List[str]) -> str:
-    if not target_languages:
+_TS_FRONTEND_HINT_TERMS = (
+    "react",
+    "next.js",
+    "nextjs",
+    "next/",
+    "tsx",
+    "jsx",
+    "typescript",
+    "tailwind",
+    "shadcn",
+    "zustand",
+    "component",
+    "usestate",
+    "useeffect",
+    "frontend",
+    "vite",
+    "webpack",
+    "jest",
+    "vitest",
+    "cypress",
+    "playwright",
+    "storybook",
+    "npm ",
+    "yarn ",
+    "pnpm ",
+)
+_PY_HINT_TERMS = (
+    "python",
+    "pytest",
+    "django",
+    "flask",
+    "fastapi",
+    "pydantic",
+    "asyncio",
+    "typing",
+    "dataclass",
+    "mypy",
+    "ruff",
+    "poetry",
+    "pip ",
+    "unittest",
+)
+
+
+def _issue_signals_ts_frontend(issue_text: str) -> bool:
+    """True when the issue text or paths suggest TS/React-style UI work."""
+    if not issue_text:
+        return False
+    lower = issue_text.lower()
+    for p in _extract_issue_path_mentions(issue_text):
+        suf = Path(p).suffix.lower()
+        if suf in {".ts", ".tsx", ".jsx", ".js", ".mjs", ".cjs", ".vue", ".svelte"}:
+            return True
+    return any(t in lower for t in _TS_FRONTEND_HINT_TERMS)
+
+
+def _issue_signals_python(issue_text: str) -> bool:
+    """True when the issue text or paths suggest Python work."""
+    if not issue_text:
+        return False
+    lower = issue_text.lower()
+    for p in _extract_issue_path_mentions(issue_text):
+        if Path(p).suffix.lower() == ".py":
+            return True
+    return any(t in lower for t in _PY_HINT_TERMS)
+
+
+def _build_language_idiom_block(target_languages: List[str], issue_text: str) -> str:
+    """Short stack hints only when repo *and* issue both signal that stack."""
+    if not target_languages or not issue_text.strip():
         return ""
     ts_like = {".ts", ".tsx", ".jsx"}
     py_like = {".py"}
-    if any(ext in ts_like for ext in target_languages):
+    if any(ext in ts_like for ext in target_languages) and _issue_signals_ts_frontend(issue_text):
         return (
-            "\nLanguage hint (TypeScript / TSX detected): reuse existing import aliases "
+            "\nLanguage hint (TypeScript / TSX — issue-aligned): reuse existing import aliases "
             "(`@/components/...`, `next/navigation`, zustand `create`). Wire interactive "
             "elements with onClick/onChange, useState with explicit types. Named function "
             "exports unless the file uses default exports. Tailwind inline in className; "
             "shadcn/ui from `@/components/ui/...`. Prefer `import type` when only types are needed.\n"
         )
-    if any(ext in py_like for ext in target_languages):
+    if any(ext in py_like for ext in target_languages) and _issue_signals_python(issue_text):
         return (
-            "\nLanguage hint (Python detected): match existing typing style; reuse fixtures "
+            "\nLanguage hint (Python — issue-aligned): match existing typing style; reuse fixtures "
             "and exception types from nearby tests; stdlib patterns over new deps unless "
             "the codebase already imports otherwise.\n"
         )
@@ -2270,7 +2346,7 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """Replace the preloaded HTML block with a short breadcrumb list."""
+    """Swap the HTML preloaded snippet block for a short breadcrumb (saves tokens)."""
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -2502,7 +2578,7 @@ def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str,
     multi_file = _detect_multi_file_task(issue_text)
     lang_block = ""
     try:
-        lang_block = _build_language_idiom_block(_detect_target_languages(repo))
+        lang_block = _build_language_idiom_block(_detect_target_languages(repo), issue_text)
     except Exception:
         lang_block = ""
 
@@ -2612,15 +2688,14 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     """Force a minimal edit when the patch is still empty."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "Your patch is still empty after refinement. You must produce a "
-        "non-empty diff on disk.\n\n"
+        "Refinement did not produce an on-disk code change yet. You still need at least "
+        "one substantive edit that plausibly addresses a requirement from the issue "
+        "(behaviour or fix the failure describes), not comment-only or file-mode-only noise.\n\n"
         "Issue (for context):\n\n"
         f"{short}\n\n"
-        "Make ONE targeted code change consistent with the issue. Pick the most "
-        "likely file from preloaded snippets or one focused search. Use "
-        "`sed -i`, a short `python -c` one-liner, or a heredoc — change real "
-        "executable code, not comments-only and not file modes. Then end with "
-        "<final> immediately."
+        "Pick the most justified file (preloaded snippets or one short search), apply "
+        "ONE minimal `sed -i`, `python -c`, or heredoc edit to real executable code, "
+        "then end with <final> summarizing what you changed and why it matches the issue."
     )
 
 
@@ -2731,11 +2806,12 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
         f"TASK:\n{task_view}\n\n"
         f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
         "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in the target file consistent with the task. Use "
-        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
-        "only. Do NOT change file modes. Make a real code edit.\n\n"
+        "code change in the target file that addresses the task (fix the described "
+        "bug or implement the described behaviour — not noise). Use `sed -i`, a "
+        "`python -c` one-liner, or a heredoc. Do NOT add comments only. Do NOT change "
+        "file modes.\n\n"
         "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
+        "<final>brief summary of the edit</final>"
     )
 
 
@@ -2768,8 +2844,9 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
             {
                 "role": "system",
                 "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
+                    "You are a one-shot patch generator. Output exactly one bash command "
+                    "that edits the user file to satisfy the described task, then "
+                    "<final> with a one-line honest summary. Nothing else."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -3153,7 +3230,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """True if a corrective user turn was queued (polish→syntax→lint→test→… )."""
+        """Return True if a refinement user message was queued.
+
+        Order: polish → syntax → lint → companion test → path coverage → criteria
+        → self-check. Empty patch uses hail-mary outside MAX_TOTAL_REFINEMENT_TURNS.
+        """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
         nonlocal hail_mary_turns_used, total_refinement_turns_used
@@ -3324,11 +3405,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     {
                         "role": "user",
                         "content": (
-                            "EMERGENCY — wall clock is almost exhausted and your draft diff is still empty. "
-                            "In your NEXT response: pick ONE file and ONE edit that addresses the most central "
-                            "requirement in the issue. Use a single `sed -i` or a single short `python -c` "
-                            "one-liner. Do not explore. Do not run grep. After the edit command, end with "
-                            "`<final>emergency edit</final>` in ONE response."
+                            "Time budget is almost exhausted and there is still no on-disk code change. "
+                            "In your NEXT response: pick ONE file and apply ONE minimal edit that targets "
+                            "the issue's main requirement (the bug, regression, or missing behaviour described). "
+                            "Use a single `sed -i` or one short `python -c` line — no broad exploration, no grep-only. "
+                            "After the command, end with <final> summarizing the change and how it maps to the issue."
                         ),
                     }
                 )
@@ -3395,7 +3476,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 if consecutive_no_command >= MAX_NO_COMMAND_REPAIRS:
-                    logs.append("\nSTOPPED: \nModel repeatedly failed to produce a command or final answer.")
+                    logs.append("\nSTOPPED:\nModel repeatedly failed to produce a command or final answer.")
                     break
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": build_no_command_repair_prompt()})
