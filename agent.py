@@ -837,7 +837,32 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         used += len(recent_examples)
 
     if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
-        for relative_path in _resolve_issue_named_paths_by_basename(issue, tracked_set, set(included)):
+        basename_candidates: List[str] = []
+        seen_names: set = set()
+        included_set = set(included)
+        for raw in _extract_issue_path_mentions(issue):
+            normalized = raw.strip("./")
+            if normalized in tracked_set or normalized in included_set:
+                continue
+            basename = Path(normalized).name.lower()
+            if not basename or basename in seen_names:
+                continue
+            seen_names.add(basename)
+            matches = [
+                path for path in tracked_set
+                if Path(path).name.lower() == basename
+                and _context_file_allowed(path)
+                and path not in included_set
+            ]
+            if 1 <= len(matches) <= 4:
+                basename_candidates.extend(sorted(matches, key=lambda p: (len(p), p)))
+        basename_seen: set = set()
+        for relative_path in basename_candidates:
+            if relative_path in basename_seen:
+                continue
+            basename_seen.add(relative_path)
+            if len(basename_seen) > 4:
+                break
             snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
             if not snippet.strip():
                 continue
@@ -849,62 +874,28 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
             used += len(block)
 
     if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
-        tree_block = _compact_tracked_file_tree(tracked_set, set(included), max_paths=40)
+        source_exts = {
+            ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".kt",
+            ".go", ".rb", ".php", ".rs", ".cs", ".css", ".scss", ".html", ".md",
+            ".json", ".yml", ".yaml", ".toml", ".sh",
+        }
+        included_set = set(included)
+        tree_paths = [
+            path for path in tracked_set
+            if path not in included_set
+            and _context_file_allowed(path)
+            and Path(path).suffix.lower() in source_exts
+        ]
+        tree_paths.sort(key=lambda p: (len(Path(p).parts), p))
+        tree_block = ""
+        if tree_paths:
+            tree_body = "\n".join(tree_paths[:40])
+            tree_block = f"### Compact tracked file tree (source-like files not preloaded)\n```\n{tree_body}\n```"
         if tree_block and used + len(tree_block) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
             parts.append(tree_block)
             used += len(tree_block)
 
     return "\n\n".join(parts), included
-
-
-def _resolve_issue_named_paths_by_basename(issue: str, tracked_set: set, included_set: set) -> List[str]:
-    """Preload real files when the issue names a stale or partial path."""
-    candidates: List[str] = []
-    seen_names: set = set()
-    for raw in _extract_issue_path_mentions(issue):
-        normalized = raw.strip("./")
-        if normalized in tracked_set or normalized in included_set:
-            continue
-        basename = Path(normalized).name.lower()
-        if not basename or basename in seen_names:
-            continue
-        seen_names.add(basename)
-        matches = [
-            path for path in tracked_set
-            if Path(path).name.lower() == basename and _context_file_allowed(path) and path not in included_set
-        ]
-        if 1 <= len(matches) <= 4:
-            candidates.extend(sorted(matches, key=lambda p: (len(p), p)))
-    out: List[str] = []
-    seen: set = set()
-    for path in candidates:
-        if path in seen:
-            continue
-        seen.add(path)
-        out.append(path)
-        if len(out) >= 4:
-            break
-    return out
-
-
-def _compact_tracked_file_tree(tracked_set: set, included_set: set, *, max_paths: int = 40) -> str:
-    """Tiny source-file tree to reveal owners not captured by ranked snippets."""
-    source_exts = {
-        ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".kt",
-        ".go", ".rb", ".php", ".rs", ".cs", ".css", ".scss", ".html", ".md",
-        ".json", ".yml", ".yaml", ".toml", ".sh",
-    }
-    paths = [
-        path for path in tracked_set
-        if path not in included_set
-        and _context_file_allowed(path)
-        and Path(path).suffix.lower() in source_exts
-    ]
-    paths.sort(key=lambda p: (len(Path(p).parts), p))
-    if not paths:
-        return ""
-    body = "\n".join(paths[:max_paths])
-    return f"### Compact tracked file tree (source-like files not preloaded)\n```\n{body}\n```"
 
 
 def _preload_needles(issue: str) -> List[str]:
