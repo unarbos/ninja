@@ -3609,9 +3609,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # on empty input and won't reduce the patch to empty.
         if patch.strip():
             try:
-                _pruned, _dropped = _prune_offtopic_hunks(repo, patch, issue_text=issue)
+                _, _dropped = _prune_offtopic_hunks(repo, patch, issue_text=issue)
             except Exception as _prune_exc:
-                _pruned, _dropped = patch, []
+                _, _dropped = patch, []
                 logs.append("PRUNE_OFFTOPIC_HUNKS_ERROR:\n" + repr(_prune_exc)[:300])
             if _dropped:
                 patch = get_patch(repo)  # re-read after working-tree revert
@@ -3619,6 +3619,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "PRUNE_OFFTOPIC_HUNKS: dropped=" + str(len(_dropped))
                     + " " + "; ".join(_dropped[:4])
                 )
+
+        # Observability: wall time for the full inner solve loop (bounded work metric).
+        logs.append(f"SOLVE_WALL_S: {time.monotonic() - _wall_start:.3f}")
 
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
