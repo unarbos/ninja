@@ -191,13 +191,35 @@ class AgentResult:
         }
 
 
+_PATCH_CORRUPTION_MARKERS = (
+    "<command>", "</command>", "<final>", "</final>",
+    "```bash", "<<EOF", "<<'EOF'",
+)
+
+
 # -----------------------------
 # Utility
 # -----------------------------
 
+def _looks_like_traceback(text: str) -> bool:
+    tail = text[-2000:]
+    return (
+        "Traceback (most recent call last)" in text
+        or re.search(r"\n[A-Z][A-Za-z]*Error: ", tail) is not None
+        or re.search(r"\n[A-Z][A-Za-z]*Exception: ", tail) is not None
+        or re.search(r"\n\s+at .+:\d+", tail) is not None
+    )
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
+    if _looks_like_traceback(text):
+        head = max_chars // 4
+        tail = max_chars - head - 80
+        return (text[:head]
+                + "\n\n...[head dropped " + str(len(text) - max_chars) + " chars]...\n\n"
+                + text[-tail:])
     half = max_chars // 2
     return (
         text[:half]
@@ -518,6 +540,43 @@ def extract_final(model_text: str) -> Optional[str]:
 # Git helpers
 # -----------------------------
 
+def _run_git(repo: Path, args: List[str], timeout: int = 10) -> subprocess.CompletedProcess:
+    """Run a git sub-command in `repo` and return the CompletedProcess."""
+    return subprocess.run(
+        ["git"] + args,
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _read_lines_around(
+    repo: Path,
+    relative_path: str,
+    lineno: int,
+    *,
+    before: int = 4,
+    after: int = 14,
+) -> str:
+    """Return a formatted slice of lines around `lineno` (1-based) from a repo file."""
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    start = max(0, lineno - 1 - before)
+    end = min(len(lines), lineno - 1 + after + 1)
+    header = f"--- lines {start + 1}-{end} of {len(lines)} ({relative_path}) ---"
+    body = "\n".join(f"{i + 1:5d}| {lines[i]}" for i in range(start, end))
+    return header + "\n" + body
+
+
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
     if git_dir.exists():
@@ -796,10 +855,15 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+    definer_snippets = _collect_definer_snippets(repo, needles, 4500)
 
     parts: List[str] = []
     included: List[str] = []
     used = 0
+    for _defpath, _defsnip in definer_snippets[:4]:
+        _defblock = f"### {_defpath} (definer)\n```\n{_defsnip}\n```"
+        parts.append(_defblock)
+        used += len(_defblock)
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
@@ -857,6 +921,49 @@ def _preload_needles(issue: str) -> List[str]:
         if len(term) >= 4:
             add(term)
     return out
+
+
+def _collect_definer_snippets(
+    repo: Path,
+    needles: List[str],
+    budget: int,
+) -> List[Tuple[str, str]]:
+    """For each identifier-shaped needle, locate its definition line via
+    `git grep -nE` and return (relpath, snippet) pairs capped at `budget` chars.
+    Deduplicates by (path, coarse_line_bucket) so a function redefined in tests
+    doesn't crowd out the canonical definition."""
+    pairs: List[Tuple[str, str]] = []
+    seen: set = set()
+    used = 0
+    for needle in needles[:8]:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{2,}$", needle):
+            continue
+        try:
+            out = _run_git(
+                repo,
+                ["grep", "-nE",
+                 rf"^[^=]*\b(def|class|function|fn|impl)\s+{re.escape(needle)}\b"],
+                timeout=4,
+            ).stdout
+        except Exception:
+            continue
+        for line in out.splitlines()[:3]:
+            m = re.match(r"^([^:]+):(\d+):", line)
+            if not m:
+                continue
+            rel_path, lineno = m.group(1), int(m.group(2))
+            key = (rel_path, lineno // 20)
+            if key in seen:
+                continue
+            seen.add(key)
+            snippet = _read_lines_around(repo, rel_path, lineno, before=4, after=14)
+            if not snippet:
+                continue
+            if used + len(snippet) > budget:
+                return pairs
+            pairs.append((rel_path, snippet))
+            used += len(snippet)
+    return pairs
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1271,6 +1378,30 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+def _patch_corruption_summary(patch: str) -> str:
+    """Return a short description of harness/heredoc leakage on added (+) lines,
+    or '' if the patch looks clean."""
+    issues: List[str] = []
+    for ln in patch.splitlines():
+        if not ln.startswith("+") or ln.startswith("+++"):
+            continue
+        body = ln[1:]
+        for marker in _PATCH_CORRUPTION_MARKERS:
+            if marker.strip() and marker.strip() in body:
+                issues.append(f"leaked marker {marker.strip()!r}")
+                break
+        if re.match(r"^\s*EOF\s*$", body) and "<<EOF" not in patch:
+            issues.append("orphan EOF terminator")
+    out: List[str] = []
+    seen: set = set()
+    for item in issues:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return "; ".join(out[:4])
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2435,6 +2566,27 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_patch_corruption_nudge_prompt(gap: str, patch: str) -> str:
+    """Ask the model to scrub harness-tag / HEREDOC leakage from the patch."""
+    preview = patch[-1200:] if len(patch) > 1200 else patch
+    return (
+        "Patch-corruption detected — the current diff contains raw harness markers "
+        "or heredoc artefacts on added lines:\n\n"
+        f"  {gap}\n\n"
+        "These markers leak from edit scripts that embed shell heredocs or "
+        "model output tags directly into source files. They collapse the "
+        "validator's similarity score against the reference patch.\n\n"
+        "Patch tail (for reference):\n```diff\n"
+        f"{preview}\n```\n\n"
+        "Steps to fix:\n"
+        "1. Open each affected file and remove the leaked marker lines "
+        "   (use `grep -n '<command>\\|<<EOF\\|<final>' <file>` to locate them).\n"
+        "2. Re-run `git diff` to confirm the markers are gone.\n"
+        "3. Then emit <final>summary</final>.\n\n"
+        "Do NOT redo the logical fix — only remove the corruption."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -2662,6 +2814,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    patch_corruption_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2706,7 +2859,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, patch_corruption_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2723,6 +2876,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
             return False
+
+        if (patch_corruption_turns_used < 1
+                and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS):
+            gap = _patch_corruption_summary(patch)
+            if gap:
+                patch_corruption_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_patch_corruption_nudge_prompt(gap, patch),
+                    "PATCH_CORRUPTION_NUDGE_QUEUED:\n  " + gap,
+                )
+                return True
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -2776,16 +2942,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
+            _cov_changed = _patch_changed_files(patch)
+            _cov_added = sum(1 for ln in patch.splitlines()
+                             if ln.startswith("+") and not ln.startswith("+++")
+                             and ln[1:].strip())
+            if len(_cov_changed) <= 3 and _cov_added <= 60:
+                # Tight focused patch — coverage/criteria nudges would over-expand scope.
+                pass
+            else:
+                missing = _uncovered_required_paths(patch, issue)
+                if missing:
+                    coverage_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_coverage_nudge_prompt(missing, issue),
+                        "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    )
+                    return True
 
         # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
         # FILES the issue mentions; criteria gates on the acceptance-criterion
@@ -2794,16 +2968,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # the king loses on multi-bullet issues — surfacing the unaddressed
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
+            _cri_changed = _patch_changed_files(patch)
+            _cri_added = sum(1 for ln in patch.splitlines()
+                             if ln.startswith("+") and not ln.startswith("+++")
+                             and ln[1:].strip())
+            if len(_cri_changed) <= 3 and _cri_added <= 60:
+                # Tight focused patch — coverage/criteria nudges would over-expand scope.
+                pass
+            else:
+                unaddressed = _unaddressed_criteria(patch, issue)
+                if unaddressed:
+                    criteria_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_criteria_nudge_prompt(unaddressed, issue),
+                        "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    )
+                    return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
