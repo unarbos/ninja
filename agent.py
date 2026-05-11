@@ -116,7 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 5  # v14: 5 gates need 5 turns to be reachable
+MAX_TOTAL_REFINEMENT_TURNS = 4  # v14: bumped from king's 2; 4 covers 4 new gates without blowing time budget
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1563,47 +1563,6 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
-def _find_issue_tests(repo: Path, task_text: str) -> List[str]:
-    """Find test files explicitly mentioned or implied by the task description.
-    Different from _find_test_partner which works from source files.
-    Returns list of relative paths (max 2), empty if none found."""
-    import re as _re
-    candidates: List[str] = []
-    # Match explicit test file patterns in the task
-    for m in _re.finditer(
-        r"(test[\w/\-]*\.(?:js|ts|py|rb|go|java)|[\w/\-]*\.test\.\w+|[\w/\-]*_test\.\w+|[\w/\-]*spec\.\w+)",
-        task_text, _re.I
-    ):
-        path = m.group(1).strip("./")
-        full = repo / path
-        if full.exists():
-            candidates.append(path)
-    # Deduplicate and return
-    seen: set = set()
-    valid: List[str] = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            valid.append(c)
-    return valid[:2]
-
-
-# ─── CL-GPT-v14 additions ─────────────────────────────────────────────────
-
-_ATOMIC_SYSTEM_ADDENDUM = (
-    "\n[Scope: ATOMIC — single-file, focused change. "
-    "Produce the MINIMAL diff that satisfies the spec exactly. "
-    "Do NOT refactor, expand, or add features beyond the stated criteria.]\n"
-)
-_COMPLEX_SYSTEM_ADDENDUM = (
-    "\n[Scope: COMPLEX — multi-concern change. "
-    "Enumerate EVERY required integration point in your plan BEFORE writing code.]\n"
-)
-_ENTERPRISE_FRAMEWORKS = (
-    "spring boot", "laravel", "django", "rails", "asp.net",
-    "fastapi", "flask", "express", "nestjs", "nest.js",
-)
-
 
 def _pre_gen_criteria_check(task_text: str) -> str:
     """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
@@ -1619,6 +1578,21 @@ def _pre_gen_criteria_check(task_text: str) -> str:
         f"Address ALL before finalizing:\n{items}\n"
         f"Verify each criterion is reflected in your diff before submitting.]\n"
     )
+
+
+_ATOMIC_SYSTEM_ADDENDUM = (
+    "\n[Scope: ATOMIC — single-file, focused change. "
+    "Produce the MINIMAL diff that satisfies the spec exactly. "
+    "Do NOT refactor, expand, or add features beyond the stated criteria.]\n"
+)
+_COMPLEX_SYSTEM_ADDENDUM = (
+    "\n[Scope: COMPLEX — multi-concern change. "
+    "Enumerate EVERY required integration point in your plan BEFORE writing code.]\n"
+)
+_ENTERPRISE_FRAMEWORKS = (
+    "spring boot", "laravel", "django", "rails", "asp.net",
+    "fastapi", "flask", "express", "nestjs", "nest.js",
+)
 
 
 def _classify_task_scope_v14(task_text: str, ctx_lines: int) -> str:
@@ -2321,8 +2295,8 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    _pgc = _pre_gen_criteria_check(issue)  # pass issue to task_text param
-    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))  # pass issue to task_text
+    _pgc = _pre_gen_criteria_check(issue)
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
     _prefix = _pgc + _scope
     return _prefix + f"""Fix this issue:
 
@@ -2945,7 +2919,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
         # v14: enterprise framework precision hint
-        _ef_hint = _detect_enterprise_framework(issue)  # pass issue to task_text
+        _ef_hint = _detect_enterprise_framework(issue)
         if _ef_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
             queue_refinement_turn(assistant_text, _ef_hint, "ENTERPRISE_FW_HINT")
