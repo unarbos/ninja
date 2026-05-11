@@ -60,7 +60,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -122,6 +122,8 @@ MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAZARD_REVIEW_TURNS = 1  # catch diff hazards that are cheap to repair pre-final
 MAX_LITERAL_NUDGES = 1     # catch exact quoted strings/keys/paths missed by broad criteria
 MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
+MAX_CONTRACT_NUDGES = 1    # catch route/import/rename propagation gaps
+MAX_DELIVERABLE_NUDGES = 1  # catch named files/modules from issue not touched
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1349,6 +1351,9 @@ _JS_HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]*\s*\(")
 _SHELL_LIFECYCLE_PATH_RE = re.compile(r"(?:^|/)(?:start|stop|dev|serve|run)[-_A-Za-z0-9]*\.sh$")
 _REACT_HOOK_IMPORT_RE = re.compile(r"import\s+(?:React,\s*)?\{([^}]+)\}\s+from\s+['\"]react['\"]")
 _NOOP_HANDLER_RE = re.compile(r"\bon(?:Change|Click|Submit|Input|Upload)\s*=\s*\{\s*\(\s*[^)]*\)\s*=>\s*\{\s*(?://[^}\n]*)?\}\s*\}")
+_LOCAL_IMPORT_RE = re.compile(r"^\s*(?:import\s+(?:[^'\"]+\s+from\s+)?|import\s*\(|require\()\s*['\"](\.{1,2}/[^'\"]+)['\"]", re.MULTILINE)
+_DUPLICATE_IMPORT_RE = re.compile(r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"];?\s*$", re.MULTILINE)
+_FIELD_RENAME_RE = re.compile(r"^\s*[-+]\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", re.MULTILINE)
 
 
 _CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
@@ -1504,6 +1509,12 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     return not _uncovered_required_paths(patch, issue_text)
 
 
+_DELIVERABLE_KEYWORDS = (
+    "add", "create", "update", "modify", "edit", "fix", "implement", "include",
+    "generate", "write", "document", "test", "configure", "rename",
+)
+
+
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
@@ -1521,6 +1532,36 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+def _named_deliverable_gap_summary(patch: str, issue_text: str) -> str:
+    """Catch explicitly named deliverable files/modules the patch skipped."""
+    if not patch.strip() or not issue_text:
+        return ""
+    changed = set(_patch_changed_files(patch))
+    if not changed:
+        return ""
+    missing: List[str] = []
+    issue_lower = issue_text.lower()
+    for req in _extract_issue_path_mentions(issue_text):
+        req_lower = req.lower()
+        start = max(0, issue_lower.find(req_lower) - 80)
+        end = min(len(issue_lower), issue_lower.find(req_lower) + len(req_lower) + 80)
+        window = issue_lower[start:end]
+        if not any(keyword in window for keyword in _DELIVERABLE_KEYWORDS):
+            continue
+        if any(req == c or c.endswith("/" + req) for c in changed):
+            continue
+        missing.append(req)
+    if not missing:
+        return ""
+    bullets = "\n".join(f"- `{path}`" for path in missing[:6])
+    return (
+        "Issue names deliverable files/modules that are not touched:\n"
+        f"{bullets}\n"
+        "If a named path is intentionally unchanged, inspect the local owner and explain why; "
+        "otherwise update the requested file/module directly."
+    )
 
 
 _INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
@@ -2399,6 +2440,103 @@ def _literal_acceptance_gap_summary(patch: str, issue_text: str) -> str:
     )
 
 
+def _normalize_route_params(text: str) -> List[str]:
+    return sorted({name.lower() for name in _ROUTE_PARAM_RE.findall(text or "")})
+
+
+def _resolve_local_import_path(source_path: str, spec: str) -> str:
+    base = PurePosixPath(source_path).parent
+    candidate = (base / spec).as_posix()
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    parts: List[str] = []
+    for part in candidate.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _local_import_target_exists(repo: Optional[Path], target: str) -> bool:
+    if repo is None or not target:
+        return True
+    base = repo / target
+    candidates = [base]
+    if base.suffix:
+        candidates.append(base)
+    else:
+        for suffix in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".vue", ".svelte", ".py"):
+            candidates.append(repo / f"{target}{suffix}")
+        for suffix in (".ts", ".tsx", ".js", ".jsx", ".json", ".py"):
+            candidates.append(repo / target / f"index{suffix}")
+            candidates.append(repo / target / f"__init__{suffix}")
+    return any(candidate.exists() for candidate in candidates)
+
+
+def _contract_propagation_gap_summary(patch: str, issue_text: str, repo: Optional[Path] = None) -> str:
+    """Spot public-contract changes that look only partially propagated."""
+    if not patch.strip():
+        return ""
+    notes: List[str] = []
+    changed_files = set(_patch_changed_files(patch))
+
+    for path, (added, removed) in _patch_added_removed_by_file(patch).items():
+        added_text = "\n".join(added)
+        removed_text = "\n".join(removed)
+        added_params = _normalize_route_params(added_text)
+        route_read_params = sorted({name.lower() for name in _REQ_PARAM_RE.findall(added_text)})
+        if added_params and route_read_params and not set(route_read_params).issubset(set(added_params)):
+            notes.append(
+                f"{path}: route params {added_params} do not match request params {route_read_params}"
+            )
+
+        import_lines = _DUPLICATE_IMPORT_RE.findall(added_text)
+        if import_lines:
+            seen_imports: set = set()
+            for symbols, source in import_lines:
+                key = (source, re.sub(r"\s+", " ", symbols.strip()))
+                if key in seen_imports:
+                    notes.append(f"{path}: duplicate import from `{source}` added")
+                    break
+                seen_imports.add(key)
+
+        for spec in _LOCAL_IMPORT_RE.findall(added_text):
+            if not spec.startswith(".") or spec.endswith((".css", ".scss", ".sass", ".less", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                continue
+            target = _resolve_local_import_path(path, spec)
+            target_stem = target.rsplit(".", 1)[0]
+            touched_target = any(changed == target or changed.rsplit(".", 1)[0] == target_stem for changed in changed_files)
+            if not touched_target and "/" in target and not _local_import_target_exists(repo, target):
+                notes.append(f"{path}: added local import `{spec}` but no matching file is touched")
+
+        removed_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(removed_text)}
+        added_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(added_text)}
+        likely_renamed = sorted(
+            old for old in removed_fields - added_fields
+            if re.search(rf"\b{re.escape(old)}\b", added_text) or re.search(rf"\b{re.escape(old)}\b", issue_text)
+        )
+        if likely_renamed:
+            notes.append(f"{path}: removed/renamed field still appears nearby: {', '.join(likely_renamed[:4])}")
+
+        if len(notes) >= 6:
+            break
+
+    if not notes:
+        return ""
+    deduped: List[str] = []
+    seen: set = set()
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "\n".join(f"- {note}" for note in deduped[:6])
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2949,6 +3087,36 @@ def build_literal_acceptance_nudge_prompt(literal_summary: str, issue_text: str)
     )
 
 
+def build_contract_propagation_prompt(contract_summary: str, issue_text: str) -> str:
+    return (
+        "Contract-propagation check: your current patch may update one side of a "
+        "public contract without updating the matching consumer/producer.\n\n"
+        f"{contract_summary}\n\n"
+        "Inspect the touched owner(s) and propagate the contract exactly: route "
+        "param names must match handler reads, imported local helpers/files must "
+        "exist, duplicate imports should be collapsed, and renamed fields must "
+        "leave no stale read/write/test path behind. If the warning is a false "
+        "positive, finish with <final>summary</final> and name why. Otherwise "
+        "issue the minimal edit command(s) to repair the propagation gap.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_deliverable_gap_prompt(deliverable_summary: str, issue_text: str) -> str:
+    return (
+        "Named-deliverable check: the issue appears to require a specific file "
+        "or module, but the current patch does not touch it.\n\n"
+        f"{deliverable_summary}\n\n"
+        "Open the named path/module and either make the minimal requested change "
+        "there, or finish with <final>summary</final> and explain why the named "
+        "deliverable is already satisfied elsewhere. Do not add unrelated files "
+        "or broad refactors.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
         "Integration check: your patch appears to add implementation code, but "
@@ -3304,6 +3472,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hazard_review_turns_used = 0
     literal_nudges_used = 0
     corruption_turns_used = 0
+    contract_nudges_used = 0
+    deliverable_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3345,16 +3515,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             5. coverage-nudge — name issue-mentioned paths still untouched
             6. criteria-nudge — name issue acceptance bullets not addressed
             7. literal-nudge — catch exact issue strings/keys/paths still missing
-            8. integration-nudge — make new code reachable from routes/nav/API
-            9. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
-            10. dependency-nudge — add metadata for new external packages
-            11. hazard-review — catch cheap diff hazards before broad self-check
-            12. self-check — show the diff and ask "did you cover everything?"
+            8. contract-nudge — propagate route/import/rename contracts exactly
+            9. deliverable-nudge — touch explicitly named deliverable files
+            10. integration-nudge — make new code reachable from routes/nav/API
+            11. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
+            12. dependency-nudge — add metadata for new external packages
+            13. hazard-review — catch cheap diff hazards before broad self-check
+            14. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, contract_nudges_used, deliverable_nudges_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3474,6 +3646,30 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_literal_acceptance_nudge_prompt(literal_summary, issue),
                     "LITERAL_NUDGE_QUEUED:\n  " + literal_summary.replace("\n", " ")[:160],
+                )
+                return True
+
+        if contract_nudges_used < MAX_CONTRACT_NUDGES:
+            contract_summary = _contract_propagation_gap_summary(patch, issue, repo)
+            if contract_summary:
+                contract_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_contract_propagation_prompt(contract_summary, issue),
+                    "CONTRACT_NUDGE_QUEUED:\n  " + contract_summary.replace("\n", " ")[:160],
+                )
+                return True
+
+        if deliverable_nudges_used < MAX_DELIVERABLE_NUDGES:
+            deliverable_summary = _named_deliverable_gap_summary(patch, issue)
+            if deliverable_summary:
+                deliverable_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_deliverable_gap_prompt(deliverable_summary, issue),
+                    "DELIVERABLE_NUDGE_QUEUED:\n  " + deliverable_summary.replace("\n", " ")[:160],
                 )
                 return True
 
