@@ -114,10 +114,16 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
-MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_CRITERIA_NUDGES = 2    # king-analysis axis 5 / P10: re-fire when unaddressed-set shrinks
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+# king-analysis axis 5 / P2: previous hard cap of 2 saturated immediately
+# on multi-bullet tasks (CRITERIA + SELF_CHECK or CRITERIA + COVERAGE
+# leave no room for syntax / test / polish). Total cap is now a floor;
+# `_dynamic_refinement_cap(issue)` returns a higher value for issues with
+# many acceptance bullets so the model gets enough nudges to close the
+# gap on issues like 074259 (12 bullets, 30% addressed).
+MAX_TOTAL_REFINEMENT_TURNS = 2  # floor; see _dynamic_refinement_cap()
+MAX_TOTAL_REFINEMENT_TURNS_CEIL = 5
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1846,6 +1852,27 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     return bullets
 
 
+def _dynamic_refinement_cap(issue_text: str) -> int:
+    """king-analysis axis 5: scale the total-refinement cap on the
+    number of acceptance bullets in the issue.
+
+    Floor = MAX_TOTAL_REFINEMENT_TURNS (2). For each block of 3 bullets
+    beyond the first, add one extra refinement turn (so a 12-bullet
+    issue gets 5). Ceiling = MAX_TOTAL_REFINEMENT_TURNS_CEIL (5) so we
+    never run past the time budget."""
+    try:
+        n = len(_extract_acceptance_criteria(issue_text))
+    except Exception:
+        n = 0
+    if n <= 0:
+        return MAX_TOTAL_REFINEMENT_TURNS
+    extra = max(0, (n - 1) // 3)
+    return max(
+        MAX_TOTAL_REFINEMENT_TURNS,
+        min(MAX_TOTAL_REFINEMENT_TURNS_CEIL, MAX_TOTAL_REFINEMENT_TURNS + extra),
+    )
+
+
 def _criterion_keywords(criterion: str) -> List[str]:
     """Significant tokens from a criterion (drop stopwords + short words)."""
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", criterion.lower())
@@ -2101,6 +2128,8 @@ PY
 
 Use `sed -i 's/exact old/exact new/' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
 
+For files larger than ~150 lines, do NOT rewrite the whole file via `cat > FILE << EOF ... EOF`. The wall-clock penalty for re-emitting the entire file as a heredoc is large (a 400-line .tsx is ~10-20 s of model output alone), and the diff judge punishes the noise. Instead, use the guarded `python - <<'PY' ... PY` block-replacement pattern above, or a uniquely-scoped `sed -i`. Whole-file `cat > FILE << EOF` rewrites are only acceptable for new files (file did not previously exist) or files under ~120 lines.
+
 When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
@@ -2154,6 +2183,22 @@ FAILURE RECOVERY AND COMMAND ECONOMY
 If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
 
 A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+
+====================================================================
+PRE-FINAL CHECKPOINT (anti-stub gate)
+====================================================================
+
+Before emitting `<final>`, run this mental checklist for every issue with 2+ acceptance bullets, numbered requirements, or "and / also / plus" clauses:
+
+1. Re-read the requirements list YOU wrote in `<plan>` at step 1. For EACH row, name the file + the lines in your staged diff (`git diff`) that satisfy it. If you cannot point to a concrete +/- line in the diff for a requirement, that requirement is NOT addressed.
+
+2. Treat secondary clauses (warning text, error messages, empty-state copy, ARIA labels, disabled-state styling, default values) as full requirements — they are usually what hidden tests assert.
+
+3. If your reasoning concludes "validation is already implemented", "this is already supported", "no changes needed in X", BEFORE you emit `<final>`: re-check the SECONDARY clauses of the issue (warning text, error message, empty-state, edge case). The primary behavior often is already implemented; the issue is asking you to add the secondary surface. Inspect the actual file content — not just `grep` for a function name — and only emit `<final>` if every secondary clause is satisfied or you have an explicit source-side reason it does not apply.
+
+4. Do not emit `<final>` after a step that only wrote a test file, only ran a smoke `python -c "import X"`, only `cat`'d / `sed -n`'d a file, or only piped a missing command (`pnpm` / `npx` when the binary is absent in the sandbox). A heredoc file-write is NOT verification.
+
+5. If a requirement is unaddressed and you still have step budget, issue the additional `<command>` blocks to address it in the SAME response, then re-check, then `<final>`. Stubs ("// similar logic here", "TODO: extend for cases X, Y", an empty function body, a test that imports a function you never defined) count as unaddressed.
 
 ====================================================================
 FINAL ANSWER
@@ -2585,11 +2630,29 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
+        _issue_text = kwargs.get("issue", "") or ""
+
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # king-analysis axis 4 / P3: previous gate was "≥3 added
+        # non-comment lines → accept". 152110's 258-line wrong-file
+        # patch and 074259's 7-of-23-file patch BOTH cleared it, so
+        # multishot never fired on the tasks that needed it most.
+        # Coverage-aware retry: trigger retry when line-count is low
+        # OR coverage gates flag the patch as incomplete.
+        _u1_paths = _uncovered_required_paths(_patch1, _issue_text)
+        _u1_crits = _unaddressed_criteria(_patch1, _issue_text)
+        _crits = _extract_acceptance_criteria(_issue_text)
+        _crit_count = max(1, len(_crits))
+        _crit_gap_ratio = len(_u1_crits) / _crit_count
+        _retry_needed = (
+            _n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            or bool(_u1_paths)
+            or _crit_gap_ratio >= 0.5
+        )
+        if not _retry_needed:
             _result1["multishot_attempts"] = 1
             return _result1
 
@@ -2605,7 +2668,32 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        # king-analysis axis 4 tiebreak: previous rule was purely
+        # line-count (`_n2 >= _n1`). On tasks where attempt 2 produced
+        # a patch with more lines but worse coverage, we kept the
+        # worse one. Extend tiebreak: when both attempts are
+        # substantive, the one with fewer unaddressed criteria wins;
+        # only when criteria-gap is equal do we fall back to the
+        # line-count rule.
+        _u2_paths = _uncovered_required_paths(_patch2, _issue_text)
+        _u2_crits = _unaddressed_criteria(_patch2, _issue_text)
+        _prefer_retry = False
+        if not _patch1.strip():
+            _prefer_retry = bool(_patch2.strip())
+        elif not _patch2.strip():
+            _prefer_retry = False
+        elif len(_u2_paths) < len(_u1_paths):
+            _prefer_retry = True
+        elif len(_u2_paths) > len(_u1_paths):
+            _prefer_retry = False
+        elif len(_u2_crits) < len(_u1_crits):
+            _prefer_retry = True
+        elif len(_u2_crits) > len(_u1_crits):
+            _prefer_retry = False
+        else:
+            _prefer_retry = _n2 >= _n1
+
+        if _prefer_retry:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -2663,6 +2751,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    # king-analysis axis 5 / P2: dynamic cap based on the acceptance-
+    # bullet count in this specific issue. Multi-bullet tasks get more
+    # refinement turns; simple ones keep the floor of 2.
+    total_refinement_cap = _dynamic_refinement_cap(issue)
+    last_unaddressed_criteria: Optional[List[str]] = None
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2706,7 +2799,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_unaddressed_criteria
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2726,7 +2819,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+        # king-analysis axis 5 / P2: cap is now per-issue dynamic.
+        if total_refinement_turns_used >= total_refinement_cap:
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -2795,9 +2889,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
+            # king-analysis axis 5 / P10: previously the criteria nudge
+            # fired exactly once. If the model addressed two of five
+            # listed bullets but left three, no further nudge surfaced
+            # the remaining gap. Allow a re-fire iff the unaddressed
+            # set has *strictly shrunk* since the last fire — protects
+            # against firing repeatedly on the same untouched bullets.
+            should_fire = False
             if unaddressed:
+                if last_unaddressed_criteria is None:
+                    should_fire = True
+                elif len(unaddressed) < len(last_unaddressed_criteria):
+                    should_fire = True
+            if should_fire:
                 criteria_nudges_used += 1
                 total_refinement_turns_used += 1
+                last_unaddressed_criteria = list(unaddressed)
                 queue_refinement_turn(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
@@ -2952,6 +3059,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
+                        # king-analysis axis 2 / P5: step-≥8 branch below
+                        # already requires _patch_covers_required_paths.
+                        # Lift the same check to the step-≥4 branch so a
+                        # stray `cat src/servers.ts` that happens to look
+                        # like a successful test can't end the run before
+                        # the planner's "update X across modules" item is
+                        # picked up. When the issue text does not mention
+                        # any specific path (feature-spec issues),
+                        # _patch_covers_required_paths returns True
+                        # vacuously, so this only bites on path-naming
+                        # issues — which is exactly the failure mode in
+                        # 065456, 074259, 110555.
+                        if not _patch_covers_required_paths(patch, issue):
+                            continue
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
@@ -3051,6 +3172,10 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
 
+    # king-analysis P1/P5/P7: previous bad_markers list missed
+    # "command not found" and "no such file" — `pnpm test 2>&1 | tail`
+    # under a sandbox without pnpm prints those on stderr but the
+    # pipeline still returns exit 0, so AUTO_STOP would accept.
     bad_markers = [
         " failed",
         " failures",
@@ -3060,27 +3185,115 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "assertionerror",
         "syntaxerror",
         "exception",
+        "command not found",
+        "no such file",
+        "executable not found",
+        "modulenotfounderror",
     ]
 
-    good_markers = [
+    # king-analysis P1: previous list had bare "ok" and "success" as
+    # substring matches. `string_token`, `Lockdown`, `print('Import
+    # successful')`, and even heredoc bodies that contained `"OK"` all
+    # tripped them. Require a word-boundary so only real status tokens
+    # match.
+    good_markers_word = [
         " passed",
         " all passed",
-        "ok",
-        "success",
+        "passed!",
+        "tests passed",
+        "test passed",
+    ]
+    good_markers_re = [
+        r"\bok\b",
+        r"\bsucceeded\b",
+        r"(?<![A-Za-z])success(?![A-Za-z0-9_])",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
-    has_good = any(marker in lower for marker in good_markers)
+    has_good = any(marker in lower for marker in good_markers_word) or any(
+        re.search(pattern, lower) for pattern in good_markers_re
+    )
     has_bad = any(marker in lower for marker in bad_markers)
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
+
+    # king-analysis P6/P7 (axis 7): commands that are file writes
+    # (`cat > FILE << EOF ... EOF`), trivial `echo > FILE`, or smoke
+    # imports (`python -c "import X"` with no test runner) are not
+    # verification — refuse the AUTO_STOP regardless of marker state.
+    if _command_is_file_write_or_smoke(command):
+        return False
+
+    # king-analysis P7: a pipelined verification command (`pnpm test
+    # 2>&1 | tail`) can mask exit 127 ("command not found") as exit 0.
+    # When the command is pipelined and the body shows "command not
+    # found" / "no such file", refuse regardless of has_good.
+    if _command_has_pipeline(command) and any(
+        marker in lower for marker in ("command not found", "no such file", "executable not found")
+    ):
+        return False
 
     if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
         return True
 
     return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
+def _command_has_pipeline(command: str) -> bool:
+    """True when the command body chains via shell pipe / && / ; — these
+    can mask the real exit code of an earlier component (e.g.
+    `pnpm test 2>&1 | tail -40` returns exit 0 even if `pnpm` is missing).
+
+    Plain `||` is excluded because it's only reached when the prior
+    command failed — its presence does not mask a success/failure of an
+    inner command in a way relevant to AUTO_STOP."""
+    if not command:
+        return False
+    stripped = command.strip()
+    return bool(re.search(r"\s\|\s|\s&&\s|;\s", stripped))
+
+
+def _command_is_file_write_or_smoke(command: str) -> bool:
+    """king-analysis axis 7: detect commands that look like a 'real test'
+    to the substring-based marker check but are actually file writes or
+    smoke imports.
+
+    - `cat > FILE << EOF`, `cat >> FILE << EOF`, `tee FILE << EOF`,
+      `tee -a FILE << EOF` — model writes a whole file, claims it as
+      verification.
+    - `python -c "import X"` / `python -c 'import X; print(...)'`
+      WITHOUT a pytest / unittest call — smoke imports don't validate
+      behavior.
+    - `echo ... > FILE` / `echo ... >> FILE` — trivial file write."""
+    if not command:
+        return False
+    body = command.strip()
+    if not body:
+        return False
+    lowered = body.lower()
+
+    # heredoc file writes — cat > / cat >> / tee + heredoc
+    if re.search(r"\b(?:cat|tee)\s+(?:-a\s+)?\S*\s*>{1,2}\s*\S+\s*<<", lowered):
+        return True
+    if re.search(r"\btee\s+(?:-a\s+)?\S+\s*<<", lowered):
+        return True
+
+    # plain echo redirect
+    if re.search(r"\becho\b.*>{1,2}\s*\S+", lowered) and "pytest" not in lowered and "unittest" not in lowered:
+        return True
+
+    # python -c "import ..." with no test runner call
+    m = re.search(r"\bpython\d*(?:\.\d+)?\s+-c\s+(['\"])(.+?)\1", body, flags=re.DOTALL)
+    if m:
+        inner = m.group(2).lower()
+        if "import" in inner and not any(
+            tok in inner for tok in ("pytest", "unittest", "doctest", ".main(", ".run(")
+        ):
+            return True
+
+    return False
 
 
 def _looks_like_verification_command(command: str) -> bool:
