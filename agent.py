@@ -115,7 +115,8 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_HAIL_MARY_TURNS = 2    # raised: hail-mary often needs two passes on hard tasks
+MIN_SUBSTANTIVE_ADDED_LINES = 3  # patches below this count as near-empty and get hail-mary
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -1263,6 +1264,31 @@ def _diff_low_signal_summary(patch: str) -> str:
     return "; ".join(deduped[:10])
 
 
+def _patch_substantive_added_lines(patch: str) -> int:
+    """Count added lines in a unified diff that are not blank, whitespace, or comment-only.
+
+    Used by the refinement gate to recognise near-empty patches that escape the
+    literal-empty check but still carry almost no signal.
+    """
+    if not patch.strip():
+        return 0
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if body.startswith("#") or body.startswith("//"):
+            continue
+        if body.startswith("/*") or body.endswith("*/") or body.startswith("*"):
+            continue
+        if body in ('"""', "'''"):
+            continue
+        count += 1
+    return count
+
+
 def _patch_changed_files(patch: str) -> List[str]:
     """Return the list of `b/` paths touched by a unified diff, in order."""
     seen: List[str] = []
@@ -2038,6 +2064,7 @@ First response format:
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- No-stub rule: every new function/method/component you add must have a complete body — no `pass` / `TODO` / `raise NotImplementedError` / `// implementation goes here` / empty-bracket placeholders. Stub-and-defer is the most-dinged "incomplete" pattern; the diff judge ranks a partial-but-fully-implemented patch above a complete-shape-but-stubbed one.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2125,7 +2152,7 @@ Preserve meaningful comments around changed code — section headers, TODO/FIXME
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response.
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response. When restyling or refactoring an existing component, function, or template, also preserve every observable behavior present pre-edit (transforms/animations, conditional rendering, class-state toggles, event handlers, return-state/reset semantics) unless the issue explicitly removes it — silently dropped behaviors regress hidden tests even when public API is unchanged.
 
 Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one. Patch the general root behavior, not only the visible case.
 
@@ -2585,7 +2612,21 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        try:
+            _result1 = _solve_attempt(**kwargs)
+        except Exception as _exc1:
+            _result1 = {
+                "patch": "",
+                "logs": f"INNER_ATTEMPT1_ERROR: {type(_exc1).__name__}: {str(_exc1)[:300]}",
+                "steps": 0,
+                "cost": 0.0,
+                "success": False,
+            }
+            try:
+                if _multishot_repo_obj is not None:
+                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            except Exception:
+                pass
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -2601,7 +2642,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        try:
+            _result2 = _solve_attempt(**kwargs)
+        except Exception as _exc2:
+            _result2 = {
+                "patch": "",
+                "logs": f"INNER_ATTEMPT2_ERROR: {type(_exc2).__name__}: {str(_exc2)[:300]}",
+                "steps": 0,
+                "cost": 0.0,
+                "success": False,
+            }
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2664,6 +2714,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
+    consecutive_empty_steps = 0
     solve_started_at = time.monotonic()
 
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
@@ -2723,6 +2774,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
             return False
+
+        if _patch_substantive_added_lines(patch) < MIN_SUBSTANTIVE_ADDED_LINES:
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hail_mary_prompt(issue),
+                    "HAIL_MARY_QUEUED: patch near-empty at refinement gate",
+                )
+                return True
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -3012,7 +3073,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip():
+                consecutive_empty_steps += 1
+            else:
+                consecutive_empty_steps = 0
+
+            if not get_patch(repo).strip() and (
+                step in {2, 4}
+                or (step >= 2 and consecutive_empty_steps >= 2 and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS)
+            ):
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
