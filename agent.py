@@ -90,10 +90,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PRELOADED_CONTEXT_CHARS = 32000
+MAX_PRELOADED_FILES = 10
+MAX_NO_COMMAND_REPAIRS = 3
+MAX_COMMANDS_PER_RESPONSE = 12
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # keep one inner attempt strong; outer multi-shot wrapper handles retry budget
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -765,11 +765,8 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
-def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
+def build_preloaded_context(repo: Path, issue: str) -> str:
     """Preload the highest-ranked tracked files plus their companion tests.
-
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
 
     Two improvements over a vanilla rank-and-read loop:
 
@@ -783,34 +780,26 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          text get a substantial rank boost via `_symbol_grep_hits`. This
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
     """
     files = _rank_context_files(repo, issue)
     if not files:
-        return "", []
+        return ""
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
-    needles = _preload_needles(issue)
-
     parts: List[str] = []
-    included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
-        included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo, max_chars=max(1200, _STYLE_HINT_BUDGET * 4))
@@ -825,38 +814,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    return "\n\n".join(parts), included
-
-
-def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: explicit identifiers (`_extract_issue_symbols`) first since they
-    are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
-    """
-    out: List[str] = []
-    seen: set = set()
-
-    def add(token: str) -> None:
-        if not token:
-            return
-        key = token.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(token)
-
-    for sym in _extract_issue_symbols(issue):
-        add(sym)
-    for mention in _extract_issue_path_mentions(issue):
-        stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
-    for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
-    return out
+    return "\n\n".join(parts)
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1009,19 +967,7 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(
-    repo: Path,
-    relative_path: str,
-    max_chars: int,
-    needles: Optional[List[str]] = None,
-) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows.
-
-    When `needles` is provided and the file is larger than `max_chars`, we
-    extract regions around lines that match any needle (case-insensitive
-    substring) plus a few lines of context, instead of head/tail truncation.
-    Falls back to `_truncate` when no needles match or the file already fits.
-    """
+def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1034,84 +980,7 @@ def _read_context_file(
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    if needles:
-        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
-
-
-def _extract_relevant_regions(
-    text: str,
-    needles: List[str],
-    max_chars: int,
-    *,
-    ctx_before: int = 8,
-    ctx_after: int = 12,
-) -> str:
-    """Return windows around lines matching any needle, capped at `max_chars`.
-
-    When the file already fits within `max_chars`, the whole file is returned
-    verbatim. When no needles match, fall back to `_truncate` (head/tail
-    summary). Otherwise produce a concatenation of merged windows around each
-    matching line, prefixed with line-range headers so the model can reason
-    about location.
-    """
-    if not text:
-        return text
-    if len(text) <= max_chars:
-        return text
-
-    needles_lower: List[str] = []
-    seen: set = set()
-    for n in needles:
-        if not n:
-            continue
-        key = n.lower()
-        if len(key) < 3 or key in seen:
-            continue
-        seen.add(key)
-        needles_lower.append(key)
-    if not needles_lower:
-        return _truncate(text, max_chars)
-
-    lines = text.splitlines()
-    matched: List[int] = []
-    for i, line in enumerate(lines):
-        ll = line.lower()
-        if any(n in ll for n in needles_lower):
-            matched.append(i)
-
-    if not matched:
-        return _truncate(text, max_chars)
-
-    windows: List[Tuple[int, int]] = []
-    for i in matched:
-        start = max(0, i - ctx_before)
-        end = min(len(lines), i + ctx_after + 1)
-        if windows and start <= windows[-1][1]:
-            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-        else:
-            windows.append((start, end))
-
-    parts: List[str] = []
-    used = 0
-    total_lines = len(lines)
-    omitted = 0
-    for idx, (start, end) in enumerate(windows):
-        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
-        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
-        block = header + "\n" + body
-        if parts and used + len(block) + 2 > max_chars:
-            omitted = len(windows) - idx
-            break
-        parts.append(block)
-        used += len(block) + 2
-
-    if omitted > 0:
-        parts.append(
-            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
-        )
-
-    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -2154,6 +2023,7 @@ FAILURE RECOVERY AND COMMAND ECONOMY
 If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
 
 A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+After at most 2 inspection commands (grep/cat/ls/head) without producing an edit, your next command MUST be a substantive edit to the most plausible target file from the issue (use `sed -i`, a `python -c "open(...).write(...)"` one-liner, or a heredoc). Continuing to inspect without editing is the dominant cause of timeout-empty patches that score zero — an imperfect 1-line edit that addresses the issue beats a 0-line forfeit.
 
 ====================================================================
 FINAL ANSWER
@@ -2169,19 +2039,13 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
 
-_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
-_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
-
-
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
-{_PRELOAD_BEGIN_MARKER}
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
-{_PRELOAD_END_MARKER}
 """
 
     return f"""Fix this issue:
@@ -2202,45 +2066,6 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
-
-
-_PRELOAD_BLOCK_RE = re.compile(
-    re.escape(_PRELOAD_BEGIN_MARKER) + r".*?" + re.escape(_PRELOAD_END_MARKER),
-    re.DOTALL,
-)
-
-
-def _strip_preloaded_section(
-    initial_user_text: str,
-    preloaded_files: List[str],
-    modified_files: Optional[List[str]] = None,
-) -> str:
-    """Replace the bulky preloaded snippet block with a short breadcrumb.
-
-    Triggered after step 4 to free token budget for later iterations: the
-    model has already seen the snippets in earlier turns and only needs to
-    know which files were preloaded (and which it has already touched) so it
-    can re-open them on demand instead of re-reading the whole block on
-    every request.
-    """
-    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
-        return initial_user_text
-
-    lines: List[str] = []
-    if modified_files:
-        lines.append("You modified these files so far: " + ", ".join(modified_files))
-    if preloaded_files:
-        lines.append(
-            "You previously inspected these files (snippets dropped to save context — "
-            "re-open with `sed -n` or `cat` if a region is needed): "
-            + ", ".join(preloaded_files)
-        )
-    if not lines:
-        replacement = "[Preloaded context omitted to save token budget.]"
-    else:
-        replacement = "\n".join(lines)
-
-    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2664,6 +2489,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
+    consecutive_empty_steps = 0
     solve_started_at = time.monotonic()
 
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
@@ -2822,40 +2648,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        preloaded_context = build_preloaded_context(repo, issue)
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
-        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
-
-            # Past step 4 the preloaded snippets are no longer load-bearing —
-            # the model has either used them or moved on. Replace the bulky
-            # block in the initial user message with a short breadcrumb so
-            # the next request fits more recent context within the token cap.
-            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
-                original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
-                stripped = _strip_preloaded_section(
-                    original_initial,
-                    preloaded_files,
-                    modified_files=modified_files,
-                )
-                if stripped != original_initial:
-                    messages[1] = {**messages[1], "content": stripped}
-                    saved = max(0, len(original_initial) - len(stripped))
-                    logs.append(
-                        "INITIAL_PRELOAD_TRIMMED: "
-                        f"step={step} preloaded={len(preloaded_files)} "
-                        f"modified={len(modified_files)} saved_chars={saved}"
-                    )
-                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
@@ -3012,7 +2815,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip():
+                consecutive_empty_steps += 1
+            else:
+                consecutive_empty_steps = 0
+
+            if not get_patch(repo).strip() and (
+                step in {2, 4}
+                or (step >= 2 and consecutive_empty_steps >= 2 and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS)
+            ):
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
@@ -3190,3 +3001,4 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
