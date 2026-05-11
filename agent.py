@@ -118,6 +118,7 @@ _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
 MAX_STRUCTURAL_INTEGRITY_TURNS = 1  # repair narrow JS/TS wiring defects
+MAX_EXT_STUB_TURNS = 1     # repair unfinished JSX/TODO/empty-body stubs
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check run
 MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
@@ -1301,6 +1302,51 @@ def _patch_safety_summary(patch: str) -> str:
     if not hits:
         return ""
     return "added lines contain review-process wording: " + ", ".join(hits[:6])
+
+
+_EXT_STUB_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
+    (
+        "JSX attribute with empty expression",
+        re.compile(
+            r"^\+(?!\+).*\b(?:className|style|onClick|onChange|onSubmit|"
+            r"onBlur|onFocus|value|placeholder|aria-[\w-]+)=\{\s*\}",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "JSX style with empty object",
+        re.compile(r"^\+(?!\+).*style=\{\{\s*\}\}", re.MULTILINE),
+    ),
+    (
+        "TODO/FIXME placeholder in added code",
+        re.compile(
+            r"^\+(?!\+).*(?://|#|/\*)\s*(?:TODO|FIXME|XXX|"
+            r"implement\s+later|not\s+implemented)\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "empty arrow function body",
+        re.compile(r"^\+(?!\+).*=>\s*\{\s*\}\s*[;,]?\s*$", re.MULTILINE),
+    ),
+)
+
+
+def _extended_stub_findings(patch: str) -> List[str]:
+    """Find added code that still looks like an unfinished placeholder."""
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _EXT_STUB_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 5:
+                return findings
+    return findings
 
 
 _INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
@@ -3342,6 +3388,18 @@ def build_patch_safety_prompt(safety_summary: str) -> str:
     )
 
 
+def build_extended_stub_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {finding}" for finding in findings[:5]) or "  - (none)"
+    return (
+        "Stub check: the patch adds code that still looks unfinished:\n\n"
+        f"{body}\n\n"
+        "Fix only the listed stub-shaped expression(s): fill the intended "
+        "value/body, remove the unused placeholder, or replace it with the "
+        "minimal real code required by the task. Do not add unrelated behavior. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
@@ -4069,6 +4127,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     artifact_nudges_used = 0
     dependency_nudges_used = 0
     structural_integrity_turns_used = 0
+    ext_stub_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -4107,11 +4166,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             6. coverage/criteria — name explicit issue gaps
             7. required-surface — satisfy exact task-named files/literals
             8. missing-class/visible-surface — close direct task-shape gaps
-            9. contract/structural/integration/artifact/dependency — close common missing pieces
+            9. contract/structural/stub/integration/artifact/dependency — close common missing pieces
             10. empty-arg/lint — remove malformed calls and tool errors
             11. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, required_surface_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, structural_integrity_turns_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, required_surface_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, structural_integrity_turns_used, ext_stub_turns_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4286,6 +4345,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_structural_integrity_prompt(structural_findings, issue),
                     "STRUCTURAL_INTEGRITY_QUEUED:\n  " + "\n  ".join(structural_findings),
+                )
+                return True
+
+        if ext_stub_turns_used < MAX_EXT_STUB_TURNS:
+            stub_findings = _extended_stub_findings(patch)
+            if stub_findings:
+                ext_stub_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_extended_stub_prompt(stub_findings),
+                    "EXT_STUB_QUEUED:\n  " + "\n  ".join(stub_findings),
                 )
                 return True
 
