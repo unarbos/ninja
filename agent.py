@@ -125,7 +125,8 @@ MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
 MAX_CONTRACT_NUDGES = 1    # catch route/import/rename propagation gaps
 MAX_DELIVERABLE_NUDGES = 1  # catch named files/modules from issue not touched
 MAX_UI_BINDING_NUDGES = 1  # catch stale UI selectors/actions after visible UI edits
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+                                # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1468,8 +1469,8 @@ def _hazard_review_summary(patch: str) -> str:
     """Spot cheap-to-fix patch hazards before the final self-check.
 
     Examples: generated/binary churn, malformed component insertion, parsers
-    that only split on blank lines, or fallback code that both resets state and
-    still reports an error when the task asks for graceful recovery.
+    that only split on blank lines, UI actions that only toggle a dialog flag,
+    or fallback code that both resets state and still reports an error.
     """
     if not patch.strip():
         return ""
@@ -1496,6 +1497,11 @@ def _hazard_review_summary(patch: str) -> str:
             notes.append(f"{path}: line parser appears to require blank-line separators; verify normal single-newline records still parse")
         if re.search(r"\b(error|err)\.message\b", added_text) and re.search(r"\b(res\.json|json\s*\(|return\s+)", added_text):
             notes.append(f"{path}: raw internal error message appears in an API/client response")
+        if re.search(r"\bsetShow[A-Za-z0-9_]*\s*\(\s*true\s*\)|\bset(?:Open|Visible|Modal|Dialog)\s*\(\s*true\s*\)", added_text):
+            has_visible_surface = re.search(r"<(?:Modal|Dialog|Confirm|Alert|Form|Sheet|Drawer)\b|show[A-Za-z0-9_]*\s*&&|open=\{|visible=\{", added_text)
+            has_completion = re.search(r"\b(?:dispatch|onConfirm|onSubmit|handleSubmit|fetch|axios|mutate|delete|remove|save|create|update)\b", added_text)
+            if not (has_visible_surface and has_completion):
+                notes.append(f"{path}: UI action toggles state but lacks visible confirmation/form plus completion handler")
         if re.search(r"\b(?:catch|except|onError|parse\s*failure|parse\s*error|fallback)\b", added_text, re.IGNORECASE):
             if re.search(r"\b(?:empty|initial|default|reset|fallback)\b", added_text, re.IGNORECASE) and re.search(r"\b(?:throw|raise|error\(|setError|st\.error|alert)\b", added_text):
                 notes.append(f"{path}: fallback path both resets state and surfaces an error; verify graceful fallback semantics")
@@ -2527,7 +2533,7 @@ def _literal_in_patch(literal: str, added_text: str) -> bool:
 
 
 def _literal_acceptance_gap_summary(patch: str, issue_text: str) -> str:
-    """Find exact issue literals that are not visible in added patch lines."""
+    """Find issue literals whose semantic owner may still need inspection."""
     if not patch.strip() or not issue_text:
         return ""
     literals = _extract_issue_literals(issue_text)
@@ -2541,8 +2547,10 @@ def _literal_acceptance_gap_summary(patch: str, issue_text: str) -> str:
     return (
         "Exact issue literals/details not visible in added lines:\n"
         f"{bullets}\n"
-        "If any are intentionally satisfied without adding the literal, inspect "
-        "and explain that in the final summary; otherwise patch the missing exact detail."
+        "First verify whether each literal belongs to the changed owner or a "
+        "related producer/consumer. Only patch it when that owner contract "
+        "requires the exact value; otherwise explain why the existing semantic "
+        "implementation satisfies the requirement."
     )
 
 
@@ -2685,8 +2693,8 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
     """Find visible UI edits whose state/action/selector binding may be stale.
 
     Examples: dispatch used without a context binding, a new collection rendered
-    without definition/import, or a button that toggles confirmation state
-    without rendering the confirmation surface and completion handler.
+    without definition/import, or a style key used without a matching style
+    definition.
     """
     if not patch.strip():
         return ""
@@ -2745,12 +2753,6 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
                 hook_bindings = " ".join(_CONTEXT_HOOK_RE.findall(added_text))
                 if "dispatch" not in hook_bindings and not re.search(r"\bconst\s+dispatch\s*=", added_text):
                     notes.append(f"{path}: added dispatch(...) but no visible dispatch binding/destructure was added")
-
-            if re.search(r"\bsetShow[A-Za-z0-9_]*\s*\(\s*true\s*\)|\bset(?:Open|Visible|Modal|Dialog)\s*\(\s*true\s*\)", added_text):
-                has_visible_surface = re.search(r"<(?:Modal|Dialog|Confirm|Alert|Form|Sheet|Drawer)\b|show[A-Za-z0-9_]*\s*&&|open=\{|visible=\{", added_text)
-                has_completion = re.search(r"\b(?:dispatch|onConfirm|onSubmit|handleSubmit|fetch|axios|mutate|delete|remove|save|create|update)\b", added_text)
-                if not (has_visible_surface and has_completion):
-                    notes.append(f"{path}: UI action toggles state but lacks visible confirmation/form plus completion handler")
 
             new_actions = sorted({m.group(1) for m in _JS_ACTION_CALL_RE.finditer(added_text)})
             if new_actions and re.search(r"<(?:button|form|input|select|textarea)\b|on(?:Click|Submit|Change|Input)=", added_text):
@@ -3348,11 +3350,13 @@ def build_literal_acceptance_nudge_prompt(literal_summary: str, issue_text: str)
         "Exact-detail check: your current patch may satisfy broad behavior but "
         "miss exact strings, keys, paths, renamed fields, or labels from the issue.\n\n"
         f"{literal_summary}\n\n"
-        "These exact details are often hidden-test or reference-match requirements. "
-        "Inspect the relevant owner(s) and add the missing exact literal/detail if "
-        "the task requires it. If the detail is already satisfied indirectly, finish "
-        "with <final>summary</final> and name where it is satisfied. Do not add "
-        "unrelated scope.\n\n"
+        "Do not copy issue text into the patch just because it appears above. "
+        "First identify the semantic owner for each detail (route, config key, "
+        "field, label, command, producer/consumer contract, or test fixture). "
+        "Add or adjust the exact literal only when that owner requires this "
+        "specific value. If the requirement is already satisfied by existing "
+        "code or by a canonical local spelling, finish with <final>summary</final> "
+        "and name where it is satisfied. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -3404,7 +3408,6 @@ def build_ui_binding_nudge_prompt(ui_summary: str, issue_text: str) -> str:
         "options when display filters/categories change, and touch the frontend "
         "owner when the task explicitly asks for visible UI. Define any new "
         "arrays, style keys, or handler names used by the rendered JSX/template. "
-        "For each new action, verify trigger -> visible modal/form/confirmation -> handler -> dispatch/API/reducer -> refresh/feedback. "
         "Preserve existing form availability, component boundaries, default route/page ordering, local-date behavior, mobile/responsive parity, and route/nav/page chains while adding the requested UI. If the warning is "
         "a false positive, finish with <final>summary</final> and name why. "
         "Do not rewrite unrelated layout or styling.\n\n"
