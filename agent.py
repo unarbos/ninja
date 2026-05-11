@@ -2218,7 +2218,7 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def resolve_missing_paths(repo: Path, issue: str, known_paths: set[str]) -> list[str]:
+def resolve_missing_paths(repo: Path, task_text: str, known_paths: set[str]) -> list[str]:
     """Find issue-named files that don't exist at their literal path.
 
     Parses backtick-quoted paths from the issue text, checks each against
@@ -2227,7 +2227,7 @@ def resolve_missing_paths(repo: Path, issue: str, known_paths: set[str]) -> list
     to the preloaded context.
     """
     discovered: list[str] = []
-    for match in re.finditer(r"`([^`]{3,160})`", issue):
+    for match in re.finditer(r"`([^`]{3,160})`", task_text):
         raw = match.group(1).strip().replace("./", "")
         if not raw or len(raw) < 3 or "/" not in raw:
             continue
