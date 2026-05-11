@@ -127,6 +127,7 @@ MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
+MAX_CHAIN_COVERAGE_TURNS = 1
 MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
@@ -1837,6 +1838,107 @@ def _frontend_coverage_gap(task_text: str, patch: str) -> str:
     )
 
 
+_BACKEND_CHAINS = (
+    {
+        "name": "django_mvc",
+        "min_signals": 2,
+        "signals": ("django", "models.py", "serializer", "viewset", "urls.py", "rest_framework"),
+        "members": ("models", "serializer", "views", "urls"),
+        "description": "Django REST chain (models -> serializers -> views -> urls)",
+    },
+    {
+        "name": "spring_boot",
+        "min_signals": 2,
+        "signals": ("@entity", "@restcontroller", "@service", "@repository", "springframework", "jpa"),
+        "members": ("Entity", "Repository", "Service", "Controller"),
+        "description": "Spring Boot chain (Entity -> Repository -> Service -> Controller)",
+    },
+    {
+        "name": "express_rest",
+        "min_signals": 2,
+        "signals": ("express", "router.", "req, res", "app.use(", "module.exports", "mongoose"),
+        "members": ("schema", "route", "controller", "middleware"),
+        "description": "Express REST chain (schema -> routes -> controller)",
+    },
+    {
+        "name": "laravel_mvc",
+        "min_signals": 2,
+        "signals": ("laravel", "artisan", "eloquent", "illuminate", "php artisan"),
+        "members": ("migration", "model", "controller", "route"),
+        "description": "Laravel MVC chain (migration -> model -> controller -> routes)",
+    },
+    {
+        "name": "rails_mvc",
+        "min_signals": 2,
+        "signals": ("rails", "activerecord", "actioncontroller", "config/routes", "app/models"),
+        "members": ("migration", "model", "controller", "route"),
+        "description": "Rails MVC chain (migration -> model -> controller -> routes)",
+    },
+    {
+        "name": "full_stack_feature",
+        "min_signals": 2,
+        "signals": ("frontend", "backend", "api endpoint", "api route", "vue", "react", "component"),
+        "members": ("api", "component", "view", "route"),
+        "description": "Full-stack feature (backend API + frontend component)",
+    },
+    {
+        "name": "bulk_upload",
+        "min_signals": 2,
+        "signals": ("bulk", "import", "csv upload", "batch upload", "bulk create"),
+        "members": ("schema", "validator", "route", "controller"),
+        "description": "Bulk upload chain (schema -> validator -> route -> controller)",
+    },
+)
+
+_CHAIN_GENERATED_TYPES = frozenset({"controller", "service", "component", "view", "route", "migration"})
+
+
+def _detect_backend_chain(task_text: str, baseline_filenames: List[str]) -> Optional[Dict[str, Any]]:
+    if not task_text:
+        return None
+    combined = (task_text + " " + " ".join(baseline_filenames)).lower()
+    for chain in _BACKEND_CHAINS:
+        matched = sum(1 for sig in chain["signals"] if sig.lower() in combined)
+        if matched >= chain["min_signals"]:
+            return chain
+    return None
+
+
+def _extract_patch_touched_files(patch: str) -> List[str]:
+    files: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            files.append(line[6:].strip())
+        elif line.startswith("diff --git a/"):
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                files.append(parts[1].strip())
+    return files
+
+
+def _verify_chain_coverage(patch: str, chain: Dict[str, Any], baseline_filenames: List[str]) -> List[str]:
+    touched = [f.lower() for f in _extract_patch_touched_files(patch)]
+    baseline_lower = [f.lower() for f in baseline_filenames]
+    missing: List[str] = []
+    for member in chain["members"]:
+        m_lower = member.lower()
+        if any(m_lower in f for f in touched):
+            continue
+        in_baseline = any(m_lower in f for f in baseline_lower)
+        if in_baseline or m_lower in _CHAIN_GENERATED_TYPES:
+            missing.append(member)
+    return missing
+
+
+def build_chain_coverage_prompt(chain: Dict[str, Any], missing: List[str]) -> str:
+    return (
+        f"This task involves a {chain['name']} ({chain['description']}). "
+        f"Your patch is missing changes to: {', '.join(missing)}. "
+        f"A complete implementation must touch every member of the chain. "
+        f"Add the missing file(s) now."
+    )
+
+
 def _structured_acceptance_items(issue_text: str) -> List[Dict[str, Any]]:
     items = _extract_acceptance_criteria(issue_text)
     structured: List[Dict[str, Any]] = []
@@ -2159,6 +2261,40 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _looks_like_test_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    lowered = str(path).lower()
+    name = path.name.lower()
+    return (
+        "test" in name
+        or "spec" in name
+        or "/tests/" in f"/{lowered}"
+        or lowered.startswith("tests/")
+        or lowered.startswith("spec/")
+    )
+
+
+def _find_issue_tests(repo: Path, task_text: str, tracked: Optional[set] = None) -> List[str]:
+    tracked_set = tracked if tracked is not None else set(_tracked_files(repo))
+    if not tracked_set:
+        return []
+    found: List[str] = []
+    for mention in _extract_issue_path_mentions(task_text):
+        if not _looks_like_test_path(mention):
+            continue
+        matches = [
+            candidate
+            for candidate in tracked_set
+            if (candidate == mention or candidate.endswith("/" + mention))
+            and _context_file_allowed(candidate)
+        ]
+        for candidate in sorted(matches, key=len):
+            if candidate not in found:
+                found.append(candidate)
+                break
+    return found[:3]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -2281,6 +2417,7 @@ def _run_companion_test(
 def _select_companion_test_failure(
     repo: Path,
     patch: str,
+    task_text: str = "",
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
     """For files touched by the patch, find the first companion test that fails.
@@ -2295,6 +2432,10 @@ def _select_companion_test_failure(
     tracked = set(_tracked_files(repo))
     if not tracked:
         return None
+    for test_path in _find_issue_tests(repo, task_text, tracked):
+        output = _run_companion_test(repo, test_path, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (test_path, output)
     for relative_path in edited:
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
@@ -3480,6 +3621,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     lint_turns_used = 0
     deliverable_turns_used = 0
     frontend_gap_turns_used = 0
+    chain_coverage_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3524,7 +3666,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, strict_criteria_turns_used, dead_helper_turns_used, lint_turns_used, deliverable_turns_used, frontend_gap_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, strict_criteria_turns_used, dead_helper_turns_used, lint_turns_used, deliverable_turns_used, frontend_gap_turns_used, chain_coverage_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3581,7 +3723,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_companion_test_failure(repo, patch, issue)
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
@@ -3760,6 +3902,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "FRONTEND_GAP_QUEUED:\n  " + fe_gap[:120],
                 )
                 return True
+
+        if chain_coverage_turns_used < MAX_CHAIN_COVERAGE_TURNS:
+            _chain_baseline = list(_tracked_files(repo)) if repo is not None else []
+            _chain = _detect_backend_chain(issue, _chain_baseline)
+            if _chain:
+                _chain_missing = _verify_chain_coverage(patch, _chain, _chain_baseline)
+                if _chain_missing:
+                    chain_coverage_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_chain_coverage_prompt(_chain, _chain_missing),
+                        "CHAIN_COVERAGE_QUEUED:\n  " + ", ".join(_chain_missing[:4]),
+                    )
+                    return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
