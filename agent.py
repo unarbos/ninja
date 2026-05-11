@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -105,6 +106,14 @@ HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Dynamic wall-clock guard. The constant above is the *baseline*; the actual
+# budget for a given (repo, issue) is computed by `_estimate_wall_clock_budget`
+# and clamped to [BASELINE - FLEX, BASELINE + FLEX], with absolute safety bounds
+# of [HARD_MIN, HARD_MAX] so a runaway estimate cannot starve or oversubscribe
+# the multi-shot envelope. Inspired by `_agents/time_limit_estimate.py`.
+WALL_CLOCK_BUDGET_HARD_MIN = 120.0
+WALL_CLOCK_BUDGET_HARD_MAX = 600.0
+WALL_CLOCK_BUDGET_FLEX_SECONDS = 60.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -115,7 +124,9 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_HAIL_MARY_TURNS = 2    # last-resort: force a real edit when patch is empty (or near-empty) after everything
+MIN_SUBSTANTIVE_ADDED_LINES = 3  # below this, patch counts as near-empty and gets hail-mary
+MISSING_PATHS_HAIL_MARY_USES_SLOT = True  # re-use hail-mary slot for non-empty patches that skip issue-mentioned paths
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -206,6 +217,51 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+# Long test/compiler output puts the actionable failure body between a header
+# ("collected N tests") and a summary footer; symmetric head/tail truncation
+# preserves both ends but drops the body. Centering the keep-window on the
+# first known error marker keeps the failure body visible while still capping
+# total chars. Falls through to plain head/tail when no marker is found.
+_OBS_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "NameError",
+    "KeyError",
+    "RuntimeError",
+    "panic:",
+    "error[E",
+    "error TS",
+    "FAILED ",
+    "FAIL ",
+)
+
+
+def _truncate_observation(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _OBS_ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker <= half or first_marker >= len(text) - half:
+        return _truncate(text, max_chars)
+    window_start = max(0, first_marker - max_chars // 3)
+    window_end = min(len(text), window_start + max_chars)
+    head_dropped = window_start
+    tail_dropped = len(text) - window_end
+    prefix = "" if head_dropped == 0 else f"...[head {head_dropped} chars]...\n"
+    suffix = "" if tail_dropped == 0 else f"\n...[tail {tail_dropped} chars]..."
+    return prefix + text[window_start:window_end] + suffix
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -425,8 +481,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_observation(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_observation(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -441,8 +497,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_observation(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_observation(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -488,6 +544,185 @@ def format_observation(result: CommandResult) -> str:
     if result.stderr.strip():
         parts.extend(["", "STDERR:", result.stderr])
     return "\n".join(parts) + "\n"
+
+
+# -----------------------------
+# Dynamic wall-clock budget estimation
+# -----------------------------
+#
+# Ported from `_agents/time_limit_estimate.py` (least-squares fit to the
+# `max(min(600, 2*cursor+1), 120)` ceiling, blended with a structural repo
+# score). Differences vs the offline tool:
+#   * No reference patch is available at solve-time, so the patch-shape
+#     features (patch bytes / patch lines / `diff --git` count) are zero.
+#     The model coefficients tolerate this via `log1p(max(x, 1))` clamps.
+#   * The "task text" is the live `issue` string passed into `solve()`; we
+#     count its UTF-8 byte length in Python instead of `wc -c`-ing a file.
+#   * The bash probe is launched with the same style as the agent's
+#     `run_command` (`shell=True, executable="/bin/bash", env=_command_env()`)
+#     and inherits the same hardened PATH/HOME/etc, so it behaves identically
+#     to the rest of the agent's shell surface.
+#
+# The output is intentionally clamped: the dynamic estimate is wrapped to
+# `[BASELINE - FLEX, BASELINE + FLEX]` (and then to `[HARD_MIN, HARD_MAX]`)
+# so the per-attempt wall clock cannot drift far from the proven baseline.
+
+_WALL_CLOCK_PROBE_BASH = r"""set -euo pipefail
+cd "${REPO:?}"
+files=$(find . -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+dirs=$(find . -type d 2>/dev/null | wc -l | tr -d "[:space:]")
+code=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) 2>/dev/null | wc -l | tr -d "[:space:]")
+line_stat=$(find . -type f \( \
+  -name "*.ts" -o -name "*.tsx" -o -name "*.mts" -o -name "*.cts" \
+  -o -name "*.js" -o -name "*.jsx" -o -name "*.mjs" -o -name "*.cjs" \
+  -o -name "*.py" -o -name "*.pyi" \
+  -o -name "*.go" -o -name "*.rs" \
+  -o -name "*.java" -o -name "*.kt" -o -name "*.kts" \
+  -o -name "*.cs" -o -name "*.fs" -o -name "*.swift" \
+  -o -name "*.rb" -o -name "*.php" \
+  -o -name "*.vue" -o -name "*.svelte" \
+  -o -name "*.c" -o -name "*.h" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cc" \
+  -o -name "*.scala" -o -name "*.dart" \
+\) -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+lines=${line_stat:-0}
+case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+printf '%s\t%s\t%s\t%s\n' "$files" "$dirs" "$code" "$lines"
+"""
+
+# Coefficients verbatim from `time_limit_estimate.py`. Order matches
+# `_wall_clock_feature_vector`: bias, log(files), log(dirs), log(code_files),
+# log(lines), log(prompt_bytes), log(patch_bytes), patch_bytes^0.25,
+# log(patch_lines), log(diff_git_count).
+_WALL_CLOCK_CAP_BETA: Tuple[float, ...] = (
+    -1502.280905,
+    17.15374,
+    24.155525,
+    -25.281183,
+    15.948134,
+    129.154837,
+    -5.283372,
+    -11.022089,
+    109.164775,
+    7.151717,
+)
+_WALL_CLOCK_LIN_BLEND = 0.488
+_WALL_CLOCK_STRUCT_BLEND = 1.06
+_WALL_CLOCK_RATIO_TARGET_SCALE = 1.68
+_WALL_CLOCK_PROBE_TIMEOUT_SEC = 30
+
+
+def _wall_clock_feature_vector(probe: Tuple[int, int, int, int, int, int, int, int]) -> List[float]:
+    f, d, c, ln, p, pb, pl, dg = probe
+    return [
+        1.0,
+        math.log1p(f),
+        math.log1p(d),
+        math.log1p(max(c, 1)),
+        math.log1p(max(ln, 1)),
+        math.log1p(max(p, 1)),
+        math.log1p(max(pb, 1)),
+        (max(pb, 0) ** 0.25),
+        math.log1p(max(pl, 1)),
+        math.log1p(max(dg, 1)),
+    ]
+
+
+def _wall_clock_linear_cap_hat(features: List[float]) -> float:
+    pred = sum(b * x for b, x in zip(_WALL_CLOCK_CAP_BETA, features))
+    return float(max(WALL_CLOCK_BUDGET_HARD_MIN, min(WALL_CLOCK_BUDGET_HARD_MAX, pred)))
+
+
+def _wall_clock_structural_score(probe: Tuple[int, int, int, int, int, int, int, int]) -> float:
+    """Repo-only complexity score; same caps as the offline estimator."""
+    f, d, c, ln, p, pb, _pl, _dg = probe
+    f_cap = min(max(f, 0), 400_000)
+    d_cap = min(max(d, 0), 100_000)
+    c_cap = min(max(c, 0), 120_000)
+    ln_cap = min(max(ln, 0), 3_000_000)
+    p_cap = min(max(p, 0), 2_000_000)
+    pb_cap = min(max(pb, 0), 8_000_000)
+
+    tree = min(math.log1p(f_cap) * 3.0 + math.log1p(d_cap) * 1.6, 70.0)
+    code = min(math.log1p(c_cap) * 5.8 + math.sqrt(max(c_cap, 1)) * 0.65, 75.0)
+    vol = min(math.log1p(max(ln_cap, 1)) * 4.3 + (ln_cap ** 0.25) * 0.25, 95.0)
+    patch = min(math.log1p(max(pb_cap, 1)) * 3.6 + (pb_cap ** 0.20) * 0.22, 80.0)
+    prompt = min(math.log1p(max(p_cap, 1)) * 2.3 + (p_cap / 110_000.0), 28.0)
+    avg_loc = (ln_cap / c_cap) if c_cap > 0 else 0.0
+    dens = 1.0 + max(-0.08, min(0.12, (avg_loc - 120.0) / 2300.0))
+    base = 22.0 + tree + code + vol + patch + prompt
+    raw = base * dens
+    if c_cap == 0 and ln_cap == 0:
+        raw = 22.0 + tree * 0.90 + patch * 0.80 + prompt * 0.70
+    return float(raw)
+
+
+def _estimate_seconds_from_probe(probe: Tuple[int, int, int, int, int, int, int, int]) -> int:
+    """Combine patch-/tree-informed cap estimate with structural score; integer seconds."""
+    feats = _wall_clock_feature_vector(probe)
+    cap_hat = _wall_clock_linear_cap_hat(feats)
+    struct = _wall_clock_structural_score(probe)
+    blended = min(_WALL_CLOCK_LIN_BLEND * cap_hat, _WALL_CLOCK_STRUCT_BLEND * struct)
+    scaled = blended * _WALL_CLOCK_RATIO_TARGET_SCALE
+    est = int(round(scaled))
+    return max(int(WALL_CLOCK_BUDGET_HARD_MIN), min(est, int(WALL_CLOCK_BUDGET_HARD_MAX) - 1))
+
+
+def _run_wall_clock_probe(repo_dir: Path) -> Tuple[int, int, int, int]:
+    """Run the bash complexity probe (770-style invocation)."""
+    env = {**_command_env(), "REPO": str(repo_dir.resolve())}
+    proc = subprocess.run(
+        _WALL_CLOCK_PROBE_BASH,
+        cwd=str(repo_dir),
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_WALL_CLOCK_PROBE_TIMEOUT_SEC,
+        executable="/bin/bash",
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "").strip() or f"probe exit {proc.returncode}")
+    line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+    parts = line.split("\t")
+    if len(parts) != 4:
+        raise RuntimeError(f"unexpected probe output: {line!r}")
+    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+
+
+def _estimate_wall_clock_budget(repo_dir: Path, issue: str) -> float:
+    """Dynamically size the per-attempt wall-clock budget for this (repo, issue).
+
+    Returns a value clamped to ``[BASELINE - FLEX, BASELINE + FLEX]`` and to
+    the absolute safety bounds ``[HARD_MIN, HARD_MAX]``. Falls back to the
+    baseline `WALL_CLOCK_BUDGET_SECONDS` if anything goes wrong (probe fails,
+    bash unavailable, math overflow, etc.) — never raises.
+    """
+    lo = max(WALL_CLOCK_BUDGET_HARD_MIN, WALL_CLOCK_BUDGET_SECONDS - WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    hi = min(WALL_CLOCK_BUDGET_HARD_MAX, WALL_CLOCK_BUDGET_SECONDS + WALL_CLOCK_BUDGET_FLEX_SECONDS)
+    try:
+        files, dirs, code_files, lines = _run_wall_clock_probe(repo_dir)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    prompt_bytes = len(issue.encode("utf-8")) if issue else 0
+    # Patch features unavailable during live solve; supplied as zeros.
+    probe = (files, dirs, code_files, lines, prompt_bytes, 0, 0, 0)
+    try:
+        estimated = _estimate_seconds_from_probe(probe)
+    except Exception:
+        return float(max(lo, min(hi, WALL_CLOCK_BUDGET_SECONDS)))
+    return float(max(lo, min(hi, float(estimated))))
 
 
 # -----------------------------
@@ -582,6 +817,62 @@ def get_patch(repo: Path) -> str:
     return _strip_low_signal_hunks(cleaned)
 
 
+def _validate_patch_applies(repo: Path, patch: str) -> Optional[str]:
+    """Check the unified diff reverses cleanly against the current working tree.
+
+    Uses `git apply --check --reverse` which is read-only and bounded to 8s.
+    Empty patches are treated as valid (the hail-mary path owns that case).
+    Returns None when the patch is coherent; otherwise an error tail. Any
+    infrastructure failure also returns None — we never want this gate to
+    block shipping a real patch.
+    """
+    if not patch.strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--reverse", "-"],
+            cwd=str(repo),
+            input=patch,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    return err[-600:] if err else "git apply --check returned non-zero"
+
+
+def _patch_substantive_added_lines(patch: str) -> int:
+    """Count added lines that aren't blank, whitespace-only, or comment-only.
+
+    Patches that are technically non-empty but consist of only blank lines and
+    comments score zero on cursor-similarity and barely register with the LLM
+    judge. The refinement gate uses this to recognise near-empty patches that
+    escape the literal-empty check but still carry almost no signal.
+    """
+    if not patch.strip():
+        return 0
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if body.startswith("#") or body.startswith("//"):
+            continue
+        if body.startswith("/*") or body.endswith("*/") or body == "*":
+            continue
+        if body in ('"""', "'''"):
+            continue
+        count += 1
+    return count
+
+
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -603,6 +894,21 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         )
         if mode_only:
             continue
+        # v48: when a file has real content edits AND a mode change,
+        # the chmod is incidental and the judge consistently flags it as
+        # "unrelated file mode churn." Drop the `old mode` / `new mode`
+        # lines so only the substantive content edit remains.
+        # Only do this when the block also contains a real content hunk
+        # (`@@ ` or `new file mode ` or binary marker).
+        has_content = "\n@@ " in block or "\nnew file mode " in block or "\nGIT binary patch" in block or "\nBinary files " in block
+        if has_content and ("\nold mode " in block or "\nnew mode " in block):
+            cleaned_lines: List[str] = []
+            for line in block.splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+                    continue
+                cleaned_lines.append(line)
+            block = "".join(cleaned_lines)
         kept.append(block)
 
     result = "".join(kept)
@@ -1271,6 +1577,99 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+_OFFTOPIC_DROP_RATIO_MAX = 0.30
+
+
+def _prune_offtopic_hunks(
+    repo: Path,
+    patch: str,
+    issue_text: str,
+) -> Tuple[str, List[str]]:
+    """Score per-file diff blocks against issue overlap; drop zero-score blocks.
+
+    Score for each file block:
+      +8 if the file's path appears in the issue's explicit path mentions
+      +5 per backtick-wrapped identifier from the issue found in the block
+      +3 per issue term (from `_issue_terms`) found in added lines
+
+    Blocks scoring 0 across all signals are dropped. Capped at 30% of total
+    files so a legitimately sweeping refactor is preserved. Dropped files are
+    reverted in the working tree via `git checkout --` so the on-disk state
+    matches the returned filtered patch. Empty patch and edge cases pass
+    through unchanged. Pure text + one git command per dropped file.
+    """
+    if not patch.strip():
+        return patch, []
+
+    issue_paths = {p.strip("./") for p in _extract_issue_path_mentions(issue_text) if p}
+    issue_idents = set(_BACKTICK_IDENT_RE.findall(issue_text))
+    issue_terms_list = list(_issue_terms(issue_text))
+
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    file_entries: List[Tuple[str, str]] = []
+    for block in blocks:
+        if not block.strip():
+            continue
+        m = re.match(r"diff --git a/(.+?) b/(.+?)(?:\n|$)", block)
+        rel = m.group(2) if m else ""
+        file_entries.append((rel, block))
+
+    if not file_entries:
+        return patch, []
+
+    max_drop = int(len(file_entries) * _OFFTOPIC_DROP_RATIO_MAX)
+    if max_drop < 1:
+        return patch, []
+
+    def _score(relative_path: str, block_text: str) -> int:
+        score = 0
+        norm = relative_path.strip("./")
+        if norm:
+            for ip in issue_paths:
+                if norm == ip or norm.endswith("/" + ip) or ip.endswith("/" + norm):
+                    score += 8
+                    break
+        block_lower = block_text.lower()
+        added = " ".join(
+            line[1:] for line in block_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ).lower()
+        for ident in issue_idents:
+            if ident.lower() in block_lower:
+                score += 5
+        for term in issue_terms_list:
+            if term in added:
+                score += 3
+        return score
+
+    scored = [(_score(rp, bt), rp, bt) for rp, bt in file_entries]
+    to_drop = [(rp, bt) for s, rp, bt in scored if s == 0 and rp][:max_drop]
+    if not to_drop:
+        return patch, []
+
+    drop_paths = {rp for rp, _ in to_drop}
+    kept = [bt for s, rp, bt in scored if rp not in drop_paths]
+    if not kept:
+        return patch, []
+
+    for relative_path in drop_paths:
+        try:
+            subprocess.run(
+                ["git", "checkout", "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    summaries = [f"{rp} (score=0)" for rp, _ in to_drop]
+    return "".join(kept), summaries
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -2419,6 +2818,35 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_missing_paths_hail_mary_prompt(missing_paths: List[str], issue_text: str) -> str:
+    """Re-use the hail-mary slot for non-empty patches that skip issue-named files.
+
+    The hail-mary slot is exempt from MAX_TOTAL_REFINEMENT_TURNS, so this is the
+    only refinement step guaranteed to fire when polish/syntax have already
+    consumed the regular cap. A `<final>NO-OP</final>` escape lets the model
+    bail out of the extra edit when the paths are merely referenced (not
+    targeted) in the issue.
+    """
+    paths_block = "\n".join(f"  - {p}" for p in missing_paths[:6])
+    short = issue_text[:1200].rstrip()
+    return (
+        "FINAL TARGETING CHECK. Your patch is non-empty, but the issue "
+        "explicitly names these paths and your diff does not touch any of "
+        "them:\n"
+        f"{paths_block}\n\n"
+        "If the issue's intent genuinely requires changes in those files, "
+        "issue the additional <command> block(s) NOW in one final turn. "
+        "Match the existing surrounding style and add only what the issue "
+        "requires.\n\n"
+        "If you are confident the issue mentions those paths only as "
+        "references (NOT as edit targets), reply with exactly "
+        "<final>NO-OP</final> and we will ship the current diff. Do not "
+        "explain at length — produce either the targeted edits or the "
+        "no-op response.\n\n"
+        f"Issue (for reference):\n{short}\n"
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2444,7 +2872,12 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
+# v51: tighter than the legacy 580s envelope. The validator's per-round
+# timeout is variable (120-600s depending on task difficulty); a fixed 580s
+# overshoots on easy tasks and triggers external kills that return nothing
+# instead of attempt-1's on-disk patch. 420s leaves clear headroom on every
+# task class while still allowing one strong retry on hard tasks.
+_MULTISHOT_TOTAL_BUDGET = 420.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
 
@@ -2555,8 +2988,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
+       Two attempts at the per-attempt wall-clock budget (baseline 255s,
+       dynamically sized in [BASELINE-FLEX, BASELINE+FLEX] ≈ [195s, 315s]
+       per (repo, issue) by `_estimate_wall_clock_budget`) already saturate the
+       _MULTISHOT_TOTAL_BUDGET=420s envelope (v51). A third attempt would have to
        be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
        The empty-patch case is already handled inside `_solve_attempt` by
@@ -2594,7 +3029,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
-        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _remaining = _multishot_total_budget - _elapsed
+        # v51: when attempt 1 produced a NON-EMPTY (but low-signal) patch and
+        # the remaining budget is below twice the inner wall-clock reserve,
+        # ship the attempt-1 patch instead of risking a partial-retry that
+        # might be killed mid-attempt and return nothing.
+        if _patch1.strip() and _remaining < 2 * WALL_CLOCK_RESERVE_SECONDS:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "patch1_nonempty_low_budget"
+            return _result1
+        if _remaining < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
@@ -2667,14 +3111,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     solve_started_at = time.monotonic()
 
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
-    # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 580s`), but
+    # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 420s`, v51), but
     # that wrapper only checks elapsed time *between* attempts. Without an
     # inner guard, a single attempt can blow the whole budget on a stuck
     # model loop and starve the retry of any time. We stop the inner loop
     # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
     # return whatever patch is already on disk.
+    #
+    # The budget itself is sized dynamically per (repo, issue) by the
+    # `_estimate_wall_clock_budget` helper after `repo` is resolved; until
+    # that runs we use the baseline `WALL_CLOCK_BUDGET_SECONDS` so this
+    # closure is safe to call before the refinement happens.
+    wall_clock_budget = float(WALL_CLOCK_BUDGET_SECONDS)
+
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return wall_clock_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2723,6 +3174,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
             return False
+
+        # v51: near-empty patches (technically non-empty but only
+        # blank/whitespace/comment additions) escape the literal-empty check
+        # but score zero on cursor-similarity. Treat them like empty: fire
+        # hail-mary (exempt from the total-refinement cap).
+        if _patch_substantive_added_lines(patch) < MIN_SUBSTANTIVE_ADDED_LINES:
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hail_mary_prompt(issue),
+                    "HAIL_MARY_QUEUED: patch near-empty (< MIN_SUBSTANTIVE_ADDED_LINES)",
+                )
+                return True
+
+        # v51: orthogonal hail-mary case — patch is non-empty AND has
+        # substantive content but skips files the issue explicitly names.
+        # Re-use the hail-mary slot (exempt from MAX_TOTAL_REFINEMENT_TURNS)
+        # so this gate fires even when polish/syntax already ate the regular
+        # cap. The model can escape via <final>NO-OP</final> when the paths
+        # are referenced rather than targeted.
+        if MISSING_PATHS_HAIL_MARY_USES_SLOT and hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+            _missing_hm = _uncovered_required_paths(patch, issue)
+            if _missing_hm:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_paths_hail_mary_prompt(_missing_hm, issue),
+                    "MISSING_PATHS_HAIL_MARY_QUEUED:\n  " + ", ".join(_missing_hm[:4]),
+                )
+                return True
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
@@ -2820,6 +3302,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     try:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
+        # Dynamically size the per-attempt wall-clock budget based on repo
+        # complexity (bash probe) and issue length. Stays within ±FLEX of the
+        # baseline and absolute [HARD_MIN, HARD_MAX] so a misestimate cannot
+        # starve or oversubscribe the multi-shot envelope. Falls back to the
+        # baseline silently if the probe or estimator fails.
+        wall_clock_budget = _estimate_wall_clock_budget(repo, issue)
+        logs.append(
+            "WALL_CLOCK_BUDGET_DYNAMIC:\n"
+            f"  baseline={WALL_CLOCK_BUDGET_SECONDS:.1f}s "
+            f"flex=±{WALL_CLOCK_BUDGET_FLEX_SECONDS:.0f}s "
+            f"hard=[{WALL_CLOCK_BUDGET_HARD_MIN:.0f},{WALL_CLOCK_BUDGET_HARD_MAX:.0f}]s "
+            f"chosen={wall_clock_budget:.1f}s"
+        )
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
@@ -3019,6 +3514,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+
+        # v51: drop file diffs whose content has zero overlap with the issue's
+        # paths / identifiers / terms. Caps at 30% of files so sweeping
+        # refactors are not gutted. Reverts dropped files in the working
+        # tree so a follow-up `git diff` matches what we return.
+        if patch.strip():
+            _, _dropped = _prune_offtopic_hunks(repo, patch, issue)
+            if _dropped:
+                patch = get_patch(repo)
+                logs.append(
+                    "PRUNE_OFFTOPIC_HUNKS: dropped="
+                    + str(len(_dropped)) + " " + "; ".join(_dropped[:4])
+                )
+
+        # v51: validate the final diff applies cleanly against the working
+        # tree. Read-only `git apply --check --reverse`; ~8s timeout. On
+        # persistent failure we surface the error tail in logs and clear
+        # success so the safety net sees the failure rather than shipping
+        # a broken patch.
+        if patch.strip():
+            _apply_err = _validate_patch_applies(repo, patch)
+            if _apply_err is not None:
+                patch = get_patch(repo)  # re-read in case refinement left state stale
+                _apply_err2 = _validate_patch_applies(repo, patch)
+                if _apply_err2 is not None:
+                    logs.append("PATCH_APPLY_CHECK_FAILED:\n" + _apply_err2)
+                    success = False
+
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
