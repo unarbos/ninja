@@ -1987,69 +1987,6 @@ def build_empty_args_fix_prompt(findings: List[str]) -> str:
     )
 
 
-# Extended-stub gate: catches the broader stub family `_check_empty_args`
-# misses — JSX `className={}`, `style={{}}`, `// TODO` placeholder
-# comments, and empty arrow-function bodies.
-
-_EXT_STUB_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
-    (
-        "JSX attribute with empty expression",
-        re.compile(
-            r"^\+(?!\+\+).*\b(?:className|style|onClick|onChange|onSubmit|"
-            r"onBlur|onFocus|onMouseEnter|onMouseLeave|onKeyDown|key|id|"
-            r"value|placeholder|aria-[\w-]+)=\{\s*\}",
-            re.MULTILINE,
-        ),
-    ),
-    (
-        "JSX style with empty object",
-        re.compile(r"^\+(?!\+\+).*style=\{\{\s*\}\}", re.MULTILINE),
-    ),
-    (
-        "TODO/FIXME placeholder comment in added code",
-        re.compile(
-            r"^\+(?!\+\+).*(?://|#|/\*)\s*(?:TODO|FIXME|XXX|HACK|"
-            r"implement\s+later|to\s+be\s+implemented|not\s+implemented)\b",
-            re.IGNORECASE | re.MULTILINE,
-        ),
-    ),
-    (
-        "empty arrow function body",
-        re.compile(r"^\+(?!\+\+).*=>\s*\{\s*\}\s*[;,]?\s*$", re.MULTILINE),
-    ),
-)
-
-
-def _check_extended_stubs(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _EXT_STUB_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip().splitlines()[0]
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:160]}")
-            if len(findings) >= 5:
-                return findings
-    return findings
-
-
-def build_extended_stub_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains stub-shaped expressions that read as unfinished:"
-        f"\n\n{body}\n\n"
-        "Emit ONE bash command that fills in the intended value, removes the "
-        "stub, or replaces the placeholder with real code. Do NOT add new "
-        "behavior beyond closing the stub. Then end with "
-        "`<final>stubs filled</final>`."
-    )
-
-
 # Placeholder-endpoint gate: hardcoded test URLs, credentials, or localhost
 # without env-var fallback that read as forgotten dev artifacts.
 
