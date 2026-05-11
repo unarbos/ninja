@@ -117,15 +117,12 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
-MAX_ARTIFACT_NUDGES = 0    # disabled: over-adds when reference is minimal (caused 064674 forced createdBy:null regression)
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_CONTRACT_TURNS = 1
 MAX_PATCH_SAFETY_TURNS = 1
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1
-MAX_STRICT_CRITERIA_TURNS = 0  # disabled: redundant with MAX_CRITERIA_NUDGES; strict variant adds scope-drift pressure
 MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
-MAX_DELIVERABLE_TURNS = 0  # disabled: over-builds vs reference (caused 064689 wrong section structure regression)
 MAX_FRONTEND_GAP_TURNS = 1
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted). Lower cap reduces churn-vs-reference divergence cited in 064658/064672/064677 rationales.
 _STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
@@ -1363,35 +1360,6 @@ def _integration_gap_summary(patch: str, issue_text: str) -> str:
     )
 
 
-_ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], "re.Pattern[str]"], ...] = (
-    ("tests", ("test", "tests", "testing", "regression", "spec"), re.compile(r"(^|/)(tests?|__tests__|specs?)/|(_test|test_|\.test\.|\.spec\.)", re.IGNORECASE)),
-    ("docs", ("doc", "docs", "documentation", "readme", "guide", "adr"), re.compile(r"(^|/)(docs?|adr|guides?)/|(^|/)(readme|changelog|adr)[^/]*\.(md|rst|txt)$", re.IGNORECASE)),
-    ("version/package metadata", ("version", "bump", "package.json", "pyproject", "pom.xml", "gradle", "cargo.toml"), re.compile(r"(^|/)(package\.json|pyproject\.toml|pom\.xml|build\.gradle|build\.gradle\.kts|cargo\.toml|setup\.py|setup\.cfg|pubspec\.yaml|composer\.json)$", re.IGNORECASE)),
-    ("schema/migration", ("schema", "migration", "migrations", "sql", "prisma", "ddl"), re.compile(r"(^|/)(migrations?|schema|prisma)/|schema\.(sql|prisma)$|\.(sql)$", re.IGNORECASE)),
-    ("i18n/locale", ("i18n", "locale", "locales", "translation", "translations", "lang"), re.compile(r"(^|/)(i18n|locales?|lang|translations?)/|\.(po|pot|strings)$", re.IGNORECASE)),
-    ("fixture/sample", ("fixture", "fixtures", "sample", "example"), re.compile(r"(^|/)(fixtures?|samples?|examples?)/", re.IGNORECASE)),
-)
-
-
-def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
-    return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
-
-
-def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
-    """Find explicitly requested artifact classes missing from the patch."""
-    if not patch.strip():
-        return ""
-    issue_lower = issue_text.lower()
-    changed = _patch_changed_files(patch)
-    missing: List[str] = []
-    for label, hints, path_re in _ARTIFACT_REQUESTS:
-        if _issue_has_artifact_hint(issue_lower, hints) and not any(path_re.search(path) for path in changed):
-            missing.append(label)
-    if not missing:
-        return ""
-    return "task text appears to request these artifact(s), but no matching files were touched: " + ", ".join(missing[:6])
-
-
 _DEPENDENCY_MANIFEST_RE = re.compile(
     r"(^|/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|"
     r"requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|poetry\.lock|"
@@ -1570,13 +1538,12 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
     return findings
 
 
-# Narrow to phrases that only appear as system-prompt leakage. Broader words
-# (grader, scoring rubric, judge model/prompt/rubric) false-positive on
-# legitimate user code touching grading/judging systems and would force the
-# model to scrub valid identifiers out of its own patch.
 _PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"^\+(?!\+\+).*grader", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*scoring\s+rubric", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*reference\s+patch", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*oracle\s+(?:answer|solution|patch)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+(?!\+\+).*judge\s+(?:model|prompt|rubric)", re.IGNORECASE | re.MULTILINE),
 )
 
 
@@ -1747,64 +1714,6 @@ def _helpers_defined_but_uncalled(patch: str) -> List[str]:
     return unwired[:3]
 
 
-_NAMED_DELIVERABLE_RE = re.compile(
-    r'(?:^|[\s`\'",(\[])([A-Za-z0-9_.\-/]+\.[a-zA-Z]{2,5})(?:$|[\s`\'",.)])',
-    re.MULTILINE,
-)
-
-
-def _extract_named_deliverables(task_text: str) -> List[str]:
-    if not task_text:
-        return []
-    seen: set = set()
-    deliverables: List[str] = []
-    for match in _NAMED_DELIVERABLE_RE.finditer(task_text):
-        name = match.group(1).strip().strip("`'\"")
-        if not name:
-            continue
-        if name.startswith(("http", "www.", "//", "ftp")):
-            continue
-        if len(name) > 80 or name.count("/") > 4:
-            continue
-        ext = Path(name).suffix.lower()
-        if ext not in TEXT_FILE_EXTENSIONS and ext not in {".sh", ".env", ".cfg", ".lock"}:
-            continue
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deliverables.append(name)
-        if len(deliverables) >= 8:
-            break
-    return deliverables
-
-
-def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
-    if not patch or not deliverables:
-        return []
-    header_paths: set = set()
-    for line in patch.splitlines():
-        if line.startswith("+++ b/"):
-            header_paths.add(line[6:].strip().lower())
-        elif line.startswith("+++ "):
-            raw = line[4:].strip().lower()
-            if raw != "/dev/null":
-                header_paths.add(raw)
-    uncovered: List[str] = []
-    for item in deliverables:
-        item_lower = item.lower()
-        item_stem = Path(item).stem.lower()
-        covered = any(
-            item_lower == hp or hp.endswith("/" + item_lower) or item_lower in hp
-            for hp in header_paths
-        )
-        if not covered and len(item_stem) >= 3:
-            covered = any(item_stem in hp for hp in header_paths)
-        if not covered:
-            uncovered.append(item)
-    return uncovered
-
-
 _FRONTEND_TASK_SIGNALS = (
     ".vue", "vue component", "react component", "next.js", "nextjs",
     "page.tsx", "page.jsx", "svelte", "angular component",
@@ -1836,62 +1745,6 @@ def _frontend_coverage_gap(task_text: str, patch: str) -> str:
         f"task signals '{signal}' but diff touches only backend extensions "
         f"({', '.join(sorted(changed_exts))})"
     )
-
-
-def _structured_acceptance_items(issue_text: str) -> List[Dict[str, Any]]:
-    items = _extract_acceptance_criteria(issue_text)
-    structured: List[Dict[str, Any]] = []
-    for item in items:
-        paths = _extract_issue_path_mentions(item)
-        backticked = re.findall(r"`([A-Za-z_$][\w.$]*)`", item)
-        camel = re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){1,})\b", item)
-        snake = re.findall(r"\b([a-z][a-z0-9]*_[a-z][a-z0-9_]+)\b", item)
-        identifiers: List[str] = []
-        for src in (backticked, camel, snake):
-            for tok in src:
-                if tok and tok not in identifiers:
-                    identifiers.append(tok)
-        structured.append({
-            "text": item,
-            "paths": paths[:3],
-            "identifiers": identifiers[:5],
-        })
-    return structured
-
-
-def _strict_unaddressed_items(patch: str, issue_text: str) -> List[str]:
-    items = _structured_acceptance_items(issue_text)
-    if not items:
-        return []
-    changed = set(_patch_changed_files(patch))
-    added_lower = _patch_added_text(patch)
-    missing: List[str] = []
-    for entry in items:
-        text = entry["text"]
-        paths = entry["paths"]
-        identifiers = entry["identifiers"]
-        addressed = False
-        if paths and any(
-            (p in changed) or any(cf == p or cf.endswith("/" + p) for cf in changed)
-            for p in paths
-        ):
-            addressed = True
-        if not addressed and identifiers:
-            for idn in identifiers:
-                if idn.lower() in added_lower:
-                    addressed = True
-                    break
-        if not addressed:
-            keywords = _criterion_keywords(text)
-            if keywords:
-                hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
-                if hits * 10 >= len(keywords) * 7:
-                    addressed = True
-        if not addressed:
-            missing.append(text[:200])
-        if len(missing) >= 5:
-            break
-    return missing
 
 
 # -----------------------------
@@ -3005,22 +2858,6 @@ def build_integration_nudge_prompt(integration_summary: str, issue_text: str) ->
     )
 
 
-def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
-    return (
-        "The task asks for a supporting artifact (tests, docs, version bump, "
-        "schema/migration, locale, or fixtures), and your current patch does "
-        "not touch a matching file.\n\n"
-        f"{artifact_summary}\n\n"
-        "Add or update the requested artifact. Inspect the repo convention "
-        "for that artifact type and issue the minimal edit command(s). Only "
-        "skip if the issue text mentioned the artifact purely as background "
-        "context (not as a requirement) — then say so in <final>summary</final>. "
-        "Do not add unrelated artifacts.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1500]}\n"
-    )
-
-
 def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> str:
     return (
         "Your patch imports or requires a package that is not declared in "
@@ -3078,20 +2915,6 @@ def build_failed_verification_prompt(command: str, output_tail: str) -> str:
     )
 
 
-def build_strict_criteria_prompt(missing: List[str]) -> str:
-    body = "\n  ".join(f"- {m}" for m in missing[:5])
-    return (
-        "Final coverage check — these items from the task are still NOT "
-        "reflected in any file you touched or any specific identifier you "
-        "added:\n  "
-        f"{body}\n\n"
-        "For each item, either add the minimal change to address it (cite "
-        "the file and the concrete edit) or explicitly justify why it is "
-        "intentionally out of scope. End with <final>done</final>. Do not "
-        "leave any item unaddressed without explanation."
-    )
-
-
 def build_dead_helper_prompt(names: List[str]) -> str:
     body = "\n  ".join(f"- {n}(...)" for n in names[:5])
     return (
@@ -3112,15 +2935,6 @@ def build_quick_lint_prompt(issues: List[str]) -> str:
         f"{body}\n\n"
         "Fix each listed issue with the smallest possible edit. End with "
         "<final>done</final>."
-    )
-
-
-def build_deliverable_prompt(uncovered: List[str]) -> str:
-    body = ", ".join(uncovered[:5])
-    return (
-        f"The task explicitly names these files that are NOT touched by your "
-        f"patch: {body}. Create or modify each of them, then end with "
-        f"<final>done</final>."
     )
 
 
@@ -3471,15 +3285,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     integration_nudges_used = 0
-    artifact_nudges_used = 0
     dependency_nudges_used = 0
     contract_turns_used = 0
     patch_safety_turns_used = 0
     failed_verification_turns_used = 0
-    strict_criteria_turns_used = 0
     dead_helper_turns_used = 0
     lint_turns_used = 0
-    deliverable_turns_used = 0
     frontend_gap_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -3525,7 +3336,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, strict_criteria_turns_used, dead_helper_turns_used, lint_turns_used, deliverable_turns_used, frontend_gap_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, dead_helper_turns_used, lint_turns_used, frontend_gap_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # close the architectural hole at the empty-patch early
@@ -3543,11 +3354,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # Cap total refinement turns to bound time-per-task. There are ~19
-        # single-shot gates and each consumes one turn from this counter;
-        # without a cap, multi-gate misses would routinely chain 5-7
-        # refinements and blow the per-task time budget. Hail-mary is exempt
-        # because it's the last-resort patch-recovery, not a normal refinement.
+        # Cap total refinement turns to bound time-per-task. Each active
+        # single-shot gate consumes one turn from this counter; without a cap,
+        # multi-gate misses would routinely chain 5-7 refinements and blow
+        # the per-task time budget. Hail-mary is exempt because it's the
+        # last-resort patch-recovery, not a normal refinement.
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -3649,21 +3460,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if (
-            strict_criteria_turns_used < MAX_STRICT_CRITERIA_TURNS
-            and criteria_nudges_used > 0
-        ):
-            strict_missing = _strict_unaddressed_items(patch, issue)
-            if len(strict_missing) >= 2:
-                strict_criteria_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_strict_criteria_prompt(strict_missing),
-                    "STRICT_CRITERIA_QUEUED:\n  " + " | ".join(c[:60] for c in strict_missing[:3]),
-                )
-                return True
-
         if integration_nudges_used < MAX_INTEGRATION_NUDGES:
             integration_summary = _integration_gap_summary(patch, issue)
             if integration_summary:
@@ -3673,18 +3469,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_integration_nudge_prompt(integration_summary, issue),
                     "INTEGRATION_NUDGE_QUEUED:\n  " + integration_summary[:120],
-                )
-                return True
-
-        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
-            artifact_summary = _requested_artifact_gap_summary(patch, issue)
-            if artifact_summary:
-                artifact_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_artifact_nudge_prompt(artifact_summary, issue),
-                    "ARTIFACT_NUDGE_QUEUED:\n  " + artifact_summary[:120],
                 )
                 return True
 
@@ -3736,20 +3520,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "DEAD_HELPER_QUEUED:\n  " + ", ".join(dead_helpers[:4]),
                 )
                 return True
-
-        if deliverable_turns_used < MAX_DELIVERABLE_TURNS:
-            _deliverables = _extract_named_deliverables(issue)
-            if _deliverables:
-                _uncovered_del = _check_deliverable_coverage(patch, _deliverables)
-                if _uncovered_del:
-                    deliverable_turns_used += 1
-                    total_refinement_turns_used += 1
-                    queue_refinement_turn(
-                        assistant_text,
-                        build_deliverable_prompt(_uncovered_del),
-                        "DELIVERABLE_QUEUED:\n  " + ", ".join(_uncovered_del[:4]),
-                    )
-                    return True
 
         if frontend_gap_turns_used < MAX_FRONTEND_GAP_TURNS:
             fe_gap = _frontend_coverage_gap(issue, patch)
