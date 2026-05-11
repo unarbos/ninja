@@ -32,22 +32,14 @@ Design goals:
     - Miners only patch this file.
 
 Miner editing guide:
-    You are expected to improve this file. Good areas to edit include prompting,
-    context gathering, command selection, tool/result parsing, stopping logic,
-    patch generation, safety checks, and how the agent uses its step budget.
+    Improve prompting, preload/context, parsers, refinement gates, stepping, and solve() wiring.
 
-    PR hygiene (helps reviewers and forks): ship one behavioral mechanism per PR
-    (e.g. lint gate, preload strip, fenced-parser change) rather than bundled rewrites.
+    Extras vs slimmer upstream harness templates: multishot+memo, empty-attempt
+    emergency pass, inner-loop timeout nudge, HTML-marked preload strip after ~4 steps,
+    optional lint refinement turn, trimmed observations with stderr path hints.
 
-    Preserve existing docstrings and historical comments unless something is wrong
-    — cosmetic churn across the whole file hides what actually moved.
-
-    Extras vs compact reference harness: multishot+memo, empty-attempt emergency
-    single-shot, TLE user nudge, preload HTML-marked block strip after step 4,
-    lint refinement gate, stderr path:line hints on observations.
-
-    Brace-balance self-check fixtures live in ``brace_balance_fixtures_verify.py``
-    alongside this repo (optional local run before mining).
+    Optional: ``python brace_balance_fixtures_verify.py`` (bundled checker for the
+    naive delimiter lexer).
 
     Keep these validator-owned boundaries intact:
     - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
@@ -112,9 +104,8 @@ MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
+# Anti-whiff: empty unified diffs are usually worthless; retry aggressively
+# rather than exiting early without edits.
 # Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
@@ -140,11 +131,7 @@ MAX_TOTAL_REFINEMENT_TURNS = 2  # refinement cap per cycle (hail-mary exempt)
 # Cap for `_project_hint_block` text inside preloaded context.
 _STYLE_HINT_BUDGET = 600
 
-# Append recent small git diffs as style anchors (size limits below).
-# We cap insertions and diff size so the model sees "how this repo patches"
-# without drowning preloaded context in huge churn; `--pretty=format:` on
-# `git show` yields raw unified diff only (no commit headers), matching the
-# patch-shaped text validators score against.
+# Append recent small commits as unified-diff style anchors (`_RECENT_COMMIT_*`).
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
@@ -1293,9 +1280,7 @@ def _extract_relevant_regions(
 # Hunk classifiers + diff hygiene
 # -----------------------------
 #
-# Two failure modes hurt the 2/3 Cursor-similarity score: drive-by whitespace /
-# comment / blank-line edits, and patches that cover the wrong files. The
-# helpers below detect both. They're applied at two stages:
+# Hunk hygiene: suppress whitespace/comment-only noise and unrelated churn before return.
 #
 #   1. At patch-return time: low-signal hunks are silently dropped from the
 #      final diff (so the validator never sees them).
@@ -1467,25 +1452,52 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Brace / bracket / paren balance hint for `_check_syntax`. Naive lexer: tracks
-# // line comments, /* */ blocks, "", '', and Go/Java-style `` ` `` raw-ish spans,
-# plus standard escapes inside quotes.
-#
-# C++ raw user literals (`R"delim(...)delim"` etc.) trip this scanner — regression
-# checked 2026-05-11 in ``brace_balance_fixtures_verify.py`` — so *.cpp *.hpp *.cc
-# … are deliberately excluded below; use compiler-backed checks when you add them.
-#
-# Fixtures passed there for: Java char '\'' / JSON-ish double-quoted escapes, Go runes/
-# raw literals with `{}` bodies, C char + escaped doubles, benign `}` inside // comments,
-# synthetic unbalanced-positive cases.
+# Brace / bracket / paren balance hint for `_check_syntax`. Naive lexer (see
+# ``brace_balance_fixtures_verify.py``): skips C++ when a raw-string literal
+# opener is present, JS/TS when a template contains `${`, Swift when a
+# `#"…"` style raw opener appears — those patterns break the scan or are easier
+# to false-positive; compiler/node checks still apply elsewhere.
+_CXX_RAW_LITERAL_START = re.compile(r'R"[^"]*\(')
+_JS_TEMPLATE_INTERP_START = re.compile(r"`[\s\S]*?\$\{")
+_SWIFT_RAW_STRING_HINT = re.compile(r'#+"')
+
 _BRACE_LANG_SUFFIXES = frozenset(
     {
         ".java",
         ".go",
         ".c",
         ".h",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".hpp",
+        ".hh",
+        ".inl",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".swift",
     }
 )
+
+_CPPISH_BRACE_SUFFIXES = frozenset(
+    {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".inl", ".h"}
+)
+_JSISH_BRACE_SUFFIXES = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"})
+
+
+def _should_skip_naive_brace_scan(source: str, suffix: str) -> bool:
+    s = suffix.lower()
+    if s in _CPPISH_BRACE_SUFFIXES:
+        return _CXX_RAW_LITERAL_START.search(source) is not None
+    if s in _JSISH_BRACE_SUFFIXES:
+        return _JS_TEMPLATE_INTERP_START.search(source) is not None
+    if s == ".swift":
+        return _SWIFT_RAW_STRING_HINT.search(source) is not None
+    return False
 
 
 def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
@@ -1604,6 +1616,8 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
         text = full.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
+    if _should_skip_naive_brace_scan(text, suffix):
+        return None
     err = _delimiter_balance_error(text)
     if err is not None:
         err_line, detail = err
@@ -1684,8 +1698,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed or had no checker; unsupported languages rely on
-    the LLM judge.
+    know how to check parsed or had no checker; unsupported languages skip here.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1793,11 +1806,8 @@ def _check_lint(repo: Path, patch: str) -> List[str]:
 # Companion-test discovery + execution
 # -----------------------------
 #
-# When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
-# repo, running that test before <final> catches a class of regressions the
-# scope/judge gates can't see. Cursor's baseline diffs almost always update
-# tests in lockstep with source edits, and a fast pytest -k catches "I broke
-# the test I was supposed to fix."
+# When the agent edits `src/foo.py` and a `tests/test_foo.py` exists, a quick
+# companion run catches regressions path/criteria gates can miss.
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     # Python — the most common shapes.
@@ -2045,9 +2055,9 @@ def _recent_commit_examples(repo: Path) -> str:
         if not examples:
             return ""
         return (
-            "\n\nRECENT REFERENCE PATCHES from this codebase (style anchors — "
+            "\n\nRECENT COMMITS from this codebase (diff style anchors — "
             "match the shape, scale, and conventions of these real recent "
-            "commits when writing your patch):\n\n" + "\n\n".join(examples)
+            "changes when writing your patch):\n\n" + "\n\n".join(examples)
         )
     except Exception:
         return ""
@@ -2358,7 +2368,7 @@ def _strip_preloaded_section(
 # Body = base sections + short POLICY ADDENDUM tail (delta-only edits preferred).
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
-You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
+You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Optimize for correctness and completeness against the issue (including edge cases that often show up only in tests), and for the smallest change a senior maintainer would merge without follow-up cleanup.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -2468,7 +2478,7 @@ STYLE, COMMENTS, AND PUBLIC API
 
 Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
 
-Preserve meaningful comments around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve meaningful comments around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to reviewers. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
@@ -2518,12 +2528,12 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 POLICY ADDENDUM (DELTA — short; keeps sections above verbatim)
 ====================================================================
 
-- Reference-style scoring still rewards locality: touch only files you must; avoid chmod-only hunks and drive-by whitespace/comment churn.
+- Stay local: touch only files you must; avoid chmod-only hunks and drive-by whitespace/comment churn.
 - First `<plan>` may add OPTIONAL labeled rows (Explicit:, Implicit:, Acceptance:, Risk:) when they clarify work; keep every required row from the format above.
 - Functional completeness: do not land TODO / placeholder / empty handlers for behaviour the issue demands; wire UI/API/services end-to-end when you modify them.
 - No-stub rule: prefer a smaller working change over a larger skeleton.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+You are producing the smallest complete patch that fixes the issue and holds up under review and tests. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 '''
 
 
@@ -2546,7 +2556,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — missing bullets loses heavily on the LLM-judge half of scoring.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — silent misses on listed bullets are a common failure mode.
 
 Strategy: the fix is often in ONE specific function or block, but multi-file integration tasks are common — when the issue spans modules, emit ALL coordinated edits in ONE response.
 
@@ -2694,18 +2704,17 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass — review your patch for correctness, completeness, and unnecessary churn:\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "or equivalent now. A passing targeted test is strong evidence of correctness.\n\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE / MINIMALITY:\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2736,7 +2745,7 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
     """Ask for minimal lint-only fixes (ruff/eslint), no behaviour change."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
-        "Lint issues were found in your patch. The judge prefers lint-clean code:\n\n"
+        "Lint issues were found in your patch. Keep changes lint-clean where project tooling enforces it:\n\n"
         f"{body}\n\n"
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
         "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
@@ -3274,7 +3283,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # New gate vs `2.py` reference: optional ruff/eslint after parse passes.
+        # Optional ruff/eslint after parse passes.
         if lint_turns_used < MAX_LINT_TURNS:
             lint_errors = _check_lint(repo, patch)
             if lint_errors:
@@ -3545,7 +3554,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
+                        "to verify correctness — prefer evidence from a real test run over syntax-only checks.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
