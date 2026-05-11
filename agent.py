@@ -116,6 +116,9 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_DELIVERABLE_NUDGES = 1
+# v14: enterprise hints cap already in king as MAX_ENTERPRISE_HINTS
+
 MAX_TOTAL_REFINEMENT_TURNS = 4  # v14: bumped from king's 2; 4 covers 4 new gates without blowing time budget
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -2801,6 +2804,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     syntax_fix_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
+    deliverable_nudges_used = 0
+    fe_gap_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
@@ -2847,7 +2852,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, deliverable_nudges_used, fe_gap_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2948,9 +2953,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # v14: named-deliverable coverage check
         _task_dels = _extract_named_deliverables(issue)
-        if _task_dels:
+        if _task_dels and deliverable_nudges_used < MAX_DELIVERABLE_NUDGES:
             _missing_dels = _check_deliverable_coverage(patch, _task_dels)
             if _missing_dels and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                deliverable_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
@@ -2971,7 +2977,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # v11: frontend gap detection
         _fe_hint = _detect_frontend_gap(issue, patch)
-        if _fe_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+        if _fe_hint and fe_gap_used < 1 and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            fe_gap_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
