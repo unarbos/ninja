@@ -4031,11 +4031,16 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
-    # Only retry when the patch is empty OR it has too few substantive lines
-    # AND failed to touch any path the issue explicitly mentions. A surgical
-    # 1-2 line fix that covers the required paths is correct — don't discard it.
+    # Retry only for clear weak first attempts: empty, tiny and off-target, or
+    # still missing several extracted acceptance criteria.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
-    _should_retry = (not _patch1.strip()) or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+    _unaddressed1 = _unaddressed_criteria(_patch1, issue) if _patch1.strip() else []
+    _criteria_starved = len(_unaddressed1) >= 3
+    _should_retry = (
+        (not _patch1.strip())
+        or (_n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _covered_required)
+        or _criteria_starved
+    )
     if not _should_retry:
         _result1["multishot_attempts"] = 1
         return _result1
@@ -4074,13 +4079,14 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
     _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
     _patch2 = _result2.get("patch", "") or ""
+    _unaddressed2 = _unaddressed_criteria(_patch2, issue) if _patch2.strip() else []
 
     _q1 = _multishot_quality_score(_patch1, issue)
     _q2 = _multishot_quality_score(_patch2, issue)
-    if _q2 >= _q1:
+    if len(_unaddressed2) < len(_unaddressed1) or (len(_unaddressed2) == len(_unaddressed1) and _q2 >= _q1):
         _result2["multishot_attempts"] = 2
         _result2["multishot_winner"] = "retry"
-        _result2["multishot_quality"] = (_q1, _q2)
+        _result2["multishot_quality"] = (_q1, _q2, len(_unaddressed1), len(_unaddressed2))
         return _result2
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
