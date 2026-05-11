@@ -9,8 +9,7 @@ does not queue raw `owner/repo@sha` commitments or arbitrary external repos; it
 only runs PR heads from `unarbos/ninja` that are also committed on-chain by a
 registered miner hotkey.
 
-For a short miner-facing checklist, see `miner_readme.txt`. For a detailed
-end-to-end submission guide, see
+For the miner-facing submission guide, see
 [`MINER_SUBMISSION_CHECKLIST.md`](./MINER_SUBMISSION_CHECKLIST.md).
 
 ## What You Are Allowed To Edit
