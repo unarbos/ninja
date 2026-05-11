@@ -90,8 +90,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
+MAX_PRELOADED_CONTEXT_CHARS = 50000
+MAX_PRELOADED_FILES = 18
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -127,7 +127,7 @@ MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
-MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -1063,7 +1063,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -3289,7 +3289,7 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
         parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
     if last_fail:
         parts.append(f"  Last failing command: {last_fail}")
-    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
+    parts.append("  Strategy: produce the smallest alternative diff that still addresses the central issue; do not repeat the same approach.")
     return "\n".join(parts)
 
 
@@ -3409,7 +3409,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # lines. Falls back to line-count rule when no extractable bullets.
         _u1 = len(_unaddressed1)
         _u2 = len(_unaddressed2)
-        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 > _n1 and _u1 > 0)
+        _retry_wins = _u2 + 1 < _u1
 
         if _retry_wins:
             _result2["multishot_attempts"] = 2
