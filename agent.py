@@ -68,7 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "22"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -103,8 +103,8 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+WALL_CLOCK_BUDGET_SECONDS = 175.0  # below historical 180s floor — untouched territory
+WALL_CLOCK_RESERVE_SECONDS = 30.0  # wider reserve so on-disk patch finalises before external kill
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -865,6 +865,37 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+# Paths that almost never appear in reference patches — penalised during
+# context-file ranking so they don't crowd out real source files.
+_INFRA_PATH_PATTERNS: Tuple[str, ...] = (
+    ".github/",
+    "package-lock.json",
+    "yarn.lock",
+    "uv.lock",
+    "pipfile.lock",
+    "poetry.lock",
+    "/node_modules/",
+    "/__pycache__/",
+    "/dist/",
+    "/build/",
+    "/coverage/",
+    ".egg-info/",
+    ".min.js",
+    ".min.css",
+    ".map",
+    "/vendor/",
+)
+
+
+def _is_infra_path(relative_path: str) -> bool:
+    """Return True when a tracked path looks like generated/vendored infrastructure.
+
+    These files rarely appear in reference patches; surfacing them consumes
+    context budget that should go to actual source.
+    """
+    p = "/" + relative_path.lower()
+    return any(pat in p for pat in _INFRA_PATH_PATTERNS)
+
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
@@ -898,6 +929,15 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+
+    # Backtick identifiers that look like concrete file paths (contain a slash
+    # AND a dotted file extension in the last component). These are stronger
+    # targeting signals than plain symbol names.
+    _backtick_concrete_paths: set = {
+        ident for ident in set(_BACKTICK_IDENT_RE.findall(issue))
+        if "/" in ident and "." in ident.split("/")[-1]
+    }
+
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -920,6 +960,15 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Stronger boost when the backtick token is an explicit path with extension.
+        if _backtick_concrete_paths and any(
+            relative_path.endswith(ident) for ident in _backtick_concrete_paths
+        ):
+            score += 50
+        # Penalise infrastructure paths — lockfiles, generated artefacts, vendored
+        # deps rarely appear in reference patches and consume preload budget.
+        if _is_infra_path(relative_path):
+            score -= 40
         if score > 0:
             scored.append((score, relative_path))
 
@@ -2443,7 +2492,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 1  # only retry on truly empty — 1-line fixes are valid answers
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
 
@@ -2508,6 +2557,24 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _should_ship_substantive(elapsed: float, patch_lines: int, step_idx: int) -> bool:
+    """Return True when the agent already has a good-enough patch and further
+    refinement risks losing the wall-clock race more than it can credibly
+    improve quality.
+
+    Fires when all three conditions hold simultaneously:
+      - at least 6 substantive added lines on disk (non-trivial patch)
+      - at least 4 steps taken (model has had a real chance to edit)
+      - at least 95 s elapsed (tight-budget validator rounds have ~120 s total)
+
+    On short rounds (120 s cap) this exits at ~95 s and ships what exists,
+    rather than burning the last 25 s on a refinement that won't complete.
+    On long rounds (600 s cap) the wall-clock condition never fires inside
+    the 175 s budget window, so behaviour is unchanged from a normal exit.
+    """
+    return patch_lines >= 6 and step_idx >= 4 and elapsed >= 95.0
 
 
 # -----------------------------
@@ -2709,6 +2776,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
+        # Wall-clock-aware bail-out: a refinement turn costs a full LLM
+        # round-trip plus optional subprocess, easily 20-40 s. If we don't
+        # have at least 45 s of headroom AND already have a shippable patch,
+        # decline refinement and let the caller declare success on the current
+        # on-disk diff. The hail-mary case (empty patch) is still allowed
+        # under tighter budget because it's the only chance of a non-zero
+        # submission.
+        if patch.strip() and time_remaining() < 45.0:
+            logs.append(
+                "REFINEMENT_SKIP_LOW_BUDGET: "
+                f"remaining={time_remaining():.1f}s -- shipping current patch."
+            )
+            return False
+
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
@@ -2863,6 +2944,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
+                break
+
+            _elapsed_now = time.monotonic() - solve_started_at
+            if _should_ship_substantive(
+                _elapsed_now,
+                _multishot_count_substantive(get_patch(repo)),
+                step,
+            ):
+                logs.append(
+                    f"EARLY_SHIP_SUBSTANTIVE: step={step} elapsed_s={_elapsed_now:.1f}"
+                )
+                success = True
                 break
 
             response_text: Optional[str] = None
