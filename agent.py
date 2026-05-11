@@ -87,7 +87,7 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 270.0  # widen the inner-agent budget by ~15s; emergency fallback still has ~30s headroom before the docker kill at 600s
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -125,10 +125,17 @@ MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/A
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
-                                # Sized to leave room for both a syntax/lint repair and a
-                                # scope nudge (coverage or criteria) on multi-file tasks
-                                # without blowing the wall-clock budget.
+MAX_TOTAL_REFINEMENT_TURNS = 2  # cap total refinement turns across all gates.
+                                # Reduced from 3: the current main bundles many
+                                # gate-builders (lint, contract, empty-arg,
+                                # integration/artifact/dependency nudges,
+                                # patch-safety, failed-verification). At 3
+                                # chained turns the inner agent regularly
+                                # exhausts the wall-clock budget before any
+                                # gate produces a usable edit, returning an
+                                # empty patch. 2 turns leaves room for syntax
+                                # + one scope nudge while keeping the primary
+                                # attempt intact.
                                 # Exempted gates: hail-mary, syntax-fix.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
@@ -1746,8 +1753,12 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
         "Lint issues were found in your patch:\n\n"
         f"{body}\n\n"
         "Emit ONE bash command that fixes these specific issues only. Do NOT change "
-        "the patch's logic. Use `sed -i` or a small `python -c` script. Then "
-        "confirm with <final>lint clean</final>."
+        "the patch's logic. Use `sed -i` or a small `python -c` script. Keep the "
+        "fix surgical: do not rename symbols, reorder imports, reflow whitespace, "
+        "or touch lines outside the reported error positions — those edits would "
+        "drift the patch away from the issue without fixing the lint complaint. "
+        "If a reported error is in code you did not introduce, leave it alone. "
+        "Then confirm with <final>lint clean</final>."
     )
 
 
@@ -3104,8 +3115,13 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "likely target file from the preloaded snippets (or one focused grep). "
         "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
         "TARGETED CODE CHANGE in that file. Do NOT change file modes or "
-        "permissions. Do NOT add comments only as a substitute for code. Make "
-        "a real code edit, then <final> immediately."
+        "permissions. Do NOT add comments only as a substitute for code. "
+        "The edit MUST be executable code (a new statement, a changed "
+        "expression, a new function/method body) — `# TODO`, `// TODO`, "
+        "`pass`-only stubs, `raise NotImplementedError`, or doc-only "
+        "additions do not count. Reference at least one concrete identifier "
+        "or phrase from the issue above so the change is clearly motivated. "
+        "Make a real code edit, then <final> immediately."
     )
 
 
@@ -3140,155 +3156,6 @@ _MULTISHOT_INCOMPLETE_CRITERIA_THRESHOLD = 4  # retry when this many extracted
                                               # catches large-but-incomplete
                                               # patches that the line-count
                                               # threshold misses.
-
-# Emergency single-shot constants
-_EMERGENCY_MAX_TOKENS = 1024
-_EMERGENCY_TIMEOUT_SECONDS = 45
-_EMERGENCY_COMMAND_TIMEOUT = 30
-_EMERGENCY_PROMPT_TARGET_CHARS = 2000
-
-
-def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """Pick the single most-likely-to-need-editing tracked file."""
-    mentioned_paths = _extract_issue_path_mentions(task_text)
-    tracked = set(_tracked_files(repo))
-    for mention in mentioned_paths:
-        normalized = mention.strip("./")
-        if normalized in tracked and _context_file_allowed(normalized):
-            return normalized
-    ranked = _rank_context_files(repo, task_text)
-    for relative_path in ranked:
-        if relative_path in tracked and _context_file_allowed(relative_path):
-            return relative_path
-    for relative_path in tracked:
-        if _context_file_allowed(relative_path):
-            return relative_path
-    return None
-
-
-def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """Stripped-down single-shot prompt: one command, one final, nothing else."""
-    task_view = task_text[:1500]
-    return (
-        "You are a one-shot patch generator. Time and tokens are extremely "
-        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
-        f"TASK:\n{task_view}\n\n"
-        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
-        "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in the target file consistent with the task. Use "
-        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
-        "only. Do NOT change file modes. Make a real code edit.\n\n"
-        "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
-    )
-
-
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """Single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-
-    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
-    repo: Optional[Path] = None
-    try:
-        repo = _repo_path(repo_path_value)
-        ensure_git_repo(repo)
-        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-
-        target = _emergency_pick_target(repo, task_text)
-        if target is None:
-            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict()
-
-        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-        prompt = _emergency_build_prompt(target, snippet, task_text)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response_text, _, _ = chat_completion(
-                messages=messages,
-                model=model_name,
-                api_base=base,
-                api_key=key,
-                max_tokens=_EMERGENCY_MAX_TOKENS,
-                timeout=_EMERGENCY_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-        except Exception as exc:
-            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
-            patch_text = get_patch(repo) if repo is not None else ""
-            return AgentResult(
-                patch=patch_text, logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=bool(patch_text.strip()),
-            ).to_dict()
-
-        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
-        commands = extract_commands(response_text)
-        if not commands:
-            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
-        for cmd in commands[:2]:
-            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
-            logs.append(format_observation(result))
-
-        patch_text = get_patch(repo)
-        return AgentResult(
-            patch=patch_text,
-            logs=_safe_join_logs(logs),
-            steps=1,
-            cost=0.0,
-            success=bool(patch_text.strip()),
-        ).to_dict()
-    except Exception:
-        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
-        patch_text = ""
-        if repo is not None:
-            try:
-                patch_text = get_patch(repo)
-            except Exception:
-                pass
-        return AgentResult(
-            patch=patch_text, logs=_safe_join_logs(logs),
-            steps=0, cost=None, success=False,
-        ).to_dict()
-
-
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test error output."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
 
 # v66: emergency single-shot constants (adapted from PR518)
 _EMERGENCY_MAX_TOKENS = 1024
@@ -3816,8 +3683,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 syntax_fix_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors[:4]),
                 )
                 return True
 
