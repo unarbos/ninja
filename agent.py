@@ -118,6 +118,8 @@ MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look una
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
+MAX_CONSECUTIVE_IDENTICAL_COMMANDS = 2
+MIN_SUCCESSFUL_VERIFICATIONS = 1
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -2545,6 +2547,11 @@ def _multishot_capture_head(repo: Path) -> Optional[str]:
     return None
 
 
+def _command_signature(command: str) -> str:
+    """Normalize command text for stable duplicate detection."""
+    return " ".join((command or "").strip().split())
+
+
 def _multishot_revert(repo: Path, head: Optional[str]) -> None:
     try:
         if head:
@@ -2736,7 +2743,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        if _n2 > _n1 or (
+            _n2 == _n1
+            and bool(_result2.get("success"))
+            and not bool(_result1.get("success"))
+        ):
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -2796,6 +2807,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
+    last_command_sig = ""
+    consecutive_identical_commands = 0
+    successful_verifications = 0
+    verification_runner_unavailable = False
     solve_started_at = time.monotonic()
 
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
@@ -3074,6 +3089,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not commands:
                 if final is not None:
+                    patch = get_patch(repo)
+                    if (
+                        patch.strip()
+                        and successful_verifications < MIN_SUCCESSFUL_VERIFICATIONS
+                        and not verification_runner_unavailable
+                    ):
+                        logs.append(
+                            "\nFINAL_BLOCKED:\nPatch exists but no successful verification observed yet."
+                        )
+                        messages.append({"role": "assistant", "content": response_text})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Before finalizing, run at least one focused verification command "
+                                    "(targeted test/build/lint for changed files). "
+                                    "If tooling is unavailable, run a probe and report the concrete "
+                                    "unavailability signal from command output."
+                                ),
+                            }
+                        )
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
@@ -3100,10 +3137,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                command_sig = _command_signature(command)
+                if command_sig and command_sig == last_command_sig:
+                    consecutive_identical_commands += 1
+                else:
+                    consecutive_identical_commands = 1
+                    last_command_sig = command_sig
+                if (
+                    command_sig
+                    and consecutive_identical_commands > MAX_CONSECUTIVE_IDENTICAL_COMMANDS
+                ):
+                    observations.append(
+                        f"OBSERVATION {command_index}/{len(command_batch)}:\n"
+                        f"Command blocked: identical command repeated "
+                        f"{consecutive_identical_commands} times ('{command_sig[:220]}'). "
+                        "Use a different high-signal action (edit, focused verification, or diff review)."
+                    )
+                    continue
+
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+                if _looks_like_verification_command(command):
+                    if _looks_like_successful_test_output(observation, command):
+                        successful_verifications += 1
+                    elif _looks_like_runner_unavailable(observation):
+                        verification_runner_unavailable = True
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -3136,6 +3196,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
 
             if final is not None and get_patch(repo).strip():
+                if (
+                    successful_verifications < MIN_SUCCESSFUL_VERIFICATIONS
+                    and not verification_runner_unavailable
+                ):
+                    logs.append(
+                        "\nFINAL_BLOCKED:\nPatch exists but no successful verification observed yet."
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Before finalizing, run one focused verification command. "
+                                "If the runner/tooling is unavailable, capture that concrete signal "
+                                "via command output and then summarize."
+                            ),
+                        }
+                    )
+                    continue
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
@@ -3269,6 +3347,22 @@ def _looks_like_patch_review_command(command: str, result: CommandResult) -> boo
         re.search(r"\bgit\s+(diff|status)\b", lowered)
         or re.search(r"\bgit\s+show\s+--stat\b", lowered)
     )
+
+
+def _looks_like_runner_unavailable(observation: str) -> bool:
+    lower = observation.lower()
+    markers = [
+        "command not found",
+        "no such file or directory",
+        "module not found",
+        "no module named",
+        "not installed",
+        "pytest: not found",
+        "npm: command not found",
+        "pnpm: command not found",
+        "yarn: command not found",
+    ]
+    return any(marker in lower for marker in markers)
 
 
 def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
