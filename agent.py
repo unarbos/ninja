@@ -115,7 +115,8 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_HAIL_MARY_TURNS = 2    # last-resort: force a real edit when patch is empty after everything
+MIN_SUBSTANTIVE_ADDED_LINES = 3  # hail-mary fires when substantive added lines fall below this
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -866,6 +867,66 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
+def _definer_path_prelude(repo: Path, issue_text: str, tracked_set: set) -> List[str]:
+    """Return paths that *define* (not just mention) identifiers from the issue.
+
+    Uses `git grep -lE` with a definition-site pattern per identifier. Bounded
+    to max 8 identifiers, 2 s per grep, and 200 total path-hits so the call is
+    always cheap. Results are prepended to the ranked list in `_rank_context_files`
+    so definer files always make the MAX_PRELOADED_FILES cut before the
+    score-sorted remainder.
+    """
+    idents: set = set(_BACKTICK_IDENT_RE.findall(issue_text))
+    for term in _issue_terms(issue_text):
+        if (
+            len(term) >= 4
+            and term[0].isalpha()
+            and ("_" in term or any(c.isupper() for c in term[1:]))
+        ):
+            idents.add(term)
+    if not idents:
+        return []
+    idents_bounded = list(idents)[:8]
+    ordered: List[str] = []
+    seen: set = set()
+    total_hits = 0
+    for ident in idents_bounded:
+        if total_hits >= 200:
+            break
+        # Match definition-site lines across common languages.
+        def_pattern = (
+            r"^[[:space:]]*(def|class|function|"
+            r"export[[:space:]]+(default[[:space:]]+)?(function|class)|"
+            r"const|let|var)[[:space:]]+" + re.escape(ident) + r"\b"
+        )
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-lE", "--", def_pattern],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for raw_line in proc.stdout.splitlines():
+            relative_path = raw_line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            if relative_path not in seen:
+                seen.add(relative_path)
+                ordered.append(relative_path)
+            total_hits += 1
+            if total_hits >= 200:
+                break
+    return ordered[:8]
+
+
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
     if not tracked:
@@ -931,7 +992,10 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             continue
         seen.add(relative_path)
         ranked.append(relative_path)
-    return ranked
+    # Prepend identifier-definer paths so they always make the preload cut.
+    definers = _definer_path_prelude(repo, issue, tracked_set)
+    prelude: List[str] = [p for p in definers if p not in seen]
+    return prelude + ranked
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -1883,6 +1947,55 @@ def _patch_added_text(patch: str) -> str:
     return "\n".join(out).lower()
 
 
+# Comment-prefix strings across common languages: Python, C-family, HTML/JSX,
+# and Lisp/config formats. Used by _patch_substantive_added_lines to skip
+# purely-comment added lines when counting substantive edits.
+_COMMENT_PREFIXES: Tuple[str, ...] = ("#", "//", "/*", "*", "<!--", ";")
+
+
+def _patch_substantive_added_lines(patch: str) -> int:
+    """Count added lines that are neither blank nor pure comment.
+
+    Treats any added line as substantive when it lacks a recognised comment
+    prefix — deliberately language-agnostic so the gate works for JS, TS,
+    Go, Rust, Shell, etc., not only Python.
+    """
+    n = 0
+    for raw in patch.splitlines():
+        if not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        body = raw[1:].strip()
+        if not body:
+            continue
+        if any(body.startswith(p) for p in _COMMENT_PREFIXES):
+            continue
+        n += 1
+    return n
+
+
+def _patch_is_surgical(patch: str) -> bool:
+    """True when the patch touches exactly one file, adds at most 6 substantive
+    lines, and spans at most 2 hunks.
+
+    Coverage-nudge and criteria-nudge are disabled for surgical patches because
+    broadening a 1-file / <=6-line fix almost always regresses similarity against
+    the reference — the reference is similarly surgical and the nudge pushes the
+    model to add scope that doesn't appear in the reference diff.
+    """
+    files: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++ b/") or line.startswith("--- a/"):
+            files.add(line[6:])
+        if len(files) > 1:
+            break
+    if len(files) != 1:
+        return False
+    if _patch_substantive_added_lines(patch) > 6:
+        return False
+    hunks = sum(1 for line in patch.splitlines() if line.startswith("@@"))
+    return hunks <= 2
+
+
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines. The judge frequently dings the king for missing N of M criteria;
@@ -2059,6 +2172,8 @@ Treat the issue as a contract. Extract every requirement before editing — main
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
 Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
+
+Definition of done: every function or method you introduce or modify must implement observable behavior. No stub bodies (pass / TODO / raise NotImplementedError) and no functions that exist only to be imported but never called. The verifier treats unimplemented public symbols as failure.
 
 ====================================================================
 INSPECTION STRATEGY
@@ -2510,6 +2625,22 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _attempt2_extended_budget(envelope_remaining: float) -> float:
+    """Compute how much wall-clock budget attempt 2 may use.
+
+    When attempt 1 ends quickly (empty patch, early hail-mary), there is often
+    350+ seconds left in the _MULTISHOT_TOTAL_BUDGET envelope, yet the second
+    attempt would still self-limit to WALL_CLOCK_BUDGET_SECONDS. This function
+    allows attempt 2 to consume up to 90 extra seconds beyond the default cap
+    while always leaving WALL_CLOCK_RESERVE_SECONDS + 5 s for diff capture.
+    """
+    cap = max(
+        WALL_CLOCK_BUDGET_SECONDS,
+        envelope_remaining - WALL_CLOCK_RESERVE_SECONDS - 5.0,
+    )
+    return min(cap, WALL_CLOCK_BUDGET_SECONDS + 90.0)
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2601,7 +2732,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _elapsed2 = time.monotonic() - _multishot_started
+        _attempt2_budget = _attempt2_extended_budget(_multishot_total_budget - _elapsed2)
+        kwargs2 = {**kwargs, "_attempt_budget_override": _attempt2_budget}
+        _result2 = _solve_attempt(**kwargs2)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2649,6 +2783,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    _attempt_budget = kwargs.get("_attempt_budget_override") or WALL_CLOCK_BUDGET_SECONDS
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2674,7 +2809,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
     # return whatever patch is already on disk.
     def time_remaining() -> float:
-        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
+        return _attempt_budget - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2713,7 +2848,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
-        if not patch.strip():
+        if not patch.strip() or _patch_substantive_added_lines(patch) < MIN_SUBSTANTIVE_ADDED_LINES:
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
@@ -2777,7 +2912,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            if missing:
+            if missing and not _patch_is_surgical(patch):
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
@@ -2795,7 +2930,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
+            if unaddressed and not _patch_is_surgical(patch):
                 criteria_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
