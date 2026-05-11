@@ -1464,6 +1464,12 @@ _NEW_FILE_STRUCT_RE = re.compile(
     r"\b(?:reorganize|reorganise|extract)\s+(?:into|as)\b",
     re.IGNORECASE,
 )
+_NEW_NAMED_SURFACE_RE = re.compile(
+    r"\b(?:create|add|implement|introduce|build|extract)\s+(?:a\s+|an\s+|the\s+|new\s+)?"
+    r"(?:component|page|module|class|view|service|hook|store|helper|util)\s+"
+    r"(?:called\s+|named\s+)?[`\"']?([A-Z][A-Za-z0-9_]{2,60})[`\"']?",
+    re.IGNORECASE,
+)
 
 
 def _patch_new_files(patch: str) -> List[str]:
@@ -1481,6 +1487,21 @@ def _patch_new_files(patch: str) -> List[str]:
     return out
 
 
+def _extract_required_named_surfaces(issue_text: str) -> List[str]:
+    """Requested class/component/module names that usually imply a new file."""
+    out: List[str] = []
+    seen: set = set()
+    for match in _NEW_NAMED_SURFACE_RE.finditer(issue_text or ""):
+        name = match.group(1).strip("`\"'")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= 6:
+            break
+    return out
+
+
 def _required_new_files_missing(patch: str, issue_text: str) -> List[str]:
     """Explicit create/extract/split requests whose named files are still absent."""
     if not issue_text:
@@ -1488,7 +1509,8 @@ def _required_new_files_missing(patch: str, issue_text: str) -> List[str]:
     if not (_NEW_FILE_VERB_RE.search(issue_text) or _NEW_FILE_STRUCT_RE.search(issue_text)):
         return []
     mentioned = _extract_issue_path_mentions(issue_text)
-    if not mentioned:
+    named_surfaces = _extract_required_named_surfaces(issue_text)
+    if not mentioned and not named_surfaces:
         return []
     new_files = set(_patch_new_files(patch))
     changed = set(_patch_changed_files(patch))
@@ -1499,6 +1521,15 @@ def _required_new_files_missing(patch: str, issue_text: str) -> List[str]:
         if path in changed or any(f.endswith("/" + path) for f in changed):
             continue
         missing.append(path)
+    all_paths = new_files | changed
+    added_text = _patch_added_text(patch)
+    for name in named_surfaces:
+        name_lower = name.lower()
+        if name in added_text:
+            continue
+        if any(Path(path).stem.lower() == name_lower for path in all_paths):
+            continue
+        missing.append(name)
     return missing[:6]
 
 
@@ -4650,12 +4681,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
-        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        _initial_user = _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)
         if _multishot_memo:
             _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
         initial_preload_stripped = False
 
