@@ -93,7 +93,7 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
 MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_COMMANDS_PER_RESPONSE = 16
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 260.0  # v75: expanded for deeper refinement
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -111,12 +111,12 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 # loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
-MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_SYNTAX_FIX_TURNS = 2   # v75: second pass catches cascading errors
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_COVERAGE_NUDGES = 2    # v75: deeper completeness checks
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # v75: extra turn for completeness
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
