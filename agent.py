@@ -4430,6 +4430,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
+        try:
+            return _maybe_queue_refinement_inner(assistant_text)
+        except Exception as exc:
+            logs.append(f"REFINEMENT_GATE_ERROR:\n{type(exc).__name__}: {exc}")
+            return False
+
+    def _maybe_queue_refinement_inner(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
         Returns True when the loop should continue (a turn was queued); False
@@ -4477,8 +4484,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 syntax_fix_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -4540,15 +4547,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_integration_nudge_prompt(integration, issue),
-                    f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
 
