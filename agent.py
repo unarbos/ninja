@@ -118,6 +118,7 @@ MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look una
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
+MAX_REFINEMENT_REORDERS = 1    # at most one adaptive gate reorder per solve cycle
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -206,6 +207,51 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+def _classify_output_shape(text: str) -> str:
+    """Classify command output to guide truncation strategy.
+
+    Returns one of: traceback, test_summary, json_blob, stream, generic.
+    Tracebacks and test summaries put the actionable content at the tail;
+    JSON blobs and high-repetition streams are head-heavy; everything else
+    uses the symmetric center-split fallback.
+    """
+    tail = text[-1200:]
+    head = text[:600]
+    if re.search(r"Traceback \(most recent call last\)", text):
+        return "traceback"
+    if re.search(r"^\s*(FAILED|PASSED|ERROR|=+\s*FAILURES)", tail, re.MULTILINE):
+        return "test_summary"
+    if head.lstrip().startswith(("{", "[")) and tail.rstrip().endswith(("}", "]")):
+        return "json_blob"
+    if text.count("\n") > 400 and len(set(text.splitlines()[:50])) < 20:
+        return "stream"
+    return "generic"
+
+
+def _smart_truncate(text: str, max_chars: int) -> str:
+    """Shape-aware truncation that preserves the actionable portion of output.
+
+    Dispatches to a per-class strategy rather than always center-splitting,
+    so tracebacks keep their failing frame and test output keeps its summary.
+    Falls back to the same center-split as _truncate for generic content.
+    """
+    if len(text) <= max_chars:
+        return text
+    kind = _classify_output_shape(text)
+    omitted = len(text) - max_chars
+    omit_marker = f"\n\n...[truncated {omitted} chars]...\n\n"
+    if kind in ("traceback", "test_summary"):
+        h = max_chars // 4
+        t = max_chars - h
+        return text[:h] + omit_marker + text[-t:]
+    if kind in ("json_blob", "stream"):
+        h = (3 * max_chars) // 4
+        t = max_chars - h
+        return text[:h] + omit_marker + text[-t:]
+    half = max_chars // 2
+    return text[:half] + omit_marker + text[-half:]
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -425,8 +471,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_smart_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_smart_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -441,8 +487,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_smart_truncate(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_smart_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -765,6 +811,47 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+def _file_contains(path: Path, substr: str) -> bool:
+    """Return True if the file at `path` contains `substr`, False on any error."""
+    try:
+        return substr in path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+
+def _safe_load_json(path: Path) -> Any:
+    """Load JSON from `path`, returning None on any parse or IO error."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _detect_test_runner(repo_path: str) -> Optional[str]:
+    """Cheaply detect the project's primary test runner from config files.
+
+    Returns a ready-to-run test command string, or None when no recognizable
+    runner config is found. Runs once at solve-start and injects the result
+    into the initial prompt so the model picks the right verification command
+    without a trial-and-error turn.
+    """
+    root = Path(repo_path)
+    if (root / "pytest.ini").exists() or _file_contains(root / "pyproject.toml", "[tool.pytest"):
+        return "pytest -x --tb=short"
+    if (root / "package.json").exists():
+        pj = _safe_load_json(root / "package.json") or {}
+        scripts = pj.get("scripts") if isinstance(pj, dict) else None
+        if isinstance(scripts, dict) and "test" in scripts:
+            return "npm test --silent"
+    if (root / "go.mod").exists():
+        return "go test ./..."
+    if (root / "Cargo.toml").exists():
+        return "cargo test --quiet"
+    if (root / "Makefile").exists() and _file_contains(root / "Makefile", "test:"):
+        return "make test"
+    return None
+
+
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -796,6 +883,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+
+    # Augment with call-site regions for extracted symbols. Caller files are
+    # appended as extra entries so _read_context_file can extract focused windows
+    # around the call sites. Deduplicate against files already in the list.
+    caller_anchors = _find_identifier_callers(repo, needles)
+    _caller_files_seen = set(files)
+    for _cf, _lo, _hi in caller_anchors:
+        if _cf not in _caller_files_seen:
+            files.append(_cf)
+            _caller_files_seen.add(_cf)
 
     parts: List[str] = []
     included: List[str] = []
@@ -1993,6 +2090,82 @@ def _symbol_grep_hits(
     return hits
 
 
+def _find_identifier_callers(
+    repo: Path,
+    symbols: List[str],
+    *,
+    max_slices: int = 6,
+    ctx_lines: int = 8,
+) -> List[Tuple[str, int, int]]:
+    """Locate call sites for each symbol and return focused region anchors.
+
+    For each symbol we search for three patterns: function-call form
+    (`sym(`), attribute-access form (`.sym`), and import form. This surfaces
+    call sites that the definer-focused ranking misses, which is critical when
+    the issue asks to rename or change a public function whose callers are
+    spread across the repo.
+
+    Returns a deduplicated list of `(relative_path, line_start, line_end)`
+    tuples capped at `max_slices` entries. The caller appends these to the
+    preload file list so `_read_context_file` can extract the relevant windows.
+    """
+    if not symbols:
+        return []
+
+    _tracked = set(_tracked_files(repo))
+    results: List[Tuple[str, int, int]] = []
+    seen_locs: set = set()
+
+    for sym in symbols[:8]:
+        if not sym or len(sym) < 3:
+            continue
+        patterns = [
+            rf"\b{re.escape(sym)}\(",
+            rf"\.{re.escape(sym)}\b",
+            rf"^\s*(from|import)\s+.*\b{re.escape(sym)}\b",
+        ]
+        for pat in patterns:
+            try:
+                proc = subprocess.run(
+                    ["rg", "-n", "--no-heading", pat],
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=4,
+                )
+            except Exception:
+                break
+            if proc.returncode not in (0, 1):
+                break
+            for raw_line in proc.stdout.splitlines():
+                if len(results) >= max_slices:
+                    break
+                try:
+                    parts = raw_line.split(":", 2)
+                    if len(parts) < 2:
+                        continue
+                    rel = parts[0].strip()
+                    lineno = int(parts[1])
+                except (ValueError, IndexError):
+                    continue
+                if rel not in _tracked or not _context_file_allowed(rel):
+                    continue
+                key = (rel, lineno)
+                if key in seen_locs:
+                    continue
+                seen_locs.add(key)
+                lo = max(1, lineno - ctx_lines)
+                hi = lineno + ctx_lines
+                results.append((rel, lo, hi))
+            if len(results) >= max_slices:
+                break
+        if len(results) >= max_slices:
+            break
+
+    return results
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -2510,6 +2683,71 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _pick_focused_target(path: str, query: str) -> str:
+    """Deterministically pick the single most-likely file for a focused retry.
+
+    Returns the top-ranked file from `_rank_context_files`, or an empty string
+    when the repo has no tracked files. Used by `_solve_focused_continuation`
+    to narrow the model's scope to one file when the first attempt produced
+    no patch at all.
+    """
+    try:
+        ranked = _rank_context_files(_repo_path(path), query)
+        return ranked[0] if ranked else ""
+    except Exception:
+        return ""
+
+
+def _solve_focused_continuation(
+    prior_commands: List[str],
+    target_file: str,
+    remaining: float,
+    **kwargs: Any,
+) -> str:
+    """Bounded mini-loop that runs when attempt1 produces an empty patch.
+
+    Receives the list of commands attempted in the first pass (to avoid
+    repetition) and the deterministically chosen target file. Runs a
+    5-step inner solve attempt with a reduced wall-clock budget and a
+    focused prompt addendum so the model doesn't re-explore from scratch.
+
+    Returns the patch string produced (possibly empty). The caller decides
+    whether to promote it or fall through to the normal revert-and-retry.
+    """
+    if remaining <= 0:
+        return ""
+
+    amended_kwargs = dict(kwargs)
+    amended_kwargs["max_steps"] = 5
+
+    _memo_lines: List[str] = []
+    if prior_commands:
+        _memo_lines.append(
+            "PREVIOUSLY ATTEMPTED COMMANDS (do not repeat these, they produced no patch):"
+        )
+        for cmd in prior_commands[:12]:
+            _memo_lines.append(f"  {cmd}")
+    if target_file:
+        _memo_lines.append(f"Focus exclusively on file: {target_file}")
+    if _memo_lines:
+        _addendum = "\n" + "\n".join(_memo_lines)
+        amended_kwargs["issue"] = (kwargs.get("issue") or "") + _addendum
+
+    _budget_save = WALL_CLOCK_BUDGET_SECONDS
+    try:
+        import builtins as _builtins
+        _old = globals().get("WALL_CLOCK_BUDGET_SECONDS")
+        globals()["WALL_CLOCK_BUDGET_SECONDS"] = min(remaining, _budget_save)
+        try:
+            result = _solve_attempt(**amended_kwargs)
+        finally:
+            globals()["WALL_CLOCK_BUDGET_SECONDS"] = _budget_save
+    except Exception:
+        return ""
+
+    return result.get("patch", "") or ""
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2593,6 +2831,29 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _result1["multishot_attempts"] = 1
             return _result1
 
+        # Focused continuation: when attempt1 produced no patch at all and
+        # enough time remains, run a tight 5-step mini-loop targeting the
+        # most-likely file with a memo of what was already tried. This is
+        # distinct from attempt2 (which is a full reset) and from a
+        # single-shot fallback (which has no cross-attempt signal transfer).
+        _elapsed = time.monotonic() - _multishot_started
+        _remaining = _multishot_total_budget - _elapsed
+        if not _patch1.strip() and _remaining > 75.0:
+            _patch_focused = _solve_focused_continuation(
+                prior_commands=[],
+                target_file=_pick_focused_target(kwargs.get("repo_path", ""), kwargs.get("issue", "")),  # noqa: E501
+                remaining=min(60.0, _remaining - 15.0),
+                **kwargs,
+            )
+            if _patch_focused.strip():
+                _patch1 = _patch_focused
+                _n1 = _multishot_count_substantive(_patch1)
+                if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+                    _result1["patch"] = _patch1
+                    _result1["multishot_attempts"] = 1
+                    _result1["multishot_focused"] = True
+                    return _result1
+
         _elapsed = time.monotonic() - _multishot_started
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
@@ -2638,6 +2899,67 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+def _quick_lint_signal(patch_text: str) -> int:
+    """Count trivially-bad patterns in patch additions.
+
+    Returns an integer score: higher means the patch additions have more
+    easily-detectable style noise (unused imports, overlong lines, trailing
+    whitespace lines). Used by the adaptive dispatcher as a proxy for whether
+    a polish turn would be worthwhile. Does NOT shell out to ruff or eslint —
+    the regex pass is fast enough to call inline without burning budget.
+    """
+    count = 0
+    _long_line = 120
+    for raw in patch_text.splitlines():
+        if not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        line = raw[1:]
+        if re.search(r"^\s*import\s+\w+\s*$", line) or re.search(r"^from\s+\S+\s+import\s+\*", line):
+            count += 1
+        if len(line) > _long_line and not line.strip().startswith(("#", "//")):
+            count += 1
+        if line != line.rstrip() and line.strip():
+            count += 1
+    return count
+
+
+def _score_next_refinement(
+    *,
+    is_empty: bool,
+    has_syntax_error: bool,
+    has_test_failure: bool,
+    criteria_unaddressed_count: int,
+    coverage_gap_paths: List[str],
+    patch_text: str,
+    fired: set,
+) -> List[str]:
+    """Return the refinement gate names ordered by estimated utility.
+
+    The adaptive dispatcher calls this once before the fixed-order chain
+    (up to MAX_REFINEMENT_REORDERS times per solve) to decide which gate
+    to fire first. Gates not yet fired are ordered by priority score so the
+    highest-leverage correction happens before the turn cap is reached.
+    Hail-mary is always listed first when the patch is empty because it is
+    exempt from the total cap and is the only guaranteed recovery path.
+    """
+    candidates: List[Tuple[str, int]] = []
+    if is_empty:
+        candidates.append(("hail_mary", 200))
+    if has_syntax_error:
+        candidates.append(("syntax", 100))
+    if has_test_failure:
+        candidates.append(("test", 90))
+    if criteria_unaddressed_count >= 2:
+        candidates.append(("criteria", 80))
+    if coverage_gap_paths:
+        candidates.append(("coverage", 70))
+    if _quick_lint_signal(patch_text) > 3:
+        candidates.append(("polish", 40))
+    if not is_empty:
+        candidates.append(("self_check", 30))
+    return [name for name, _ in sorted(candidates, key=lambda x: -x[1]) if name not in fired]
+
+
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     """Original solve loop, callable through kwargs to avoid re-stating the
     validator-protected parameter signature outside of solve()."""
@@ -2663,6 +2985,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    refinement_reorders_used = 0     # adaptive dispatcher: at most MAX_REFINEMENT_REORDERS reorders
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2706,7 +3029,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, refinement_reorders_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2728,6 +3051,69 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
+
+        # Adaptive dispatcher: before falling into the fixed-order chain, ask
+        # _score_next_refinement which gate has the highest utility. If it
+        # suggests something other than polish (e.g. syntax errors are present),
+        # pre-empt polish and fire the urgent gate first.  We only reorder once
+        # per solve (MAX_REFINEMENT_REORDERS) to avoid over-spending on scoring.
+        if refinement_reorders_used < MAX_REFINEMENT_REORDERS and polish_turns_used == 0:
+            _syntax_pre = _check_syntax(repo, patch)
+            _test_pre = _select_companion_test_failure(repo, patch) if test_fix_turns_used < MAX_TEST_FIX_TURNS else None
+            _missing_pre = _uncovered_required_paths(patch, issue)
+            _unaddr_pre = _unaddressed_criteria(patch, issue)
+            _fired_pre: set = set()
+            if polish_turns_used >= MAX_POLISH_TURNS:
+                _fired_pre.add("polish")
+            _priority = _score_next_refinement(
+                is_empty=False,
+                has_syntax_error=bool(_syntax_pre),
+                has_test_failure=bool(_test_pre),
+                criteria_unaddressed_count=len(_unaddr_pre),
+                coverage_gap_paths=_missing_pre,
+                patch_text=patch,
+                fired=_fired_pre,
+            )
+            _top = _priority[0] if _priority else ""
+            if _top and _top != "polish":
+                refinement_reorders_used += 1
+                if _top == "syntax" and _syntax_pre and syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+                    syntax_fix_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_syntax_fix_prompt(_syntax_pre),
+                        "SYNTAX_FIX_QUEUED (dispatched):\n  " + "\n  ".join(_syntax_pre),
+                    )
+                    return True
+                if _top == "test" and _test_pre and test_fix_turns_used < MAX_TEST_FIX_TURNS:
+                    _tp, _to = _test_pre
+                    test_fix_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_test_fix_prompt(_tp, _to),
+                        f"TEST_FIX_QUEUED (dispatched):\n  {_tp}",
+                    )
+                    return True
+                if _top == "criteria" and _unaddr_pre and criteria_nudges_used < MAX_CRITERIA_NUDGES:
+                    criteria_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_criteria_nudge_prompt(_unaddr_pre, issue),
+                        "CRITERIA_NUDGE_QUEUED (dispatched):\n  " + " | ".join(c[:60] for c in _unaddr_pre[:4]),
+                    )
+                    return True
+                if _top == "coverage" and _missing_pre and coverage_nudges_used < MAX_COVERAGE_NUDGES:
+                    coverage_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_coverage_nudge_prompt(_missing_pre, issue),
+                        "COVERAGE_NUDGE_QUEUED (dispatched):\n  " + ", ".join(_missing_pre),
+                    )
+                    return True
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
@@ -2823,10 +3209,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        _runner_hint = _detect_test_runner(repo_path)
+        _ctx_with_hint = preloaded_context
+        if _runner_hint:
+            _ctx_with_hint = (
+                preloaded_context
+                + f"\n\nProject test runner hint: {_runner_hint}"
+            )
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, _ctx_with_hint)},
         ]
         initial_preload_stripped = False
 
