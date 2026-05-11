@@ -2167,7 +2167,9 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+
+When the issue lists numbered requirements or bullet points, your patch MUST address EVERY item. Leaving any requirement unaddressed scores zero for that item.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2519,6 +2521,52 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
+def _count_issue_sections(issue: str) -> list:
+    """Extract numbered requirements or bullet points from the issue text.
+
+    Returns a list of requirement strings. Used to detect when the patch
+    addresses fewer sections than the issue specifies.
+    """
+    import re as _re_sec
+    # Numbered items: "1. ...", "2. ...", etc.
+    numbered = _re_sec.findall(r"(?m)^\s*\d+\.\s+(.+)$", issue)
+    if len(numbered) >= 2:
+        return numbered[:8]
+    # Bullet items: "- ...", "* ...", etc.
+    bullets = _re_sec.findall(r"(?m)^\s*[-*]\s+(.+)$", issue)
+    if len(bullets) >= 2:
+        return bullets[:8]
+    return []
+
+
+def _sections_covered(sections: list, patch: str) -> list:
+    """Return sections whose keywords are absent from the patch diff.
+
+    A section is considered covered if >= 1 of its words (>4 chars) appears
+    in the patch's added lines.
+    """
+    added_text = " ".join(
+        line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")
+    ).lower()
+    missing = []
+    for sec in sections:
+        words = [w for w in sec.lower().split() if len(w) > 4]
+        if words and not any(w in added_text for w in words[:3]):
+            missing.append(sec[:60])
+    return missing
+
+
+def build_section_coverage_prompt(missing: list) -> str:
+    """Prompt the model to address uncovered issue requirements."""
+    bullets = "\n".join(f"  - {m}" for m in missing[:4])
+    return (
+        "Issue-requirement gap -- these items appear in the issue but not in your patch:\n"
+        f"{bullets}\n\n"
+        "Add the minimal code changes to address each uncovered requirement. "
+        "End with <final>summary</final>."
+    )
+
+
 def solve(
     repo_path: str,
     issue: str,
@@ -2661,6 +2709,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    _section_nudge_used = [False]  # v17: issue-section coverage gate
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2805,6 +2854,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v17: issue-section coverage gate -- fires once after criteria/coverage
+        if not _section_nudge_used[0] and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            _sections = _count_issue_sections(issue)
+            if _sections:
+                _missing_secs = _sections_covered(_sections, patch)
+                if len(_missing_secs) >= 2:
+                    _section_nudge_used[0] = True
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(assistant_text, build_section_coverage_prompt(_missing_secs), "SECTION_COVERAGE_GAP")
+                    return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2830,7 +2890,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
