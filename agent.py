@@ -127,7 +127,8 @@ MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
-MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 5
+_SUBSTANTIVE_PATCH_EARLY_EXIT_LINES = 50
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -1821,9 +1822,10 @@ def _frontend_coverage_gap(task_text: str, patch: str) -> str:
     if not signal:
         return ""
     diff_files = re.findall(r"^(?:\+\+\+|---)\s+[ab]/(\S+)", patch, re.M)
-    if not diff_files:
+    distinct_files = {f for f in diff_files if f != "/dev/null"}
+    if len(distinct_files) < 2:
         return ""
-    changed_exts = {os.path.splitext(f)[1].lower() for f in diff_files if f != "/dev/null"}
+    changed_exts = {os.path.splitext(f)[1].lower() for f in distinct_files}
     changed_exts.discard("")
     if not changed_exts:
         return ""
@@ -2763,7 +2765,9 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+
+When a follow-up corrective message arrives mid-conversation, add only the missing piece it names. Do not rewrite logic that is already correct, do not refactor surrounding code, do not expand scope. Smaller, surgical follow-ups are always better than ambitious rewrites.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -3542,9 +3546,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
+        if (
+            total_refinement_turns_used >= 1
+            and _multishot_count_substantive(patch) >= _SUBSTANTIVE_PATCH_EARLY_EXIT_LINES
+        ):
             return False
 
         if polish_turns_used < MAX_POLISH_TURNS:
@@ -3652,7 +3660,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             and criteria_nudges_used > 0
         ):
             strict_missing = _strict_unaddressed_items(patch, issue)
-            if len(strict_missing) >= 2:
+            if len(strict_missing) >= 3:
                 strict_criteria_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
