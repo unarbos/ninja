@@ -106,11 +106,6 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 REFINEMENT_PATCH_RETURN_RESERVE_SECONDS = 45.0
-_LLM_HEADROOM_SECONDS = 5.0
-_LLM_TIMEOUT_FLOOR = 5
-_LLM_TIMEOUT_CEILING = 120
-_CMD_HEADROOM_SECONDS = 2.0
-_CMD_TIMEOUT_FLOOR = 3
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -151,21 +146,6 @@ _CONTRACT_NAME_DENYLIST = {
     "beforeEach",
     "afterEach",
 }
-
-
-def _remaining_wall_clock(started_at: float) -> float:
-    return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - started_at)
-
-
-def _adaptive_llm_timeout(started_at: float, default: int = _LLM_TIMEOUT_CEILING) -> int:
-    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _LLM_HEADROOM_SECONDS
-    return max(_LLM_TIMEOUT_FLOOR, min(default, int(remaining)))
-
-
-def _adaptive_command_timeout(started_at: float, default: int) -> int:
-    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _CMD_HEADROOM_SECONDS
-    return max(_CMD_TIMEOUT_FLOOR, min(default, int(remaining)))
-
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -3095,9 +3075,11 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
+<!-- preloaded-context-begin -->
 Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
 
 {preloaded_context}
+<!-- preloaded-context-end -->
 """
 
     return f"""Fix this issue:
@@ -3118,6 +3100,23 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+_PRELOAD_BLOCK_RE = re.compile(
+    r"<!-- preloaded-context-begin -->.*?<!-- preloaded-context-end -->",
+    re.DOTALL,
+)
+
+
+def _strip_preloaded_section(initial_user_text: str, modified_files: Optional[List[str]] = None) -> str:
+    """Replace bulky preloaded snippets after the model has already seen them."""
+    if not _PRELOAD_BLOCK_RE.search(initial_user_text):
+        return initial_user_text
+    if modified_files:
+        replacement = "Preloaded snippets omitted. Files changed so far: " + ", ".join(modified_files)
+    else:
+        replacement = "Preloaded snippets omitted to keep later repair context focused."
+    return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
 def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
@@ -4194,6 +4193,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_v33_initial_user_message(repo, issue, repo_summary, preloaded_context)},
         ]
+        initial_preload_stripped = False
 
         _wall_start = time.monotonic()
         # v33: emergency-emit threshold is RELATIVE to WALL_CLOCK_BUDGET_SECONDS.
@@ -4205,6 +4205,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+
+            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
+                original_initial = messages[1].get("content") or ""
+                stripped_initial = _strip_preloaded_section(
+                    original_initial,
+                    modified_files=_patch_changed_files(get_patch(repo)),
+                )
+                if stripped_initial != original_initial:
+                    messages[1] = {**messages[1], "content": stripped_initial}
+                    logs.append("INITIAL_PRELOAD_TRIMMED")
+                initial_preload_stripped = True
 
             if out_of_time():
                 logs.append(
@@ -4243,14 +4254,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
-                    step_llm_timeout = _adaptive_llm_timeout(solve_started_at)
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
-                        timeout=step_llm_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -4321,8 +4330,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                cmd_timeout = _adaptive_command_timeout(solve_started_at, command_timeout)
-                result = run_command(command, repo, timeout=cmd_timeout)
+                result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
