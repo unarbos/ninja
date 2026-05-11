@@ -124,7 +124,10 @@ MAX_PATCH_SAFETY_TURNS = 1
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1
 MAX_CASCADE_TURNS = 1
 MAX_CRITICAL_TAG_TURNS = 1
-MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_STRICT_CRITERIA_TURNS = 1
+MAX_DEAD_HELPER_TURNS = 1
+MAX_PLACEHOLDER_TURNS = 1
+MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
@@ -1678,6 +1681,144 @@ def _critical_tag_removal_summary(patch: str) -> List[str]:
     return findings
 
 
+_HELPER_DEF_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"^\+(?!\+\+)\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\("),
+    re.compile(r"^\+(?!\+\+).*\bfunction\s+([A-Za-z_$][\w$]*)\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?\("),
+    re.compile(r"^\+(?!\+\+)\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\("),
+    re.compile(r"^\+(?!\+\+)\s*class\s+([A-Za-z_][\w]*)\s*[\(:]"),
+)
+
+
+def _patch_added_text_raw(patch: str) -> str:
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append(line[1:])
+    return "\n".join(out)
+
+
+def _helpers_defined_but_uncalled(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    defined_names: List[str] = []
+    seen: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for pattern in _HELPER_DEF_PATTERNS:
+            m = pattern.match(line)
+            if m:
+                name = m.group(1)
+                if (
+                    name
+                    and name not in _CONTRACT_NAME_DENYLIST
+                    and len(name) >= 3
+                    and name not in seen
+                ):
+                    seen.add(name)
+                    defined_names.append(name)
+                break
+    if not defined_names:
+        return []
+    added_text = _patch_added_text_raw(patch)
+    uncalled: List[str] = []
+    for name in defined_names:
+        call_pattern = re.compile(rf"\b{re.escape(name)}\s*\(")
+        matches = call_pattern.findall(added_text)
+        if len(matches) < 2:
+            uncalled.append(name)
+        if len(uncalled) >= 4:
+            break
+    return uncalled
+
+
+_PLACEHOLDER_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\bYOUR_[A-Z][A-Z_]+\b"),
+    re.compile(r"<your-[\w-]+>"),
+    re.compile(r"https?://(?:www\.)?example\.(?:com|net|org)\b"),
+    re.compile(r"\bFIXME\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"localhost:\d{4,5}"),
+    re.compile(r"\bREPLACE_ME\b"),
+    re.compile(r"\bINSERT_[A-Z_]+_HERE\b"),
+)
+
+
+def _placeholder_findings(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    added_text = _patch_added_text_raw(patch)
+    findings: List[str] = []
+    seen: set = set()
+    for pattern in _PLACEHOLDER_PATTERNS:
+        for m in pattern.finditer(added_text):
+            snippet = m.group(0)[:80]
+            key = snippet.lower()
+            if key not in seen:
+                seen.add(key)
+                findings.append(snippet)
+                if len(findings) >= 4:
+                    return findings
+    return findings
+
+
+def _structured_acceptance_items(issue_text: str) -> List[Dict[str, Any]]:
+    items = _extract_acceptance_criteria(issue_text)
+    structured: List[Dict[str, Any]] = []
+    for item in items:
+        paths = _extract_issue_path_mentions(item)
+        backticked = re.findall(r"`([A-Za-z_$][\w.$]*)`", item)
+        camel = re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){1,})\b", item)
+        snake = re.findall(r"\b([a-z][a-z0-9]*_[a-z][a-z0-9_]+)\b", item)
+        identifiers: List[str] = []
+        for src in (backticked, camel, snake):
+            for tok in src:
+                if tok and tok not in identifiers:
+                    identifiers.append(tok)
+        structured.append({
+            "text": item,
+            "paths": paths[:3],
+            "identifiers": identifiers[:5],
+        })
+    return structured
+
+
+def _strict_unaddressed_items(patch: str, issue_text: str) -> List[str]:
+    items = _structured_acceptance_items(issue_text)
+    if not items:
+        return []
+    changed = set(_patch_changed_files(patch))
+    added_lower = _patch_added_text(patch)
+    missing: List[str] = []
+    for entry in items:
+        text = entry["text"]
+        paths = entry["paths"]
+        identifiers = entry["identifiers"]
+        addressed = False
+        if paths and any(
+            (p in changed) or any(cf == p or cf.endswith("/" + p) for cf in changed)
+            for p in paths
+        ):
+            addressed = True
+        if not addressed and identifiers:
+            for idn in identifiers:
+                if idn.lower() in added_lower:
+                    addressed = True
+                    break
+        if not addressed:
+            keywords = _criterion_keywords(text)
+            if keywords:
+                hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
+                if hits * 10 >= len(keywords) * 7:
+                    addressed = True
+        if not addressed:
+            missing.append(text[:200])
+        if len(missing) >= 5:
+            break
+    return missing
+
+
 _PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
     re.compile(r"^\+(?!\+\+).*grader", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*scoring\s+rubric", re.IGNORECASE | re.MULTILINE),
@@ -2919,6 +3060,45 @@ def build_patch_safety_prompt(hits: List[str]) -> str:
     )
 
 
+def build_strict_criteria_prompt(missing: List[str]) -> str:
+    body = "\n  ".join(f"- {m}" for m in missing[:5])
+    return (
+        "Final coverage check — these items from the task are still NOT "
+        "reflected in any file you touched or any specific identifier you "
+        "added:\n  "
+        f"{body}\n\n"
+        "For each item, either add the minimal change to address it (cite "
+        "the file and the concrete edit) or explicitly justify why it is "
+        "intentionally out of scope. End with <final>done</final>. Do not "
+        "leave any item unaddressed without explanation."
+    )
+
+
+def build_dead_helper_prompt(names: List[str]) -> str:
+    body = "\n  ".join(f"- {n}(...)" for n in names[:5])
+    return (
+        "Your patch defines new helpers/functions/classes but does NOT call "
+        "them from any other added line:\n  "
+        f"{body}\n\n"
+        "Either integrate each helper at its expected call site, or remove "
+        "the unused definition. Dead helpers usually mean the original call "
+        "site (e.g. an event handler or route) was not updated to use the "
+        "new helper. End with <final>done</final>."
+    )
+
+
+def build_placeholder_prompt(findings: List[str]) -> str:
+    body = "\n  ".join(f"- {f}" for f in findings[:4])
+    return (
+        "Your patch contains placeholder values that look unfinished:\n  "
+        f"{body}\n\n"
+        "Replace each with the real value implied by the issue or by an "
+        "existing repo convention. If a value genuinely is unknown, prefer "
+        "reading it from a config/env that the repo already uses rather "
+        "than hardcoding a placeholder. End with <final>done</final>."
+    )
+
+
 def build_cascade_gap_prompt(findings: List[str]) -> str:
     body = "\n".join(f"  - {f}" for f in findings)
     return (
@@ -3158,6 +3338,19 @@ def solve(
     )
 
 
+def _solve_attempt_safe(**kwargs: Any) -> Dict[str, Any]:
+    try:
+        return _solve_attempt(**kwargs)
+    except Exception as exc:
+        return {
+            "patch": "",
+            "logs": f"ATTEMPT_CRASH:\n{type(exc).__name__}: {str(exc)[:400]}",
+            "steps": 0,
+            "cost": 0.0,
+            "success": False,
+        }
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """The actual multi-shot driver, wrapped so any exception still returns
     the on-disk patch state instead of propagating.
@@ -3197,7 +3390,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        _result1 = _solve_attempt_safe(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -3215,7 +3408,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _issue = kwargs.get("issue", "")
         _unaddressed1 = _unaddressed_criteria(_patch1, _issue)
-        _result2 = _solve_attempt(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
+        _result2 = _solve_attempt_safe(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
         _unaddressed2 = _unaddressed_criteria(_patch2, _issue)
@@ -3290,6 +3483,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     failed_verification_turns_used = 0
     cascade_turns_used = 0
     critical_tag_turns_used = 0
+    strict_criteria_turns_used = 0
+    dead_helper_turns_used = 0
+    placeholder_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3334,7 +3530,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, cascade_turns_used, critical_tag_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, cascade_turns_used, critical_tag_turns_used, strict_criteria_turns_used, dead_helper_turns_used, placeholder_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3452,6 +3648,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if dead_helper_turns_used < MAX_DEAD_HELPER_TURNS:
+            dead_helpers = _helpers_defined_but_uncalled(patch)
+            if dead_helpers:
+                dead_helper_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dead_helper_prompt(dead_helpers),
+                    "DEAD_HELPER_QUEUED:\n  " + ", ".join(dead_helpers[:4]),
+                )
+                return True
+
         if critical_tag_turns_used < MAX_CRITICAL_TAG_TURNS:
             tag_findings = _critical_tag_removal_summary(patch)
             if tag_findings:
@@ -3461,6 +3669,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_critical_tag_prompt(tag_findings),
                     "CRITICAL_TAG_QUEUED:\n  " + " | ".join(f[:80] for f in tag_findings[:3]),
+                )
+                return True
+
+        if placeholder_turns_used < MAX_PLACEHOLDER_TURNS:
+            placeholder_hits = _placeholder_findings(patch)
+            if placeholder_hits:
+                placeholder_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_placeholder_prompt(placeholder_hits),
+                    "PLACEHOLDER_QUEUED:\n  " + " | ".join(h[:60] for h in placeholder_hits[:3]),
                 )
                 return True
 
@@ -3491,6 +3711,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if (
+            strict_criteria_turns_used < MAX_STRICT_CRITERIA_TURNS
+            and criteria_nudges_used > 0
+        ):
+            strict_missing = _strict_unaddressed_items(patch, issue)
+            if len(strict_missing) >= 2:
+                strict_criteria_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_strict_criteria_prompt(strict_missing),
+                    "STRICT_CRITERIA_QUEUED:\n  " + " | ".join(c[:60] for c in strict_missing[:3]),
                 )
                 return True
 
