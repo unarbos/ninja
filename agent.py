@@ -2520,9 +2520,9 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
 
-def _detect_frontend_gap(issue: str, patch: str) -> str:
+def _detect_frontend_gap(task_text: str, patch: str) -> str:
     fe_signals = ('.vue', 'vue component', 'react component', 'next.js', 'page.tsx', 'svelte')
-    if not any(s in issue.lower() for s in fe_signals):
+    if not any(s in task_text.lower() for s in fe_signals):
         return ''
     diff_files = re.findall(r'^(?:\+\+\+|---) [ab]/(.+)$', patch, re.M)
     exts = {f.rsplit('.', 1)[-1].lower() for f in diff_files if '.' in f}
