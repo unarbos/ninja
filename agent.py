@@ -1045,7 +1045,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1903,6 +1903,44 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
+
+
+# Tuples of frontend framework signals and file extensions
+_FE_TASK_SIGNALS = (
+    ".vue", "vue component", "react component", "next.js", "nextjs",
+    "page.tsx", "page.jsx", "svelte", "angular component",
+    "nuxt", "remix route", "gatsby page",
+)
+_FE_ONLY_EXTS = frozenset({".vue", ".jsx", ".tsx", ".svelte"})
+_BE_ONLY_EXTS = frozenset({".py", ".java", ".rb", ".go", ".php", ".rs", ".cs", ".kt"})
+
+
+def _detect_frontend_gap(task_text: str, patch: str) -> str:
+    """Return a coaching hint when the task requires frontend changes but the
+    patch only touches backend files. Empty string means no gap detected.
+
+    Rationale: ~3 rounds per duel lost because we implement Spring Boot / FastAPI
+    but miss the required Vue/React/Next.js page. King catches this; we don't.
+    """
+    task_lower = task_text.lower()
+    fe_signals = sum(1 for sig in _FE_TASK_SIGNALS if sig in task_lower)
+    if fe_signals < 1:
+        return ""
+    # Check the diff header lines
+    import re as _re
+    diff_files = _re.findall(r"^(?:\+\+\+|---)\s+[ab]/(\S+)", patch, _re.M)
+    changed_ext_set = {os.path.splitext(f)[1].lower() for f in diff_files}
+    # If any frontend extension is changed, no gap
+    if changed_ext_set & _FE_ONLY_EXTS:
+        return ""
+    # If all changed files are backend, report gap
+    if changed_ext_set and changed_ext_set.issubset(_BE_ONLY_EXTS):
+        return (
+            f"[Frontend gap detected: task mentions '{next(s for s in _FE_TASK_SIGNALS if s in task_lower)}' "
+            f"but patch only touches backend files ({', '.join(sorted(changed_ext_set))}). "
+            f"Ensure required frontend pages/components are also created or modified.]"
+        )
+    return ""
 
 
 # -----------------------------
@@ -2805,6 +2843,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v11: frontend gap detection
+        _fe_hint = _detect_frontend_gap(issue, patch)
+        if _fe_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                _fe_hint,
+                "FE_GAP_DETECTED",
+            )
+            return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -2829,8 +2878,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
