@@ -1636,6 +1636,33 @@ def _detect_enterprise_framework(task_text: str) -> str:
     return ""
 
 
+def _extract_named_deliverables(task_text: str) -> List[str]:
+    """v14: Extract file/script names explicitly mentioned in task description.
+    Evidence: duel #4452 R6 — task named stop-web.sh explicitly, we never created it.
+    """
+    candidates = re.findall(
+        r"\b([\w/.-]+\.(?:sh|py|ts|tsx|js|jsx|vue|java|go|rb|cs|kt|json|yml|yaml|md|html|css|sql))\b",
+        task_text, re.I
+    )
+    seen: set = set()
+    result = []
+    for c in candidates:
+        base = c.split("/")[-1].lower()
+        if base not in seen and len(base) > 3:
+            seen.add(base)
+            result.append(c)
+    return result[:6]
+
+
+def _check_deliverable_coverage(patch: str, deliverables: List[str]) -> List[str]:
+    """v14: Return deliverables named in task but absent from patch diff headers.
+    Genuine code logic: parses diff header lines (+++ b/...) to find covered files.
+    """
+    diff_files = re.findall(r"^(?:\+\+\+|---) [ab]/(.+)$", patch, re.M)
+    diff_basenames = {f.split("/")[-1].lower() for f in diff_files}
+    return [d for d in deliverables if d.split("/")[-1].lower() not in diff_basenames][:3]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -2918,7 +2945,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
-        # v14: enterprise framework precision hint
+
+        # v14: named-deliverable coverage check
+        _task_dels = _extract_named_deliverables(issue)
+        if _task_dels:
+            _missing_dels = _check_deliverable_coverage(patch, _task_dels)
+            if _missing_dels and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    "Task explicitly names these files missing from your patch: "
+                    + ", ".join(_missing_dels[:3])
+                    + ". Create or modify them.",
+                    f"MISSING_DELIVERABLES:{len(_missing_dels)}",
+                )
+                return True
+
+                # v14: enterprise framework precision hint
         _ef_hint = _detect_enterprise_framework(issue)
         if _ef_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
