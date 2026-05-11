@@ -124,7 +124,8 @@ MAX_LITERAL_NUDGES = 1     # catch exact quoted strings/keys/paths missed by bro
 MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
 MAX_CONTRACT_NUDGES = 1    # catch route/import/rename propagation gaps
 MAX_DELIVERABLE_NUDGES = 1  # catch named files/modules from issue not touched
-MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_UI_BINDING_NUDGES = 1  # catch stale UI selectors/actions after visible UI edits
+MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1354,6 +1355,9 @@ _NOOP_HANDLER_RE = re.compile(r"\bon(?:Change|Click|Submit|Input|Upload)\s*=\s*\
 _LOCAL_IMPORT_RE = re.compile(r"^\s*(?:import\s+(?:[^'\"]+\s+from\s+)?|import\s*\(|require\()\s*['\"](\.{1,2}/[^'\"]+)['\"]", re.MULTILINE)
 _DUPLICATE_IMPORT_RE = re.compile(r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"];?\s*$", re.MULTILINE)
 _FIELD_RENAME_RE = re.compile(r"^\s*[-+]\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", re.MULTILINE)
+_CSS_SELECTOR_LITERAL_RE = re.compile(r"['\"]([#.][A-Za-z0-9_-]+(?:\s+[.#][A-Za-z0-9_-]+)?)['\"]")
+_JS_ACTION_CALL_RE = re.compile(r"\b(dispatch|set[A-Z][A-Za-z0-9_]*|on[A-Z][A-Za-z0-9_]*)\s*\(")
+_CONTEXT_HOOK_RE = re.compile(r"const\s*\{([^}]+)\}\s*=\s*use[A-Z][A-Za-z0-9_]*\s*\(")
 
 
 _CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
@@ -2537,6 +2541,76 @@ def _contract_propagation_gap_summary(patch: str, issue_text: str, repo: Optiona
     return "\n".join(f"- {note}" for note in deduped[:6])
 
 
+_FRONTEND_TASK_SIGNALS = (
+    "button", "click", "form", "input", "modal", "dialog", "navbar", "nav",
+    "sidebar", "page", "component", "view", "screen", "selector", "css",
+    "class", "id", "vue", "react", "next", "svelte", "frontend", "ui",
+)
+_FRONTEND_EXTS = {".jsx", ".tsx", ".vue", ".svelte", ".css", ".scss", ".html"}
+_BACKEND_EXTS = {".py", ".java", ".kt", ".go", ".rb", ".php", ".rs", ".cs"}
+
+
+def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
+    """Find visible UI edits whose state/action/selector binding may be stale."""
+    if not patch.strip():
+        return ""
+    notes: List[str] = []
+    changed = _patch_changed_files(patch)
+    changed_exts = {Path(path).suffix.lower() for path in changed}
+    issue_lower = issue_text.lower()
+    if changed_exts and changed_exts.issubset(_BACKEND_EXTS):
+        if any(signal in issue_lower for signal in _FRONTEND_TASK_SIGNALS):
+            notes.append("task mentions frontend/UI work but patch only touches backend-looking files")
+
+    for path, (added, removed) in _patch_added_removed_by_file(patch).items():
+        suffix = Path(path).suffix.lower()
+        added_text = "\n".join(added)
+        removed_text = "\n".join(removed)
+        if suffix in {".jsx", ".tsx", ".js", ".ts", ".vue", ".svelte", ".html"}:
+            added_selectors = set(_CSS_SELECTOR_LITERAL_RE.findall(added_text))
+            removed_selectors = set(_CSS_SELECTOR_LITERAL_RE.findall(removed_text))
+            stale_selectors = sorted(selector for selector in removed_selectors - added_selectors if selector in added_text)
+            if stale_selectors:
+                notes.append(f"{path}: removed/renamed selector still appears in added logic: {', '.join(stale_selectors[:4])}")
+
+            if "dispatch(" in added_text:
+                hook_bindings = " ".join(_CONTEXT_HOOK_RE.findall(added_text))
+                if "dispatch" not in hook_bindings and not re.search(r"\bconst\s+dispatch\s*=", added_text):
+                    notes.append(f"{path}: added dispatch(...) but no visible dispatch binding/destructure was added")
+
+            new_actions = sorted({m.group(1) for m in _JS_ACTION_CALL_RE.finditer(added_text)})
+            if new_actions and re.search(r"<(?:button|form|input|select|textarea)\b|on(?:Click|Submit|Change|Input)=", added_text):
+                missing_bindings = [
+                    name for name in new_actions
+                    if name.startswith("on")
+                    and not re.search(rf"\b(?:const|function)\s+{re.escape(name)}\b", added_text + "\n" + removed_text)
+                    and re.search(rf"\b{name}\s*\(", added_text)
+                ]
+                if missing_bindings:
+                    notes.append(f"{path}: new UI handler(s) lack visible binding: {', '.join(missing_bindings[:4])}")
+
+        if suffix in _FRONTEND_EXTS and re.search(r"\b(?:category|filter|badge|accent|date|today|form|edit|add)\b", issue_lower):
+            lower_added = added_text.lower()
+            wants_form = any(word in issue_lower for word in ("form", "input", "edit", "add", "create"))
+            if wants_form and re.search(r"\bbadge|filter|category|today|date\b", lower_added):
+                if not re.search(r"\b(input|select|textarea|form|option|value=|onchange|onChange)\b", added_text):
+                    notes.append(f"{path}: category/date UI changed without visible form/input option update")
+
+        if len(notes) >= 6:
+            break
+
+    if not notes:
+        return ""
+    deduped: List[str] = []
+    seen: set = set()
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "\n".join(f"- {note}" for note in deduped[:6])
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -3117,6 +3191,24 @@ def build_deliverable_gap_prompt(deliverable_summary: str, issue_text: str) -> s
     )
 
 
+def build_ui_binding_nudge_prompt(ui_summary: str, issue_text: str) -> str:
+    return (
+        "UI binding check: your current patch may add or rename visible UI "
+        "behavior without updating the state/action/selector owner that makes "
+        "it work at runtime.\n\n"
+        f"{ui_summary}\n\n"
+        "Inspect the affected component/template/script and make the smallest "
+        "binding fix: include needed context/store destructuring, keep DOM ids/"
+        "classes/selectors synchronized after renames, update create/edit form "
+        "options when display filters/categories change, and touch the frontend "
+        "owner when the task explicitly asks for visible UI. If the warning is "
+        "a false positive, finish with <final>summary</final> and name why. "
+        "Do not rewrite unrelated layout or styling.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
     return (
         "Integration check: your patch appears to add implementation code, but "
@@ -3474,6 +3566,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     corruption_turns_used = 0
     contract_nudges_used = 0
     deliverable_nudges_used = 0
+    ui_binding_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3517,16 +3610,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             7. literal-nudge — catch exact issue strings/keys/paths still missing
             8. contract-nudge — propagate route/import/rename contracts exactly
             9. deliverable-nudge — touch explicitly named deliverable files
-            10. integration-nudge — make new code reachable from routes/nav/API
-            11. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
-            12. dependency-nudge — add metadata for new external packages
-            13. hazard-review — catch cheap diff hazards before broad self-check
-            14. self-check — show the diff and ask "did you cover everything?"
+            10. ui-binding-nudge — keep UI actions/selectors/forms wired
+            11. integration-nudge — make new code reachable from routes/nav/API
+            12. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
+            13. dependency-nudge — add metadata for new external packages
+            14. hazard-review — catch cheap diff hazards before broad self-check
+            15. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, contract_nudges_used, deliverable_nudges_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, contract_nudges_used, deliverable_nudges_used, ui_binding_nudges_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3670,6 +3764,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_deliverable_gap_prompt(deliverable_summary, issue),
                     "DELIVERABLE_NUDGE_QUEUED:\n  " + deliverable_summary.replace("\n", " ")[:160],
+                )
+                return True
+
+        if ui_binding_nudges_used < MAX_UI_BINDING_NUDGES:
+            ui_summary = _ui_binding_gap_summary(patch, issue)
+            if ui_summary:
+                ui_binding_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_ui_binding_nudge_prompt(ui_summary, issue),
+                    "UI_BINDING_NUDGE_QUEUED:\n  " + ui_summary.replace("\n", " ")[:160],
                 )
                 return True
 
