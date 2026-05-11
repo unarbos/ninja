@@ -127,6 +127,16 @@ MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
+# Cap at 5, not 2. The king's original cap=2 was calibrated against ~8 gates
+# (25% of gates allowed to fire per task). The current chain has ~19 gates;
+# holding cap=2 starves 17 of them and leaves only ~10% effective capacity,
+# which is why per-task patches were thin on the gates added after the king's
+# baseline. Cap=5 restores the original ~26% gate-firing ratio (5/19) without
+# crossing into the empirically-flagged 5-7 danger band: 5 sits at the *lower*
+# edge of that band, and per-turn cost is bounded by the 120s round budget
+# (challenger_agent_timeout_seconds in the duel JSON) minus the initial solve
+# and hail-mary reserve. Raising beyond 5 (closer to 7) consumes the full
+# 120s budget in worst-case chains and triggers time_limit_exceeded.
 MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
