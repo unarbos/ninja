@@ -121,6 +121,7 @@ MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config 
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAZARD_REVIEW_TURNS = 1  # catch diff hazards that are cheap to repair pre-final
 MAX_LITERAL_NUDGES = 1     # catch exact quoted strings/keys/paths missed by broad criteria
+MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -1346,6 +1347,51 @@ _ROUTE_PARAM_RE = re.compile(r"[:{<]([A-Za-z_][A-Za-z0-9_]*)[>}]?")
 _REQ_PARAM_RE = re.compile(r"(?:req|request)\.params(?:\.|\[['\"])([A-Za-z_][A-Za-z0-9_]*)")
 _JS_HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]*\s*\(")
 _SHELL_LIFECYCLE_PATH_RE = re.compile(r"(?:^|/)(?:start|stop|dev|serve|run)[-_A-Za-z0-9]*\.sh$")
+_REACT_HOOK_IMPORT_RE = re.compile(r"import\s+(?:React,\s*)?\{([^}]+)\}\s+from\s+['\"]react['\"]")
+_NOOP_HANDLER_RE = re.compile(r"\bon(?:Change|Click|Submit|Input|Upload)\s*=\s*\{\s*\(\s*[^)]*\)\s*=>\s*\{\s*(?://[^}\n]*)?\}\s*\}")
+
+
+_CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "shell heredoc marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*<<['\"]?(?:EOF|PYEOF|TXT|END|SCRIPT|HEREDOC)['\"]?\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "agent control tag leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*</?(?:command|final|plan)>\s*$",
+            re.MULTILINE,
+        ),
+    ),
+    (
+        "raw shell prompt marker leaked into source",
+        re.compile(
+            r"^\+(?!\+\+).*\$\s+[a-zA-Z0-9_.-]+\s+\S+.*\$\s*$",
+            re.MULTILINE,
+        ),
+    ),
+)
+
+
+def _check_corruption(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for label, pattern in _CORRUPTION_PATTERNS:
+        for match in pattern.finditer(patch):
+            sample = match.group(0).strip().splitlines()[0]
+            key = (label, sample[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"{label}: {sample[:160]}")
+            if len(findings) >= 4:
+                return findings
+    return findings
 
 
 def _hazard_review_summary(patch: str) -> str:
@@ -1366,12 +1412,30 @@ def _hazard_review_summary(patch: str) -> str:
     for path, (added, removed) in _patch_added_removed_by_file(patch).items():
         added_text = "\n".join(added)
         removed_text = "\n".join(removed)
+        all_text = "\n".join(added + removed)
         if re.search(r"\b(useState|useEffect|useMemo|useCallback|useRef|useReducer)\b", added_text):
             if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
                 notes.append(f"{path}: removed 'use client' while adding/keeping React hooks")
         if path.endswith((".tsx", ".jsx")) and _JS_HOOK_RE.search(added_text):
             if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
                 notes.append(f"{path}: client component directive may be missing for hook usage")
+            hook_names = sorted(set(re.findall(r"\b(useState|useEffect|useMemo|useCallback|useRef|useReducer)\b", added_text)))
+            if hook_names:
+                imported_hooks: set = set()
+                for match in _REACT_HOOK_IMPORT_RE.finditer(all_text):
+                    imported_hooks.update(part.strip().split(" as ", 1)[0] for part in match.group(1).split(","))
+                missing_hooks = [hook for hook in hook_names if hook not in imported_hooks and f"React.{hook}" not in all_text]
+                if missing_hooks:
+                    notes.append(f"{path}: hook(s) used without visible React import: {', '.join(missing_hooks[:4])}")
+            if _NOOP_HANDLER_RE.search(added_text):
+                notes.append(f"{path}: added no-op event handler for requested UI action")
+            if re.search(r"\b(document|window)\.", added_text):
+                has_client_directive = any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in added + removed)
+                if not has_client_directive:
+                    notes.append(f"{path}: browser global used without a visible client-component directive")
+            if re.search(r"\b(?:import|upload|attach|csv|file)\b", added_text, re.IGNORECASE):
+                if re.search(r"\bfileInputRef\b", added_text) and "useRef" not in added_text:
+                    notes.append(f"{path}: new file/import action appears to reuse an existing fileInputRef")
 
         removed_exports = set(re.findall(r"^\s*(?:export\s+)?(?:class|function|const|let|var|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)", removed_text, re.MULTILINE))
         if removed_exports:
@@ -1418,6 +1482,12 @@ def _hazard_review_summary(patch: str) -> str:
             if re.search(r"\bstop\b", path.lower()) and re.search(r"\bPORT\b|port_listener|fuser|lsof|ss ", added_text):
                 if not re.search(r"verif|still.*listen|port.*free|ERRORS", added_text, re.IGNORECASE):
                     notes.append(f"{path}: stop script should verify target ports are free after stopping")
+
+        if path.endswith((".php", ".java", ".kt", ".cs")):
+            opens = added_text.count("{")
+            closes = added_text.count("}")
+            if opens > closes and re.search(r"\b(public|private|protected)\s+(?:static\s+)?function\b|\bpublic\s+static\b", added_text):
+                notes.append(f"{path}: added class/method block may be missing a closing brace")
 
     deduped: List[str] = []
     seen: set = set()
@@ -2944,6 +3014,20 @@ def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
     )
 
 
+def build_corruption_fix_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch contains markers that belong to your shell or agent harness, "
+        "not to the source file being edited:\n\n"
+        f"{body}\n\n"
+        "These usually leak into source when a heredoc edit runs past its "
+        "terminator or when a <command>/<plan>/<final> block is captured "
+        "verbatim. Emit one targeted command that either reverts the affected "
+        "region or reapplies the intended edit cleanly without harness markup. "
+        "Then end with <final>corruption removed</final>."
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -3219,6 +3303,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     dependency_nudges_used = 0
     hazard_review_turns_used = 0
     literal_nudges_used = 0
+    corruption_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3254,21 +3339,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
+            3. corruption — remove leaked edit/control markers from source
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. literal-nudge — catch exact issue strings/keys/paths still missing
-            7. integration-nudge — make new code reachable from routes/nav/API
-            8. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
-            9. dependency-nudge — add metadata for new external packages
-            10. hazard-review — catch cheap diff hazards before broad self-check
-            11. self-check — show the diff and ask "did you cover everything?"
+            5. coverage-nudge — name issue-mentioned paths still untouched
+            6. criteria-nudge — name issue acceptance bullets not addressed
+            7. literal-nudge — catch exact issue strings/keys/paths still missing
+            8. integration-nudge — make new code reachable from routes/nav/API
+            9. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
+            10. dependency-nudge — add metadata for new external packages
+            11. hazard-review — catch cheap diff hazards before broad self-check
+            12. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3312,6 +3398,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if corruption_turns_used < MAX_CORRUPTION_TURNS:
+            corruption_findings = _check_corruption(patch)
+            if corruption_findings:
+                corruption_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_corruption_fix_prompt(corruption_findings),
+                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
                 )
                 return True
 
