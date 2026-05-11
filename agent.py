@@ -834,8 +834,77 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+        used += len(recent_examples)
+
+    if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
+        for relative_path in _resolve_issue_named_paths_by_basename(issue, tracked_set, set(included)):
+            snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+            if not snippet.strip():
+                continue
+            block = f"### {relative_path}\n```\n{snippet}\n```"
+            if used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+                break
+            parts.append(block)
+            included.append(relative_path)
+            used += len(block)
+
+    if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
+        tree_block = _compact_tracked_file_tree(tracked_set, set(included), max_paths=40)
+        if tree_block and used + len(tree_block) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+            parts.append(tree_block)
+            used += len(tree_block)
 
     return "\n\n".join(parts), included
+
+
+def _resolve_issue_named_paths_by_basename(issue: str, tracked_set: set, included_set: set) -> List[str]:
+    """Preload real files when the issue names a stale or partial path."""
+    candidates: List[str] = []
+    seen_names: set = set()
+    for raw in _extract_issue_path_mentions(issue):
+        normalized = raw.strip("./")
+        if normalized in tracked_set or normalized in included_set:
+            continue
+        basename = Path(normalized).name.lower()
+        if not basename or basename in seen_names:
+            continue
+        seen_names.add(basename)
+        matches = [
+            path for path in tracked_set
+            if Path(path).name.lower() == basename and _context_file_allowed(path) and path not in included_set
+        ]
+        if 1 <= len(matches) <= 4:
+            candidates.extend(sorted(matches, key=lambda p: (len(p), p)))
+    out: List[str] = []
+    seen: set = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _compact_tracked_file_tree(tracked_set: set, included_set: set, *, max_paths: int = 40) -> str:
+    """Tiny source-file tree to reveal owners not captured by ranked snippets."""
+    source_exts = {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".kt",
+        ".go", ".rb", ".php", ".rs", ".cs", ".css", ".scss", ".html", ".md",
+        ".json", ".yml", ".yaml", ".toml", ".sh",
+    }
+    paths = [
+        path for path in tracked_set
+        if path not in included_set
+        and _context_file_allowed(path)
+        and Path(path).suffix.lower() in source_exts
+    ]
+    paths.sort(key=lambda p: (len(Path(p).parts), p))
+    if not paths:
+        return ""
+    body = "\n".join(paths[:max_paths])
+    return f"### Compact tracked file tree (source-like files not preloaded)\n```\n{body}\n```"
 
 
 def _preload_needles(issue: str) -> List[str]:
@@ -1354,6 +1423,7 @@ _REACT_HOOK_IMPORT_RE = re.compile(r"import\s+(?:React,\s*)?\{([^}]+)\}\s+from\s
 _NOOP_HANDLER_RE = re.compile(r"\bon(?:Change|Click|Submit|Input|Upload)\s*=\s*\{\s*\(\s*[^)]*\)\s*=>\s*\{\s*(?://[^}\n]*)?\}\s*\}")
 _LOCAL_IMPORT_RE = re.compile(r"^\s*(?:import\s+(?:[^'\"]+\s+from\s+)?|import\s*\(|require\()\s*['\"](\.{1,2}/[^'\"]+)['\"]", re.MULTILINE)
 _DUPLICATE_IMPORT_RE = re.compile(r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"];?\s*$", re.MULTILINE)
+_NAMED_IMPORT_RE = re.compile(r"^\s*import\s+\{([^}]+)\}\s+from\s+['\"][^'\"]+['\"];?\s*$", re.MULTILINE)
 _FIELD_RENAME_RE = re.compile(r"^\s*[-+]\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", re.MULTILINE)
 _CSS_SELECTOR_LITERAL_RE = re.compile(r"['\"]([#.][A-Za-z0-9_-]+(?:\s+[.#][A-Za-z0-9_-]+)?)['\"]")
 _JS_ACTION_CALL_RE = re.compile(r"\b(dispatch|set[A-Z][A-Za-z0-9_]*|on[A-Z][A-Za-z0-9_]*)\s*\(")
@@ -2526,6 +2596,21 @@ def _contract_propagation_gap_summary(patch: str, issue_text: str, repo: Optiona
         if likely_renamed:
             notes.append(f"{path}: removed/renamed field still appears nearby: {', '.join(likely_renamed[:4])}")
 
+        removed_named_imports: List[str] = []
+        for import_group in _NAMED_IMPORT_RE.findall(removed_text):
+            for name in re.split(r",", import_group):
+                clean = name.strip().split(" as ")[0].strip()
+                if clean:
+                    removed_named_imports.append(clean)
+        if removed_named_imports:
+            added_without_imports = _NAMED_IMPORT_RE.sub("", added_text)
+            stale_import_uses = sorted({
+                name for name in removed_named_imports
+                if re.search(rf"\b{re.escape(name)}\b", added_without_imports)
+            })
+            if stale_import_uses:
+                notes.append(f"{path}: removed import name still appears in added code: {', '.join(stale_import_uses[:4])}")
+
         if len(notes) >= 6:
             break
 
@@ -3168,9 +3253,9 @@ def build_contract_propagation_prompt(contract_summary: str, issue_text: str) ->
         f"{contract_summary}\n\n"
         "Inspect the touched owner(s) and propagate the contract exactly: route "
         "param names must match handler reads, imported local helpers/files must "
-        "exist, duplicate imports should be collapsed, and renamed fields must "
-        "leave no stale read/write/test path behind. If the warning is a false "
-        "positive, finish with <final>summary</final> and name why. Otherwise "
+        "exist, duplicate/stale imports should be collapsed or removed, and "
+        "renamed fields must leave no stale read/write/test path behind. If the "
+        "warning is a false positive, finish with <final>summary</final> and name why. Otherwise "
         "issue the minimal edit command(s) to repair the propagation gap.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
