@@ -116,8 +116,11 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
+MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
+MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
+MAX_HAZARD_REVIEW_TURNS = 1  # catch diff hazards that are cheap to repair pre-final
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -793,6 +796,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         return "", []
 
     tracked_set = set(_tracked_files(repo))
+    issue_tests = _find_issue_tests(repo, issue, tracked_set)
+    files = _merge_priority_files(files, issue_tests)
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
@@ -977,6 +982,20 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
     return mentions
 
 
+def _merge_priority_files(files: List[str], priority: List[str]) -> List[str]:
+    """Put high-confidence issue-mentioned files first without duplicates."""
+    if not priority:
+        return files
+    merged: List[str] = []
+    seen: set = set()
+    for relative_path in [*priority, *files]:
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        merged.append(relative_path)
+    return merged
+
+
 def _issue_terms(issue: str) -> List[str]:
     stop = {
         "about",
@@ -1045,7 +1064,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1222,9 +1241,25 @@ def _diff_low_signal_summary(patch: str) -> str:
         return ""
 
     notes: List[str] = []
+    current_block: List[str] = []
     current_file = "?"
     current_added: List[str] = []
     current_removed: List[str] = []
+
+    def flush_block() -> None:
+        if not current_block:
+            return
+        block = "\n".join(current_block)
+        if (
+            "\nold mode " in "\n" + block
+            and "\nnew mode " in "\n" + block
+            and "\n@@ " not in "\n" + block
+            and "\nGIT binary patch" not in "\n" + block
+            and "\nBinary files " not in "\n" + block
+            and "\nnew file mode " not in "\n" + block
+            and "\ndeleted file mode " not in "\n" + block
+        ):
+            notes.append(f"{current_file}: file-mode-only diff")
 
     def flush() -> None:
         if not current_added and not current_removed:
@@ -1238,12 +1273,17 @@ def _diff_low_signal_summary(patch: str) -> str:
 
     for line in patch.splitlines():
         if line.startswith("diff --git "):
+            flush_block()
             flush()
+            current_block = [line]
             current_added, current_removed = [], []
             tokens = line.split()
             if len(tokens) >= 4 and tokens[3].startswith("b/"):
                 current_file = tokens[3][2:]
-        elif line.startswith("@@"):
+            continue
+
+        current_block.append(line)
+        if line.startswith("@@"):
             flush()
             current_added, current_removed = [], []
         elif line.startswith("+") and not line.startswith("+++"):
@@ -1251,6 +1291,7 @@ def _diff_low_signal_summary(patch: str) -> str:
         elif line.startswith("-") and not line.startswith("---"):
             current_removed.append(line[1:])
 
+    flush_block()
     flush()
 
     deduped: List[str] = []
@@ -1271,6 +1312,95 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+def _patch_added_removed_by_file(patch: str) -> Dict[str, Tuple[List[str], List[str]]]:
+    """Collect added/removed source lines by file from a unified diff."""
+    out: Dict[str, Tuple[List[str], List[str]]] = {}
+    current: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current = tokens[3][2:]
+                out.setdefault(current, ([], []))
+            continue
+        if current is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            out[current][0].append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            out[current][1].append(line[1:])
+    return out
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"\b(?:TODO_URL|YOUR_[A-Z0-9_]+|PROJECT_REF|example\.com|localhost:\d+)\b|"
+    r"\[(?:YOUR|PROJECT|REPLACE)[^\]]*\]|"
+    r"https?://(?:your-|replace-|example\.)[^\s'\"<>]+",
+    re.IGNORECASE,
+)
+_ROUTE_PARAM_RE = re.compile(r"[:{<]([A-Za-z_][A-Za-z0-9_]*)[>}]?")
+_REQ_PARAM_RE = re.compile(r"(?:req|request)\.params(?:\.|\[['\"])([A-Za-z_][A-Za-z0-9_]*)")
+_JS_HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]*\s*\(")
+
+
+def _hazard_review_summary(patch: str) -> str:
+    """Spot cheap-to-fix patch hazards before the final self-check."""
+    if not patch.strip():
+        return ""
+
+    notes: List[str] = []
+    if re.search(r"^(?:old mode|new mode|new file mode|deleted file mode)\s+", patch, re.MULTILINE):
+        notes.append("file mode or permission metadata changed; remove it unless the issue explicitly asks")
+    if "GIT binary patch" in patch or re.search(r"^Binary files ", patch, re.MULTILINE):
+        notes.append("binary/generated-file diff detected; avoid binary/cache churn unless explicitly required")
+    if re.search(r"\.(?:pyc|pyo|class|o|so|dll|dylib|png|jpg|jpeg|gif|webp|zip|tar|gz)$", patch, re.MULTILINE):
+        notes.append("generated/cache/binary-looking file touched; confirm it is required or revert it")
+    if _PLACEHOLDER_RE.search(patch):
+        notes.append("placeholder URL/token text appears in the diff; replace with real existing config or remove it")
+
+    for path, (added, removed) in _patch_added_removed_by_file(patch).items():
+        added_text = "\n".join(added)
+        removed_text = "\n".join(removed)
+        if re.search(r"\b(useState|useEffect|useMemo|useCallback|useRef|useReducer)\b", added_text):
+            if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
+                notes.append(f"{path}: removed 'use client' while adding/keeping React hooks")
+        if path.endswith((".tsx", ".jsx")) and _JS_HOOK_RE.search(added_text):
+            if any(line.strip() in {"'use client';", '"use client";', "'use client'", '"use client"'} for line in removed):
+                notes.append(f"{path}: client component directive may be missing for hook usage")
+
+        removed_exports = set(re.findall(r"^\s*(?:export\s+)?(?:class|function|const|let|var|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)", removed_text, re.MULTILINE))
+        if removed_exports:
+            stale_imports = [
+                name for name in removed_exports
+                if re.search(rf"^\s*import\b.*\b{name}\b", added_text, re.MULTILINE)
+            ]
+            if stale_imports:
+                notes.append(f"{path}: added import references removed symbol(s): {', '.join(stale_imports[:3])}")
+
+        route_params = set()
+        req_params = set()
+        for line in added:
+            if "route" in line.lower() or "path" in line.lower() or "router" in line.lower():
+                route_params.update(_ROUTE_PARAM_RE.findall(line))
+            req_params.update(_REQ_PARAM_RE.findall(line))
+        filtered_route_params = {p for p in route_params if p not in {"http", "https"}}
+        if filtered_route_params and req_params and filtered_route_params.isdisjoint(req_params):
+            notes.append(
+                f"{path}: route parameter names {sorted(filtered_route_params)[:3]} "
+                f"do not match request params {sorted(req_params)[:3]}"
+            )
+
+    deduped: List[str] = []
+    seen: set = set()
+    for note in notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        deduped.append(note)
+    return "\n".join(f"- {note}" for note in deduped[:6])
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -1295,6 +1425,155 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+_INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
+    "route", "routing", "router", "page", "screen", "view", "sidebar",
+    "navigation", "nav", "menu", "endpoint", "api", "controller", "service",
+    "handler", "wire", "integrate", "dashboard",
+)
+
+_INTEGRATION_ENTRYPOINT_RE = re.compile(
+    r"(^|/)(app|main|index|router|routes|urls|sidebar|navigation|nav|menu|"
+    r"controller|controllers|service|services|api|server|layout|dashboard)"
+    r"([./_-]|$)|"
+    r"(App|Main|Router|Routes|Sidebar|Navigation|Nav|Menu|Controller|Service|Layout|Dashboard)\."
+)
+
+_IMPLEMENTATION_FILE_RE = re.compile(
+    r"(^|/)(components?|pages?|views?|screens?|features?|modules?|services?|controllers?|api)/"
+    r"|[A-Z][A-Za-z0-9_]*(Page|View|Screen|Component|Panel|Card|Form|Modal|Controller|Service)\."
+)
+
+
+def _integration_gap_summary(patch: str, issue_text: str) -> str:
+    """Heuristic for patches that add implementation but may not wire it in."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    if not any(hint in issue_lower for hint in _INTEGRATION_ISSUE_HINTS):
+        return ""
+    changed = _patch_changed_files(patch)
+    if not changed or any(_INTEGRATION_ENTRYPOINT_RE.search(path) for path in changed):
+        return ""
+    implementation_paths = [path for path in changed if _IMPLEMENTATION_FILE_RE.search(path)]
+    added = _patch_added_text(patch)
+    added_mentions_integration = bool(
+        re.search(
+            r"\b(route|routes|router|navigate|navigation|sidebar|menu|endpoint|"
+            r"controller|service|handler|app\.|urlpatterns|path\(|Route\b|"
+            r"useNavigate|Link\b|NavLink|RouterProvider)\b",
+            added,
+        )
+    )
+    if not implementation_paths and not added_mentions_integration:
+        return ""
+    examples = ", ".join((implementation_paths or changed)[:6])
+    return (
+        "patch adds implementation-like files or code but no obvious route/nav/API "
+        f"entrypoint was touched. Changed implementation paths: {examples}"
+    )
+
+
+_ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], "re.Pattern[str]"], ...] = (
+    ("tests", ("test", "tests", "testing", "regression", "spec"), re.compile(r"(^|/)(tests?|__tests__|specs?)/|(_test|test_|\.test\.|\.spec\.)", re.IGNORECASE)),
+    ("docs", ("doc", "docs", "documentation", "readme", "guide", "adr"), re.compile(r"(^|/)(docs?|adr|guides?)/|(^|/)(readme|changelog|adr)[^/]*\.(md|rst|txt)$", re.IGNORECASE)),
+    ("version/package metadata", ("version", "bump", "package.json", "pyproject", "pom.xml", "gradle", "cargo.toml"), re.compile(r"(^|/)(package\.json|pyproject\.toml|pom\.xml|build\.gradle|build\.gradle\.kts|cargo\.toml|setup\.py|setup\.cfg|pubspec\.yaml|composer\.json)$", re.IGNORECASE)),
+    ("schema/migration", ("schema", "migration", "migrations", "sql", "prisma", "ddl"), re.compile(r"(^|/)(migrations?|schema|prisma)/|schema\.(sql|prisma)$|\.(sql)$", re.IGNORECASE)),
+    ("i18n/locale", ("i18n", "locale", "locales", "translation", "translations", "lang"), re.compile(r"(^|/)(i18n|locales?|lang|translations?)/|\.(po|pot|strings)$", re.IGNORECASE)),
+    ("fixture/sample", ("fixture", "fixtures", "sample", "example"), re.compile(r"(^|/)(fixtures?|samples?|examples?)/", re.IGNORECASE)),
+)
+
+
+def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
+    return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
+
+
+def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
+    """Find explicitly requested artifact classes missing from the patch."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    changed = _patch_changed_files(patch)
+    missing: List[str] = []
+    for label, hints, path_re in _ARTIFACT_REQUESTS:
+        if _issue_has_artifact_hint(issue_lower, hints) and not any(path_re.search(path) for path in changed):
+            missing.append(label)
+    if not missing:
+        return ""
+    return "task text appears to request these artifact(s), but no matching files were touched: " + ", ".join(missing[:6])
+
+
+_DEPENDENCY_MANIFEST_RE = re.compile(
+    r"(^|/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|"
+    r"requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|poetry\.lock|"
+    r"cargo\.toml|cargo\.lock|go\.mod|go\.sum|pom\.xml|build\.gradle|"
+    r"build\.gradle\.kts|composer\.json|composer\.lock|gemfile|pubspec\.yaml)$",
+    re.IGNORECASE,
+)
+_LOCAL_IMPORT_PREFIXES = (".", "/", "@/", "~/", "@renderer/", "@app/", "@src/", "src/", "app/")
+_COMMON_JS_GLOBALS = {
+    "react", "react-dom", "vue", "svelte", "next",
+    "fs", "path", "url", "http", "https", "crypto", "util", "stream", "events", "os",
+}
+_PY_STDLIB_ROOTS = set(getattr(sys, "stdlib_module_names", ()))
+
+
+def _package_root_from_spec(spec: str) -> str:
+    spec = spec.strip().strip("\"'").split("::", 1)[0]
+    if not spec or spec.startswith(_LOCAL_IMPORT_PREFIXES):
+        return ""
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else spec
+    return spec.split("/")[0]
+
+
+def _introduced_dependency_roots(patch: str) -> List[str]:
+    added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    found: List[str] = []
+    patterns = (
+        r"\bimport\s+(?:[^'\"]+\s+from\s+)?['\"]([^'\"]+)['\"]",
+        r"\bexport\s+[^'\"]+\s+from\s+['\"]([^'\"]+)['\"]",
+        r"\brequire\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        r"(?m)^\s*from\s+([A-Za-z_][\w.]*)\s+import\b",
+        r"(?m)^\s*import\s+([A-Za-z_][\w.]*)\b(?!\s+from\b)",
+        r"(?m)^\s*use\s+([A-Za-z_][\w:]*)\s*;",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, added):
+            root = _package_root_from_spec(match.group(1).split(".")[0])
+            if not root or root in _COMMON_JS_GLOBALS or root in _PY_STDLIB_ROOTS:
+                continue
+            if root not in found:
+                found.append(root)
+    return found
+
+
+def _dependency_metadata_gap_summary(patch: str, repo: Optional[Path] = None) -> str:
+    """Flag new package usage without a matching dependency manifest touch."""
+    if not patch.strip():
+        return ""
+    roots = _introduced_dependency_roots(patch)
+    if not roots:
+        return ""
+    changed = _patch_changed_files(patch)
+    if any(_DEPENDENCY_MANIFEST_RE.search(path) for path in changed):
+        return ""
+    if repo is not None:
+        try:
+            manifest_paths = [path for path in _tracked_files(repo) if _DEPENDENCY_MANIFEST_RE.search(path)]
+            manifest_text = "\n".join(
+                (repo / path).read_text(encoding="utf-8", errors="replace")[:20000]
+                for path in manifest_paths[:12]
+                if (repo / path).exists()
+            ).lower()
+            roots = [root for root in roots if root.lower() not in manifest_text]
+        except Exception:
+            pass
+    if not roots:
+        return ""
+    return "patch appears to introduce external package usage without touching a dependency manifest. Package root(s): " + ", ".join(roots[:8])
 
 
 # -----------------------------
@@ -1563,6 +1842,41 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _looks_like_test_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    lowered = str(path).lower()
+    name = path.name.lower()
+    return (
+        "test" in name
+        or "spec" in name
+        or "/tests/" in f"/{lowered}"
+        or lowered.startswith("tests/")
+        or lowered.startswith("spec/")
+    )
+
+
+def _find_issue_tests(repo: Path, issue_text: str, tracked: Optional[set] = None) -> List[str]:
+    """Return existing test files explicitly named in the issue text."""
+    tracked_set = tracked if tracked is not None else set(_tracked_files(repo))
+    if not tracked_set:
+        return []
+    found: List[str] = []
+    for mention in _extract_issue_path_mentions(issue_text):
+        if not _looks_like_test_path(mention):
+            continue
+        matches = [
+            candidate
+            for candidate in tracked_set
+            if (candidate == mention or candidate.endswith("/" + mention))
+            and _context_file_allowed(candidate)
+        ]
+        for candidate in sorted(matches, key=len):
+            if candidate not in found:
+                found.append(candidate)
+                break
+    return found[:3]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -1685,6 +1999,7 @@ def _run_companion_test(
 def _select_companion_test_failure(
     repo: Path,
     patch: str,
+    issue_text: str = "",
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
     """For files touched by the patch, find the first companion test that fails.
@@ -1699,6 +2014,10 @@ def _select_companion_test_failure(
     tracked = set(_tracked_files(repo))
     if not tracked:
         return None
+    for test_path in _find_issue_tests(repo, issue_text, tracked):
+        output = _run_companion_test(repo, test_path, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (test_path, output)
     for relative_path in edited:
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
@@ -2037,8 +2356,15 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
+- Acceptance contract: for each requirement, name the exact owner to change, exact edge cases to cover, exact producer/consumer names that must match, and the verification target.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
+- Binding check: for every new UI action, route, command, callback, or provider, name the state/hook/context/import/service/backend handler that makes it executable.
+- Canonical owner check: for persisted data, routes, schemas, commands, or shared resources, explain why the chosen file is the source future reads/calls actually use, not just a related surface.
+- Preservation check: identify any existing real data/auth/storage/network behavior nearby and keep it unless the task explicitly says to replace it.
+- Diff hygiene check: plan to avoid file-mode-only churn, generated caches, compiled/binary artifacts, and unrelated broad rewrites.
+- Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
 </plan>
@@ -2056,6 +2382,8 @@ ISSUE CONTRACT
 
 Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
 
+Exact detail fidelity matters: if the issue names a path, route, env key, response field, UI label, CSS class owner, numeric scale, image size, provider list, or validation case, preserve it exactly unless nearby code proves a canonical local spelling. Do not replace a specific requirement with an approximate implementation.
+
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
 Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
@@ -2067,6 +2395,18 @@ INSPECTION STRATEGY
 Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+
+Owner discovery before editing:
+- UI/layout tasks: inspect the parent page/container plus existing theme/style/layout owner before editing only a leaf component. If the task asks for shared layout, inspect at least one consumer page.
+- Route/command/navigation tasks: inspect both the registration table and the destination handler/component. A link or route without its target is incomplete.
+- Backend/refactor tasks: inspect the executor/router/service owner and one caller/callee in each direction before changing signatures or dependency injection.
+- Parser/protocol tasks: inspect parser, command/model type, and executor/handler together; changing only one layer often compiles poorly or misses behavior.
+- Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
+- UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
+- Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
+- Import/export tasks: inspect existing file-input refs, upload/image handlers, CSV/JSON parsers, export builders, and refresh flows before adding parallel import/export behavior.
+- Validation tasks: inspect the current accepted/rejected boundary cases, including empty, whitespace, missing parts, wrong type, malformed shape, negative/boundary values, and non-string inputs when applicable.
+- Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
 ====================================================================
 ROOT CAUSE RULE
@@ -2199,6 +2539,8 @@ Strategy: the fix is typically in ONE specific function or block. Identify it pr
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+
+If the issue spans multiple architectural concerns (route/router/API/endpoint, model/schema/migration, controller/service, page/view/component/form, hook/store), enumerate each required owner and integration point in your <plan> before editing.
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
@@ -2339,10 +2681,35 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Acceptance contract: for each requirement, identify the exact owner changed, exact edge cases covered, exact producer/consumer names matched, and exact verification evidence.\n"
+        "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
+        "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
+        "  - Every newly used identifier is declared, imported, destructured, or in scope in the touched file.\n"
+        "  - Every removed/moved function, route, component, or helper leaves no stale import/export/registration behind.\n"
+        "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
+        "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
+        "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
+        "  - Edge-case matrix: parser/validation/import fixes cover non-string input, missing pieces, empty strings, whitespace-only strings, wrong type, malformed structure, negative/boundary values, and wrong field shape where relevant.\n"
+        "  - Canonical owner check: persisted data updates modify the source future reads use, not a derived table, stale snapshot, UI-only copy, cache, or unrelated repository.\n"
+        "  - Exact path check: route/link/command names use the same literal path at the UI trigger, registration, page/component, service/client, and backend handler.\n"
+        "  - Existing schema/API check: do not invent unsupported fields, methods, enum variants, imports, dependency APIs, or response shapes; inspect and match the local contract.\n"
+        "  - Signature/API call check: every changed function call includes required arguments, every route parameter name matches controller/service reads, and every callback/event payload matches the local handler signature.\n"
+        "  - Every newly imported symbol is actually defined/exported by the source module; do not import helper names you have not added.\n"
+        "  - Every renamed data field is updated across create/read/update/delete, bulk import/export, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
+        "  - Validation/parser fixes cover missing parts, empty strings, wrong type, malformed structure, negative/boundary values, and route-level behavior when applicable.\n"
+        "  - New file inputs, refs, timers, sockets, subscriptions, or background resources use a dedicated state/ref/lifecycle unless intentionally sharing an existing one.\n"
+        "  - Independent user actions use independent resources: do not reuse an image/file/upload ref, timer, worker, socket, canvas, or subscription for a new unrelated action unless that sharing is already the existing pattern.\n"
+        "  - Click path check: every new button/form/control has its handler, dispatch/context/hook/ref, loading/error state, and side effect in scope and wired.\n"
+        "  - Route path check: every new link/command/route has registration, destination component/page, client/service method, backend handler, and type/model support when applicable.\n"
+        "  - Preservation check: no existing real auth, backend, database, Supabase, localStorage, cache, upload, or submission flow was replaced by fake/demo/local-only behavior unless required.\n"
+        "  - Redesign preservation check: visual/layout rewrites keep existing submission, auth, data fetch, tilt/animation, responsive, and error/empty-state behavior unless the issue explicitly changes it.\n"
+        "  - Syntax enclosure check: added methods/classes/components still close braces/tags/exports correctly after insertion.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No file-mode-only chmod churn, generated caches, compiled artifacts, or unrelated script permission flips\n"
+        "  - No binary files, __pycache__, build outputs, lockfile churn, sample/demo data invention, or broad generated artifacts unless explicitly required.\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
@@ -2387,6 +2754,71 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "needed to satisfy it, then end with <final>summary</final>.\n\n"
         "Do NOT add scope the task did not ask for. Do NOT rewrite working "
         "code. Add only what is required to cover the listed criteria.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_integration_nudge_prompt(integration_summary: str, issue_text: str) -> str:
+    return (
+        "Integration check: your patch appears to add implementation code, but "
+        "it may not wire that code into the app/API entrypoints that make it "
+        "reachable.\n\n"
+        f"{integration_summary}\n\n"
+        "Before finalizing, inspect or update the relevant integration point: "
+        "App/routes/router, sidebar/navigation/menu, urls.py/routes, controller/"
+        "service registration, main/index entry, or dashboard/layout wiring. "
+        "If the new code is already reachable through an existing convention, "
+        "finish with <final>summary</final> and name that convention. Otherwise "
+        "issue the minimal edit command(s) to wire it in. Do not broaden the "
+        "feature beyond the task.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_artifact_nudge_prompt(artifact_summary: str, issue_text: str) -> str:
+    return (
+        "Requested-artifact check: the task appears to ask for a supporting "
+        "artifact, but the current patch does not touch a matching file.\n\n"
+        f"{artifact_summary}\n\n"
+        "Before finalizing, inspect the repository conventions for the requested "
+        "artifact type: tests/specs, docs/README/changelog, package/version "
+        "metadata, migrations/schema, locale files, or fixtures/examples. If the "
+        "artifact is truly unnecessary because the task text only mentioned it "
+        "as context, finish with <final>summary</final> and say why. Otherwise "
+        "issue the minimal edit command(s) needed to add or update the requested "
+        "artifact. Do not add unrelated artifacts.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> str:
+    return (
+        "Dependency metadata check: your patch appears to import or require a "
+        "package that may not be declared in the repository metadata.\n\n"
+        f"{dependency_summary}\n\n"
+        "Before finalizing, inspect the repo's dependency manifest convention "
+        "(package.json, pyproject.toml/requirements, Cargo.toml, go.mod, pom.xml, "
+        "Gradle, composer.json, Gemfile, pubspec.yaml, etc.). If the package is "
+        "already provided by the platform or existing transitive code convention, "
+        "finish with <final>summary</final> and say why. Otherwise add the "
+        "minimal manifest entry needed for the import to work. Do not add "
+        "unused dependencies.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
+    return (
+        "Pre-final hazard review: the current diff has one or more common "
+        "patch hazards that often lose review or hidden tests.\n\n"
+        f"{hazard_summary}\n\n"
+        "Inspect the relevant lines and either fix/revert the hazard, or if it "
+        "is intentionally required by the issue, finish with <final>summary</final> "
+        "and name why it is required. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -2662,6 +3094,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    integration_nudges_used = 0
+    artifact_nudges_used = 0
+    dependency_nudges_used = 0
+    hazard_review_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2701,12 +3137,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. integration-nudge — make new code reachable from routes/nav/API
+            7. artifact-nudge — add explicitly requested tests/docs/schema/i18n/etc.
+            8. dependency-nudge — add metadata for new external packages
+            9. hazard-review — catch cheap diff hazards before broad self-check
+            10. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2763,7 +3203,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_companion_test_failure(repo, patch, issue)
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
@@ -2802,6 +3242,54 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if integration_nudges_used < MAX_INTEGRATION_NUDGES:
+            integration_summary = _integration_gap_summary(patch, issue)
+            if integration_summary:
+                integration_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_integration_nudge_prompt(integration_summary, issue),
+                    "INTEGRATION_NUDGE_QUEUED:\n  " + integration_summary[:120],
+                )
+                return True
+
+        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
+            artifact_summary = _requested_artifact_gap_summary(patch, issue)
+            if artifact_summary:
+                artifact_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_artifact_nudge_prompt(artifact_summary, issue),
+                    "ARTIFACT_NUDGE_QUEUED:\n  " + artifact_summary[:120],
+                )
+                return True
+
+        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
+            dependency_summary = _dependency_metadata_gap_summary(patch, repo)
+            if dependency_summary:
+                dependency_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_dependency_nudge_prompt(dependency_summary, issue),
+                    "DEPENDENCY_NUDGE_QUEUED:\n  " + dependency_summary[:120],
+                )
+                return True
+
+        if hazard_review_turns_used < MAX_HAZARD_REVIEW_TURNS:
+            hazard_summary = _hazard_review_summary(patch)
+            if hazard_summary:
+                hazard_review_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hazard_review_prompt(hazard_summary, issue),
+                    "HAZARD_REVIEW_QUEUED:\n  " + hazard_summary.replace("\n", " ")[:160],
                 )
                 return True
 
