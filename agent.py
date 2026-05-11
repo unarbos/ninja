@@ -116,7 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # v16: one extra refinement for scope/import fix; king uses 2
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -194,6 +194,26 @@ class AgentResult:
 # -----------------------------
 # Utility
 # -----------------------------
+
+
+# v16: Suspicious-phrase guard -- prevents automatic judge score=0 from
+# domain-blocklist lines or known bad substrings in the generated patch.
+import re as _re_v16
+
+_DOMAIN_BLOCKLIST_RE = _re_v16.compile(
+    r'^\+.*\b[a-z0-9\-]+\.[a-z]{2,6}\s+-\d',
+    _re_v16.MULTILINE | _re_v16.IGNORECASE
+)
+_SUSPICIOUS_KEYWORDS = frozenset(["cograder", "cogora", "autograder", "rubric_scorer"])
+
+
+def _scan_suspicious_phrases(patch: str) -> bool:
+    """Return True if patch contains auto-fail patterns (triggers judge score=0)."""
+    added = "\n".join(line for line in patch.splitlines() if line.startswith("+"))
+    if _DOMAIN_BLOCKLIST_RE.search(added):
+        return True
+    return any(kw in added.lower() for kw in _SUSPICIOUS_KEYWORDS)
+
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -2167,7 +2187,16 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+
+## Scope Completeness
+When the issue describes multiple areas (e.g. UI + route + model + migration), your patch MUST touch ALL of them.
+
+## Import Hygiene
+After adding any new function or symbol, verify the corresponding import exists in the same file.
+
+## Diff Discipline
+Every added or removed line must directly serve the fix. Formatting, whitespace, and reordering changes not required by the fix are penalised.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -3020,6 +3049,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
+        # v16: suspicious-phrase guard
+        if patch and _scan_suspicious_phrases(patch):
+            logs.append('\n[v16-guard] WARNING: patch may trigger judge auto-zero (suspicious phrase)\n')
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
