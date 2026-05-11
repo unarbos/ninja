@@ -125,7 +125,7 @@ MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
 MAX_CONTRACT_NUDGES = 1    # catch route/import/rename propagation gaps
 MAX_DELIVERABLE_NUDGES = 1  # catch named files/modules from issue not touched
 MAX_UI_BINDING_NUDGES = 1  # catch stale UI selectors/actions after visible UI edits
-MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1597,7 +1597,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
     Used by the coverage-nudge refinement turn to tell the model concretely
     which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
+    Reviewers and tests frequently catch missing explicitly named files; surfacing
     the gap to the model directly is the cheapest way to close it.
     """
     required = _extract_issue_path_mentions(issue_text)
@@ -1880,8 +1880,8 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
+    Reviewers and compilers frequently catch "extra closing braces" or
+    "duplicate brace" issues. This naive
     counter ignores braces inside string and comment context (best-effort)
     and reports an imbalance with file + count delta.
     """
@@ -1975,7 +1975,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model; language-specific checks above catch the cheap cases.
         if result:
             errors.append(result)
     return errors
@@ -2723,7 +2723,7 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
             if wants_form and re.search(r"\bbadge|filter|category|today|date\b", lower_added):
                 if not re.search(r"\b(input|select|textarea|form|option|value=|onchange|onChange)\b", added_text):
                     notes.append(f"{path}: category/date UI changed without visible form/input option update")
-            if "today" in issue_lower and re.search(r"\bupcoming|pr[oó]xim", lower_added, re.IGNORECASE):
+            if "today" in issue_lower and re.search(r"\b(upcoming|future|later|next)\b", lower_added, re.IGNORECASE):
                 if re.search(r"\btoISOString\s*\(", added_text) or not re.search(r"[<>!=]==?|isToday|startOfDay|local", added_text):
                     notes.append(f"{path}: today/upcoming split may duplicate or timezone-shift events")
 
@@ -2734,12 +2734,11 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
 
         touched_names = " ".join(Path(changed_path).stem.lower() for changed_path in changed)
         owner_sets = (
-            ("category/filter/date task", ("category", "filter", "badge", "form", "edit"), ("form", "edit", "badge", "css")),
-            ("settings/dashboard task", ("settings", "dashboard", "header", "dark", "tab"), ("settings", "dashboard", "topbar", "header")),
-            ("import/export/upload task", ("import", "export", "upload", "file", "csv"), ("import", "export", "ref", "upload")),
-            ("seo/metadata task", ("seo", "metadata", "sitemap", "robots", "json-ld", "case-studies"), ("metadata", "layout", "robots", "sitemap", "json")),
-            ("route/page/nav task", ("route", "page", "nav", "link", "component", "panel"), ("route", "page", "nav", "link", "panel")),
-            ("modal/confirm/i18n task", ("modal", "confirm", "confirmation", "locale", "translation"), ("modal", "confirm", "locale", "settings", "test")),
+            ("filtered editable list UI", ("category", "filter", "date", "badge", "form", "edit"), ("form", "input", "filter", "badge", "style")),
+            ("navigation and page registration", ("route", "page", "nav", "link", "component", "view"), ("route", "page", "nav", "link", "component")),
+            ("file transfer workflow", ("import", "export", "upload", "download", "file"), ("input", "ref", "parser", "download", "refresh")),
+            ("localized confirmation flow", ("modal", "confirm", "confirmation", "locale", "translation"), ("modal", "confirm", "locale", "message", "test")),
+            ("metadata and discovery files", ("metadata", "sitemap", "robots", "schema", "json-ld"), ("metadata", "layout", "sitemap", "robots", "schema")),
         )
         for label, issue_words, owner_words in owner_sets:
             if sum(1 for word in issue_words if word in issue_lower) >= 2:
@@ -2943,7 +2942,7 @@ Owner discovery before editing:
 - Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
 - UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
 - Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
-- Import/export tasks: inspect existing file-input refs, upload/image handlers, CSV/JSON parsers, export builders, and refresh flows before adding parallel import/export behavior.
+- File transfer tasks: inspect existing file-input refs, upload/image handlers, structured-data parsers, download builders, and refresh flows before adding parallel transfer behavior.
 - Validation tasks: inspect the current accepted/rejected boundary cases, including empty, whitespace, missing parts, wrong type, malformed shape, negative/boundary values, and non-string inputs when applicable.
 - Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
@@ -3000,7 +2999,7 @@ STYLE, COMMENTS, AND PUBLIC API
 
 Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
 
-Preserve meaningful comments around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve meaningful comments around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to maintainers. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
@@ -3071,7 +3070,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -3154,7 +3153,7 @@ def build_budget_pressure_prompt(step: int) -> str:
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
-    The LLM judge frequently penalises patches for "unrelated changes",
+    Reviewers frequently penalise patches for "unrelated changes",
     "unnecessary churn", and "cosmetic edits". Be explicit about which
     classes of changes count as scope creep so the model knows what to
     revert and what to keep.
@@ -3211,20 +3210,20 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Review the patch for correctness, completeness, and "
+        "minimal scope before finalizing:\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Acceptance contract: for each requirement, identify the exact owner changed, exact edge cases covered, exact producer/consumer names matched, and exact verification evidence.\n"
         "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
         "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
         "  - Every newly used identifier is declared, imported, destructured, or in scope in the touched file.\n"
-        "  - Every removed/moved function, route, component, or helper leaves no stale import/export/registration behind.\n"
+        "  - Every removed/moved function, route, component, or helper leaves no stale module or registration references behind.\n"
         "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
         "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
         "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
@@ -3234,7 +3233,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Existing schema/API check: do not invent unsupported fields, methods, enum variants, imports, dependency APIs, or response shapes; inspect and match the local contract.\n"
         "  - Signature/API call check: every changed function call includes required arguments, every route parameter name matches controller/service reads, and every callback/event payload matches the local handler signature.\n"
         "  - Every newly imported symbol is actually defined/exported by the source module; do not import helper names you have not added.\n"
-        "  - Every renamed data field is updated across create/read/update/delete, bulk import/export, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
+        "  - Every renamed data field is updated across create/read/update/delete, bulk transfer, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
         "  - Validation/parser fixes cover missing parts, empty strings, wrong type, malformed structure, negative/boundary values, and route-level behavior when applicable.\n"
         "  - New file inputs, refs, timers, sockets, subscriptions, or background resources use a dedicated state/ref/lifecycle unless intentionally sharing an existing one.\n"
         "  - Independent user actions use independent resources: do not reuse an image/file/upload ref, timer, worker, socket, canvas, or subscription for a new unrelated action unless that sharing is already the existing pattern.\n"
@@ -3277,8 +3276,8 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """Tell the model which acceptance-criteria checkpoints look unaddressed.
 
-    The LLM judge frequently dings the king for "missing N of M criteria" on
-    multi-bullet issues. The path-coverage gate sees files; this gate sees the
+    Multi-bullet issues often fail from missing one listed criterion. The
+    path-coverage gate sees files; this gate sees the
     criterion checkpoints themselves and surfaces them with the original text.
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
@@ -4180,7 +4179,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "1. Any remaining file edits or companion test updates.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — the LLM judge rewards passing tests.\n"
+                        "to verify correctness.\n"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
