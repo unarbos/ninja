@@ -2118,6 +2118,8 @@ First response format:
 - Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
 - Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
+- Binding check: for every new UI action, route, command, callback, or provider, name the state/hook/context/import/service/backend handler that makes it executable.
+- Preservation check: identify any existing real data/auth/storage/network behavior nearby and keep it unless the task explicitly says to replace it.
 - Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2156,6 +2158,9 @@ Owner discovery before editing:
 - Backend/refactor tasks: inspect the executor/router/service owner and one caller/callee in each direction before changing signatures or dependency injection.
 - Parser/protocol tasks: inspect parser, command/model type, and executor/handler together; changing only one layer often compiles poorly or misses behavior.
 - Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
+- UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
+- Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
+- Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
 ====================================================================
 ROOT CAUSE RULE
@@ -2435,6 +2440,14 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
         "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
         "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
+        "  - Every newly imported symbol is actually defined/exported by the source module; do not import helper names you have not added.\n"
+        "  - Every renamed data field is updated across create/read/update/delete, bulk import/export, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
+        "  - Validation/parser fixes cover missing parts, empty strings, wrong type, malformed structure, negative/boundary values, and route-level behavior when applicable.\n"
+        "  - New file inputs, refs, timers, sockets, subscriptions, or background resources use a dedicated state/ref/lifecycle unless intentionally sharing an existing one.\n"
+        "  - Click path check: every new button/form/control has its handler, dispatch/context/hook/ref, loading/error state, and side effect in scope and wired.\n"
+        "  - Route path check: every new link/command/route has registration, destination component/page, client/service method, backend handler, and type/model support when applicable.\n"
+        "  - Preservation check: no existing real auth, backend, database, Supabase, localStorage, cache, upload, or submission flow was replaced by fake/demo/local-only behavior unless required.\n"
+        "  - Syntax enclosure check: added methods/classes/components still close braces/tags/exports correctly after insertion.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
