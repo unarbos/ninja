@@ -10,10 +10,10 @@
 ```
 1. git checkout -b submission/my-agent && edit agent.py only
 2. ./scripts/precommit_ninja_pr.py --hotkey <SS58> --judge
-3. git add agent.py && git commit -m "<SS58>: <description>"
+3. git add agent.py && git commit -m "Improve agent: <description>"
 4. git push origin submission/my-agent
-   → OPTION A: btcli commit SHA on-chain FIRST → open PR
-   → OPTION B: open PR first → commit "#<PR>@<SHA>" on-chain
+   → OPTION A: run precommit/commit helper FIRST → open PR
+   → OPTION B: open PR first → commit "github-pr:unarbos/ninja#<PR>@<SHA>" on-chain
 5. PR title = "<exact-SS58-hotkey> <description>" (nothing before the SS58!)
 6. Monitor CI — do NOT amend/rebase/edit via GitHub web after SHA committed
 ```
@@ -82,11 +82,10 @@
 
 ### 2.1 Contract Compliance
 
-- [ ] Your `agent.py` exports exactly one function with this signature — do not add, remove, or rename parameters:
-  ```python
-  def solve(repo_path: str, issue: str, model: str, api_base: str, api_key: str) -> str:
-  ```
-- [ ] The function returns a **unified diff patch string** (or empty string on failure).
+- [ ] Keep the validator-facing `solve(repo_path, issue, model, api_base, api_key, ...)` entry point intact.
+- [ ] Do not remove, rename, or reorder the validator-owned parameters `repo_path`, `issue`, `model`, `api_base`, and `api_key`.
+- [ ] `solve(...)` must return a dict containing `patch`, `logs`, `steps`, `cost`, and `success`.
+- [ ] The `patch` field should contain a unified diff, and failure paths should return `success=False` with an empty `patch` instead of crashing.
 - [ ] You use `model`, `api_base`, and `api_key` **exclusively as passed** — no overrides, no fallbacks to your own credentials.
 - [ ] You do **not** set any sampling parameters when calling the LLM API:
   - ❌ `temperature=...`
@@ -100,12 +99,12 @@
 
 ### 2.2 Dependencies & Imports
 
-- [ ] Use **only Python standard library** modules plus what is already in the repo's `requirements.txt`.
+- [ ] Use Python standard library only for new logic in `agent.py`; do not add new third-party package requirements to this starter harness.
 - [ ] Do NOT import third-party packages not already present in the repo:
   - ❌ `pip install <anything-new>` then import it
   - ❌ `langchain`, `crewai`, `autogen`, `instructor`, `tiktoken`, or any new library
-- [ ] If you need a capability, implement it with stdlib or the existing dependencies.
-- [ ] Verify your imports at the top of `agent.py` — none should be new third-party packages.
+- [ ] If you need a capability, implement it with stdlib or by refactoring the existing harness logic.
+- [ ] Verify your imports at the top of `agent.py` — none should introduce a new dependency requirement.
 
 ### 2.3 Security & Integrity Rules
 
@@ -123,7 +122,7 @@
 
 ### 2.4 Code Quality Targets
 
-- [ ] Your agent handles edge cases gracefully (malformed diffs, empty issues, API errors) — return `""` on failure rather than raising.
+- [ ] Your agent handles edge cases gracefully (malformed diffs, empty issues, API errors) — return `success=False` with an empty `patch` rather than letting exceptions escape.
 - [ ] Your agent produces **syntactically valid unified diffs** — test this locally.
 - [ ] Your patch is **complete** — addresses the full issue, not just a partial fix.
 - [ ] Your patch is **aligned** with the stated issue — judges score on task alignment.
@@ -151,9 +150,9 @@
   from agent import solve
   sig = inspect.signature(solve)
   params = list(sig.parameters.keys())
-  expected = ['repo_path', 'issue', 'model', 'api_base', 'api_key']
-  assert params == expected, f'Signature mismatch: {params}'
-  print('Signature OK:', params)
+  expected_prefix = ['repo_path', 'issue', 'model', 'api_base', 'api_key']
+  assert params[:len(expected_prefix)] == expected_prefix, f'Signature mismatch: {params}'
+  print('Signature prefix OK:', params)
   "
   ```
 
@@ -163,8 +162,8 @@
   - Simple single-file fix
   - Multi-file change
   - Issue requiring code understanding (not just string replacement)
-- [ ] Confirm each test returns a non-empty, valid unified diff.
-- [ ] Validate patch format:
+- [ ] Confirm each test result includes a non-empty `patch` and a sensible `success` flag.
+- [ ] Validate the returned `patch` field format:
   ```bash
   echo "<your-patch-output>" | patch --dry-run -p1
   ```
@@ -174,7 +173,7 @@
   result = subprocess.run(['patch', '--dry-run', '-p1'], input=patch, capture_output=True, text=True)
   print(result.returncode, result.stderr)
   ```
-- [ ] Test graceful failure — pass an invalid API key and confirm it returns `""` instead of crashing.
+- [ ] Test graceful failure — pass an invalid API key and confirm it returns `success=False` with an empty `patch` instead of crashing.
 - [ ] Test with a large repo (>100 files) to verify no timeout issues.
 
 ### 3.3 Performance Check
@@ -304,14 +303,19 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 
 ### Option A — Commit SHA Before Opening PR (Private Window)
 
-- [ ] Submit your SHA on-chain FIRST, before creating the PR:
+- [ ] Generate the pre-PR commitment string and run local checks:
   ```bash
-  btcli subnet commit \
-    --netuid 66 \
-    --wallet.name <wallet-name> \
-    --wallet.hotkey <hotkey-name> \
-    --data "<COMMIT_SHA>" \
-    --subtensor.network finney
+  ./scripts/precommit_ninja_pr.py --hotkey <your-SS58-hotkey> --judge
+  # Prints: github-pr-head:unarbos/ninja@<head-sha>
+  ```
+- [ ] Submit that exact printed commitment on-chain before creating the PR:
+  ```bash
+  ./scripts/precommit_ninja_pr.py \
+    --hotkey <your-SS58-hotkey> \
+    --judge \
+    --commit-on-chain \
+    --wallet-name <wallet-name> \
+    --wallet-hotkey <wallet-hotkey-name>
   ```
 - [ ] If Finney RPC has SSL timeouts, use an alternative public subtensor endpoint (check the community Discord for current options).
 - [ ] Confirm the transaction succeeded and note the block number.
@@ -323,12 +327,12 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 - [ ] Note the PR number (e.g., `#123`).
 - [ ] Submit the combined reference on-chain:
   ```bash
-  btcli subnet commit \
+  ./scripts/commit_on_chain.py \
+    --wallet-name <wallet-name> \
+    --wallet-hotkey <wallet-hotkey-name> \
+    --hotkey <your-SS58-hotkey> \
     --netuid 66 \
-    --wallet.name <wallet-name> \
-    --wallet.hotkey <hotkey-name> \
-    --data "#<PR_NUMBER>@<COMMIT_SHA>" \
-    --subtensor.network finney
+    --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
   ```
 
 ### On-Chain Verification
@@ -340,7 +344,7 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
     --hotkey <your-SS58-hotkey> \
     --subtensor.network finney
   ```
-- [ ] Confirm the stored value matches exactly what you submitted (SHA or `#PR@SHA`).
+- [ ] Confirm the stored value matches exactly what you submitted (`github-pr-head:unarbos/ninja@<head-sha>` or `github-pr:unarbos/ninja#<pr-number>@<head-sha>`).
 
 ---
 
@@ -364,13 +368,7 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 
 ### 7.2 Final Verification After PR Opens
 
-- [ ] Confirm the PR head commit SHA matches your on-chain commitment:
-  ```bash
-  # The SHA shown on GitHub PR should match:
-  echo "On-chain SHA: <your-committed-SHA>"
-  echo "PR head SHA:  <SHA shown in GitHub PR>"
-  # These MUST be identical
-  ```
+- [ ] Confirm the PR head commit SHA matches the `<head-sha>` embedded in your on-chain commitment string.
 - [ ] Confirm the PR only modifies `agent.py` (visible in the "Files changed" tab).
 - [ ] Confirm PR title starts with your exact SS58 hotkey.
 - [ ] Watch CI checks — they will run automatically. Do NOT touch the branch while CI runs.
@@ -382,13 +380,7 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 ### 8.1 CI Check Results
 
 - [ ] Monitor the PR for CI status (usually runs within a few minutes).
-- [ ] **PR Scope Guard** checks:
-  - Files outside `agent.py` → rejected
-  - Forbidden API patterns → rejected
-  - Sampling parameters → rejected
-  - Contract signature changes → rejected
-  - Validator-avoidance code → rejected
-- [ ] **Agent PR Smoke** checks (added May 2026):
+- [ ] **Agent PR Smoke** checks:
   - `agent.py` must compile without syntax errors (`py_compile`)
   - No new `pyflakes` warnings beyond the known baseline
   - Run locally: `python3 -m py_compile agent.py && python3 -m pyflakes agent.py`
@@ -468,8 +460,7 @@ git ls-remote origin <branch>         # Verify remote SHA matches
 ```bash
 # Verify on-chain commitment landed:
 btcli subnet get_commitment --netuid 66 --hotkey <SS58> --subtensor.network finney
-# Verify SHA matches your commit:
-echo "Committed: <SHA from btcli output>"
+# Verify the <head-sha> inside the stored commitment string matches your branch:
 echo "Branch HEAD: $(git rev-parse HEAD)"
 ```
 
@@ -493,9 +484,15 @@ btcli wallet overview --wallet.name <name> --wallet.hotkey <hotkey>
 # Get current HEAD SHA
 git rev-parse HEAD
 
-# Commit SHA on-chain (Finney)
-btcli subnet commit --netuid 66 --wallet.name <name> --wallet.hotkey <hotkey> \
-  --data "<SHA>" --subtensor.network finney
+# Commit pre-PR head on-chain (Option A)
+./scripts/commit_on_chain.py --wallet-name <name> --wallet-hotkey <hotkey> \
+  --hotkey <SS58> --netuid 66 \
+  --commit "github-pr-head:unarbos/ninja@<head-sha>"
+
+# Commit PR-number reference on-chain (Option B)
+./scripts/commit_on_chain.py --wallet-name <name> --wallet-hotkey <hotkey> \
+  --hotkey <SS58> --netuid 66 \
+  --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
 
 # Verify on-chain commitment
 btcli subnet get_commitment --netuid 66 --hotkey <SS58> --subtensor.network finney

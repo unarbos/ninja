@@ -9,7 +9,9 @@ does not queue raw `owner/repo@sha` commitments or arbitrary external repos; it
 only runs PR heads from `unarbos/ninja` that are also committed on-chain by a
 registered miner hotkey.
 
-For a short miner-facing checklist, see `miner_readme.txt`.
+For a short miner-facing checklist, see `miner_readme.txt`. For a detailed
+end-to-end submission guide, see
+[`MINER_SUBMISSION_CHECKLIST.md`](./MINER_SUBMISSION_CHECKLIST.md).
 
 ## What You Are Allowed To Edit
 
@@ -121,7 +123,7 @@ There are two supported ways to bind your PR to your miner hotkey. The newer
 pre-PR flow gives you a private period: you commit the exact Git head on-chain
 before the PR is public, then open the PR after the commitment is included. The
 classic flow still works if you prefer to open the PR first and commit
-`#<pr-number>@<head-sha>` afterward.
+`github-pr:unarbos/ninja#<pr-number>@<head-sha>` afterward.
 
 ### Option A: pre-PR commitment
 
@@ -221,10 +223,14 @@ the committed SHA matches the current PR head SHA.
 
 ### PR Guardrails
 
-The validator requires two checks before queuing a PR:
+The validator requires these checks before queuing a PR:
 
+- `Agent PR Smoke`
 - `PR Scope Guard`
 - `OpenRouter PR Judge`
+
+`Agent PR Smoke` catches basic syntax/import regressions in `agent.py` before
+the heavier policy and judge gates run.
 
 `PR Scope Guard` rejects edits that break these boundaries (file scope,
 contract scope, forbidden provider/sampling/secret usage).
