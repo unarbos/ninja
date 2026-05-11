@@ -90,8 +90,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
+MAX_PRELOADED_CONTEXT_CHARS = 40000
+MAX_PRELOADED_FILES = 14
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 245.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -707,6 +707,54 @@ _PROJECT_HINT_FILES = (
     "vitest.config.ts",
 )
 
+_INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
+    "api",
+    "app",
+    "client",
+    "component",
+    "components",
+    "config",
+    "controller",
+    "controllers",
+    "context",
+    "db",
+    "form",
+    "handler",
+    "handlers",
+    "layout",
+    "migration",
+    "migrations",
+    "model",
+    "models",
+    "page",
+    "pages",
+    "repository",
+    "repositories",
+    "route",
+    "routes",
+    "router",
+    "schema",
+    "schemas",
+    "screen",
+    "screens",
+    "service",
+    "services",
+    "store",
+    "types",
+    "view",
+    "views",
+)
+
+_INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
+    "Dockerfile",
+    "Makefile",
+    "build.gradle",
+    "docker-compose.yml",
+    "package.json",
+    "pyproject.toml",
+    "settings.gradle",
+)
+
 
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     """Compact top-level verification hints: test scripts and build config.
@@ -765,6 +813,102 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+_PRELOAD_RERANK_CAP = 20
+_PRELOAD_RERANK_TIMEOUT_S = 5
+_PRELOAD_RERANK_MAX_TOKENS = 256
+_PRELOAD_RERANK_CTX: Dict[str, Any] = {}
+
+
+def _llm_rerank_preload_candidates(
+    repo: Path,
+    issue_text: str,
+    heuristic_top: List[str],
+) -> List[str]:
+    """Use validator-supplied LLM to rerank top heuristic candidate files.
+
+    Reliance on the in-round inference proxy lets the agent ask "which of these
+    paths most plausibly contains the bug?" before committing the larger
+    context budget to reading them. Tightly time-capped (5 s) and fail-open: on
+    timeout / HTTP error / hallucinated paths, the original heuristic order is
+    returned unchanged. Costs one small chat completion per round; pays for
+    itself when the heuristic ranks the right file 2nd or 3rd.
+    """
+    ctx = _PRELOAD_RERANK_CTX
+    model = ctx.get("model")
+    api_base = ctx.get("api_base")
+    api_key = ctx.get("api_key")
+    if not model or not api_base or not api_key or not heuristic_top:
+        return heuristic_top
+    deadline = ctx.get("deadline")
+    if deadline is not None and (deadline - time.monotonic()) < _PRELOAD_RERANK_TIMEOUT_S + 2:
+        return heuristic_top
+
+    cap = min(_PRELOAD_RERANK_CAP, len(heuristic_top))
+    candidates = heuristic_top[:cap]
+    snippets: List[str] = []
+    for path in candidates:
+        head = ""
+        try:
+            head_bytes = (repo / path).read_bytes()[:260]
+            head = head_bytes.decode("utf-8", errors="replace").replace("\n", " ")[:90]
+        except Exception:
+            head = ""
+        snippets.append(f"- {path} :: {head}")
+    desc = issue_text[:1500]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rank candidate source files by likelihood of containing the "
+                "bug described in the issue. Output ONE path per line, in rank "
+                "order, MOST LIKELY first. Use ONLY paths from the provided "
+                "candidate list. No extra commentary."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Issue (head):\n{desc}\n\n"
+                f"Candidates (path :: file-head):\n" + "\n".join(snippets) + "\n\n"
+                "Ranked paths:"
+            ),
+        },
+    ]
+    try:
+        response_text, _cost, _raw = chat_completion(
+            messages=messages,
+            model=str(model),
+            api_base=str(api_base),
+            api_key=str(api_key),
+            max_tokens=_PRELOAD_RERANK_MAX_TOKENS,
+            timeout=_PRELOAD_RERANK_TIMEOUT_S,
+            max_retries=0,
+        )
+    except Exception:
+        return heuristic_top
+    if not response_text:
+        return heuristic_top
+
+    candidate_set = set(candidates)
+    seen: set = set()
+    ordered: List[str] = []
+    for raw_line in response_text.splitlines():
+        line = raw_line.strip().lstrip("0123456789.)- \t")
+        line = line.split("::", 1)[0].strip().strip("`\"'")
+        if not line:
+            continue
+        if line in candidate_set and line not in seen:
+            seen.add(line)
+            ordered.append(line)
+    if not ordered:
+        return heuristic_top
+    for path in heuristic_top:
+        if path not in seen:
+            ordered.append(path)
+            seen.add(path)
+    return ordered
+
+
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -784,6 +928,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
 
+    v49: when the validator-supplied LLM is available, the heuristic top-N is
+    rebroadcast through `_llm_rerank_preload_candidates` for a small final
+    rerank pass. Fail-open: any failure leaves the heuristic order intact.
+
+    After ranked files and companion tests, a bounded pass adds high-confidence
+    integration-adjacent files (routes, schemas, configs, etc.) when they
+    match anchor/issue signals.
+
     Each file snippet is fetched via `_read_context_file` with issue-derived
     needles so we keep only the regions relevant to the task instead of the
     head N chars of the file.
@@ -792,8 +944,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if not files:
         return "", []
 
+    files = _llm_rerank_preload_candidates(repo, issue, files)
+
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_integration_partners(files, tracked_set, issue)
 
     needles = _preload_needles(issue)
 
@@ -932,6 +1087,107 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         seen.add(relative_path)
         ranked.append(relative_path)
     return ranked
+
+
+def _split_path_tokens(relative_path: str) -> set:
+    """Lower-case path/name tokens used for cheap related-file discovery."""
+    tokens: set = set()
+    for part in Path(relative_path).parts:
+        for token in re.findall(r"[a-z0-9]+", part.lower()):
+            if len(token) >= 3:
+                tokens.add(token)
+    return tokens
+
+
+def _looks_like_integration_surface(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.name in _INTEGRATION_ROOT_FILES:
+        return True
+    tokens = _split_path_tokens(relative_path)
+    return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Append a few likely integration files after direct hits and tests.
+
+    The agent was already good at finding the local function named by an issue,
+    but duel losses showed repeated misses in adjacent wiring: routes, API
+    clients, schemas, migrations, UI entry pages, and build metadata. This keeps
+    the direct ranking intact and only appends high-confidence neighbors.
+    """
+    if not files or not tracked:
+        return files
+
+    seen = set(files)
+    anchors = files[:6]
+    anchor_dirs = {
+        str(Path(p).parent).replace("\\", "/")
+        for p in anchors
+        if str(Path(p).parent) not in {"", "."}
+    }
+    anchor_top_dirs = {
+        Path(p).parts[0]
+        for p in anchors
+        if Path(p).parts
+    }
+    anchor_tokens = set()
+    for path in anchors:
+        anchor_tokens.update(_split_path_tokens(path))
+
+    issue_tokens = set(_issue_terms(issue))
+    issue_symbols = {s.lower() for s in _extract_issue_symbols(issue, max_symbols=16)}
+    signal_tokens = {t for t in (anchor_tokens | issue_tokens | issue_symbols) if len(t) >= 4}
+    root_file_wanted = bool(
+        issue_tokens
+        & {
+            "build",
+            "cli",
+            "config",
+            "dependency",
+            "dependencies",
+            "docker",
+            "package",
+            "script",
+            "setup",
+            "workflow",
+        }
+    )
+
+    candidates: List[Tuple[int, str]] = []
+    for relative_path in sorted(tracked):
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        if not _looks_like_integration_surface(relative_path):
+            continue
+
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        parent = str(path.parent).replace("\\", "/")
+        parts = path.parts
+        score = 0
+
+        if parent in anchor_dirs:
+            score += 6
+        if parts and parts[0] in anchor_top_dirs:
+            score += 3
+        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
+        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
+        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
+            score += 5
+        if "test" in path_lower or "spec" in path_lower:
+            score -= 2  # companion-test loading already handles tests.
+
+        if score >= 6:
+            candidates.append((score, relative_path))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:4]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+    return augmented
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -2357,6 +2613,116 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
     )
 
 
+_VERIFIER_TIMEOUT_S = 6
+_VERIFIER_MAX_TOKENS = 320
+_VERIFIER_MIN_TIME_REMAINING_S = 35
+_VERIFIER_PATCH_HEAD_CHARS = 2400
+_VERIFIER_PATCH_TAIL_CHARS = 1600
+_VERIFIER_CTX: Dict[str, Any] = {}
+
+
+def _llm_verify_patch_coverage(patch: str, issue_text: str) -> List[str]:
+    """Ask the validator-supplied LLM to list concrete unaddressed requirements.
+
+    Returns a short list of one-line bullets the model believes the patch is
+    still missing relative to the issue. Empty list = verifier sees no gaps
+    (or call failed). Designed as a smarter replacement for the heuristic
+    `build_self_check_prompt` text — the validator-side LLM can detect missing
+    multi-file integration, missing route wiring, or unwired UI even when the
+    issue text doesn't repeat those words. Time-capped 6 s, fail-open.
+    """
+    ctx = _VERIFIER_CTX
+    model = ctx.get("model")
+    api_base = ctx.get("api_base")
+    api_key = ctx.get("api_key")
+    deadline = ctx.get("deadline")
+    if not model or not api_base or not api_key:
+        return []
+    if deadline is not None and (deadline - time.monotonic()) < _VERIFIER_MIN_TIME_REMAINING_S:
+        return []
+    if not patch.strip() or not issue_text:
+        return []
+
+    if len(patch) <= _VERIFIER_PATCH_HEAD_CHARS + _VERIFIER_PATCH_TAIL_CHARS:
+        patch_excerpt = patch
+    else:
+        patch_excerpt = (
+            patch[:_VERIFIER_PATCH_HEAD_CHARS]
+            + "\n...[truncated]...\n"
+            + patch[-_VERIFIER_PATCH_TAIL_CHARS:]
+        )
+
+    issue_excerpt = issue_text[:2800]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict reviewer comparing a candidate patch to a "
+                "task description. List ONLY the concrete things the patch "
+                "fails to address. Be terse: one short bullet each, no "
+                "preamble, no praise. If the patch addresses everything, "
+                "respond with the single word OK."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"TASK:\n{issue_excerpt}\n\n"
+                f"CANDIDATE PATCH:\n```diff\n{patch_excerpt}\n```\n\n"
+                "List unaddressed requirements (or OK):"
+            ),
+        },
+    ]
+    try:
+        response_text, _cost, _raw = chat_completion(
+            messages=messages,
+            model=str(model),
+            api_base=str(api_base),
+            api_key=str(api_key),
+            max_tokens=_VERIFIER_MAX_TOKENS,
+            timeout=_VERIFIER_TIMEOUT_S,
+            max_retries=0,
+        )
+    except Exception:
+        return []
+    if not response_text:
+        return []
+    stripped = response_text.strip()
+    if not stripped or stripped.upper().startswith("OK"):
+        return []
+    bullets: List[str] = []
+    for raw in stripped.splitlines():
+        line = raw.strip().lstrip("0123456789.)- \t*")
+        if not line:
+            continue
+        if line.upper().startswith("OK") and len(line) <= 8:
+            continue
+        if len(line) > 220:
+            line = line[:220].rstrip() + "..."
+        bullets.append(line)
+        if len(bullets) >= 6:
+            break
+    return bullets
+
+
+def build_verifier_nudge_prompt(missing: List[str], issue_text: str) -> str:
+    """Prompt that re-injects the verifier's findings as concrete TODOs."""
+    bullets = "\n  ".join(f"- {item}" for item in missing[:6])
+    snippet = issue_text[:1500].rstrip()
+    return (
+        "Verifier pass: an independent reviewer flagged these items in your "
+        "current patch as not yet addressed:\n\n"
+        f"  {bullets}\n\n"
+        "For each item, decide whether you genuinely missed it (then emit "
+        "the additional <command> blocks to fix it) or whether the patch "
+        "already covers it under a different name (then proceed). Make the "
+        "smallest correct edits, do NOT broaden scope, do NOT churn unrelated "
+        "code, and end with <final>summary</final>.\n\n"
+        "Task (for reference):\n"
+        f"{snippet}\n"
+    )
+
+
 def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
@@ -2806,13 +3172,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+            # Verifier asks the validator-side LLM for concrete gaps; inject
+            # bullets into the refinement when present; else heuristic self-check.
             self_check_turns_used += 1
             total_refinement_turns_used += 1
-            queue_refinement_turn(
-                assistant_text,
-                build_self_check_prompt(patch, issue),
-                "SELF_CHECK_QUEUED",
-            )
+            missing_items = _llm_verify_patch_coverage(patch, issue)
+            if missing_items:
+                queue_refinement_turn(
+                    assistant_text,
+                    build_verifier_nudge_prompt(missing_items, issue),
+                    "VERIFIER_NUDGE_QUEUED:\n  "
+                    + "\n  ".join(item[:90] for item in missing_items[:4]),
+                )
+            else:
+                queue_refinement_turn(
+                    assistant_text,
+                    build_self_check_prompt(patch, issue),
+                    "SELF_CHECK_QUEUED",
+                )
             return True
 
         return False
@@ -2822,7 +3199,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        _deadline = solve_started_at + WALL_CLOCK_BUDGET_SECONDS
+        _PRELOAD_RERANK_CTX["model"] = model_name
+        _PRELOAD_RERANK_CTX["api_base"] = api_base
+        _PRELOAD_RERANK_CTX["api_key"] = api_key
+        _PRELOAD_RERANK_CTX["deadline"] = _deadline
+        _VERIFIER_CTX["model"] = model_name
+        _VERIFIER_CTX["api_base"] = api_base
+        _VERIFIER_CTX["api_key"] = api_key
+        _VERIFIER_CTX["deadline"] = _deadline
+        try:
+            preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        finally:
+            _PRELOAD_RERANK_CTX.clear()
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
