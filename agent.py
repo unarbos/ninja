@@ -91,9 +91,8 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-# a.py top-agent budgets + k.py discipline: larger preload/observation so the
-# model sees real bug loci in big files; tighter no-command repairs (empty
-# patches score zero — fail fast into repair/hail-mary instead of chatting).
+# Larger preload/observation caps help big-file loci; empty patches score zero,
+# so fail fast into repair/hail-mary instead of no-command chatter.
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
@@ -110,10 +109,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# v69 (j.py king): 180->240 inner budget — pairs with outer 540s multishot envelope +
-# emergency single-shot so one attempt stays strong while still leaving wall-clock
-# reserve for retry / salvage paths.
-# d.py top-agent inner budget (255s): leaves more multishot envelope headroom vs 270s.
+# Inner attempt wall clock (seconds). Pairs with multishot outer budget + reserve.
 WALL_CLOCK_BUDGET_SECONDS = 255.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
@@ -127,10 +123,10 @@ MAX_TEST_FIX_TURNS = 1     # actually run the companion test if one exists
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_CORRUPTION_TURNS = 1   # harness/heredoc leaks into source (kept — d.py omits; cheap win)
-MAX_TOTAL_REFINEMENT_TURNS = 2  # d.py + k.py: ninjaking66#268 — long refinement chains blow wall-clock
+MAX_CORRUPTION_TURNS = 1   # harness/heredoc noise leaked into source files
+MAX_TOTAL_REFINEMENT_TURNS = 2  # cap non-hail-mary refinement turns per finalize
 
-# k.py champion: cap on project-hints block in preloaded context.
+# Max chars for optional project-style hints in preloaded context.
 _STYLE_HINT_BUDGET = 600
 
 # Recent-commit injection (v21 edge): small style anchors from real git history.
@@ -874,7 +870,7 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload ranked files + companion tests; return `(text, included_paths)`.
 
-    d.py-style: tracked **path-mentions that look like tests** are merged to the
+    Tracked path-mentions that look like tests are merged to the
     front via `_merge_priority_files` (higher signal than regex-mining prose).
 
     Needle windows (`_preload_needles` + `_extract_relevant_regions`) keep huge
@@ -1076,6 +1072,27 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
     return mentions
 
 
+def _classify_task_scope(task_text: str, baseline_lines: int) -> str:
+    """Coarse task size hint for the initial user message (atomic vs complex)."""
+    if not task_text:
+        return "moderate"
+    task_len = len(task_text)
+    file_mentions = _extract_issue_path_mentions(task_text)
+    num_files = len(file_mentions)
+    has_complexity_keyword = bool(
+        re.search(
+            r"\b(redesign|refactor|architecture|migration|migrate|overhaul|rewrite)\b",
+            task_text,
+            re.IGNORECASE,
+        )
+    )
+    if task_len > 600 or num_files >= 4 or has_complexity_keyword:
+        return "complex"
+    if baseline_lines < 100 and task_len < 200 and num_files <= 1:
+        return "atomic"
+    return "moderate"
+
+
 # Real GitHub issues frequently paste a stack trace; the deepest non-stdlib
 # frame is almost always the bug locus. We extract those frames in *order*
 # (top of paste first) so callers can boost the deepest frame more than
@@ -1188,7 +1205,7 @@ def _issue_terms(issue: str) -> List[str]:
 
 
 def _preload_needles(issue: str) -> List[str]:
-    """Deduped needle list for issue-aware partial file loading (a.py)."""
+    """Deduped needle list for issue-aware partial file loading."""
     out: List[str] = []
     seen: set = set()
 
@@ -1221,7 +1238,7 @@ def _extract_relevant_regions(
     ctx_before: int = 8,
     ctx_after: int = 18,
 ) -> str:
-    """Windows around lines matching any needle, capped at max_chars (a.py)."""
+    """Windows around lines matching any needle, capped at max_chars."""
     if not text:
         return text
     if len(text) <= max_chars:
@@ -1816,7 +1833,7 @@ def _looks_like_test_path(relative_path: str) -> bool:
 
 
 def _merge_priority_files(files: List[str], priority: List[str]) -> List[str]:
-    """Put high-confidence issue-mentioned files first without duplicates (d.py)."""
+    """Put high-confidence issue-mentioned files first without duplicates."""
     if not priority:
         return files
     merged: List[str] = []
@@ -1830,7 +1847,7 @@ def _merge_priority_files(files: List[str], priority: List[str]) -> List[str]:
 
 
 def _find_issue_tests(repo: Path, issue_text: str, tracked: Optional[set] = None) -> List[str]:
-    """Return existing test files explicitly named in the issue path mentions (d.py)."""
+    """Return test files explicitly named in the issue path mentions."""
     tracked_set = tracked if tracked is not None else set(_tracked_files(repo))
     if not tracked_set:
         return []
@@ -1982,7 +1999,7 @@ def _select_companion_test_failure(
     issue_text: str = "",
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
-    """Run issue-named tests first, then partner tests for edited files (d.py)."""
+    """Run issue-named tests first, then partner tests for edited files."""
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -2132,17 +2149,14 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
-# criteria words (e.g. "selecting", "loaded") often surface in identifier form
-# as `select`, `load`, etc. A literal substring `in` check misses these and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix (with
-# a minimum-stem length to avoid false positives like `action`->`act` matching
-# `react`) bridges the natural-language <-> identifier gap.
+# Stem-stripping suffix list: natural-language criteria ("selecting", "loaded")
+# often appear in patches as `select`, `load`, etc. Plain substring checks miss
+# these; minimum stem length avoids false positives (e.g. action/act vs react).
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
+    """Stem-stripped membership check for criterion keywords in added lines."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -2162,13 +2176,10 @@ def _patch_added_text(patch: str) -> str:
 
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
-    """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>.
+    """Criteria whose significant tokens don't appear in the patch's added lines.
 
-    v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
-    check, ported from UID49 PR#527 — closes the natural-language <-> identifier
-    gap so criteria like "selecting items" match patches that contain `select`.
+    Surfacing gaps nudges the model before <final>. Uses stem-stripped
+    `_keyword_in_added` so natural-language criteria align with identifier tokens.
     """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
@@ -2282,16 +2293,18 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
+#
+# Trimmed from the prompt2.txt expansion (~760 lines) to a tight policy
+# block. The earlier draft repeated itself across PATCH SELECTION,
+# REFERENCE PATCH HEURISTICS, BENCHMARK MINDSET, DIFF QUALITY CHECK and
+# similar sections. Sending those duplicates on every step burned token
+# budget linearly without changing model behaviour. We keep:
+#   - the first-response `<plan>` + immediate command rule (load-bearing)
+#   - the command/final output protocol (validator parses these)
+#   - a single source of truth for scope, style, verification, safety
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
-You operate inside a real repository. Your goal is to produce a patch that maximizes:
-
-(1) Correctness (passes hidden tests, fully satisfies issue)
-(2) Reference similarity (matches minimal maintainer-style patch)
-
-These are NOT separate goals — both are maximized by the same principle:
-
-→ Apply the smallest possible correct change at the exact root cause location.
+You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -2306,141 +2319,164 @@ bash command here
 To finish, emit exactly:
 
 <final>
-brief summary of root cause fix + verification command used
+brief summary of what changed and what verification was run
 </final>
 
-First response MUST include:
+Your first response MUST contain a `<plan>` block followed immediately by one focused inspection command.
 
-1. <plan> block
-2. ONE focused inspection command immediately after it
-
-====================================================================
-FIRST RESPONSE FORMAT (STRICT)
-====================================================================
+First response format:
 
 <plan>
-- Requirements: list EVERY explicit requirement from issue
-- Edge cases: list ALL constraints (must/should/also/unless/only/preserve)
-- Hidden test risks: list likely failure conditions
-- Exact literals: record all paths, keys, names, constants that must NOT change
-- Root cause hypothesis: single most likely bug source
-- Minimal fix strategy: smallest possible patch to fix root cause
-- Files to inspect: only top 1–3 most likely files/functions
-- Verification: single best targeted test command
+- Requirement: restate every explicit issue requirement.
+- Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
+- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
+- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
+- Binding check: for every new UI action, route, command, callback, or provider, name the state/hook/context/import/service/backend handler that makes it executable.
+- Preservation check: identify any existing real data/auth/storage/network behavior nearby and keep it unless the task explicitly says to replace it.
+- Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
+- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Verification: targeted test command expected after patching.
 </plan>
-
 <command>
 focused inspection command
 </command>
 
-No extra text allowed.
+Never emit markdown fences around `<plan>`, `<command>`, or `<final>`.
+
+Never emit `<final>` before a required code change has been made and verification has been attempted, unless the issue clearly requires no code change.
 
 ====================================================================
-HARD OPTIMIZATION RULES (VERY IMPORTANT)
+ISSUE CONTRACT
 ====================================================================
 
-You are optimized for benchmark scoring.
+Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
 
-Always follow:
+Exact detail fidelity matters: if the issue names a path, route, env key, response field, UI label, CSS class owner, numeric scale, image size, provider list, or validation case, preserve it exactly unless nearby code proves a canonical local spelling. Do not replace a specific requirement with an approximate implementation.
 
-### 1. ROOT CAUSE ONLY
-Fix the source of the bug, never symptoms.
+If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
-### 2. MINIMAL DIFF LAW
-Your patch must:
-- change as few lines as possible
-- avoid structural refactors unless explicitly required
-- avoid moving code
-
-### 3. LOCALITY RULE (CRITICAL FOR SIMILARITY SCORE)
-Your edits must stay inside:
-- the same function OR
-- the immediate owner module
-
-Do NOT “improve architecture”.
-
-### 4. NO EXTRA CHANGES RULE
-Forbidden unless required:
-- formatting changes
-- renaming variables
-- reordering logic
-- unused imports
-- new helpers
-- new abstractions
-- test edits unless required
-
-### 5. DO NOT EXPAND SCOPE
-If issue says “fix X”, do NOT modify Y even if related.
-
-### 6. PRESERVE BEHAVIOR OUTSIDE BUG
-Everything not explicitly broken must remain identical.
+Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
 
 ====================================================================
-INSPECTION STRATEGY (STRICT BUDGET)
+INSPECTION STRATEGY
 ====================================================================
 
-You are allowed:
-- max 1–2 searches
-- max 1–2 file inspections before patching
+Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
-Order:
-1. preloaded snippet (if available)
-2. exact file search (rg/grep)
-3. inspect target function region
-4. inspect ONLY relevant test
+Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
 
-STOP EARLY once root cause is found.
-
-====================================================================
-PATCH STRATEGY
-====================================================================
-
-Your patch must:
-- touch only files necessary for fix
-- modify only required lines
-- preserve formatting style exactly
-- avoid rewriting functions
-
-If 2 solutions exist:
-→ choose the one with smallest diff footprint
+Owner discovery before editing:
+- UI/layout tasks: inspect the parent page/container plus existing theme/style/layout owner before editing only a leaf component. If the task asks for shared layout, inspect at least one consumer page.
+- Route/command/navigation tasks: inspect both the registration table and the destination handler/component. A link or route without its target is incomplete.
+- Backend/refactor tasks: inspect the executor/router/service owner and one caller/callee in each direction before changing signatures or dependency injection.
+- Parser/protocol tasks: inspect parser, command/model type, and executor/handler together; changing only one layer often compiles poorly or misses behavior.
+- Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
+- UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
+- Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
+- Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
 ====================================================================
-TEST POLICY
+ROOT CAUSE RULE
 ====================================================================
 
-Only run:
-- the most specific test related to fix
+Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input -> fix parser. Serializer omits field -> fix serializer. Cache returns stale value -> fix invalidation. CLI option ignored -> fix option parsing. Validation rejects valid case -> fix validation rule, not caller workaround.
 
-Do NOT run full suite unless necessary.
+Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
 
-If test fails:
-- fix root cause in same file
-- re-run same test only
+When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
 
 ====================================================================
-REFERENCE SIMILARITY RULE (VERY IMPORTANT)
+SURGICAL EDITING
 ====================================================================
 
-Assume reference patch:
-- is minimal
-- avoids refactoring
-- avoids cleanup
-- changes only bug location
+Change the fewest lines necessary. Allowed: one-line substitution, small guarded block replacement, one narrow branch, focused companion-test update, required call-site updates when a signature change is unavoidable.
 
-You must imitate this style.
+Forbidden unless explicitly required: whole-file or whole-function rewrites when 1-5 lines suffice, formatting churn, whitespace/comment-only edits, code reordering, import sorting, renames for taste, new helpers/abstractions/files, dependency or lockfile changes, vendor/generated edits.
+
+When editing with scripts, always guard replacements:
+
+python - <<'PY'
+from pathlib import Path
+p = Path("path/to/file")
+s = p.read_text()
+old = """exact old block"""
+new = """exact new block"""
+if old not in s:
+    raise SystemExit("old block not found")
+p.write_text(s.replace(old, new, 1))
+PY
+
+Use `sed -i 's/exact old/exact new/' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
+
+When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+
+When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
 ====================================================================
-FINAL ANSWER RULE
+TESTS AND VERIFICATION
 ====================================================================
+
+Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
+
+After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
+
+If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests. Never claim tests passed if they did not run or failed. If dependencies/environment block verification, say so briefly in `<final>`.
+
+====================================================================
+STYLE, COMMENTS, AND PUBLIC API
+====================================================================
+
+Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
+
+Preserve meaningful comments around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+
+Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
+
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response.
+
+Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one. Patch the general root behavior, not only the visible case.
+
+====================================================================
+LANGUAGE NOTES (only the load-bearing items)
+====================================================================
+
+- TypeScript/C#/Java: cascade interface/type changes to every implementer and call site; write complete method bodies (no `// similar logic` stubs); include required imports.
+- C/C++: update header + implementation together; preserve const-correctness and ownership style.
+- Go: keep error wrapping style; update all impacted struct literals; run `gofmt` on changed Go files.
+- Rust: preserve ownership/lifetime style; do not clone just to silence borrow errors; update all struct initializers and pattern matches.
+- Python: preserve existing typing style; do not add annotations to untyped code unless required; avoid broad `except Exception`; reuse existing exceptions and fixtures.
+- JS/TS: preserve CJS vs ESM and async style; avoid `any` unless nearby code uses it; do not change package-manager files unless required.
+- Shell/SQL: preserve POSIX/bash compatibility, quoting style, naming conventions; minimal reversible migrations only.
+
+====================================================================
+SAFETY AND ENVIRONMENT
+====================================================================
+
+Never: use sudo, delete repo files, access host secrets, modify hidden tests/evaluator files, install packages, use network outside the validator proxy, modify lockfiles or CI unless required, disable/skip/weaken tests, hardcode visible-example outputs, add sleeps to hide races. If deps/env are missing, proceed via source inspection and note the verification limitation in `<final>`. Avoid editing generated files unless the issue explicitly targets them.
+
+====================================================================
+FAILURE RECOVERY AND COMMAND ECONOMY
+====================================================================
+
+If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
+
+A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+
+====================================================================
+FINAL ANSWER
+====================================================================
+
+When done, emit only:
 
 <final>
-Changed [file/function] by fixing [root cause in one sentence]. Verified with [test command].
+Changed [file/function] to [brief root-cause fix]. Added/updated [test] if applicable. Verified with [command], or explain why verification could not be run.
 </final>
 
-No extra explanation.
-No diffs.
-No speculation.
-'''
+Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
+
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2488,7 +2524,7 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """After step 4, drop bulky preloads; keep breadcrumbs (a.py)."""
+    """After step 4, drop bulky preloads; keep breadcrumbs."""
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -2681,7 +2717,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
-# Patch corruption gate (a.py / Vlada): harness noise in unified diffs.
+# Patch corruption gate: harness noise in unified diffs.
 _CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     (
         "shell heredoc marker leaked into source",
@@ -2740,9 +2776,7 @@ def build_corruption_fix_prompt(findings: List[str]) -> str:
     )
 
 
-# Keep error-location extraction with the other pre-solve helpers (j.py base
-# ordering) so downstream forkers diffing against king snapshots do not see a
-# no-op relocation near the file footer.
+# Error-location patterns for compiler/test output (used by observation tail).
 _ERR_LOC_PATTERNS = [
     re.compile(r'File "([^"]+)", line (\d+)'),
     re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
@@ -2754,7 +2788,7 @@ _ERR_LOC_PATTERNS = [
 
 
 def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test output (j.py)."""
+    """Extract (path, line) pairs from compiler/test output."""
     seen: set = set()
     results: List[Tuple[str, str]] = []
     for pat in _ERR_LOC_PATTERNS:
@@ -2771,9 +2805,9 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-# k.py champion budget: two 270s attempts + reserve under 600s soft cap.
+# Multishot outer budget: two full inner attempts + reserve under validator soft cap.
 _MULTISHOT_TOTAL_BUDGET = 580.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # j.py: skip full retry if <90s remain (emergency may have run)
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # skip full retry if outer envelope too tight
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2849,7 +2883,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
-    """Extract the last failing command from attempt logs for the retry memo (j.py)."""
+    """Extract the last failing command from attempt logs for the retry memo."""
     logs_text = result.get("logs", "") or ""
     last_fail = ""
     for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
@@ -2937,9 +2971,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """The actual multi-shot driver, wrapped so any exception still returns
     the on-disk patch state instead of propagating.
 
-    Aligned with d.py: no emergency third attempt; multishot winner is
-    substantive-line count (retry wins when n2 >= n1). Hail-mary inside
-    `_solve_attempt` handles empty finalize.
+    Two inner attempts with revert between; retry wins on substantive-line
+    count (n2 >= n1). Empty finalize is handled inside `_solve_attempt` (hail-mary).
     """
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
@@ -3062,10 +3095,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """d.py + k.py: polish → syntax → corruption → test → coverage → criteria → self-check.
+        """Refinement cascade: polish → syntax → corruption → test → coverage → criteria → self-check.
 
-        MAX_TOTAL_REFINEMENT_TURNS=2 (ninjaking66#268): only two non-hail-mary
-        refinements per finalize cascade — keeps inner wall-clock for multishot retry.
+        Capped by MAX_TOTAL_REFINEMENT_TURNS so finalize repair does not dominate wall-clock.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal corruption_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
