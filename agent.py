@@ -128,7 +128,7 @@ MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
 MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
-_STYLE_HINT_BUDGET = 600   # cap on detected-style block in preloaded context
+_STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
 _CONTRACT_NAME_DENYLIST = frozenset({
@@ -1898,10 +1898,11 @@ def _strict_unaddressed_items(patch: str, issue_text: str) -> List[str]:
 # -----------------------------
 #
 # Real validator tasks come from real GitHub commits, so a sizeable fraction
-# touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
+# touch TypeScript, JavaScript, JSON, YAML, etc. A Python-only syntax check
+# would miss most of the syntax errors that actually appear in patches. This
+# module checks each touched file with the cheapest available tool, falling
+# back gracefully when tools are missing. Errors come back as
+# (path:line: msg) strings so the syntax-fix prompt can quote them.
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
@@ -3541,8 +3542,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        # Cap total refinement turns to bound time-per-task. There are ~19
+        # single-shot gates and each consumes one turn from this counter;
+        # without a cap, multi-gate misses would routinely chain 5-7
+        # refinements and blow the per-task time budget. Hail-mary is exempt
+        # because it's the last-resort patch-recovery, not a normal refinement.
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
