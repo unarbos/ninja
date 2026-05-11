@@ -107,11 +107,9 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-# v69 (j.py king): 180->240 inner budget — pairs with outer 540s multishot envelope +
-# emergency single-shot so one attempt stays strong while still leaving wall-clock
-# reserve for retry / salvage paths.
-# k.py champion tuning: keep one inner attempt strong; outer multi-shot wrapper
-# handles retry budget.
+# Inner `_solve_attempt` loop: abort when elapsed time exceeds this (minus reserve).
+# Emergency-inject threshold uses `max(WALL_CLOCK_BUDGET_SECONDS - 60, 60)`.
+# Overall multishot / retry budgeting is `_MULTISHOT_TOTAL_BUDGET`, not this value.
 WALL_CLOCK_BUDGET_SECONDS = 270.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
@@ -121,19 +119,18 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_LINT_TURNS = 1         # v72 (j.py): ruff/eslint when available — judge prefers lint-clean diffs
+MAX_LINT_TURNS = 1         # optional ruff/eslint on touched files when tools exist
 _LINT_TIMEOUT = 10         # per touched file for ruff/eslint
 MAX_TEST_FIX_TURNS = 1     # actually run the companion test if one exists
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 2  # cap chained refinements (hail-mary exempt; see maybe_queue_refinement)
 
-# k.py champion: cap on project-hints block in preloaded context.
+# Cap for `_project_hint_block` text inside preloaded context.
 _STYLE_HINT_BUDGET = 600
 
-# Recent-commit injection (v21 edge): small style anchors from real git history.
+# Append recent small git diffs as style anchors (size limits below).
 # We cap insertions and diff size so the model sees "how this repo patches"
 # without drowning preloaded context in huge churn; `--pretty=format:` on
 # `git show` yields raw unified diff only (no commit headers), matching the
@@ -874,26 +871,15 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
-    Returns ``(context_text, included_files)`` so the solve loop can strip the
-    bulky snippet block later while keeping file-name breadcrumbs (4.py pattern).
+    Returns ``(context_text, included_files)`` for later preload stripping (breadcrumb list).
 
-    Two improvements over a vanilla rank-and-read loop:
+      1. Companion tests are inserted next to source partners when tracked.
 
-      1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
-         X_test.go for X.go, etc.) are slotted in right after their source
-         partner. Real GitHub-derived tasks almost always need source+test
-         changes together; without the test in context the agent patches only
-         the source and bleeds Cursor-similarity score.
+      2. `_symbol_grep_hits` boosts rank for files containing issue-derived symbols.
 
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
+    Issue-derived needles window large files around matching lines instead of truncating blindly.
 
-    Issue-derived needles select relevant line windows inside large files instead
-    of blind head/tail truncation (4.py).
-
-    Includes a compact `_project_hint_block` after ranked source/test snippets.
+    Appends `_project_hint_block` when budget allows.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -1202,8 +1188,7 @@ def _issue_terms(issue: str) -> List[str]:
 def _preload_needles(issue: str) -> List[str]:
     """Build a deduped needle list for issue-aware partial file loading.
 
-    Order: explicit identifiers first, then file-stem mentions, then general
-    issue terms — same ordering idea as the 4.py king agent.
+    Order: issue symbols, then path stems, then general terms.
     """
     out: List[str] = []
     seen: set = set()
@@ -1658,11 +1643,8 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 # Multi-language syntax gate
 # -----------------------------
 #
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
+# Multi-language syntax gate: call the cheapest parse check per touched file
+# (not Python-only). Errors are (path:line: msg) for the syntax-fix prompt.
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
@@ -1766,9 +1748,7 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-# v72 (j.py): optional ruff/eslint on touched files — different axis from syntax
-# (parse vs style). Skips silently when tooling is missing.
-
+# Lint is optional style/diagnostics (ruff/eslint), not parse proof. Skips if missing.
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     if not _has_executable("ruff"):
@@ -2044,15 +2024,9 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
+    """Recent `git log` commits with small diffs, formatted as style anchors.
 
-    The model imitates concrete examples better than abstract rules. Cursor's
-    reference patch IS a one-off commit in this codebase's style; showing the
-    model 1-2 real recent commits gives it the same anchor.
+    Returns "" when history is too shallow or `git log` fails.
     """
     try:
         proc = subprocess.run(
@@ -2172,17 +2146,13 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# v69: stem-stripping suffix list ported from UID49 PR#527. Natural-language
-# criteria words (e.g. "selecting", "loaded") often surface in identifier form
-# as `select`, `load`, etc. A literal substring `in` check misses these and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix (with
-# a minimum-stem length to avoid false positives like `action`->`act` matching
-# `react`) bridges the natural-language <-> identifier gap.
+# Suffix strips for criteria keywords: e.g. "selecting" matches added text containing "select".
+# Minimum stem length avoids over-stripping (e.g. action -> act vs react).
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
-    """v69: ported from UID49 PR#527. Stem-stripped membership check."""
+    """True if `keyword` or a safe stem variant appears in `added_lower`."""
     if keyword in added_lower:
         return True
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
@@ -2202,13 +2172,10 @@ def _patch_added_text(patch: str) -> str:
 
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
-    """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>.
+    """Acceptance criteria whose keywords are under-represented in + lines of the patch.
 
-    v69: uses stem-stripped `_keyword_in_added` instead of plain substring `in`
-    check, ported from UID49 PR#527 — closes the natural-language <-> identifier
-    gap so criteria like "selecting items" match patches that contain `select`.
+    Uses `_keyword_in_added` so natural-language words (e.g. "selecting") can match
+    identifiers like `select` in the diff.
     """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
@@ -2343,7 +2310,7 @@ _MULTI_FILE_KEYWORDS = (
 
 
 def _detect_multi_file_task(issue_text: str) -> bool:
-    """Heuristic from 4.py: broader tasks often need coordinated multi-file edits."""
+    """Heuristic: many paths, many criteria bullets, or multi-file keywords."""
     if not issue_text:
         return False
     paths = _extract_issue_path_mentions(issue_text)
@@ -2359,7 +2326,7 @@ def _detect_multi_file_task(issue_text: str) -> bool:
 
 
 def _detect_target_languages(repo: Path) -> List[str]:
-    """Dominant tracked extensions (4.py), excluding noisy config-only types."""
+    """Most common tracked file extensions, skipping config-only suffixes."""
     try:
         tracked = _tracked_files(repo)
     except Exception:
@@ -2404,7 +2371,7 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """After early steps, drop bulky preloaded snippets to free conversation budget (4.py)."""
+    """Replace the marked preloaded block with short file breadcrumbs."""
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -2425,13 +2392,8 @@ def _strip_preloaded_section(
     return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
-#
-# Shape: upstream tight policy block (same section layout as sn66 reference
-# agents) plus a short POLICY ADDENDUM (DELTA) tail — avoid full rewrites that
-# look like similarity-shaping churn in miner diffs.
+# MINER-EDITABLE: main inner-agent policy; keep `<command>` / `<final>` protocol stable.
+# Body = base sections + short POLICY ADDENDUM tail (delta-only edits preferred).
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
 You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
@@ -2635,7 +2597,7 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 
 
 def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """Initial user message plus dynamic strategy hints (merged from 4.py)."""
+    """Initial user message plus multi-file / language strategy lines."""
     base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
     multi_file = _detect_multi_file_task(issue_text)
     lang_block = ""
@@ -2812,7 +2774,7 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 
 
 def build_lint_fix_prompt(errors: List[str]) -> str:
-    """v72 (j.py): prompt the model to fix ruff/eslint issues without logic churn."""
+    """Ask for minimal lint-only fixes (ruff/eslint), no behaviour change."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
         "Lint issues were found in your patch. The judge prefers lint-clean code:\n\n"
@@ -2845,8 +2807,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
-# v66/v70 (j.py): ultra-cheap second model call when attempt 1 ships empty — beats
-# burning the full retry on the same conversational chain.
+# Cheap one-call salvage when attempt 1 is empty (before full multishot retry).
 _EMERGENCY_MAX_TOKENS = 1024
 _EMERGENCY_TIMEOUT_SECONDS = 45
 _EMERGENCY_COMMAND_TIMEOUT = 30
@@ -2887,7 +2848,7 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
 
 
 def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """Single-call salvage path (j.py PR518 lineage)."""
+    """One LLM round + minimal command exec to rescue an empty patch."""
     repo_path_value = kwargs["repo_path"]
     task_text = kwargs["issue"]
     model = kwargs.get("model")
@@ -2970,9 +2931,7 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
-# Keep error-location extraction with the other pre-solve helpers (j.py base
-# ordering) so downstream forkers diffing against king snapshots do not see a
-# no-op relocation near the file footer.
+# Patterns for test/compiler tracebacks appended to observations.
 _ERR_LOC_PATTERNS = [
     re.compile(r'File "([^"]+)", line (\d+)'),
     re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
@@ -2984,7 +2943,7 @@ _ERR_LOC_PATTERNS = [
 
 
 def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test output (j.py)."""
+    """Extract (path, line) pairs from stderr/stdout snippets."""
     seen: set = set()
     results: List[Tuple[str, str]] = []
     for pat in _ERR_LOC_PATTERNS:
@@ -2997,13 +2956,13 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
 
 
 # -----------------------------
-# v28 multi-shot helpers
+# Multishot wrapper (attempt 2 + optional emergency salvage)
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-# k.py champion budget: two 270s attempts + reserve under 600s soft cap.
+# Wall-clock ceiling for outer multishot path (covers two `_solve_attempt` runs + salvage).
 _MULTISHOT_TOTAL_BUDGET = 580.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # j.py: skip full retry if <90s remain (emergency may have run)
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # skip full retry when too little wall clock remains after attempt 1
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -3079,7 +3038,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
-    """Extract the last failing command from attempt logs for the retry memo (j.py)."""
+    """Last non-zero-exit shell command from attempt logs (for retry memo)."""
     logs_text = result.get("logs", "") or ""
     last_fail = ""
     for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
@@ -3144,12 +3103,9 @@ def solve(
     """
     Main portable interface for validators.
 
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
+    `_solve_with_safety_net`: on unexpected exception from the multishot body,
+    return the current unified diff from disk when possible so a partial patch
+    is not replaced by empty output.
     """
     return _solve_with_safety_net(
         repo_path=repo_path,
@@ -3183,9 +3139,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         patch1 = result1.get("patch", "") or ""
         n1 = _multishot_count_substantive(patch1)
 
-        # j.py: retry only when empty OR low-signal AND issue-mentioned paths still
-        # uncovered. A surgical 1-2 line fix that touches every required path is
-        # valid — do not discard it.
+        # Retry when empty, or low-substance diff that still misses issue-mentioned paths.
         covered_required = bool(patch1.strip()) and not _uncovered_required_paths(patch1, issue)
         should_retry = (not patch1.strip()) or (
             n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not covered_required
@@ -3196,7 +3150,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         elapsed = time.monotonic() - started
 
-        # j.py v70: emergency fires on empty attempt 1 (with or without MODEL_ERROR spam).
+        # Emergency salvage on empty attempt 1 (including repeated model errors).
         attempt1_logs = result1.get("logs", "") or ""
         attempt1_was_error_failure = (
             not patch1.strip() and attempt1_logs.count("MODEL_ERROR") >= 2
@@ -3241,10 +3195,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         return result1
 
     except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
+        # Return on-disk patch instead of propagating (BaseException not caught).
         salvaged = ""
         try:
             if repo_obj is not None:
@@ -3290,7 +3241,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0  # counts toward MAX_TOTAL_REFINEMENT_TURNS (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -3316,9 +3267,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success.
 
-        Fixed ordering (upstream harness; not re-ordered without logged
-        ablation under MAX_TOTAL_REFINEMENT_TURNS):
-            0. hail-mary — empty patch only; exempt from the refinement cap
+        Order (unchanged from prior harness; rationale with MAX_TOTAL_REFINEMENT_TURNS=2):
+            Completeness before cosmetics: coverage/criteria nudges (paths and
+            acceptance text missing from the diff) fire before polish/syntax/lint
+            so capped turns address task gaps first. Companion test runs after
+            those nudges to avoid spending a runner turn on a patch still missing
+            stated paths/bullets. Self-check is last as a coarse diff review.
+
+        Sequence:
+            0. hail-mary — empty patch only; exempt from MAX_TOTAL_REFINEMENT_TURNS
             1. coverage-nudge — issue-mentioned paths still untouched
             2. criteria-nudge — acceptance bullets still unaddressed
             3. companion-test failure tail (real runner)
@@ -3326,18 +3283,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             5. syntax — parser errors
             6. lint — ruff/eslint when available
             7. self-check — diff vs issue checklist
-
-        Hail-mary is the only step exempt from MAX_TOTAL_REFINEMENT_TURNS.
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
         nonlocal hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -3349,8 +3300,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -3366,11 +3315,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on acceptance checkpoints.
-        # Judge losses on multi-bullet tasks are often "missing N of M"
-        # criteria, so surfacing unaddressed bullets is higher value than
-        # hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
@@ -3383,15 +3327,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept dead
-        # scaffolding without using it. We restore the runtime correctness
-        # signal: if an edited file has a partner test that fails, surface the
-        # failure tail to the model as one fix turn. This is the only
-        # refinement step in the chain backed by a real runner rather than
-        # heuristics.
+        # Companion test: run partner test when present; queue one fix turn from real output.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
