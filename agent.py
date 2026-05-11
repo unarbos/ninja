@@ -2116,10 +2116,13 @@ First response format:
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
+- Acceptance contract: for each requirement, name the exact owner to change, exact edge cases to cover, exact producer/consumer names that must match, and the verification target.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
 - Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
 - Binding check: for every new UI action, route, command, callback, or provider, name the state/hook/context/import/service/backend handler that makes it executable.
+- Canonical owner check: for persisted data, routes, schemas, commands, or shared resources, explain why the chosen file is the source future reads/calls actually use, not just a related surface.
 - Preservation check: identify any existing real data/auth/storage/network behavior nearby and keep it unless the task explicitly says to replace it.
+- Diff hygiene check: plan to avoid file-mode-only churn, generated caches, compiled/binary artifacts, and unrelated broad rewrites.
 - Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2160,6 +2163,8 @@ Owner discovery before editing:
 - Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
 - UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
 - Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
+- Import/export tasks: inspect existing file-input refs, upload/image handlers, CSV/JSON parsers, export builders, and refresh flows before adding parallel import/export behavior.
+- Validation tasks: inspect the current accepted/rejected boundary cases, including empty, whitespace, missing parts, wrong type, malformed shape, negative/boundary values, and non-string inputs when applicable.
 - Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
 ====================================================================
@@ -2433,6 +2438,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Acceptance contract: for each requirement, identify the exact owner changed, exact edge cases covered, exact producer/consumer names matched, and exact verification evidence.\n"
         "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
         "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
         "  - Every newly used identifier is declared, imported, destructured, or in scope in the touched file.\n"
@@ -2440,19 +2446,27 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
         "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
         "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
+        "  - Edge-case matrix: parser/validation/import fixes cover non-string input, missing pieces, empty strings, whitespace-only strings, wrong type, malformed structure, negative/boundary values, and wrong field shape where relevant.\n"
+        "  - Canonical owner check: persisted data updates modify the source future reads use, not a derived table, stale snapshot, UI-only copy, cache, or unrelated repository.\n"
+        "  - Exact path check: route/link/command names use the same literal path at the UI trigger, registration, page/component, service/client, and backend handler.\n"
+        "  - Existing schema/API check: do not invent unsupported fields, methods, enum variants, imports, dependency APIs, or response shapes; inspect and match the local contract.\n"
+        "  - Signature/API call check: every changed function call includes required arguments, every route parameter name matches controller/service reads, and every callback/event payload matches the local handler signature.\n"
         "  - Every newly imported symbol is actually defined/exported by the source module; do not import helper names you have not added.\n"
         "  - Every renamed data field is updated across create/read/update/delete, bulk import/export, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
         "  - Validation/parser fixes cover missing parts, empty strings, wrong type, malformed structure, negative/boundary values, and route-level behavior when applicable.\n"
         "  - New file inputs, refs, timers, sockets, subscriptions, or background resources use a dedicated state/ref/lifecycle unless intentionally sharing an existing one.\n"
+        "  - Independent user actions use independent resources: do not reuse an image/file/upload ref, timer, worker, socket, canvas, or subscription for a new unrelated action unless that sharing is already the existing pattern.\n"
         "  - Click path check: every new button/form/control has its handler, dispatch/context/hook/ref, loading/error state, and side effect in scope and wired.\n"
         "  - Route path check: every new link/command/route has registration, destination component/page, client/service method, backend handler, and type/model support when applicable.\n"
         "  - Preservation check: no existing real auth, backend, database, Supabase, localStorage, cache, upload, or submission flow was replaced by fake/demo/local-only behavior unless required.\n"
+        "  - Redesign preservation check: visual/layout rewrites keep existing submission, auth, data fetch, tilt/animation, responsive, and error/empty-state behavior unless the issue explicitly changes it.\n"
         "  - Syntax enclosure check: added methods/classes/components still close braces/tags/exports correctly after insertion.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No file-mode-only chmod churn, generated caches, compiled artifacts, or unrelated script permission flips\n"
+        "  - No binary files, __pycache__, build outputs, lockfile churn, sample/demo data invention, or broad generated artifacts unless explicitly required.\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
