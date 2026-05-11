@@ -128,6 +128,8 @@ MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_MISSING_CLASS_TURNS = 1  # create explicitly requested classes when the draft omitted them
+MAX_REQUIRED_NEW_FILES_NUDGES = 1  # create explicitly requested files that are still absent
+MAX_REQUIRED_LITERALS_NUDGES = 1  # use exact backticked code anchors when requested
 MAX_VISIBLE_SURFACE_NUDGES = 1  # ensure UI/page tasks touch the rendered surface
 MAX_UNDERIMPLEMENTATION_NUDGES = 1  # expand suspiciously tiny patches on broad tasks
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
@@ -1301,6 +1303,113 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+_NEW_FILE_VERB_RE = re.compile(
+    r"\b(create|add|extract|split|move|introduce|new)\s+(?:a\s+|an\s+|new\s+)?(?:"
+    r"file|component|page|module|class|util|helper|service|hook|store|"
+    r"folder|directory|cell|view)s?\b",
+    re.IGNORECASE,
+)
+_NEW_FILE_STRUCT_RE = re.compile(
+    r"\b(?:separate|individual|reusable)\s+(?:component|file|module|page|cell|view)s?\b|"
+    r"\binto\s+(?:its\s+own|a\s+new|separate)\s+(?:file|component|module|page|cell)s?\b|"
+    r"\b(?:reorganize|reorganise|extract)\s+(?:into|as)\b",
+    re.IGNORECASE,
+)
+
+
+def _patch_new_files(patch: str) -> List[str]:
+    """Files added by the patch (new file mode), in first-seen order."""
+    out: List[str] = []
+    seen: set = set()
+    cur = ""
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            tokens = line.split()
+            cur = tokens[3][2:] if len(tokens) >= 4 and tokens[3].startswith("b/") else ""
+        elif line.startswith("new file mode") and cur and cur not in seen:
+            out.append(cur)
+            seen.add(cur)
+    return out
+
+
+def _required_new_files_missing(patch: str, issue_text: str) -> List[str]:
+    """Explicit create/extract/split requests whose named files are still absent."""
+    if not issue_text:
+        return []
+    if not (_NEW_FILE_VERB_RE.search(issue_text) or _NEW_FILE_STRUCT_RE.search(issue_text)):
+        return []
+    mentioned = _extract_issue_path_mentions(issue_text)
+    if not mentioned:
+        return []
+    new_files = set(_patch_new_files(patch))
+    changed = set(_patch_changed_files(patch))
+    missing: List[str] = []
+    for path in mentioned:
+        if path in new_files or any(f.endswith("/" + path) for f in new_files):
+            continue
+        if path in changed or any(f.endswith("/" + path) for f in changed):
+            continue
+        missing.append(path)
+    return missing[:6]
+
+
+_BACKTICK_LITERAL_RE = re.compile(r"`([^`\n]{2,80})`")
+_BACKTICK_LITERAL_STOP = frozenset({
+    "true", "false", "null", "none", "undefined", "self", "this", "default",
+    "function", "class", "const", "let", "var", "if", "else", "for", "while",
+    "return", "import", "export", "from", "as", "is", "in", "and", "or", "not",
+})
+
+
+def _extract_required_literals(issue_text: str) -> List[str]:
+    """Backticked literals that look like code-level anchors, not prose."""
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    file_ext_re = re.compile(
+        r"\.(c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|php|py|rb|"
+        r"rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml)$",
+        re.IGNORECASE,
+    )
+    for match in _BACKTICK_LITERAL_RE.finditer(issue_text):
+        raw = match.group(1).strip()
+        if not raw or raw in seen:
+            continue
+        if raw.lower() in _BACKTICK_LITERAL_STOP:
+            continue
+        if " " in raw and not re.search(r"[_:=%^$().*+\\/{\[\]<>0-9-]", raw):
+            continue
+        if file_ext_re.search(raw) and "/" in raw:
+            continue
+        is_anchor = bool(
+            "_" in raw or ":" in raw or "%" in raw or "^" in raw or "$" in raw
+            or "(" in raw or "=" in raw or "->" in raw or "==" in raw
+            or any(c.isdigit() for c in raw)
+            or re.search(r"[a-z][A-Z]", raw) or re.search(r"[A-Z]{2,}", raw)
+            or "-" in raw
+        )
+        if not is_anchor or len(raw) > 60:
+            continue
+        seen.add(raw)
+        out.append(raw)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _required_literals_missing(patch: str, issue_text: str) -> List[str]:
+    """Backticked code anchors from the issue not present in patch additions."""
+    literals = _extract_required_literals(issue_text)
+    if not literals:
+        return []
+    added = _patch_added_text(patch)
+    if not added:
+        return literals
+    added_lower = added.lower()
+    return [lit for lit in literals if lit.lower() not in added_lower][:6]
 
 
 _PATCH_REVIEW_PROCESS_PHRASES: Tuple[str, ...] = (
@@ -3357,6 +3466,42 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_required_new_files_prompt(missing: List[str], issue_text: str) -> str:
+    """Surface explicit create/extract/split requests that still lack files."""
+    bullets = "\n  ".join(f"- `{p}`" for p in missing[:6]) or "(none)"
+    return (
+        "File-structure check: the task appears to ask for these file(s) to "
+        "exist, but the current patch neither creates nor edits them:\n"
+        f"  {bullets}\n\n"
+        "When the task says create, extract, split into, or introduce a new "
+        "file, imports and callers often depend on that file actually existing. "
+        "For each listed path, decide whether it is truly required. If so, "
+        "create the minimal file and wire any required import/reference. If an "
+        "existing file already satisfies the requirement, finish with "
+        "<final>summary</final> and state why. Do not add unrelated scaffolding.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_required_literals_prompt(missing: List[str], issue_text: str) -> str:
+    """Surface exact code anchors from the issue not present in added lines."""
+    bullets = "\n  ".join(f"- `{lit}`" for lit in missing[:6]) or "(none)"
+    return (
+        "Specified-literal check: the task names these exact code-like value(s), "
+        "but they do not appear in the patch's added lines:\n"
+        f"  {bullets}\n\n"
+        "Backticked regexes, feature flags, error codes, format strings, and "
+        "identifiers are often load-bearing. For each listed value, decide "
+        "whether the patch must use that exact value. If yes, issue the minimal "
+        "edit command to wire it in. If it is only contextual prose, finish "
+        "with <final>summary</final> and explain briefly. Do not introduce "
+        "unrelated constants or broad rewrites.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_underimplementation_nudge_prompt(
     kind: str,
     touched: int,
@@ -4001,6 +4146,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     missing_class_turns_used = 0
+    required_new_files_nudges_used = 0
+    required_literals_nudges_used = 0
     visible_surface_nudges_used = 0
     underimplementation_nudges_used = 0
     integration_nudges_used = 0
@@ -4042,12 +4189,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             5. failed-verification — repair the latest concrete failed check
             6. coverage/criteria — name explicit issue gaps
-            7. missing-class/visible-surface/underimplementation — close broad task-shape gaps
-            8. contract/integration/artifact/dependency — close common missing pieces
-            9. empty-arg/lint — remove malformed calls and tool errors
-            10. self-check — show the diff and ask "did you cover everything?"
+            7. required-new-files/required-literals — satisfy exact issue artifacts
+            8. missing-class/visible-surface/underimplementation — close broad task-shape gaps
+            9. contract/integration/artifact/dependency — close common missing pieces
+            10. empty-arg/lint — remove malformed calls and tool errors
+            11. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, visible_surface_nudges_used, underimplementation_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, required_new_files_nudges_used, required_literals_nudges_used, visible_surface_nudges_used, underimplementation_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4163,6 +4311,30 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if required_new_files_nudges_used < MAX_REQUIRED_NEW_FILES_NUDGES:
+            missing_new_files = _required_new_files_missing(patch, issue)
+            if missing_new_files:
+                required_new_files_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_required_new_files_prompt(missing_new_files, issue),
+                    "REQUIRED_NEW_FILES_QUEUED:\n  " + ", ".join(missing_new_files),
+                )
+                return True
+
+        if required_literals_nudges_used < MAX_REQUIRED_LITERALS_NUDGES:
+            missing_literals = _required_literals_missing(patch, issue)
+            if missing_literals:
+                required_literals_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_required_literals_prompt(missing_literals, issue),
+                    "REQUIRED_LITERALS_QUEUED:\n  " + ", ".join(missing_literals),
                 )
                 return True
 
