@@ -580,9 +580,7 @@ def get_patch(repo: Path) -> str:
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
     cleaned = _strip_low_signal_hunks(cleaned)
-    # v15: post-generation domain blocklist sanitizer — prevents validator
-    # suspicious-phrase filter from scoring the round 0.000
-    return _sanitize_patch_domain_blocks(cleaned)
+    return cleaned
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1555,101 +1553,28 @@ _BLOCKLIST_BLOCK_MIN_LINES = 4
 _BLOCKLIST_MAX_KEPT = 3
 
 
-def _sanitize_patch_domain_blocks(patch: str) -> str:
-    """Post-generation sanitizer: truncates large domain blocklist blocks in patch +lines.
-
-    The validator's suspicious-phrase filter fires when a patch diff contains large
-    domain blocklist data (blocks of "domain.com -NNN" entries), scoring the entire
-    round 0.000 regardless of patch quality.
-
-    Strategy:
-      - Parse the patch line-by-line.
-      - When we detect a run of _BLOCKLIST_BLOCK_MIN_LINES+ consecutive added lines
-        matching the domain-number pattern, keep only _BLOCKLIST_MAX_KEPT of them
-        and replace the rest with a single neutral summary comment.
-      - Context lines (' ') and removed lines ('-') are never modified.
-      - The functional intent (we ARE modifying the blocklist) is preserved; the
-        volume that triggers the filter is removed.
-
-    Returns the sanitized patch string. Called in get_patch() post-generation.
-    Also callable standalone for testing.
-    """
-    if not patch:
-        return patch
-
-    lines = patch.splitlines(keepends=True)
-    result: list = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-
-        # Check if this line starts a domain-blocklist block
-        if _DOMAIN_BLOCKLIST_LINE_RE.match(line):
-            # Collect the full consecutive block
-            block: list = []
-            j = i
-            while j < len(lines) and _DOMAIN_BLOCKLIST_LINE_RE.match(lines[j]):
-                block.append(lines[j])
-                j += 1
-
-            if len(block) >= _BLOCKLIST_BLOCK_MIN_LINES:
-                # Keep first N, replace rest with truncation marker
-                result.extend(block[:_BLOCKLIST_MAX_KEPT])
-                omitted = len(block) - _BLOCKLIST_MAX_KEPT
-                result.append(
-                    f'+# [{omitted} additional domain entries omitted]\n'
-                )
-            else:
-                # Small block — safe, keep as-is
-                result.extend(block)
-            i = j
-        else:
-            result.append(line)
-            i += 1
-
-    return ''.join(result)
-
-
-# -----------------------------
-# v15: UI structural spec extractor + verifier
-# -----------------------------
 
 @dataclass
 class UISpec:
-    kind: str             # 'column_count' | 'button_type' | 'section_id' | 'widget' | 'format' | 'image_size'
-    description: str      # Human-readable label for nudge prompt
-    search_tokens: list   # Token variants to look for in patch +lines (any match = covered)
+    kind: str
+    description: str
+    search_tokens: list
 
 
-_COL_RE = re.compile(r'\b(\d+)[- ]col(?:umn)?s?\b', re.I)
-
+_COL_RE = re.compile(r'\b(\d+)[\s-]col(?:umn)?s?\b', re.I)
+_PAGINATION_RE = re.compile(r'\bpaginat\w*\b', re.I)
 _BTN_RE = re.compile(
-    r'\b(primary|secondary|danger|warning|success|outline|ghost|'
-    r'submit|cancel|refresh|delete|add|save|export)\s+button\b',
+    r'\b(refresh|submit|delete|cancel|save|add|create|update|export|import|search|filter|reset)\s*button\b',
     re.I,
 )
-
-_SECTION_ID_RE = re.compile(
-    r'\bid\s*[=:]\s*["\']?([\w][\w-]{2,})["\']?'   # id="foo-bar"
-    r'|#([\w][\w-]{2,})\b(?!\s*\{)',               # #section-id (not CSS selector block)
-    re.I,
-)
-
-_PAGINATION_RE = re.compile(r'\b(paginat(?:e|ed|ion|ing)|paginator|page[- ]control)\b', re.I)
-
-_FORMAT_RE = re.compile(r'\b(png|jpg|jpeg|webp|svg|pdf|csv|xlsx|json)\b(?:\s+format|\s+file)?\b', re.I)
-
-_IMAGE_SIZE_RE = re.compile(r'\b(\d{2,4})\s*[x\xd7]\s*(\d{2,4})(?:\s*px)?\b')
-
+_SECTION_ID_RE = re.compile(r'[#\s]([a-zA-Z][a-zA-Z0-9_-]{3,30})\s*section', re.I)
+_FORMAT_RE = re.compile(r'\b(YYYY[-/]MM[-/]DD|DD[-/]MM[-/]YYYY|ISO\s*8601|RFC\s*\d+|JSON|XML|CSV|TSV)\b', re.I)
+_IMAGE_SIZE_RE = re.compile(r'\b(\d+)\s*[xX×]\s*(\d+)\b')
 _LAYOUT_WIDGET_RE = re.compile(
-    r'\b(sidebar|drawer|modal|dialog|tooltip|popover|accordion|'
-    r'tab(?:s|panel)?|carousel|breadcrumb|stepper|timeline|chip|badge|avatar|'
-    r'skeleton|toast|snackbar|navbar|header|footer|hero|banner|card|panel)\b',
+    r'\b(sidebar|modal|drawer|dropdown|accordion|carousel|tab|tooltip|toast|badge|breadcrumb|chip|avatar)\b',
     re.I,
 )
-
-_GRID_RE = re.compile(r'\b(\d)\s*[x\xd7]\s*(\d)\s+(?:grid|layout)\b', re.I)
+_GRID_RE = re.compile(r'\b(\d+)[\s-]row\s+grid\b|\bgrid[\s-](\d+)\b', re.I)
 
 
 def _extract_ui_specs(task_text: str) -> list:
