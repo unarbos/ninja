@@ -101,11 +101,10 @@ MAX_PRELOADED_FILES = 16
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
-# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
-# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
+# Preload/observation/log caps read os.environ("AGENT_*") with the defaults above
+# (miner-tunable where the validator allowlist permits). They are separate from
+# HTTP retry knobs, which are fixed literals (scope guard: no new AGENT_* names).
+# Anti-whiff: empty patches score zero, so retry HTTP instead of giving up early.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
@@ -1499,142 +1498,22 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Delimiter balance for touched sources uses `_delimiter_balance_error`, which
-# skips // and /* */ comments and treats ", ', and ` strings with \\ escapes.
-# Concrete spot-checks run in this fork (2026-05-08, via `_delimiter_balance_error`):
-#   - Java char literal:            `char c = '}';`                    -> None
-#   - Go rune literals:             `x := '}'` and `y := '\''`         -> None
-#   - Apostrophes in double quotes: `printf("can't");` / `"don't"`     -> None
-#   - Apostrophes inside comments:  `// don't break }`                 -> None
-# These are the exact false-positive classes previously called out as risky.
-# Rust `.rs` is still intentionally excluded: lifetime syntax like `'a` is not
-# a rune literal and still confuses the naive single-quote scan.
-_BRACE_LANG_SUFFIXES = frozenset(
-    {
-        ".cs",
-        ".java",
-        ".go",
-        ".kt",
-        ".kts",
-        ".scala",
-        ".cpp",
-        ".cc",
-        ".cxx",
-        ".c",
-        ".h",
-        ".hpp",
-        ".hh",
-        ".m",
-        ".mm",
-    }
-)
-
-
-def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
-    """Return first unmatched delimiter as (line, message), or None."""
-
-    stack: List[Tuple[str, int]] = []
-    line = 1
-    i = 0
-    n = len(source)
-    state = "code"
-    opener_to_closer = {"{": "}", "[": "]", "(": ")"}
-    closer_to_opener = {"}": "{", "]": "[", ")": "("}
-
-    while i < n:
-        c = source[i]
-        if c == "\n":
-            line += 1
-
-        if state == "code":
-            if c == "/" and i + 1 < n:
-                nxt = source[i + 1]
-                if nxt == "/":
-                    state = "line_comment"
-                    i += 2
-                    continue
-                if nxt == "*":
-                    state = "block_comment"
-                    i += 2
-                    continue
-            if c == '"':
-                state = "str_dbl"
-                i += 1
-                continue
-            if c == "'":
-                state = "str_sgl"
-                i += 1
-                continue
-            if c == "`":
-                state = "str_raw"
-                i += 1
-                continue
-            if c in opener_to_closer:
-                stack.append((c, line))
-            elif c in closer_to_opener:
-                if not stack:
-                    return line, f"unexpected closing '{c}'"
-                expected_open = closer_to_opener[c]
-                last_open, open_line = stack[-1]
-                if last_open != expected_open:
-                    expected_close = opener_to_closer[last_open]
-                    return line, (
-                        f"mismatched closing '{c}' for opening '{last_open}' "
-                        f"from line {open_line}; expected '{expected_close}'"
-                    )
-                stack.pop()
-            i += 1
-            continue
-
-        if state == "line_comment":
-            i += 1
-            if c == "\n":
-                state = "code"
-            continue
-
-        if state == "block_comment":
-            if c == "*" and i + 1 < n and source[i + 1] == "/":
-                state = "code"
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if state == "str_dbl":
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == '"':
-                state = "code"
-            i += 1
-            continue
-
-        if state == "str_sgl":
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == "'":
-                state = "code"
-            i += 1
-            continue
-
-        if state == "str_raw":
-            if c == "`":
-                state = "code"
-            i += 1
-            continue
-
-    if stack:
-        last_open, open_line = stack[-1]
-        expected_close = opener_to_closer[last_open]
-        return open_line, f"unclosed '{last_open}' (expected '{expected_close}')"
-    return None
+# Languages where ' is unambiguously a string delimiter. The brace-balance
+# scan below treats ' as a string-mode toggle, which produces false positives on:
+#   - C / C++ / C# / Java / Kotlin / Scala — 'X' character literals
+#   - Rust — 'a lifetime
+#   - Go — 'X' rune literals
+# Restrict to JS-family + Swift (and .js fallback when node is missing); see d.py.
+_BRACE_BALANCE_SUFFIXES = {
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".swift",
+}
 
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
-    suffix = Path(relative_path).suffix.lower()
-    if suffix not in _BRACE_LANG_SUFFIXES:
-        return None
+    """Cheap brace/paren/bracket balance for languages without a real parser."""
     full = (repo / relative_path).resolve()
     try:
         full.relative_to(repo.resolve())
@@ -1643,25 +1522,63 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     if not full.exists():
         return None
     try:
-        text = full.read_text(encoding="utf-8", errors="replace")
+        source = full.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
-    err = _delimiter_balance_error(text)
-    if err is not None:
-        err_line, detail = err
-        return f"{relative_path}:{err_line}: delimiter imbalance: {detail}"
+
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
-
-
-# -----------------------------
-# Multi-language syntax gate
-# -----------------------------
-#
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
@@ -1728,30 +1645,24 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
-    Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed or had no checker; unsupported languages rely on
-    the LLM judge.
+    Returns a flat list of error strings. Languages we can't check pass through.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
-        results: List[str] = []
+        result: Optional[str] = None
         if suffix == ".py":
-            r = _check_python_syntax_one(repo, relative_path)
-            if r:
-                results.append(r)
+            result = _check_python_syntax_one(repo, relative_path)
         elif suffix in {".js", ".mjs", ".cjs"}:
-            r = _check_node_syntax_one(repo, relative_path)
-            if r:
-                results.append(r)
+            result = _check_node_syntax_one(repo, relative_path)
+            if result is None and suffix == ".js":
+                result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
-            r = _check_json_syntax_one(repo, relative_path)
-            if r:
-                results.append(r)
-        bb = _check_brace_balance_one(repo, relative_path)
-        if bb:
-            results.append(bb)
-        errors.extend(results)
+            result = _check_json_syntax_one(repo, relative_path)
+        elif suffix in _BRACE_BALANCE_SUFFIXES:
+            result = _check_brace_balance_one(repo, relative_path)
+        if result:
+            errors.append(result)
     return errors
 
 
