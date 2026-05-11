@@ -4083,7 +4083,32 @@ def solve(
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """Safety-net wrapper around the multishot driver."""
+    """Outer envelope around the multishot driver.
+
+    Envelope layers (outermost in):
+      1. _solve_with_safety_net (here) — last-resort try/except that
+         salvages any on-disk patch if the driver itself raises.
+      2. _multishot_driver — runs attempt 1; on empty / criteria-starved-
+         AND-uncovered may fire an emergency single-shot or a full
+         attempt 2; picks the winner by unaddressed-bullet count with a
+         coverage guard so a surgical primary that already touched every
+         required path can only be displaced by a strictly-better retry.
+      3. _solve_attempt — the per-attempt agent loop. After each step
+         that looks like a stopping point it consults
+         `maybe_queue_refinement` (a try/except wrapper around
+         `_maybe_queue_refinement_unsafe`) which dispatches the
+         refinement gates in this fixed order:
+            hail-mary → syntax-fix → coverage-nudge → criteria-nudge
+              → [MAX_TOTAL_REFINEMENT_TURNS cap]
+              → patch-safety → failed-verification → contract → artifact
+              → dependency → placeholder → polish → empty-arg → lint
+              → test-fix → cascade → integration → ext-stub → corruption
+              → critical-tag → c-style-brace → php-syntax → dup-import
+              → required-file → undersized → self-check.
+         Each gate fires at most once per attempt. Hail-mary and
+         syntax-fix are cap-exempt because empty and non-parsing patches
+         are guaranteed losses regardless of scope.
+    """
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -4471,18 +4496,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
         if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
             empty_arg_findings = _check_empty_args(patch)
             if empty_arg_findings:
@@ -4523,36 +4536,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if (
-            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
-            and last_failed_verification_command
-            and last_failed_verification_observation
-        ):
-            failed_verification_fix_turns_used += 1
-            total_refinement_turns_used += 1
-            command = last_failed_verification_command
-            observation = last_failed_verification_observation
-            last_failed_verification_command = ""
-            last_failed_verification_observation = ""
-            queue_refinement_turn(
-                assistant_text,
-                build_failed_verification_prompt(command, observation),
-                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
-            )
-            return True
-
-        if contract_turns_used < MAX_CONTRACT_TURNS:
-            contract_findings = _contract_preservation_gap_summary(repo, patch)
-            if contract_findings:
-                contract_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_contract_preservation_prompt(contract_findings),
-                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
-                )
-                return True
-
         # Cascade-gap: contract preservation only catches REMOVED public
         # symbols. The cascade gate catches the distinct case where a
         # callable's declaration line was MODIFIED and consumers in OTHER
@@ -4581,54 +4564,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_integration_nudge_prompt(integration, issue),
                     f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
-                )
-                return True
-
-        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
-            artifact = _requested_artifact_gap_summary(patch, issue)
-            if artifact:
-                artifact_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_artifact_nudge_prompt(artifact, issue),
-                    f"ARTIFACT_NUDGE_QUEUED:\n  {artifact}",
-                )
-                return True
-
-        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
-            dependency = _dependency_metadata_gap_summary(patch)
-            if dependency:
-                dependency_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_dependency_nudge_prompt(dependency, issue),
-                    f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
-                )
-                return True
-
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
-            empty_arg_findings = _check_empty_args(patch)
-            if empty_arg_findings:
-                empty_arg_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_empty_args_fix_prompt(empty_arg_findings),
-                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
                 )
                 return True
 
@@ -4739,18 +4674,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
         # catches style issues that make the patch look unfinished.
-        if lint_turns_used < MAX_LINT_TURNS:
-            lint_errors = _check_lint(repo, patch)
-            if lint_errors:
-                lint_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_lint_fix_prompt(lint_errors),
-                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
-                )
-                return True
-
         # Undersized-patch: when the issue mentions ≥3 distinct file paths
         # but the patch only touches <2 files. Different signal from the
         # coverage_nudge path-mention check — keys on file count rather
