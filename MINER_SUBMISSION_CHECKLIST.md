@@ -241,6 +241,11 @@ Run these grep checks to catch common DQ triggers:
   grep -n "environ\|getenv\|validator\|EVAL\|IS_TEST" agent.py
   # Review any matches carefully
   ```
+- [ ] No new pyflakes warnings (Agent PR Smoke gate):
+  ```bash
+  python3 -m pyflakes agent.py
+  # Expected: no output (clean) or only the known baseline warning
+  ```
 - [ ] No third-party imports (adjust list as needed):
   ```bash
   grep -n "^import\|^from" agent.py | grep -v "^import os\|^import re\|^import json\|^import sys\|^import subprocess\|^import pathlib\|^import typing\|^import collections\|^import itertools\|^import functools\|^import time\|^import copy\|^import math\|^import random\|^import string\|^import textwrap\|^import difflib\|^import ast\|^import openai\|^from openai\|^from typing\|^from pathlib\|^from collections"
@@ -383,6 +388,16 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
   - Sampling parameters → rejected
   - Contract signature changes → rejected
   - Validator-avoidance code → rejected
+- [ ] **Agent PR Smoke** checks (added May 2026):
+  - `agent.py` must compile without syntax errors (`py_compile`)
+  - No new `pyflakes` warnings beyond the known baseline
+  - Run locally: `python3 -m py_compile agent.py && python3 -m pyflakes agent.py`
+- [ ] **PR Scope Guard** checks:
+  - Files outside `agent.py` → rejected
+  - Forbidden API patterns → rejected
+  - Sampling parameters → rejected
+  - Contract signature changes → rejected
+  - Validator-avoidance code → rejected
 - [ ] **LLM PR Judge** checks:
   - Agent quality assessment → may reject poor quality
   - Copy detection → may reject agents too similar to existing submissions
@@ -426,6 +441,8 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 | Validator-detection code | Scope Guard → DQ | No env-sniffing, no endpoint-checking |
 | Copy-pasted agent | Copy detection → rejected | Write original logic |
 | Changing `solve()` signature | Contract check → rejected | Never touch parameter names/order |
+| New `pyflakes` warnings in `agent.py` | Agent PR Smoke → rejected | Run `python3 -m pyflakes agent.py` before committing |
+| Syntax error in `agent.py` | Agent PR Smoke → rejected | Run `python3 -m py_compile agent.py` before committing |
 
 ---
 
@@ -435,6 +452,7 @@ Choose **Option A** (recommended — gives a private window) or **Option B**.
 ```bash
 git diff --cached --name-only         # Must show: agent.py only
 python3 -m py_compile agent.py        # Must show: no output (OK)
+python3 -m pyflakes agent.py          # Must show: no output (no new warnings)
 grep -n "temperature\|top_p\|top_k" agent.py  # Must show: no output
 ./scripts/precommit_ninja_pr.py --hotkey <SS58> --judge  # Must show: all pass
 ```
