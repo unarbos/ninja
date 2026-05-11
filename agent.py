@@ -117,6 +117,7 @@ MAX_LINT_TURNS = 1         # v72: ruff/eslint pass for clean, production-looking
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
 MAX_EMPTY_ARG_TURNS = 1    # repair syntax-valid but unfinished calls/values
 MAX_CONTRACT_TURNS = 1     # repair removed public symbols that still have callers
+MAX_STRUCTURAL_INTEGRITY_TURNS = 1  # repair narrow JS/TS wiring defects
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1  # repair one concrete failed test/check run
 MAX_PATCH_SAFETY_TURNS = 1  # remove unsafe review-process text before returning a patch
@@ -1814,6 +1815,90 @@ _CORRUPTION_LINE_RE_LIST: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"^\s*\$\s+(cat|ls|cd|grep|sed|python|node|git)\b"), "shell prompt leaked into source"),
 )
 _CORRUPTION_SKIP_SUFFIXES = {".sh", ".bash", ".zsh", ".fish", ".md", ".txt", ".rst"}
+_JS_TS_STRUCTURE_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_JSX_EMPTY_PROP_RE = re.compile(
+    r"\b(?:className|style|value|onClick|onChange|disabled|checked|href|src)\s*=\s*\{\s*\}"
+)
+_RELATIVE_IMPORT_RE = re.compile(
+    r"^\s*import\s+(?:.+?\s+from\s+)?['\"](\.{1,2}/[^'\"]+)['\"]",
+    re.MULTILINE,
+)
+
+
+def _relative_import_exists(base_dir: Path, spec: str) -> bool:
+    """Resolve a relative JS/TS import without invoking project tooling."""
+    try:
+        target = (base_dir / spec).resolve()
+    except Exception:
+        return True
+    candidates = [target]
+    if target.suffix == ".js":
+        candidates.extend([target.with_suffix(".ts"), target.with_suffix(".tsx")])
+    elif target.suffix == ".jsx":
+        candidates.append(target.with_suffix(".tsx"))
+    suffixes = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", "/index.ts", "/index.tsx", "/index.js", "/index.jsx")
+    for base in candidates:
+        for suffix in suffixes:
+            try:
+                if Path(str(base) + suffix).exists():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _check_js_ts_structure_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch narrow JS/TS defects that can be balanced but still broken."""
+    if Path(relative_path).suffix.lower() not in _JS_TS_STRUCTURE_SUFFIXES:
+        return None
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    source = "\n".join(lines)
+
+    empty_prop = _JSX_EMPTY_PROP_RE.search(source)
+    if empty_prop:
+        line_no = source[:empty_prop.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: empty JSX prop expression `{empty_prop.group(0)}`"
+
+    seen_funcs: Dict[str, int] = {}
+    func_re = re.compile(r"\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")
+    for idx, line in enumerate(lines, 1):
+        match = func_re.match(line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in seen_funcs:
+            return f"{relative_path}:{idx}: duplicate function declaration `{name}`"
+        seen_funcs[name] = idx
+
+    for match in _RELATIVE_IMPORT_RE.finditer(source):
+        spec = match.group(1)
+        if _relative_import_exists(full.parent, spec):
+            continue
+        line_no = source[:match.start()].count("\n") + 1
+        return f"{relative_path}:{line_no}: unresolved relative import `{spec}`"
+    return None
+
+
+def _structural_integrity_findings(repo: Path, patch: str) -> List[str]:
+    """Focused JS/TS wiring checks that complement parser/lint signals."""
+    findings: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        finding = _check_js_ts_structure_one(repo, relative_path)
+        if finding:
+            findings.append(finding)
+        if len(findings) >= 6:
+            break
+    return findings
 
 
 def _check_corruption_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -3452,6 +3537,21 @@ def build_dependency_nudge_prompt(dependency_summary: str, issue_text: str) -> s
     )
 
 
+def build_structural_integrity_prompt(findings: List[str], issue_text: str) -> str:
+    bullets = "\n".join(f"- {finding}" for finding in findings[:6]) or "(none)"
+    return (
+        "Structural integrity check: the current patch has narrow JS/TS wiring "
+        "issues that may not be caught by parser checks.\n\n"
+        f"{bullets}\n\n"
+        "Fix only the listed issue(s): resolve missing relative imports, remove "
+        "duplicate declarations, or fill accidental empty JSX prop expressions. "
+        "Keep the existing public API and file structure unless the task "
+        "explicitly requires otherwise.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_failed_verification_prompt(command: str, observation: str) -> str:
     tail = observation[-3000:] if len(observation) > 3000 else observation
     return (
@@ -3968,6 +4068,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
+    structural_integrity_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -4006,11 +4107,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             6. coverage/criteria — name explicit issue gaps
             7. required-surface — satisfy exact task-named files/literals
             8. missing-class/visible-surface — close direct task-shape gaps
-            9. contract/integration/artifact/dependency — close common missing pieces
+            9. contract/structural/integration/artifact/dependency — close common missing pieces
             10. empty-arg/lint — remove malformed calls and tool errors
             11. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, required_surface_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, required_surface_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, structural_integrity_turns_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4173,6 +4274,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_contract_preservation_prompt(contract_findings),
                     "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
+                )
+                return True
+
+        if structural_integrity_turns_used < MAX_STRUCTURAL_INTEGRITY_TURNS:
+            structural_findings = _structural_integrity_findings(repo, patch)
+            if structural_findings:
+                structural_integrity_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_structural_integrity_prompt(structural_findings, issue),
+                    "STRUCTURAL_INTEGRITY_QUEUED:\n  " + "\n  ".join(structural_findings),
                 )
                 return True
 
