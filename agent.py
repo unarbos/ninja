@@ -69,7 +69,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "10"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -103,7 +103,7 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 350.0  # GLM-5.1 needs 30-90s per step; 350s = ~6 steps minimum
+WALL_CLOCK_BUDGET_SECONDS = 255.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -824,6 +824,26 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+
+    # Append a compact file tree so the agent can navigate without an extra
+    # discovery bash call. Gathers source files only (skips node_modules,
+    # .git, __pycache__) up to 40 lines.
+    if used < MAX_PRELOADED_CONTEXT_CHARS * 3 // 4:
+        try:
+            tree_result = subprocess.run(
+                "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' "
+                "-not -path '*/__pycache__/*' -not -path '*/dist/*' -not -path '*/build/*' "
+                r"-not -path '*/.next/*' -not -path '*/target/*' "
+                r"-not -name '*.lock' -not -name '*.sum' -not -name '*.map' "
+                "| sort | head -40",
+                cwd=str(repo), shell=True, capture_output=True, text=True, timeout=5,
+            )
+            if tree_result.stdout and tree_result.returncode == 0:
+                tree_block = "### File tree (first 40 tracked source files)\n```\n" + tree_result.stdout.strip() + "\n```"
+                if used + len(tree_block) <= MAX_PRELOADED_CONTEXT_CHARS + 800:
+                    parts.append(tree_block)
+        except Exception:
+            pass
 
     return "\n\n".join(parts), included
 
@@ -2170,14 +2190,10 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 
 ====================================================================
-EDITING TIP — LINE-LEVEL PRECISION
+EDITING TIP — FOCUSED DIFF
 ====================================================================
 
-Your diff is compared against a reference solution positionally. Each changed line is evaluated on whether it appears at the same position in the reference diff:
-
-- Changing lines the reference doesn't touch increases the number of changed lines that must be matched, making your ratio harder to win. Prefer narrower edits.
-- Changing lines with wrong indentation, quotes, or style can cause a positional mismatch even if the logic is correct. Match surrounding style exactly.
-- If a change would touch extra files beyond what the issue explicitly names, prefer not to — each extra file adds changed lines the reference likely doesn't have.
+Prefer the smallest focused change that satisfies the literal issue wording. Narrow edits over broad rewrites. Match surrounding style (indentation, quotes, braces). If extra files beyond what the issue names are not strictly required, prefer not to touch them.
 
 If a test fails, check whether it is genuinely caused by your change or is a pre-existing failure before expanding the patch.'''
 
@@ -2200,7 +2216,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {issue}
 
-Focus on the smallest correct change that matches what a senior maintainer would commit. Every extra changed line reduces your score.
+Focus on the smallest correct change that matches what a senior maintainer would commit. Narrow, targeted edits are preferred over broad rewrites.
 
 Repository summary:
 
@@ -2569,8 +2585,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=350s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
+        Two attempts at WALL_CLOCK_BUDGET_SECONDS=255 already saturate the
+        _MULTISHOT_TOTAL_BUDGET=580s envelope (2 x 255 = 510, leaving 70s reserve). A third attempt would have to
        be either (a) so short it cannot produce a patch, or (b) push past
        the validator's per-round soft cap and forfeit the round entirely.
        The empty-patch case is already handled inside `_solve_attempt` by
