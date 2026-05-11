@@ -2970,6 +2970,7 @@ brief summary of what changed
 Read the full issue before issuing a command. In the SAME response as your first command, emit a short `<plan>` block:
 - Requirement: restate every explicit task requirement.
 - Requirement: mirror each numbered bullet, checkbox item, acceptance criterion, "also", "and", "unless", "only", "should", or edge-case clause as its own row.
+- Integration cascade: when the requested behavior spans concerns (UI + route + state/fetch, CLI + config + docs, model + serializer + API, interface + callers), list each required integration point as its own row before editing.
 - Likely target: name likely files/functions/classes/modules to inspect.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test/check expected after patching.
@@ -3186,8 +3187,9 @@ def _build_v33_initial_user_message(repo: Path, issue_text: str, repo_summary: s
         strategy = (
             "Strategy override: this task may span multiple files. Identify the necessary owner files "
             "and edit only those files in one coordinated response. If a signature, type, route, schema, "
-            "or public contract changes, cascade the required call-site/test updates; otherwise keep the "
-            "patch inside the smallest owning file/function."
+            "UI workflow, CLI/config path, or public contract changes, cascade the required route, caller, "
+            "test, fixture, serializer, or documentation updates; otherwise keep the patch inside the "
+            "smallest owning file/function."
         )
     else:
         strategy = (
@@ -4034,18 +4036,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
             1. patch-safety — remove unsafe review-process wording
-            2. coverage-nudge — name issue-mentioned paths still untouched
-            3. criteria-nudge — name issue acceptance bullets not addressed
-            4. missing-class — create explicitly requested class declarations
-            5. visible-surface — ensure UI/page tasks touch rendered surfaces
-            6. underimplementation — expand tiny patches on broad tasks
-            7. test — actually run the companion test if one exists; if it
+            2. polish — drop low-signal hunks before further repair
+            3. syntax — quote parser errors back at the model
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            8. failed-verification — repair the latest concrete failed check
-            9. contract — preserve public symbols still referenced by callers
-            10. integration/artifact/dependency — close common missing pieces
-            11. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            12. self-check — show the diff and ask "did you cover everything?"
+            5. failed-verification — repair the latest concrete failed check
+            6. coverage/criteria — name explicit issue gaps
+            7. missing-class/visible-surface/underimplementation — close broad task-shape gaps
+            8. contract/integration/artifact/dependency — close common missing pieces
+            9. empty-arg/lint — remove malformed calls and tool errors
+            10. self-check — show the diff and ask "did you cover everything?"
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, visible_surface_nudges_used, underimplementation_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
@@ -4086,6 +4086,61 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"PATCH_SAFETY_QUEUED:\n  {safety}",
                 )
                 return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if (
+            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
+            and last_failed_verification_command
+            and last_failed_verification_observation
+        ):
+            failed_verification_fix_turns_used += 1
+            total_refinement_turns_used += 1
+            command = last_failed_verification_command
+            observation = last_failed_verification_observation
+            last_failed_verification_command = ""
+            last_failed_verification_observation = ""
+            queue_refinement_turn(
+                assistant_text,
+                build_failed_verification_prompt(command, observation),
+                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
+            )
+            return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
@@ -4147,37 +4202,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        if (
-            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
-            and last_failed_verification_command
-            and last_failed_verification_observation
-        ):
-            failed_verification_fix_turns_used += 1
-            total_refinement_turns_used += 1
-            command = last_failed_verification_command
-            observation = last_failed_verification_observation
-            last_failed_verification_command = ""
-            last_failed_verification_observation = ""
-            queue_refinement_turn(
-                assistant_text,
-                build_failed_verification_prompt(command, observation),
-                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
-            )
-            return True
-
         if contract_turns_used < MAX_CONTRACT_TURNS:
             contract_findings = _contract_preservation_gap_summary(repo, patch)
             if contract_findings:
@@ -4223,30 +4247,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_dependency_nudge_prompt(dependency, issue),
                     f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
-                )
-                return True
-
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
