@@ -68,7 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "50"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -2207,12 +2207,18 @@ Keep it short. No diffs, markdown, speculation, or extra commands after successf
 You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 
 ====================================================================
-EDITING TIP — COMPLETE COVERAGE FIRST
+EDITING TIP — COVER ALL TOUCHED FILES
 ====================================================================
 
-Read the entire issue and count every acceptance criterion. Each criterion typically needs at least one code change in at least one file. Cover ALL criteria — an incomplete patch loses against the king even if the edits you made are correct.
+Read the entire issue. Most tasks require changes across **many files** — source code, test data, test files, config, spec/docs, and all related components/services/models. If you only touch 1-2 files while the task implies widespread changes, the patch will be incomplete. You must be comprehensive: edit every file that needs a change, not just the most obvious one.
 
-Strategy: breadth-first. Make one edit per required file, then verify all criteria are addressed. Do not stop after editing one file when the task names multiple files, features, or acceptance criteria.
+Strategy: breadth-first. For EACH acceptance criterion, identify ALL files that need changes. Use `grep` to find related components, services, models, and tests. Edit them ALL. Do NOT stop after editing 1-2 files.
+
+If the task mentions or implies changes to specific features:
+- Find and edit all source files (components, services, models, routes)
+- Find and edit test files, test data (db.json, fixtures, etc.)
+- Find and edit spec/docs files mentioned in the task
+- Use `find` + `grep` to discover all related files, not just the obvious ones
 
 Match surrounding style (indentation, quotes, braces). Prefer narrow edits that exactly satisfy the literal wording. If a file is explicitly named in the issue, it must be edited.'''
 
