@@ -1465,7 +1465,12 @@ def _check_corruption(patch: str) -> List[str]:
 
 
 def _hazard_review_summary(patch: str) -> str:
-    """Spot cheap-to-fix patch hazards before the final self-check."""
+    """Spot cheap-to-fix patch hazards before the final self-check.
+
+    Examples: generated/binary churn, malformed component insertion, parsers
+    that only split on blank lines, or fallback code that both resets state and
+    still reports an error when the task asks for graceful recovery.
+    """
     if not patch.strip():
         return ""
 
@@ -1527,15 +1532,6 @@ def _hazard_review_summary(patch: str) -> str:
             if re.search(r"\b(?:import|upload|attach|csv|file)\b", added_text, re.IGNORECASE):
                 if re.search(r"\bfileInputRef\b", added_text) and "useRef" not in added_text:
                     notes.append(f"{path}: new file/import action appears to reuse an existing fileInputRef")
-
-        removed_globals = sorted(set(re.findall(r"^\s*(?:const|let|var|export\s+const|[A-Z][A-Z0-9_]+)\s+([A-Z][A-Z0-9_]{2,})\b", removed_text, re.MULTILINE)))
-        if removed_globals:
-            stale_global_uses = [
-                name for name in removed_globals
-                if re.search(rf"\b{re.escape(name)}\b", added_text)
-            ]
-            if stale_global_uses:
-                notes.append(f"{path}: removed global/config alias still appears in added code: {', '.join(stale_global_uses[:4])}")
 
         removed_exports = set(re.findall(r"^\s*(?:export\s+)?(?:class|function|const|let|var|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)", removed_text, re.MULTILINE))
         if removed_exports:
@@ -2686,7 +2682,12 @@ _BACKEND_EXTS = {".py", ".java", ".kt", ".go", ".rb", ".php", ".rs", ".cs"}
 
 
 def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
-    """Find visible UI edits whose state/action/selector binding may be stale."""
+    """Find visible UI edits whose state/action/selector binding may be stale.
+
+    Examples: dispatch used without a context binding, a new collection rendered
+    without definition/import, or a button that toggles confirmation state
+    without rendering the confirmation surface and completion handler.
+    """
     if not patch.strip():
         return ""
     notes: List[str] = []
@@ -2784,7 +2785,6 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
             ("file transfer workflow", ("import", "export", "upload", "download", "file"), ("input", "ref", "parser", "download", "refresh")),
             ("localized confirmation flow", ("modal", "confirm", "confirmation", "locale", "translation"), ("modal", "confirm", "locale", "message", "test")),
             ("metadata and discovery files", ("metadata", "sitemap", "robots", "schema", "json-ld"), ("metadata", "layout", "sitemap", "robots", "schema")),
-            ("field model migration", ("field", "rename", "model", "schema", "form", "search"), ("form", "card", "search", "filter", "storage", "schema")),
         )
         for label, issue_words, owner_words in owner_sets:
             if sum(1 for word in issue_words if word in issue_lower) >= 2:
@@ -3370,8 +3370,7 @@ def build_contract_propagation_prompt(contract_summary: str, issue_text: str) ->
         "new external API URLs, package APIs, and dependency names against local "
         "docs/usages before finalizing; do not guess unofficial endpoints, "
         "asset prefixes, placeholder files, response fields, event names, or method names. "
-        "For end-to-end work, check the producer, transport, receiver, type/schema, UI state, and tests as one chain. "
-        "When a field/model shape changes, carry it through forms, cards, search/filter logic, persistence/API mapping, and tests. If the warning is a false positive, finish with "
+        "For end-to-end work, check the producer, transport, receiver, type/schema, UI state, and tests as one chain. If the warning is a false positive, finish with "
         "<final>summary</final> and name why. Otherwise "
         "issue the minimal edit command(s) to repair the propagation gap.\n\n"
         "Task (for reference):\n"
