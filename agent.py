@@ -1662,6 +1662,32 @@ _HOOK_RE = re.compile(
 _DSLASH_RE = re.compile(r'["\'][^"\']*//[^"\'/]')
 _ASSIGN_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*(?!=)', re.MULTILINE)
 
+# Float-valued slice indices on numeric arrays. Indexing with a literal float
+# or float(...) result raises IndexError at runtime in NumPy >=1.12 and most
+# OpenCV array views. Anchored on a ':' that follows the float so it doesn't
+# false-positive on plain float lists like [1.0, 2.5]. Catches:
+#   img[box[1]*1.5:...]   arr[float(y):z]   m[1.5:2.5]
+_FLOAT_SLICE_RE = re.compile(
+    r'(?:\*\s*\d+\.\d+\s*:|\bfloat\s*\([^)]*\)\s*:|\[\s*\d+\.\d+\s*:)'
+)
+
+# C-family printf-style call with a literal format string. Used to flag
+# argument-count mismatches against the format specifiers in the string.
+_PRINTF_CALL_RE = re.compile(
+    r'\b(?:printf|fprintf|sprintf|snprintf|dprintf|asprintf)\s*\('
+    r'(?:\s*\w+\s*,\s*)?'                       # optional stream/buf arg
+    r'\s*"((?:[^"\\]|\\.)*)"'                   # the format string
+    r'((?:\s*,\s*[^,)]+)*)'                     # zero or more value args
+    r'\s*\)'
+)
+_PRINTF_SPEC_RE = re.compile(r'%(?!%)[-+ 0#]*\d*(?:\.\d+)?[hljztL]*[diouxXeEfgGaAcspn]')
+
+# JS/TS regex literal where a newline class is followed by another newline
+# class within the same group. Narrow pattern: only flags when both halves
+# reference \n with quantifiers, which is the split(/\n+?\n+/) footgun that
+# fails on normal single-newline records.
+_REGEX_NEWLINE_TRAP_RE = re.compile(r'/(?:\\n)[+*?]+\\n[+*?]+/')
+
 
 def _quick_patch_lint(patch: str, repo_path: Optional[Path]) -> List[str]:
     issues: List[str] = []
@@ -1708,6 +1734,40 @@ def _quick_patch_lint(patch: str, repo_path: Optional[Path]) -> List[str]:
             if _DSLASH_RE.search(clean):
                 issues.append(f"{fname}: possible double-slash in URL (check string concatenation)")
                 break
+        if suffix in {".py", ".pyx"}:
+            for line in added:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if _FLOAT_SLICE_RE.search(line):
+                    issues.append(f"{fname}: array slice uses a float index — wrap with int(...) to avoid IndexError")
+                    break
+        if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
+            printf_flagged = False
+            for line in added:
+                stripped = line.strip()
+                if stripped.startswith(("//", "*", "#")):
+                    continue
+                for m in _PRINTF_CALL_RE.finditer(line):
+                    fmt = m.group(1)
+                    args = m.group(2)
+                    specs = len(_PRINTF_SPEC_RE.findall(fmt))
+                    arg_count = 0 if not args.strip() else args.count(",")
+                    if specs and specs != arg_count:
+                        issues.append(
+                            f"{fname}: printf format has {specs} specifier(s) but {arg_count} argument(s) provided"
+                        )
+                        printf_flagged = True
+                        break
+                if printf_flagged:
+                    break
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            for line in added:
+                if _REGEX_NEWLINE_TRAP_RE.search(line):
+                    issues.append(
+                        f"{fname}: regex combines \\n quantifiers in a way that won't match single-newline input"
+                    )
+                    break
     all_removed = "\n".join(l for lines in file_removed.values() for l in lines)
     all_added = "\n".join(l for lines in file_added.values() for l in lines)
     removed_vars = {m.group(1) for m in _ASSIGN_RE.finditer(all_removed)}
