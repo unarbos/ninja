@@ -1273,6 +1273,29 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _patch_is_tiny_focused(patch: str) -> bool:
+    """A small focused surgical patch: <=2 changed files AND <50 added lines.
+
+    Coverage/criteria nudges widen the patch by pointing the model at extra
+    files or unaddressed criteria. When the draft is already a tight surgical
+    edit (one or two files, very few added lines), expanding it tends to
+    regress reference match on easy/high-tier tasks where the win margin is
+    decided by tightness rather than coverage. Short-circuit those two
+    nudges in that regime; precision-preserving gates (syntax, polish,
+    test-fix, hail-mary) still fire normally.
+    """
+    files = _patch_changed_files(patch)
+    if not files or len(files) > 2:
+        return False
+    added = 0
+    for line in patch.split("\n"):
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+            if added >= 50:
+                return False
+    return True
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -2775,7 +2798,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES and not _patch_is_tiny_focused(patch):
             missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
@@ -2793,7 +2816,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # judge's "missing N of M criteria" complaint is the most common reason
         # the king loses on multi-bullet issues — surfacing the unaddressed
         # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES and not _patch_is_tiny_focused(patch):
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
