@@ -92,7 +92,7 @@ MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
 MAX_PRELOADED_FILES = 12
-MAX_NO_COMMAND_REPAIRS = 2
+MAX_NO_COMMAND_REPAIRS = 4
 MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
@@ -2220,7 +2220,9 @@ If the task mentions or implies changes to specific features:
 - Find and edit spec/docs files mentioned in the task
 - Use `find` + `grep` to discover all related files, not just the obvious ones
 
-Match surrounding style (indentation, quotes, braces). Prefer narrow edits that exactly satisfy the literal wording. If a file is explicitly named in the issue, it must be edited.'''
+Match surrounding style (indentation, quotes, braces). Prefer narrow edits that exactly satisfy the literal wording. If a file is explicitly named in the issue, it must be edited.
+
+IMPORTANT: Always wrap every command in `<command>...</command>` tags. Always end with `<final>...</final>` when done. Never output raw code without tags.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
