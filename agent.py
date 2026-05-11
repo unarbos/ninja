@@ -2649,6 +2649,38 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
             if stale_selectors:
                 notes.append(f"{path}: removed/renamed selector still appears in added logic: {', '.join(stale_selectors[:4])}")
 
+            defined_names = set(re.findall(r"\b(?:const|let|var|function|class|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)", added_text + "\n" + removed_text))
+            import_names: set = set()
+            for default_name in re.findall(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_]*)\s+from\s+['\"]", added_text + "\n" + removed_text, re.MULTILINE):
+                import_names.add(default_name)
+            for group in re.findall(r"^\s*import\s+\{([^}]+)\}\s+from\s+['\"]", added_text + "\n" + removed_text, re.MULTILINE):
+                for name in group.split(","):
+                    clean = name.strip().split(" as ")[-1].strip()
+                    if clean:
+                        import_names.add(clean)
+            for group in _CONTEXT_HOOK_RE.findall(added_text + "\n" + removed_text):
+                for name in group.split(","):
+                    clean = name.strip().split(":")[-1].strip()
+                    if clean:
+                        defined_names.add(clean)
+
+            collection_uses = sorted({
+                name for name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(?:map|filter|reduce|forEach|some|every)\s*\(", added_text)
+                if name not in defined_names and name not in import_names and name not in {"Array", "Object"}
+            })
+            if collection_uses:
+                notes.append(f"{path}: collection used without visible definition/import: {', '.join(collection_uses[:4])}")
+
+            style_keys = sorted(set(re.findall(r"\bstyles\.([A-Za-z_][A-Za-z0-9_]*)", added_text)))
+            if style_keys and re.search(r"\bconst\s+styles\s*=", added_text + "\n" + removed_text):
+                style_object_text = added_text + "\n" + removed_text
+                missing_style_keys = [
+                    key for key in style_keys
+                    if not re.search(rf"\b{re.escape(key)}\s*:", style_object_text)
+                ]
+                if missing_style_keys:
+                    notes.append(f"{path}: styles key(s) used without visible style definition: {', '.join(missing_style_keys[:4])}")
+
             if "dispatch(" in added_text:
                 hook_bindings = " ".join(_CONTEXT_HOOK_RE.findall(added_text))
                 if "dispatch" not in hook_bindings and not re.search(r"\bconst\s+dispatch\s*=", added_text):
@@ -2671,6 +2703,19 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
             if wants_form and re.search(r"\bbadge|filter|category|today|date\b", lower_added):
                 if not re.search(r"\b(input|select|textarea|form|option|value=|onchange|onChange)\b", added_text):
                     notes.append(f"{path}: category/date UI changed without visible form/input option update")
+
+        touched_names = " ".join(Path(changed_path).stem.lower() for changed_path in changed)
+        owner_sets = (
+            ("category/filter/date task", ("category", "filter", "badge", "form", "edit"), ("form", "edit", "badge", "css")),
+            ("settings/dashboard task", ("settings", "dashboard", "header", "dark", "tab"), ("settings", "dashboard", "topbar", "header")),
+            ("import/export/upload task", ("import", "export", "upload", "file", "csv"), ("import", "export", "ref", "upload")),
+        )
+        for label, issue_words, owner_words in owner_sets:
+            if sum(1 for word in issue_words if word in issue_lower) >= 2:
+                covered = sum(1 for word in owner_words if word in touched_names or word in added_text.lower())
+                if covered <= 1:
+                    notes.append(f"{label}: patch appears to cover only one owner; inspect related owners {', '.join(owner_words)}")
+                    break
 
         if len(notes) >= 6:
             break
@@ -3245,8 +3290,11 @@ def build_contract_propagation_prompt(contract_summary: str, issue_text: str) ->
         "Inspect the touched owner(s) and propagate the contract exactly: route "
         "param names must match handler reads, imported local helpers/files must "
         "exist, duplicate/stale imports should be collapsed or removed, and "
-        "renamed fields must leave no stale read/write/test path behind. If the "
-        "warning is a false positive, finish with <final>summary</final> and name why. Otherwise "
+        "renamed fields must leave no stale read/write/test path behind. Verify "
+        "new external API URLs, package APIs, and dependency names against local "
+        "docs/usages before finalizing; do not guess unofficial endpoints or "
+        "method names. If the warning is a false positive, finish with "
+        "<final>summary</final> and name why. Otherwise "
         "issue the minimal edit command(s) to repair the propagation gap.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
@@ -3277,7 +3325,8 @@ def build_ui_binding_nudge_prompt(ui_summary: str, issue_text: str) -> str:
         "binding fix: include needed context/store destructuring, keep DOM ids/"
         "classes/selectors synchronized after renames, update create/edit form "
         "options when display filters/categories change, and touch the frontend "
-        "owner when the task explicitly asks for visible UI. If the warning is "
+        "owner when the task explicitly asks for visible UI. Define any new "
+        "arrays, style keys, or handler names used by the rendered JSX/template. If the warning is "
         "a false positive, finish with <final>summary</final> and name why. "
         "Do not rewrite unrelated layout or styling.\n\n"
         "Task (for reference):\n"
