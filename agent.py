@@ -1540,17 +1540,12 @@ def _detect_frontend_gap(task_text: str, patch: str) -> str:
 # v15: Post-generation domain blocklist sanitizer
 # -----------------------------
 
-_DOMAIN_BLOCKLIST_LINE_RE = re.compile(
     r'^\+[ \t]*[\w.-]+\.(?:com|net|org|co\.\w{2,3}|io|ai|uk|de|fr|ru|cn)\b'
     r'[^\n]*(?:[-\u2013]\s*[\d,]{4,}|[\t ]+[\d,]{4,})',
     re.IGNORECASE,
 )
 
-# Minimum consecutive matching lines to consider a "block" (avoids false positives)
-_BLOCKLIST_BLOCK_MIN_LINES = 4
 
-# Maximum entries to keep in a truncated block
-_BLOCKLIST_MAX_KEPT = 3
 
 
 
