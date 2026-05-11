@@ -68,8 +68,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "10"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -85,9 +85,9 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
@@ -2167,7 +2167,19 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+
+====================================================================
+EDITING TIP — LINE-LEVEL PRECISION
+====================================================================
+
+Your diff is compared against a reference solution positionally. Each changed line is evaluated on whether it appears at the same position in the reference diff:
+
+- Changing lines the reference doesn't touch increases the number of changed lines that must be matched, making your ratio harder to win. Prefer narrower edits.
+- Changing lines with wrong indentation, quotes, or style can cause a positional mismatch even if the logic is correct. Match surrounding style exactly.
+- If a change would touch extra files beyond what the issue explicitly names, prefer not to — each extra file adds changed lines the reference likely doesn't have.
+
+If a test fails, check whether it is genuinely caused by your change or is a pre-existing failure before expanding the patch.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2187,6 +2199,8 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
     return f"""Fix this issue:
 
 {issue}
+
+Focus on the smallest correct change that matches what a senior maintainer would commit. Every extra changed line reduces your score.
 
 Repository summary:
 
