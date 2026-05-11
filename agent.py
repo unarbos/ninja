@@ -642,6 +642,7 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
+    cleaned = _strip_generated_artifact_diffs(cleaned)
     return _strip_low_signal_hunks(cleaned)
 
 
@@ -676,9 +677,12 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix == ".pyc":
+    if path.suffix.lower() in _GENERATED_ARTIFACT_SUFFIXES:
         return True
-    return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
+    parts = set(path.parts)
+    if parts & _GENERATED_ARTIFACT_PARTS:
+        return True
+    return any(part in {"node_modules", ".git"} for part in path.parts)
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1259,6 +1263,24 @@ def _read_context_file_focused(
 
 _COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
 _BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
+_GENERATED_ARTIFACT_PARTS = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".coverage",
+    "coverage",
+}
+_GENERATED_ARTIFACT_SUFFIXES = (
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".o",
+    ".so",
+    ".dll",
+    ".dylib",
+)
 
 
 def _line_is_comment(line: str) -> bool:
@@ -1339,6 +1361,35 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
             out.append(header + "".join(substantive))
         # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _strip_generated_artifact_diffs(diff_output: str) -> str:
+    """Drop cache/compiled artifact file blocks from the returned patch."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git "):
+            kept.append(block)
+            continue
+        match = re.match(r"diff --git a/(.*?) b/(.*?)\n", block)
+        paths = [p for p in match.groups()] if match else []
+        should_drop = False
+        for raw_path in paths:
+            path = Path(raw_path)
+            parts = set(path.parts)
+            if parts & _GENERATED_ARTIFACT_PARTS or path.suffix.lower() in _GENERATED_ARTIFACT_SUFFIXES:
+                should_drop = True
+                break
+        if not should_drop:
+            kept.append(block)
+    result = "".join(kept)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
@@ -3188,6 +3239,8 @@ Use preloaded snippets first. If they contain the target code, edit them directl
 
 Patch the owner of the behavior, not a downstream workaround. Parser bug -> parser. Serializer omission -> serializer. CLI option ignored -> option parsing. Validation rejects a valid case -> validation rule.
 
+Prefer editable source over generated, built, copied, or release-output files. If both `src/...` and `dist/...`, `build/...`, `release/...`, generated assets, or copied launcher files exist, patch the source owner unless the issue explicitly targets the generated copy.
+
 ## Edit discipline
 
 Change the fewest lines necessary. Allowed: one-line substitution, a small guarded block replacement, one narrow branch, required call-site updates when a signature/public API change is unavoidable, or a focused companion-test update.
@@ -3205,6 +3258,8 @@ Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, b
 Preserve meaningful comments and section headers around changed code. If a comment becomes false, update it minimally. Error messages are often tested exactly: preserve capitalization, punctuation, quotes, and error class/type unless the issue gives a required new message.
 
 Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, schemas, file formats, env-var names. If unavoidable, update every implementer, caller, test, mock, and fixture in the same response.
+
+When the issue names an exact path, package, route, command, option, class, function, file name, field, enum, error code, or argument name, preserve that spelling and shape exactly. Do not substitute a nicer abstraction or rename a requested public surface; wire the named contract into the existing code path.
 
 ## Completeness without overreach
 
