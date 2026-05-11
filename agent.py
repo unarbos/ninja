@@ -118,6 +118,14 @@ MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look una
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
+MAX_FINALIZE_TURNS = 1     # inner-loop late-step finalize turn (exempt from total cap)
+MAX_INTEGRITY_TURNS = 1    # patch-integrity gate: drift hunks + test-erosion
+_FINALIZE_DEADLINE_SECONDS = 35.0  # fire finalize turn when less than this much wall-clock remains
+_FINALIZE_MIN_STEP = 5     # don't fire before step 5 — early loop legitimately needs exploration
+_INTEGRITY_DRIFT_FILE_THRESHOLD = 2  # flag when this many off-scope files appear in the patch
+_INTEGRITY_TEST_DELETE_TOKENS = (
+    "assert", "expect(", "it(", "test_", "describe(",
+)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -788,14 +796,18 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     needles so we keep only the regions relevant to the task instead of the
     head N chars of the file.
     """
+    tracked_set = set(_tracked_files(repo))
     files = _rank_context_files(repo, issue)
     if not files:
         return "", []
 
-    tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+
+    # Compute which files were selected via ranker signals (for header transparency).
+    _tb_anchors = set(_traceback_path_anchors(issue, tracked_set))
+    _cb_hits = set(_grep_issue_codeblocks(repo, issue, tracked_set).keys())
 
     parts: List[str] = []
     included: List[str] = []
@@ -806,7 +818,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
         if not snippet.strip():
             continue
-        block = f"### {relative_path}\n```\n{snippet}\n```"
+        # Annotate why this file was ranked highly when special signals fired.
+        if relative_path in _tb_anchors:
+            header = f"### {relative_path} [TRACEBACK ANCHOR: matched stack-trace in issue]"
+        elif relative_path in _cb_hits:
+            header = f"### {relative_path} [ISSUE CODE-BLOCK MATCH: verbatim snippet found here]"
+        else:
+            header = f"### {relative_path}"
+        block = f"{header}\n```\n{snippet}\n```"
         if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
             break
         parts.append(block)
@@ -865,6 +884,70 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+# Item C: verbatim code-block grep signals for file ranking
+_ISSUE_CODEBLOCK_RE = re.compile(
+    r"```[a-zA-Z0-9+_-]*\n(.*?)\n```", re.DOTALL,
+)
+_ISSUE_INLINE_CODE_RE = re.compile(r"`([^`\n]{12,160})`")
+_ISSUE_CODEBLOCK_MIN_LINE_CHARS = 18
+_ISSUE_CODEBLOCK_HITS_MAX = 6    # cap files boosted per snippet
+_ISSUE_CODEBLOCK_BOOST = 80
+
+# Item D: traceback/stack-trace path extraction for file ranking
+_TRACEBACK_PATH_RE = re.compile(
+    r"""
+    (?:File\s+"(?P<py>[^"\n]+\.py)",\s+line\s+\d+)        # CPython
+    |(?P<pytest>[\w./_-]+\.(?:py|pyx)):\d+(?::\s|:\d+:)   # pytest / mypy
+    |\bat\s+[\w$.<>]+\s+\((?P<js>[\w./_-]+\.[jt]sx?):\d+:\d+\)  # node/V8
+    |^\s*at\s+(?P<jsbare>[\w./_-]+\.[jt]sx?):\d+:\d+      # bare-frame V8
+    |\b(?P<go>[\w./_-]+\.go):\d+\b                        # go runtime/test
+    |\b(?P<rs>[\w./_-]+\.rs):\d+:\d+                      # rust panic
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+
+
+def _traceback_path_anchors(issue_text: str, tracked_set: set) -> List[str]:
+    """Return tracked-file paths extracted from traceback/stack-trace syntax in the issue.
+
+    Resolution rules:
+      1. exact match against tracked_set wins.
+      2. else, basename match against any tracked path (picks shortest on tie).
+      3. else, drop the entry.
+
+    Returns deduped paths in first-seen order, capped at 4.
+    """
+    raw_paths: List[str] = []
+    for match in _TRACEBACK_PATH_RE.finditer(issue_text):
+        for group_name in ("py", "pytest", "js", "jsbare", "go", "rs"):
+            candidate = match.group(group_name)
+            if candidate:
+                candidate = candidate.strip()
+                if candidate and candidate not in raw_paths:
+                    raw_paths.append(candidate)
+                break
+
+    resolved: List[str] = []
+    seen: set = set()
+    for raw in raw_paths:
+        if len(resolved) >= 4:
+            break
+        # exact match
+        if raw in tracked_set and _context_file_allowed(raw):
+            if raw not in seen:
+                resolved.append(raw)
+                seen.add(raw)
+            continue
+        # basename match
+        base = Path(raw).name
+        candidates = [p for p in tracked_set if Path(p).name == base and _context_file_allowed(p)]
+        if candidates:
+            best = sorted(candidates, key=lambda p: (len(p), p))[0]
+            if best not in seen:
+                resolved.append(best)
+                seen.add(best)
+    return resolved
+
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
     tracked = _tracked_files(repo)
@@ -896,8 +979,15 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
                     mentioned.append(m)
                     seen_mentioned.add(m)
 
+    # Item D: traceback anchors get the same +100 "mentioned" boost as explicit path mentions.
+    for anchor in _traceback_path_anchors(issue, tracked_set):
+        if anchor not in seen_mentioned:
+            mentioned.append(anchor)
+            seen_mentioned.add(anchor)
+
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    codeblock_hits = _grep_issue_codeblocks(repo, issue, tracked_set)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -920,6 +1010,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Item C: boost files matching verbatim code blocks pasted into the issue.
+        if relative_path in codeblock_hits:
+            score += codeblock_hits[relative_path]
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1993,6 +2086,72 @@ def _symbol_grep_hits(
     return hits
 
 
+def _grep_issue_codeblocks(
+    repo: Path,
+    issue_text: str,
+    tracked_set: set,
+) -> Dict[str, int]:
+    """Return {relative_path: integer_boost} for files verbatim-containing code snippets from the issue.
+
+    Extracts triple-backtick fenced blocks and >=12-char inline-backtick spans
+    that contain whitespace, brackets, operators, or punctuation (so we don't
+    double-count bare identifiers already handled by _BACKTICK_IDENT_RE).
+    For each candidate snippet line >= _ISSUE_CODEBLOCK_MIN_LINE_CHARS, runs
+    `git grep -lF` to find matching tracked files. Each matching file receives
+    +_ISSUE_CODEBLOCK_BOOST, capped at _ISSUE_CODEBLOCK_HITS_MAX files per snippet.
+    """
+    hits: Dict[str, int] = {}
+
+    candidate_lines: List[str] = []
+
+    # Extract lines from fenced code blocks
+    for block_match in _ISSUE_CODEBLOCK_RE.finditer(issue_text):
+        block_body = block_match.group(1)
+        for line in block_body.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= _ISSUE_CODEBLOCK_MIN_LINE_CHARS:
+                candidate_lines.append(stripped)
+
+    # Extract long inline-backtick spans that are not bare identifiers
+    _non_ident_re = re.compile(r"[\s\[\](){}<>.,;:!@#$%^&*+=|/?~\\-]")
+    for span_match in _ISSUE_INLINE_CODE_RE.finditer(issue_text):
+        span = span_match.group(1).strip()
+        if len(span) >= _ISSUE_CODEBLOCK_MIN_LINE_CHARS and _non_ident_re.search(span):
+            candidate_lines.append(span)
+
+    seen_lines: set = set()
+    for line in candidate_lines:
+        if line in seen_lines:
+            continue
+        seen_lines.add(line)
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-lF", "--", line],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        matched = 0
+        for path_line in proc.stdout.splitlines():
+            relative_path = path_line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + _ISSUE_CODEBLOCK_BOOST
+            matched += 1
+            if matched >= _ISSUE_CODEBLOCK_HITS_MAX:
+                break
+
+    return hits
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -2392,6 +2551,136 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_finalize_now_prompt(issue_text: str, time_remaining: float) -> str:
+    """Time-pressure prompt: wall-clock nearly out with no patch yet.
+
+    Fires inside _solve_attempt's refinement chain when step >= _FINALIZE_MIN_STEP,
+    patch is still empty, and less than _FINALIZE_DEADLINE_SECONDS remain.
+    """
+    return (
+        "TIME PRESSURE: "
+        f"only {time_remaining:.0f} s of wall-clock remain and no patch "
+        "has landed yet. Your next response MUST be exactly ONE shell "
+        "<command> that makes the single highest-priority edit toward "
+        "the issue, followed by <final>. Do not propose plans. Do not "
+        "explore further. Pick the most plausible single file and emit "
+        "a sed/printf/python -c edit now.\n\n"
+        "Issue recap (first 600 chars):\n"
+        f"{issue_text[:600]}"
+    )
+
+
+def _late_step_finalize_check(
+    step: int,
+    time_remaining: float,
+    patch_is_empty: bool,
+    finalize_turns_used: int,
+) -> bool:
+    """Return True iff a finalize-now refinement turn should fire.
+
+    Gated on: step >= _FINALIZE_MIN_STEP, patch still empty,
+    time_remaining < _FINALIZE_DEADLINE_SECONDS, no prior finalize
+    turn used. The triple gate ensures we don't fire on healthy
+    early-loop progress, on already-substantive patches, or on
+    pre-step-5 explorations that legitimately need more time.
+    """
+    if finalize_turns_used >= MAX_FINALIZE_TURNS:
+        return False
+    if step < _FINALIZE_MIN_STEP:
+        return False
+    if not patch_is_empty:
+        return False
+    return time_remaining < _FINALIZE_DEADLINE_SECONDS
+
+
+def _patch_integrity_issues(
+    patch: str,
+    issue_text: str,
+    repo: Path,
+) -> List[str]:
+    """Return a list of human-readable integrity issues in `patch`.
+
+    Two signals, both pure-text and language-agnostic:
+
+    1. DRIFT — files in the patch not in the union of issue-mentioned paths and
+       symbol-grep hits. When drift count exceeds _INTEGRITY_DRIFT_FILE_THRESHOLD,
+       emit one DRIFT issue line per offending file (capped at 4).
+
+    2. TEST EROSION — for each test file touched by the patch, scan `-` lines
+       for tokens in _INTEGRITY_TEST_DELETE_TOKENS. Emit one TEST_EROSION issue
+       per match (capped at 4).
+    """
+    issues: List[str] = []
+    changed_files = _patch_changed_files(patch)
+    if not changed_files:
+        return issues
+
+    tracked_set = set(_tracked_files(repo))
+    path_mentions = set(_extract_issue_path_mentions(issue_text))
+    # Normalize mentions to match tracked paths
+    scope_files: set = set()
+    for m in path_mentions:
+        normalized = m.strip("./")
+        scope_files.add(normalized)
+        for p in tracked_set:
+            if p.endswith("/" + normalized) or p == normalized:
+                scope_files.add(p)
+    # Also include symbol-grep hits as in-scope
+    sym_hits = _symbol_grep_hits(repo, tracked_set, issue_text)
+    scope_files.update(sym_hits.keys())
+
+    # Include test partners of in-scope files as in-scope
+    partners: set = set()
+    for f in list(scope_files):
+        partner = _find_test_partner(f, tracked_set)
+        if partner:
+            partners.add(partner)
+    scope_files.update(partners)
+
+    drift_files = [
+        f for f in changed_files
+        if f not in scope_files and not any(f.endswith("/" + s) or f == s for s in scope_files)
+    ]
+    if len(drift_files) >= _INTEGRITY_DRIFT_FILE_THRESHOLD:
+        for f in drift_files[:4]:
+            issues.append(f"DRIFT: {f} is not in scope for this issue — revert edits to it")
+
+    # Test-erosion check
+    test_name_re = re.compile(r"test|spec", re.IGNORECASE)
+    patch_lines = patch.splitlines()
+    current_file = ""
+    erosion_count = 0
+    for line in patch_lines:
+        if line.startswith("diff --git "):
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_file = tokens[3][2:]
+        if not test_name_re.search(current_file):
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            body = line[1:].strip().lower()
+            if any(tok in body for tok in _INTEGRITY_TEST_DELETE_TOKENS):
+                if erosion_count < 4:
+                    issues.append(
+                        f"TEST EROSION: deleted assertion in {current_file} — "
+                        "revert test deletions or update the expectation instead"
+                    )
+                erosion_count += 1
+
+    return issues
+
+
+def build_integrity_prompt(issues: List[str]) -> str:
+    return (
+        "PATCH INTEGRITY ISSUES: a static check of your current diff "
+        "found the following concerns. For each, REVERT the offending "
+        "lines in your next response — do not re-edit them, just remove "
+        "those hunks from the patch. If the issue listed below is "
+        "spurious, justify in <=1 sentence and proceed.\n\n"
+        + "\n".join(f"- {item}" for item in issues)
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2663,6 +2952,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    finalize_turns_used = 0   # Item A: inner-loop late-step finalize (exempt from total cap)
+    integrity_turns_used = 0  # Item B: drift + test-erosion gate
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2706,14 +2997,30 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, finalize_turns_used, integrity_turns_used
         patch = get_patch(repo)
+        _patch_empty = not patch.strip()
+
+        # Item A: inner-loop late-step finalize trigger. Fires BEFORE hail-mary.
+        # Exempt from total-refinement cap — this is a time-pressure escape hatch
+        # that fires only when no patch exists yet and wall-clock is nearly exhausted.
+        if _patch_empty and _late_step_finalize_check(
+            step, time_remaining(), _patch_empty, finalize_turns_used,
+        ):
+            finalize_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_finalize_now_prompt(issue, time_remaining()),
+                "FINALIZE_NOW_TURN_QUEUED: "
+                f"step={step} remaining={time_remaining():.1f}s",
+            )
+            return True
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
-        if not patch.strip():
+        if _patch_empty:
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
@@ -2802,6 +3109,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # Item B: patch-integrity gate fires between criteria and self-check.
+        # Pure-text; language-agnostic. Does NOT raise the total-refinement cap.
+        if integrity_turns_used < MAX_INTEGRITY_TURNS:
+            int_issues = _patch_integrity_issues(patch, issue, repo)
+            if int_issues:
+                integrity_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_integrity_prompt(int_issues),
+                    "INTEGRITY_TURN_QUEUED:\n  " + "\n  ".join(int_issues[:3]),
                 )
                 return True
 
