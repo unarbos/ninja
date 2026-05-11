@@ -367,7 +367,11 @@ def chat_completion(
         raise RuntimeError(f"Model request failed after retries: {last_error}")
 
     try:
-        content = data["choices"][0]["message"]["content"] or ""
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or msg.get("reasoning_content") or ""
+        # GLM-5.1 sometimes returns content:null while still reasoning.
+        # If empty, try reasoning_content. If still empty, model is
+        # thinking-only — treat as valid but empty.
     except Exception as e:
         raise RuntimeError(f"Unexpected model response shape: {data}") from e
 
