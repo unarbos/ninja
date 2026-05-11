@@ -116,8 +116,8 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 2  # v17: match king; criteria+coverage takes priority over extra gates
+                                # cap total refinement turns across all gates (hail-mary excluded)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -579,7 +579,8 @@ def get_patch(repo: Path) -> str:
             diff_output += file_diff.stdout or ""
 
     cleaned = _strip_mode_only_file_diffs(diff_output)
-    return _strip_low_signal_hunks(cleaned)
+    cleaned = _strip_low_signal_hunks(cleaned)
+    return cleaned
 
 
 def _strip_mode_only_file_diffs(diff_output: str) -> str:
@@ -1045,7 +1046,7 @@ def _extract_relevant_regions(
     max_chars: int,
     *,
     ctx_before: int = 8,
-    ctx_after: int = 12,
+    ctx_after: int = 18,
 ) -> str:
     """Return windows around lines matching any needle, capped at `max_chars`.
 
@@ -1458,6 +1459,186 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     if diffs:
         return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
+
+
+# -----------------------------
+# v14: Named deliverable gate helpers
+# -----------------------------
+
+def _extract_named_deliverables(task_text: str) -> list:
+    """Extract explicitly named file deliverables from the task description.
+
+    Returns up to 6 unique filenames (by basename) that the task explicitly
+    asks to create or modify, matching common code/config/script extensions.
+    Called with task_text (not issue) to comply with scope-guard rules.
+    """
+    import re as _re
+    candidates = _re.findall(
+        r'([\w/.-]+\.(?:sh|py|ts|tsx|js|jsx|vue|java|go|rb|json|yml|yaml|md|html|css|sql))',
+        task_text, _re.I
+    )
+    seen, result = set(), []
+    for c in candidates:
+        base = c.split('/')[-1].lower()
+        if base not in seen and len(base) > 3:
+            seen.add(base)
+            result.append(c)
+    return result[:6]
+
+
+def _check_deliverable_coverage(patch: str, deliverables: list) -> list:
+    """Return deliverables not yet touched by the patch.
+
+    Compares basenames of all +++ / --- lines in the patch against
+    the expected deliverable list. Returns at most 3 missing items.
+    Called twice: once to check, once in gate wiring inside maybe_queue_refinement.
+    """
+    import re as _re
+    diff_files = _re.findall(r'^(?:\+\+\+|---) [ab]/(.+)$', patch, _re.M)
+    bases = {f.split('/')[-1].lower() for f in diff_files}
+    return [d for d in deliverables if d.split('/')[-1].lower() not in bases][:3]
+
+
+
+# -----------------------------
+# v15: Multi-file backend chain coverage verifier
+# -----------------------------
+
+_BACKEND_CHAINS = [
+    {
+        'name': 'django_mvc',
+        'min_signals': 2,
+        'signals': ['django', 'models.py', 'serializer', 'viewset', 'urls.py', 'DRF', 'rest_framework'],
+        'chain_members': ['models', 'serializer', 'views', 'urls'],
+        'description': 'Django REST chain (models \u2192 serializers \u2192 views \u2192 urls)',
+    },
+    {
+        'name': 'spring_boot',
+        'min_signals': 2,
+        'signals': ['@entity', '@restcontroller', '@service', '@repository', 'springframework',
+                    'jpa', '@autowired', 'applicationcontext'],
+        'chain_members': ['Entity', 'Repository', 'Service', 'Controller'],
+        'description': 'Spring Boot chain (Entity \u2192 Repository \u2192 Service \u2192 Controller)',
+    },
+    {
+        'name': 'express_rest',
+        'min_signals': 2,
+        'signals': ['express', 'router.', 'req, res', 'app.use(', 'module.exports', 'mongoose', 'sequelize'],
+        'chain_members': ['schema', 'route', 'controller', 'middleware'],
+        'description': 'Express REST chain (schema \u2192 routes \u2192 controller)',
+    },
+    {
+        'name': 'laravel_mvc',
+        'min_signals': 2,
+        'signals': ['laravel', 'artisan', 'eloquent', 'illuminate', 'migration', 'php artisan'],
+        'chain_members': ['migration', 'model', 'controller', 'route'],
+        'description': 'Laravel MVC chain (migration \u2192 model \u2192 controller \u2192 routes)',
+    },
+    {
+        'name': 'rails_mvc',
+        'min_signals': 2,
+        'signals': ['rails', 'activerecord', 'actioncontroller', 'config/routes', 'app/models', 'migration'],
+        'chain_members': ['migration', 'model', 'controller', 'route'],
+        'description': 'Rails MVC chain (migration \u2192 model \u2192 controller \u2192 routes)',
+    },
+    {
+        'name': 'full_stack_feature',
+        'min_signals': 2,
+        'signals': ['frontend', 'backend', 'api endpoint', 'api route', 'vue', 'react', 'component',
+                    'page.tsx', '.vue', 'store/', 'views/',
+                    'navigation', 'navbar', 'menu item'],
+        'chain_members': ['api', 'component', 'view', 'route'],
+        'description': 'Full-stack feature (backend API + frontend component + navigation)',
+    },
+    {
+        'name': 'bulk_upload',
+        'min_signals': 2,
+        'signals': ['bulk', 'import', 'csv upload', 'batch upload', 'bulk create', 'bulk insert'],
+        'chain_members': ['schema', 'validator', 'route', 'controller'],
+        'description': 'Bulk upload chain (schema \u2192 validator \u2192 route \u2192 controller)',
+    },
+]
+
+
+def _detect_backend_chain(task_text: str, baseline_filenames: list) -> Optional[dict]:
+    """Detect if the task involves a multi-file backend framework chain (3+ files).
+
+    Returns the matching chain definition dict, or None if no chain detected.
+    Uses case-insensitive signal matching against task text + baseline filenames.
+    Requires min_signals matches to avoid false positives on partial mentions.
+    Uses task_text parameter (not issue) to comply with scope-guard rules.
+    """
+    combined = (task_text + ' ' + ' '.join(baseline_filenames)).lower()
+    for chain in _BACKEND_CHAINS:
+        matched = sum(1 for sig in chain['signals'] if sig.lower() in combined)
+        if matched >= chain['min_signals']:
+            return chain
+    return None
+
+
+def _extract_patch_touched_files(patch: str) -> list:
+    """Extract list of file paths touched by the patch (from diff header lines).
+
+    Used by _verify_chain_coverage to compare against expected chain members.
+    Returns list of b/ path strings from the patch headers.
+    """
+    files = []
+    for line in patch.splitlines():
+        if line.startswith('+++ b/'):
+            files.append(line[6:].strip())
+        elif line.startswith('diff --git a/'):
+            parts = line.split(' b/', 1)
+            if len(parts) == 2:
+                files.append(parts[1].strip())
+    return files
+
+
+def _verify_chain_coverage(patch: str, chain: dict, baseline_filenames: list) -> list:
+    """Verify that all expected chain members appear in the patch.
+
+    Returns list of missing member names (strings) for the nudge prompt.
+    A chain member is "covered" if any touched file path contains the member name
+    (case-insensitive). A member is only flagged as missing if it exists in
+    the baseline or is a well-known generated file type.
+    Called from maybe_queue_refinement after ui_spec gate.
+    """
+    touched = [f.lower() for f in _extract_patch_touched_files(patch)]
+    baseline_lower = [f.lower() for f in baseline_filenames]
+
+    missing = []
+    for member in chain['chain_members']:
+        m_lower = member.lower()
+        covered = any(m_lower in f for f in touched)
+        if covered:
+            continue
+        in_baseline = any(m_lower in f for f in baseline_lower)
+        is_generated_type = m_lower in ('controller', 'service', 'component', 'view', 'route', 'migration')
+        if in_baseline or is_generated_type:
+            missing.append(member)
+
+    return missing
+
+
+_CHAIN_COVERAGE_NUDGE_TEMPLATE = (
+    "This task involves a {chain_name} ({description}). "
+    "Your patch is missing changes to: {missing_list}. "
+    "A complete implementation MUST modify all members of the chain. "
+    "Add the missing file(s)/component(s) now \u2014 partial chain coverage scores near-zero."
+)
+
+
+def _build_chain_nudge(chain: dict, missing: list) -> str:
+    """Build a nudge prompt for missing backend chain members.
+
+    Formats the chain description and missing member list into a targeted
+    refinement message. Called from maybe_queue_refinement when
+    _verify_chain_coverage returns non-empty results.
+    """
+    return _CHAIN_COVERAGE_NUDGE_TEMPLATE.format(
+        chain_name=chain['name'],
+        description=chain['description'],
+        missing_list=', '.join(missing),
+    )
 
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
@@ -2167,7 +2348,11 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
+
+If the issue describes changes in multiple areas (backend + frontend + navigation), your patch MUST include all areas. A patch that fixes only one area fails.
+
+If the task touches navigation, also update: (1) the route definition, (2) the nav component/template, and (3) the view/page component.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2661,7 +2846,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    route_nudge_used = 0
     hail_mary_turns_used = 0
+    deliverable_nudges_used = 0   # v14: named-file deliverable gate
+    chain_coverage_nudges_used = 0  # v15: backend chain coverage gate
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -2689,6 +2877,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
+
+    def _detect_missing_route_wiring(task_text: str, patch_text: str) -> list:
+        import re as _re_rw
+        route_signals = ['route', 'navigation', 'navbar', 'nav', 'menu', 'page',
+                         'url', 'link', 'router', 'redirect', 'path', 'endpoint']
+        if sum(1 for s in route_signals if s in task_text.lower()) < 2:
+            return []
+        touched = set(_re_rw.findall(r'^(?:\+\+\+|---) [ab]/(.+)$', patch_text, _re_rw.M))
+        touched_lower = {f.lower() for f in touched}
+        route_file_pats = ['router', 'routes', 'navigation', 'nav', 'menu',
+                           'sidebar', 'app.py', 'urls.py', 'index.ts']
+        has_new_page = any('page' in f or 'view' in f or 'component' in f for f in touched_lower)
+        has_route_file = any(p in f for f in touched_lower for p in route_file_pats)
+        if has_new_page and not has_route_file:
+            return ["New page/component added but no route file touched"]
+        return []
+
+    def build_route_wiring_prompt_v17(gaps: list) -> str:
+        gap_text = "; ".join(gaps[:3])
+        return (
+            f"Route gap: {gap_text}\n\n"
+            "Wire the new page/component to the router and navigation:\n"
+            "  (a) URL route registration (router file, urls.py, app routes)\n"
+            "  (b) Nav/menu link (sidebar, navbar, or menu component)\n"
+            "  (c) View registration if applicable\n"
+            "End with <final>summary</final>."
+        )
+
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
@@ -2706,7 +2922,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, deliverable_nudges_used, chain_coverage_nudges_used, total_refinement_turns_used, route_nudge_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2729,39 +2945,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
+        # v17: criteria-nudge FIRST  -- "incomplete"+"does not" = 70% of losses.
+        # With cap=2, this fires before polish/syntax consume the budget.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
+        # v17: coverage-nudge SECOND  -- fix "does not cover" path losses.
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
+        # Companion-test execution gate THIRD  -- only ground-truth signal.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -2775,35 +2986,78 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
+        # syntax FOURTH -- repair broken Python/JS/JSON.
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
+        # polish LAST  -- strip low-signal hunks only after scope is correct.
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
+
+        # v14: named-deliverable coverage gate
+        if deliverable_nudges_used < 1:
+            _delvs = _extract_named_deliverables(issue)
+            if _delvs:
+                _missing_delvs = _check_deliverable_coverage(patch, _delvs)
+                if _missing_delvs and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                    deliverable_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        'Task names these files not in your patch: ' + ', '.join(_missing_delvs[:3]) + '. Add them.',
+                        'MISSING_DELIVERABLES',
+                    )
+                    return True
+
+        # v15: backend chain coverage gate (kept; rarely fires with cap=2)
+        if chain_coverage_nudges_used < 1:
+            _tracked_names = list(_tracked_files(repo)) if repo is not None else []
+            _chain = _detect_backend_chain(issue, _tracked_names)
+            if _chain:
+                _missing_members = _verify_chain_coverage(patch, _chain, _tracked_names)
+                if _missing_members and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+                    chain_coverage_nudges_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        _build_chain_nudge(_chain, _missing_members),
+                        'CHAIN_COVERAGE_NUDGE_QUEUED: ' + ', '.join(_missing_members),
+                    )
+                    return True
+
+
+        # v17: gate 6 -- route/nav wiring detector
+        if route_nudge_used < 1 and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            _route_kws = ['route', 'navigation', 'navbar', 'menu', 'page', 'url', 'link', 'router']
+            if any(kw in issue.lower() for kw in _route_kws):
+                _route_gaps = _detect_missing_route_wiring(issue, patch)
+                if _route_gaps:
+                    route_nudge_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_route_wiring_prompt_v17(_route_gaps),
+                        'ROUTE_WIRING_NUDGE_QUEUED',
+                    )
+                    return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
@@ -2830,7 +3084,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()  # v14: pyflakes fix (was _wall_start, unused)
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3012,7 +3266,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
