@@ -115,7 +115,8 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
-MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_HAIL_MARY_TURNS = 2    # v54: empty patches drove 17% of v53's primary losses (#4519); allow a
+                            # second attempt when the first hail-mary itself produces nothing
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -1900,7 +1901,16 @@ def _patch_added_text(patch: str) -> str:
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
+    surfacing the gap lets the model close it before <final>.
+
+    v54 tightening: v53's #4519 had "incomplete/missing/partial" cited in 75%
+    of losses, but `_unaddressed_criteria` was firing rarely because the
+    half-keyword bar (`hits * 2 < len(keywords)`) is too generous — a
+    criterion with 4 keywords passes if any 2 appear, even if those 2 are
+    common words like "add" and "endpoint". v54 raises the bar to require
+    MOST keywords (>= 60% threshold) AND adds a forced-fire on multi-bullet
+    tasks (3+ criteria) when fewer than 2/3 are clearly addressed.
+    """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
@@ -1908,14 +1918,28 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     if not added_lower:
         return criteria
     missing: List[str] = []
+    fully_addressed = 0
     for crit in criteria:
         keywords = _criterion_keywords(crit)
         if not keywords:
             continue
-        # criterion is "addressed" if at least HALF its keywords appear
         hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
-        if hits * 2 < len(keywords):
+        coverage = hits / len(keywords)
+        if coverage >= 0.6:
+            fully_addressed += 1
+        else:
             missing.append(crit)
+    # v54 forced-fire: long multi-bullet tasks (3+ criteria) where fewer than
+    # 2/3 are confidently addressed — surface the bottom three regardless.
+    if (
+        len(criteria) >= 3
+        and fully_addressed < (2 * len(criteria) // 3)
+        and not missing
+    ):
+        # All criteria barely-addressed; promote the three with lowest coverage
+        # to be re-surfaced (heuristic: take the last three criteria as they're
+        # usually the additional / often-skipped bullets).
+        missing = criteria[-3:]
     return missing
 
 
@@ -2592,35 +2616,23 @@ def _unrequested_mutation_gap(patch: str, issue_text: str) -> List[str]:
     return candidates[:4]
 
 
-# Scope-creep auto-stripper (NEW).
-# Pre-finalize patch hygiene that runs unconditionally and does NOT consume
-# a refinement turn. Drops hunks that are entirely:
-#   - chmod / mode-only flips
-#   - paths under build / cache / IDE / lockfile noise
-# When the issue does NOT mention dependency work.
+# Scope-creep auto-stripper (v54: tightened scope).
+# Pre-finalize patch hygiene. v53 was too aggressive — it could strip
+# legitimate lockfile/IDE config changes and (worse) reduce a real patch to
+# empty when all hunks happened to fall in stripped paths. v54 narrows the
+# scope to only the strict-noise cases that no judge would ever reward:
+#   - mode-only flips (chmod without content change)
+#   - __pycache__/, .pyc, .class, .DS_Store, node_modules cache only
+# We deliberately KEEP lockfiles, IDE configs, build artifacts, etc.
+# A real lockfile change might be requested; better to leave it than to
+# strip a meaningful add.
 _SCOPE_NOISE_PATH_RE = re.compile(
     r"(^|/)("
     r"__pycache__/|"
     r"\.DS_Store$|"
-    r"\.idea/|"
-    r"\.vscode/|"
-    r"\.gradle/|"
-    r"\.next/cache/|"
-    r"\.turbo/|"
-    r"node_modules/|"
     r"\.pyc$|"
     r"\.class$"
     r")"
-)
-_SCOPE_LOCKFILE_RE = re.compile(
-    r"(^|/)("
-    r"package-lock\.json|pnpm-lock\.yaml|yarn\.lock|"
-    r"poetry\.lock|composer\.lock|Cargo\.lock|Gemfile\.lock|go\.sum"
-    r")$",
-    re.IGNORECASE,
-)
-_SCOPE_DEP_HINTS: Tuple[str, ...] = (
-    "dep", "package", "install", "version", "bump", "upgrade", "lockfile", "lock",
 )
 
 
@@ -2683,13 +2695,16 @@ def _split_diff_by_file(patch: str) -> List[Tuple[str, List[str], List[List[str]
 def _scope_creep_auto_strip(patch: str, issue_text: str, repo: Optional[Path]) -> str:
     """Drop noise hunks; verify result still applies; return cleaned patch.
 
-    On any parse error or apply-check failure, returns the original patch
-    unchanged so we never break a working patch.
+    v54: only strips the strict-noise cases. Two safety rails ensure we never
+    break a working patch:
+        1. If the cleaned result would be empty AND the original was not,
+           return the original. (v53 bug: empty result was returned verbatim,
+           which made non-noise patches look like forfeits on rounds where
+           the model produced only mode flips.)
+        2. If `git apply --check` rejects the cleaned diff, revert.
     """
     if not patch.strip():
         return patch
-    issue_lower = (issue_text or "").lower()
-    dep_work_requested = any(hint in issue_lower for hint in _SCOPE_DEP_HINTS)
     try:
         sections = _split_diff_by_file(patch)
         if not sections:
@@ -2698,9 +2713,6 @@ def _scope_creep_auto_strip(patch: str, issue_text: str, repo: Optional[Path]) -
         dropped_paths: List[str] = []
         for path, header_block, hunks in sections:
             if _SCOPE_NOISE_PATH_RE.search(path):
-                dropped_paths.append(path)
-                continue
-            if _SCOPE_LOCKFILE_RE.search(path) and not dep_work_requested:
                 dropped_paths.append(path)
                 continue
             if not hunks and _hunk_is_mode_only(header_block, hunks):
@@ -2712,7 +2724,10 @@ def _scope_creep_auto_strip(patch: str, issue_text: str, repo: Optional[Path]) -
         if not dropped_paths:
             return patch
         new_patch = "\n".join(kept) + ("\n" if kept else "")
-        # Verify the cleaned patch still applies cleanly. If not, revert.
+        # v54 safety rail 1: never return empty if we had a non-empty input.
+        if patch.strip() and not new_patch.strip():
+            return patch
+        # v54 safety rail 2: verify the cleaned patch still applies cleanly.
         if repo is not None and new_patch.strip():
             try:
                 proc = subprocess.run(
@@ -2747,7 +2762,7 @@ def _scope_creep_auto_strip(patch: str, issue_text: str, repo: Optional[Path]) -
 #   - a single source of truth for scope, style, verification, safety
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
-You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
+You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: the smallest *complete* change a senior maintainer would accept. Incomplete patches that miss task requirements consistently lose to complete ones, even when the complete patch has extra integration points or new files. Prioritise completeness over conservatism.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -2903,7 +2918,7 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the most complete patch that still respects existing code style and matches the hidden reference. Find every owner mentioned or implied by the task. Fix the root cause AND every secondary path the task lists (frontend + backend, models + migrations + serializers, tests + docs, etc.). Preserve unrelated code. Verify narrowly. Finish.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -3166,7 +3181,13 @@ def build_gap_repair_prompt(category: str, details: str, issue_text: str) -> str
     `category` is a short human-readable label (e.g. "frontend",
     "integration entrypoint", "requested artifacts"). `details` is the
     specific finding from the detector. The model is shown the gap, told to
-    address it surgically, and reminded not to rewrite unrelated code.
+    close it completely, and reminded not to rewrite unrelated code.
+
+    v54: removed the misleading "5-40 lines typical for reference patch"
+    hint. Empirical data on retest-winning leec72991 showed reference patches
+    average ~3000-6000 chars (hundreds of lines), with completeness being the
+    dominant judge signal. We tell the model to be COMPLETE and match the
+    surrounding style, not to be small.
     """
     short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
     return (
@@ -3174,13 +3195,14 @@ def build_gap_repair_prompt(category: str, details: str, issue_text: str) -> str
         "Decide which of these is true:\n"
         "  (a) you already addressed it but the heuristic missed it -> respond "
         "with <final>summary</final> and explain why in the summary; OR\n"
-        "  (b) the gap is real -> issue the minimal additional <command> "
-        "blocks needed to close it, keeping the change surgical (1-3 hunks, "
-        "5-40 lines is typical for the reference patch), then end with "
+        "  (b) the gap is real -> issue the additional <command> blocks "
+        "needed to close it COMPLETELY. The judge consistently rewards "
+        "patches that fully implement the task over partial ones, even when "
+        "the partial patch is technically clean. Then end with "
         "<final>summary</final>.\n\n"
-        "Do NOT add unrelated edits, chmod / mode changes, or fields not "
-        "requested by the task. Do NOT rewrite working code. Match the "
-        "surrounding file's style exactly.\n\n"
+        "Match the surrounding file's style exactly. Do NOT rewrite working "
+        "code or add unrelated changes. But DO cover every requirement the "
+        "task mentions.\n\n"
         "Task (for reference):\n"
         f"{short}\n"
     )
@@ -3231,31 +3253,11 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
-def _multishot_added_line_count(patch: str) -> int:
-    """Total `+` added lines (any content) in a unified diff. Used by the
-    v53 retest-similarity multishot tiebreaker: among two healthy patches
-    prefer the smaller one to maximise Jaccard similarity to typically-tiny
-    reference patches (5-40 added lines in Set-2)."""
-    if not patch:
-        return 0
-    return sum(
-        1 for line in patch.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    )
-
-
-# v53 retest-similarity edge: when attempt 1 is healthy but unusually large
-# (>= this many added lines), the second attempt is allowed to run so we can
-# pick the smaller patch. 200 lines is well above the typical reference-patch
-# size (~5-40 added lines) so legitimately large but correct patches don't
-# trigger a costly retry.
-_MULTISHOT_RETEST_LARGE_THRESHOLD = 200
-# v53 hardening: a retest-retry attempt starts from scratch on the same task,
-# so it needs roughly a full inner-attempt budget. The default 90s reserve is
-# only safe for a low-signal retry (where attempt 1 failed and attempt 2 can
-# converge fast). For retest-retry we want at least the inner wall-clock
-# budget plus a 30s safety margin so we never run out of time mid-attempt.
-_MULTISHOT_RETEST_MIN_RESERVE = 240.0
+# v54: `_multishot_added_line_count` and the retest-retry threshold constants
+# were removed. The "prefer smaller" multishot tiebreaker was empirically
+# wrong (leec72991's retest-winning patches were +1557 chars LARGER than the
+# king they dethroned), and the retest-retry mechanism caused timeouts that
+# zeroed out attempt-1 in the safety-net exception path.
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -3382,62 +3384,53 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
-        _added1 = _multishot_added_line_count(_patch1)
 
-        # Early-return when attempt 1 is healthy AND not unusually large.
-        # The v53 retest-similarity edge allows a second attempt only when the
-        # patch is very large (above the reference-patch ceiling) AND we have
-        # enough time left for a full second attempt — most retest losses come
-        # from over-large primaries, but a starved retry that times out costs
-        # us the whole round.
-        _elapsed = time.monotonic() - _multishot_started
-        _time_left = _multishot_total_budget - _elapsed
-        _retest_retry_allowed = (
-            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
-            and _added1 >= _MULTISHOT_RETEST_LARGE_THRESHOLD
-            and _time_left >= _MULTISHOT_RETEST_MIN_RESERVE
-        )
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _retest_retry_allowed:
+        # King's original behavior restored (v54): exit early whenever attempt 1
+        # is healthy. v53's "retry on large healthy attempt 1 and pick smaller"
+        # was empirically counterproductive — leec72991's retest survival data
+        # (#4409) showed challenger-bigger-than-king won retest, and v53's #4519
+        # primary had 4 of 24 losses on empty patches caused by the retry
+        # mechanism reverting attempt 1 then exception-pathing through cleanup.
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        if _time_left < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        _elapsed = time.monotonic() - _multishot_started
+        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
+        # v54 fix for the empty-patch bug: snapshot attempt-1's patch text
+        # BEFORE reverting. If attempt 2 raises or produces a worse result,
+        # we re-apply this snapshot. King's original logic re-applied via
+        # `_multishot_apply_patch(_multishot_repo_obj, _patch1)` only after
+        # attempt 2 completed normally — exceptions in attempt 2 left the
+        # repo reverted and `get_patch(repo)` returned empty.
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
-        _added2 = _multishot_added_line_count(_patch2)
 
-        # When BOTH attempts are healthy, prefer the smaller patch. This is the
-        # v53 retest tiebreaker: live retest king-wins typically had +0.09
-        # similarity advantage on margins of 0.01-0.05, and the 50% similarity
-        # component rewards short reference-shaped diffs.
-        if (
-            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
-            and _n2 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
-        ):
-            if _added1 <= _added2:
-                if _multishot_repo_obj is not None:
-                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-                    if _patch1:
-                        _multishot_apply_patch(_multishot_repo_obj, _patch1)
-                _result1["multishot_attempts"] = 2
-                _result1["multishot_winner"] = "primary_smaller"
-                return _result1
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry_smaller"
-            return _result2
+        try:
+            _result2 = _solve_attempt(**kwargs)
+            _patch2 = _result2.get("patch", "") or ""
+            _n2 = _multishot_count_substantive(_patch2)
+        except Exception:
+            # Attempt 2 blew up. Restore attempt 1's patch and return it.
+            if _patch1 and _multishot_repo_obj is not None:
+                try:
+                    _multishot_apply_patch(_multishot_repo_obj, _patch1)
+                except Exception:
+                    pass
+            _result1["multishot_attempts"] = 2
+            _result1["multishot_winner"] = "primary_attempt2_raised"
+            return _result1
 
         if _n2 >= _n1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
 
+        # Attempt 2 was worse; restore attempt 1's patch.
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         if _patch1 and _multishot_repo_obj is not None:
@@ -3448,13 +3441,20 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     except Exception as exc:
         # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
+        # should not propagate. v54: also try re-applying attempt-1 patch if
+        # we have it cached, since the most common cause of empty `get_patch`
+        # at this point is a revert without re-apply.
         salvaged = ""
         try:
             if _multishot_repo_obj is not None:
                 salvaged = get_patch(_multishot_repo_obj)
+                if not salvaged.strip():
+                    try:
+                        cached = locals().get("_patch1") or ""
+                        if cached and _multishot_apply_patch(_multishot_repo_obj, cached):
+                            salvaged = get_patch(_multishot_repo_obj)
+                    except Exception:
+                        pass
         except Exception:
             salvaged = ""
         return AgentResult(
@@ -3538,20 +3538,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, gap_nudges_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
-        if not patch.strip():
+        # v54 hail-mary trigger: fires not only on truly empty patches but also
+        # on "effectively empty" ones (less than 50 substantive characters,
+        # which is too small to score any meaningful similarity to a typical
+        # gemini-flash reference patch of ~1000-5000 chars). v53's #4519 had
+        # one round at 149 chars that lost like an empty patch — that round
+        # would have queued a hail-mary under this rule. Hail-mary remains
+        # exempt from the total-refinement cap.
+        _substantive_chars = sum(
+            len(line[1:].strip()) for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+            and line[1:].strip() and not _line_is_comment(line[1:].strip())
+        )
+        if _substantive_chars < 50:
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                    f"HAIL_MARY_QUEUED: patch is empty/tiny ({_substantive_chars} substantive chars), attempt {hail_mary_turns_used}/{MAX_HAIL_MARY_TURNS}",
                 )
                 return True
-            return False
+            # Both hail-mary attempts already used. Fall through to the
+            # normal refinement chain so polish/syntax/coverage can still fire
+            # if the patch is non-empty. Empty patches return False.
+            if not patch.strip():
+                return False
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
