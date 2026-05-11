@@ -793,6 +793,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         return "", []
 
     tracked_set = set(_tracked_files(repo))
+    issue_tests = _find_issue_tests(repo, issue, tracked_set)
+    files = _merge_priority_files(files, issue_tests)
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
@@ -975,6 +977,20 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
         if value and value not in mentions:
             mentions.append(value)
     return mentions
+
+
+def _merge_priority_files(files: List[str], priority: List[str]) -> List[str]:
+    """Put high-confidence issue-mentioned files first without duplicates."""
+    if not priority:
+        return files
+    merged: List[str] = []
+    seen: set = set()
+    for relative_path in [*priority, *files]:
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        merged.append(relative_path)
+    return merged
 
 
 def _issue_terms(issue: str) -> List[str]:
@@ -1222,9 +1238,25 @@ def _diff_low_signal_summary(patch: str) -> str:
         return ""
 
     notes: List[str] = []
+    current_block: List[str] = []
     current_file = "?"
     current_added: List[str] = []
     current_removed: List[str] = []
+
+    def flush_block() -> None:
+        if not current_block:
+            return
+        block = "\n".join(current_block)
+        if (
+            "\nold mode " in "\n" + block
+            and "\nnew mode " in "\n" + block
+            and "\n@@ " not in "\n" + block
+            and "\nGIT binary patch" not in "\n" + block
+            and "\nBinary files " not in "\n" + block
+            and "\nnew file mode " not in "\n" + block
+            and "\ndeleted file mode " not in "\n" + block
+        ):
+            notes.append(f"{current_file}: file-mode-only diff")
 
     def flush() -> None:
         if not current_added and not current_removed:
@@ -1238,12 +1270,17 @@ def _diff_low_signal_summary(patch: str) -> str:
 
     for line in patch.splitlines():
         if line.startswith("diff --git "):
+            flush_block()
             flush()
+            current_block = [line]
             current_added, current_removed = [], []
             tokens = line.split()
             if len(tokens) >= 4 and tokens[3].startswith("b/"):
                 current_file = tokens[3][2:]
-        elif line.startswith("@@"):
+            continue
+
+        current_block.append(line)
+        if line.startswith("@@"):
             flush()
             current_added, current_removed = [], []
         elif line.startswith("+") and not line.startswith("+++"):
@@ -1251,6 +1288,7 @@ def _diff_low_signal_summary(patch: str) -> str:
         elif line.startswith("-") and not line.startswith("---"):
             current_removed.append(line[1:])
 
+    flush_block()
     flush()
 
     deduped: List[str] = []
@@ -1563,6 +1601,41 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     return None
 
 
+def _looks_like_test_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    lowered = str(path).lower()
+    name = path.name.lower()
+    return (
+        "test" in name
+        or "spec" in name
+        or "/tests/" in f"/{lowered}"
+        or lowered.startswith("tests/")
+        or lowered.startswith("spec/")
+    )
+
+
+def _find_issue_tests(repo: Path, issue_text: str, tracked: Optional[set] = None) -> List[str]:
+    """Return existing test files explicitly named in the issue text."""
+    tracked_set = tracked if tracked is not None else set(_tracked_files(repo))
+    if not tracked_set:
+        return []
+    found: List[str] = []
+    for mention in _extract_issue_path_mentions(issue_text):
+        if not _looks_like_test_path(mention):
+            continue
+        matches = [
+            candidate
+            for candidate in tracked_set
+            if (candidate == mention or candidate.endswith("/" + mention))
+            and _context_file_allowed(candidate)
+        ]
+        for candidate in sorted(matches, key=len):
+            if candidate not in found:
+                found.append(candidate)
+                break
+    return found[:3]
+
+
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
@@ -1685,6 +1758,7 @@ def _run_companion_test(
 def _select_companion_test_failure(
     repo: Path,
     patch: str,
+    issue_text: str = "",
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
     """For files touched by the patch, find the first companion test that fails.
@@ -1699,6 +1773,10 @@ def _select_companion_test_failure(
     tracked = set(_tracked_files(repo))
     if not tracked:
         return None
+    for test_path in _find_issue_tests(repo, issue_text, tracked):
+        output = _run_companion_test(repo, test_path, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (test_path, output)
     for relative_path in edited:
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
@@ -2037,8 +2115,15 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Requirement: preserve exact literals from the issue — route paths, env/config keys, field names, command names, enum values, numeric constants, version strings, and path semantics.
+- Acceptance contract: for each requirement, name the exact owner to change, exact edge cases to cover, exact producer/consumer names that must match, and the verification target.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
+- Owner discovery: name the primary owner file/function AND every integration owner needed to make the change visible (container/page, route registration, command registration, API client/service, theme/style owner, test owner).
+- Binding check: for every new UI action, route, command, callback, or provider, name the state/hook/context/import/service/backend handler that makes it executable.
+- Canonical owner check: for persisted data, routes, schemas, commands, or shared resources, explain why the chosen file is the source future reads/calls actually use, not just a related surface.
+- Preservation check: identify any existing real data/auth/storage/network behavior nearby and keep it unless the task explicitly says to replace it.
+- Diff hygiene check: plan to avoid file-mode-only churn, generated caches, compiled/binary artifacts, and unrelated broad rewrites.
+- Likely target: name likely files/functions/classes/modules to inspect or modify, separating leaf component/helper from parent/container/registry when both may be needed.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
 </plan>
@@ -2056,6 +2141,8 @@ ISSUE CONTRACT
 
 Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
 
+Exact detail fidelity matters: if the issue names a path, route, env key, response field, UI label, CSS class owner, numeric scale, image size, provider list, or validation case, preserve it exactly unless nearby code proves a canonical local spelling. Do not replace a specific requirement with an approximate implementation.
+
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
 Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
@@ -2067,6 +2154,18 @@ INSPECTION STRATEGY
 Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+
+Owner discovery before editing:
+- UI/layout tasks: inspect the parent page/container plus existing theme/style/layout owner before editing only a leaf component. If the task asks for shared layout, inspect at least one consumer page.
+- Route/command/navigation tasks: inspect both the registration table and the destination handler/component. A link or route without its target is incomplete.
+- Backend/refactor tasks: inspect the executor/router/service owner and one caller/callee in each direction before changing signatures or dependency injection.
+- Parser/protocol tasks: inspect parser, command/model type, and executor/handler together; changing only one layer often compiles poorly or misses behavior.
+- Config/path/deployment tasks: inspect how paths are resolved at runtime, not just the string that looks wrong.
+- UI action tasks: inspect how nearby buttons/forms obtain dispatch, context, refs, handlers, loading/error state, and side effects before adding a new control.
+- Data-flow tasks: inspect the canonical persisted owner before writing a derived table, snapshot, cache, or local copy; update the owner that future reads actually use.
+- Import/export tasks: inspect existing file-input refs, upload/image handlers, CSV/JSON parsers, export builders, and refresh flows before adding parallel import/export behavior.
+- Validation tasks: inspect the current accepted/rejected boundary cases, including empty, whitespace, missing parts, wrong type, malformed shape, negative/boundary values, and non-string inputs when applicable.
+- Redesign tasks: preserve existing working submit/auth/storage/API flows while changing presentation. Do not downgrade real behavior to demo/local-only behavior.
 
 ====================================================================
 ROOT CAUSE RULE
@@ -2339,10 +2438,35 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Acceptance contract: for each requirement, identify the exact owner changed, exact edge cases covered, exact producer/consumer names matched, and exact verification evidence.\n"
+        "  - For feature work, trace the whole integration chain: route/link -> page/view -> handler/action -> API/client -> state/type/schema. Missing one link loses duels.\n"
+        "  - Grep for stale names after refactors. New imports, provider injections, hooks, dispatch/actions, and signature changes must be wired through every call site.\n"
+        "  - Every newly used identifier is declared, imported, destructured, or in scope in the touched file.\n"
+        "  - Every removed/moved function, route, component, or helper leaves no stale import/export/registration behind.\n"
+        "  - Every changed function signature or constructor is propagated to all callers, tests, mocks, and background-task invocations.\n"
+        "  - Route strings, URLs, command names, enum values, config keys, and field names match exactly between producer and consumer.\n"
+        "  - If the task names validation cases or UI fields, each case/field is represented in changed code or tests.\n"
+        "  - Edge-case matrix: parser/validation/import fixes cover non-string input, missing pieces, empty strings, whitespace-only strings, wrong type, malformed structure, negative/boundary values, and wrong field shape where relevant.\n"
+        "  - Canonical owner check: persisted data updates modify the source future reads use, not a derived table, stale snapshot, UI-only copy, cache, or unrelated repository.\n"
+        "  - Exact path check: route/link/command names use the same literal path at the UI trigger, registration, page/component, service/client, and backend handler.\n"
+        "  - Existing schema/API check: do not invent unsupported fields, methods, enum variants, imports, dependency APIs, or response shapes; inspect and match the local contract.\n"
+        "  - Signature/API call check: every changed function call includes required arguments, every route parameter name matches controller/service reads, and every callback/event payload matches the local handler signature.\n"
+        "  - Every newly imported symbol is actually defined/exported by the source module; do not import helper names you have not added.\n"
+        "  - Every renamed data field is updated across create/read/update/delete, bulk import/export, auth/bootstrap/initial-data paths, UI labels, tests, and docs touched by the task.\n"
+        "  - Validation/parser fixes cover missing parts, empty strings, wrong type, malformed structure, negative/boundary values, and route-level behavior when applicable.\n"
+        "  - New file inputs, refs, timers, sockets, subscriptions, or background resources use a dedicated state/ref/lifecycle unless intentionally sharing an existing one.\n"
+        "  - Independent user actions use independent resources: do not reuse an image/file/upload ref, timer, worker, socket, canvas, or subscription for a new unrelated action unless that sharing is already the existing pattern.\n"
+        "  - Click path check: every new button/form/control has its handler, dispatch/context/hook/ref, loading/error state, and side effect in scope and wired.\n"
+        "  - Route path check: every new link/command/route has registration, destination component/page, client/service method, backend handler, and type/model support when applicable.\n"
+        "  - Preservation check: no existing real auth, backend, database, Supabase, localStorage, cache, upload, or submission flow was replaced by fake/demo/local-only behavior unless required.\n"
+        "  - Redesign preservation check: visual/layout rewrites keep existing submission, auth, data fetch, tilt/animation, responsive, and error/empty-state behavior unless the issue explicitly changes it.\n"
+        "  - Syntax enclosure check: added methods/classes/components still close braces/tags/exports correctly after insertion.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No file-mode-only chmod churn, generated caches, compiled artifacts, or unrelated script permission flips\n"
+        "  - No binary files, __pycache__, build outputs, lockfile churn, sample/demo data invention, or broad generated artifacts unless explicitly required.\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
@@ -2763,7 +2887,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_companion_test_failure(repo, patch, issue)
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
