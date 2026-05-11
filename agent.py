@@ -828,34 +828,42 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     return "\n\n".join(parts), included
 
 
+_PRELOAD_NEEDLES_MAX = 24
+
+
 def _preload_needles(issue: str) -> List[str]:
     """Build a deduped needle list for issue-aware partial file loading.
 
     Order: explicit identifiers (`_extract_issue_symbols`) first since they
     are the strongest signal, then file-stem mentions (so `foo.py` in the
     issue picks out lines referencing `foo`), then general issue terms.
+    Capped at `_PRELOAD_NEEDLES_MAX` so long issues that name many paths or
+    keywords don't blow the needle list large enough to match almost every
+    line in `_extract_relevant_regions`, which collapses window selection.
     """
     out: List[str] = []
     seen: set = set()
 
-    def add(token: str) -> None:
+    def add(token: str) -> bool:
         if not token:
-            return
+            return False
         key = token.lower()
         if key in seen:
-            return
+            return False
         seen.add(key)
         out.append(token)
+        return len(out) >= _PRELOAD_NEEDLES_MAX
 
     for sym in _extract_issue_symbols(issue):
-        add(sym)
+        if add(sym):
+            return out
     for mention in _extract_issue_path_mentions(issue):
         stem = Path(mention).stem
-        if stem and len(stem) >= 3:
-            add(stem)
+        if stem and len(stem) >= 3 and add(stem):
+            return out
     for term in _issue_terms(issue):
-        if len(term) >= 4:
-            add(term)
+        if len(term) >= 4 and add(term):
+            return out
     return out
 
 
@@ -2829,8 +2837,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
