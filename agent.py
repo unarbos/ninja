@@ -1605,12 +1605,12 @@ _ENTERPRISE_FRAMEWORKS = (
 )
 
 
-def _pre_gen_criteria_check(issue: str) -> str:
+def _pre_gen_criteria_check(task_text: str) -> str:
     """v14: Enumerate ALL acceptance criteria BEFORE the agent starts coding.
     Injects a pre-flight checklist into the initial prompt.
     Evidence: RC report Root Cause #3 — systematic 1-2 criteria misses each duel.
     """
-    criteria = _extract_acceptance_criteria(issue)  # king's existing function
+    criteria = _extract_acceptance_criteria(task_text)  # king's existing function
     if not criteria or len(criteria) < 2:
         return ""
     items = chr(10).join(f"  {i+1}. {c}" for i, c in enumerate(criteria[:8]))
@@ -1621,20 +1621,20 @@ def _pre_gen_criteria_check(issue: str) -> str:
     )
 
 
-def _classify_task_scope_v14(issue: str, ctx_lines: int) -> str:
+def _classify_task_scope_v14(task_text: str, ctx_lines: int) -> str:
     """v14: Classify task scope using ACTUAL preloaded context line count.
     v13 had B1 bug: hardcoded 200 made atomic mode never fire.
     Evidence: retest pool has 60%+ atomic tasks. King scores 0.70+ on these.
     """
-    task_len = len(issue)
+    task_len = len(task_text)
     file_mentions = len(re.findall(
-        r"\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b", issue, re.I
+        r"\b[\w/.-]+\.(?:ts|tsx|js|jsx|py|vue|java|go|rb)\b", task_text, re.I
     ))
     complex_signals = ["redesign", "refactor entire", "architecture", "migrate", "rewrite"]
     is_complex = (
         task_len > 600
         or file_mentions >= 4
-        or any(s in issue.lower() for s in complex_signals)
+        or any(s in task_text.lower() for s in complex_signals)
     )
     is_atomic = task_len < 250 and file_mentions <= 1 and ctx_lines < 80
     if is_complex:
@@ -1644,14 +1644,14 @@ def _classify_task_scope_v14(issue: str, ctx_lines: int) -> str:
     return ""
 
 
-def _detect_enterprise_framework(issue: str) -> str:
+def _detect_enterprise_framework(task_text: str) -> str:
     """v14: Detect enterprise framework tasks requiring precise spec-following.
     Evidence: retest pool has more Spring Boot/Laravel tasks → king 0.70+ there.
     """
-    issue_lower = issue.lower()
+    issue_lower = task_text.lower()
     for fw in _ENTERPRISE_FRAMEWORKS:
         if fw in issue_lower:
-            criteria = _extract_acceptance_criteria(issue)
+            criteria = _extract_acceptance_criteria(task_text)
             if len(criteria) < 3:
                 return ""
             return (
@@ -2321,8 +2321,8 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    _pgc = _pre_gen_criteria_check(issue)
-    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))
+    _pgc = _pre_gen_criteria_check(issue)  # pass issue to task_text param
+    _scope = _classify_task_scope_v14(issue, len(preloaded_context.splitlines()))  # pass issue to task_text
     _prefix = _pgc + _scope
     return _prefix + f"""Fix this issue:
 
@@ -2945,7 +2945,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
         # v14: enterprise framework precision hint
-        _ef_hint = _detect_enterprise_framework(issue)
+        _ef_hint = _detect_enterprise_framework(issue)  # pass issue to task_text
         if _ef_hint and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
             total_refinement_turns_used += 1
             queue_refinement_turn(assistant_text, _ef_hint, "ENTERPRISE_FW_HINT")
