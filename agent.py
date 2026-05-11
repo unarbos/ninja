@@ -1530,6 +1530,8 @@ def _hazard_review_summary(patch: str) -> str:
             )
 
         if path.endswith(".sh") or _SHELL_LIFECYCLE_PATH_RE.search(path):
+            if re.search(r"\bfunction\s+[A-Za-z_][A-Za-z0-9_]*\s*\(\)", added_text) and '"$@"' in removed_text and '"$@"' not in added_text:
+                notes.append(f"{path}: shell wrapper may drop CLI args; preserve \"$@\" forwarding")
             pid_remove_count = len(re.findall(r"\brm\s+-f\b[^\n]*(?:PID|pid|\.pid)", added_text))
             if pid_remove_count and re.search(r"\bfuser\b|\bss\b|\blsof\b|port_listener", added_text):
                 first_rm = min((added_text.find(token) for token in ("rm -f", "rm -rf") if token in added_text), default=-1)
@@ -1552,12 +1554,22 @@ def _hazard_review_summary(patch: str) -> str:
             if re.search(r"\bstop\b", path.lower()) and re.search(r"\bPORT\b|port_listener|fuser|lsof|ss ", added_text):
                 if not re.search(r"verif|still.*listen|port.*free|ERRORS", added_text, re.IGNORECASE):
                     notes.append(f"{path}: stop script should verify target ports are free after stopping")
+            if re.search(r"\bexit\s+0\b", added_text) and re.search(r"\bfinally\b|\btrap\b|\bcatch\b", added_text, re.IGNORECASE):
+                notes.append(f"{path}: success exit in cleanup/finally path may mask command failures")
 
         if path.endswith((".php", ".java", ".kt", ".cs")):
             opens = added_text.count("{")
             closes = added_text.count("}")
             if opens > closes and re.search(r"\b(public|private|protected)\s+(?:static\s+)?function\b|\bpublic\s+static\b", added_text):
                 notes.append(f"{path}: added class/method block may be missing a closing brace")
+
+        if path.endswith((".tsx", ".jsx", ".ts", ".js", ".vue", ".svelte")):
+            if re.search(r"\btoISOString\s*\(", added_text) and re.search(r"\b(today|date|local|calendar|event|upcoming)\b", added_text, re.IGNORECASE):
+                notes.append(f"{path}: local-date UI uses toISOString(), which can reintroduce timezone boundary bugs")
+            if re.search(r"\bpassword(?:Hash|_hash|Hashes|_hashes)?\b", added_text, re.IGNORECASE) and re.search(r"\bjson|response|return|res\.|client|user\b", added_text, re.IGNORECASE):
+                notes.append(f"{path}: password hash-like field appears in client/response code")
+            if re.search(r"\bwindow\.google\b", added_text) and not re.search(r"\btypeof\s+window\b|\buseEffect\b|onLoad|isLoaded", added_text):
+                notes.append(f"{path}: browser SDK global used without visible load/client guard")
 
     deduped: List[str] = []
     seen: set = set()
@@ -2578,6 +2590,14 @@ def _contract_propagation_gap_summary(patch: str, issue_text: str, repo: Optiona
             if not touched_target and "/" in target and not _local_import_target_exists(repo, target):
                 notes.append(f"{path}: added local import `{spec}` but no matching file is touched")
 
+        if re.search(r"['\"]/api/(?:file|files|asset|assets|proxy|proxy-logo)/", added_text):
+            if not re.search(r"['\"]/api/(?:file|files|asset|assets|proxy|proxy-logo)/", removed_text):
+                notes.append(f"{path}: added new API resource prefix; verify existing response fields/routes instead of inventing paths")
+        if re.search(r"placeholder\.(?:png|jpg|jpeg|gif|webp|svg)|/placeholder", added_text, re.IGNORECASE):
+            notes.append(f"{path}: placeholder asset path added; ensure the asset exists or use existing empty-state pattern")
+        if re.search(r"font\s*\([^)\n]+,\s*['\"]https?://", added_text):
+            notes.append(f"{path}: package/framework API gained URL argument; verify local API supports that signature")
+
         removed_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(removed_text)}
         added_fields = {m.group(1) for m in _FIELD_RENAME_RE.finditer(added_text)}
         likely_renamed = sorted(
@@ -2703,12 +2723,23 @@ def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
             if wants_form and re.search(r"\bbadge|filter|category|today|date\b", lower_added):
                 if not re.search(r"\b(input|select|textarea|form|option|value=|onchange|onChange)\b", added_text):
                     notes.append(f"{path}: category/date UI changed without visible form/input option update")
+            if "today" in issue_lower and re.search(r"\bupcoming|pr[oó]xim", lower_added, re.IGNORECASE):
+                if re.search(r"\btoISOString\s*\(", added_text) or not re.search(r"[<>!=]==?|isToday|startOfDay|local", added_text):
+                    notes.append(f"{path}: today/upcoming split may duplicate or timezone-shift events")
+
+        if suffix in _FRONTEND_EXTS and re.search(r"\b(?:comment|composer|internal|public|private|role|permission)\b", issue_lower):
+            if re.search(r"\b(?:isInternal|internalOnly|user\.role|role)\b[^?\n{]*(?:&&|\?)", added_text):
+                if re.search(r"\b(?:form|textarea|composer|submit|comment)\b", added_text, re.IGNORECASE):
+                    notes.append(f"{path}: role gate may hide the whole composer/form instead of only the restricted control")
 
         touched_names = " ".join(Path(changed_path).stem.lower() for changed_path in changed)
         owner_sets = (
             ("category/filter/date task", ("category", "filter", "badge", "form", "edit"), ("form", "edit", "badge", "css")),
             ("settings/dashboard task", ("settings", "dashboard", "header", "dark", "tab"), ("settings", "dashboard", "topbar", "header")),
             ("import/export/upload task", ("import", "export", "upload", "file", "csv"), ("import", "export", "ref", "upload")),
+            ("seo/metadata task", ("seo", "metadata", "sitemap", "robots", "json-ld", "case-studies"), ("metadata", "layout", "robots", "sitemap", "json")),
+            ("route/page/nav task", ("route", "page", "nav", "link", "component", "panel"), ("route", "page", "nav", "link", "panel")),
+            ("modal/confirm/i18n task", ("modal", "confirm", "confirmation", "locale", "translation"), ("modal", "confirm", "locale", "settings", "test")),
         )
         for label, issue_words, owner_words in owner_sets:
             if sum(1 for word in issue_words if word in issue_lower) >= 2:
@@ -3292,8 +3323,8 @@ def build_contract_propagation_prompt(contract_summary: str, issue_text: str) ->
         "exist, duplicate/stale imports should be collapsed or removed, and "
         "renamed fields must leave no stale read/write/test path behind. Verify "
         "new external API URLs, package APIs, and dependency names against local "
-        "docs/usages before finalizing; do not guess unofficial endpoints or "
-        "method names. If the warning is a false positive, finish with "
+        "docs/usages before finalizing; do not guess unofficial endpoints, "
+        "asset prefixes, placeholder files, response fields, or method names. If the warning is a false positive, finish with "
         "<final>summary</final> and name why. Otherwise "
         "issue the minimal edit command(s) to repair the propagation gap.\n\n"
         "Task (for reference):\n"
@@ -3326,7 +3357,8 @@ def build_ui_binding_nudge_prompt(ui_summary: str, issue_text: str) -> str:
         "classes/selectors synchronized after renames, update create/edit form "
         "options when display filters/categories change, and touch the frontend "
         "owner when the task explicitly asks for visible UI. Define any new "
-        "arrays, style keys, or handler names used by the rendered JSX/template. If the warning is "
+        "arrays, style keys, or handler names used by the rendered JSX/template. "
+        "Preserve existing form availability, local-date behavior, mobile/responsive parity, and route/nav/page chains while adding the requested UI. If the warning is "
         "a false positive, finish with <final>summary</final> and name why. "
         "Do not rewrite unrelated layout or styling.\n\n"
         "Task (for reference):\n"
@@ -3393,7 +3425,10 @@ def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
         f"{hazard_summary}\n\n"
         "Inspect the relevant lines and either fix/revert the hazard, or if it "
         "is intentionally required by the issue, finish with <final>summary</final> "
-        "and name why it is required. Do not add unrelated scope.\n\n"
+        "and name why it is required. For scripts preserve \"$@\", exit codes, "
+        "PID/port fallbacks, and timeout semantics. For frontend/browser code "
+        "guard browser globals, avoid exposing secret/hash fields, and avoid "
+        "timezone-shifting local date logic. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
