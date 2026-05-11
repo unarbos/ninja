@@ -106,11 +106,6 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 240.0  # v69: 270->240, leaves more headroom for safety net + emergency fallback
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 REFINEMENT_PATCH_RETURN_RESERVE_SECONDS = 45.0
-_LLM_HEADROOM_SECONDS = 5.0
-_LLM_TIMEOUT_FLOOR = 5
-_LLM_TIMEOUT_CEILING = 120
-_CMD_HEADROOM_SECONDS = 2.0
-_CMD_TIMEOUT_FLOOR = 3
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -129,7 +124,6 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_MISSING_CLASS_TURNS = 1  # create explicitly requested classes when the draft omitted them
 MAX_VISIBLE_SURFACE_NUDGES = 1  # ensure UI/page tasks touch the rendered surface
-MAX_UNDERIMPLEMENTATION_NUDGES = 1  # expand suspiciously tiny patches on broad tasks
 MAX_INTEGRATION_NUDGES = 1  # make new pages/helpers reachable from routes/nav/API entrypoints
 MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config artifacts
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
@@ -139,12 +133,6 @@ MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinement
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
-_UNDERIMPL_BROAD_SCOPE_MIN_CRITERIA = 5
-_UNDERIMPL_BROAD_SCOPE_MAX_TOUCHED = 1
-_UNDERIMPL_BROAD_SCOPE_MAX_ADDED_LINES = 80
-_UNDERIMPL_LONG_ISSUE_MIN_CHARS = 2000
-_UNDERIMPL_LONG_ISSUE_MAX_ADDED_LINES = 20
-_UNDERIMPL_LONG_ISSUE_MAX_TOUCHED = 1
 _CONTRACT_NAME_DENYLIST = {
     "default",
     "main",
@@ -158,21 +146,6 @@ _CONTRACT_NAME_DENYLIST = {
     "beforeEach",
     "afterEach",
 }
-
-
-def _remaining_wall_clock(started_at: float) -> float:
-    return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - started_at)
-
-
-def _adaptive_llm_timeout(started_at: float, default: int = _LLM_TIMEOUT_CEILING) -> int:
-    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _LLM_HEADROOM_SECONDS
-    return max(_LLM_TIMEOUT_FLOOR, min(default, int(remaining)))
-
-
-def _adaptive_command_timeout(started_at: float, default: int) -> int:
-    remaining = _remaining_wall_clock(started_at) - WALL_CLOCK_RESERVE_SECONDS - _CMD_HEADROOM_SECONDS
-    return max(_CMD_TIMEOUT_FLOOR, min(default, int(remaining)))
-
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -2574,51 +2547,6 @@ def _patch_added_text(patch: str) -> str:
     return "\n".join(out).lower()
 
 
-def _patch_added_line_count(patch: str) -> int:
-    """Count added diff lines, excluding file headers."""
-    if not patch.strip():
-        return 0
-    return sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
-
-
-def _underimplementation_shortfall(patch: str, issue_text: str) -> Optional[Tuple[str, int, int, int, List[str]]]:
-    """Detect broad tasks where the current patch is probably too small."""
-    changed = _patch_changed_files(patch)
-    if not changed:
-        return None
-    touched = len(changed)
-    added_lines = _patch_added_line_count(patch)
-
-    mentions = _extract_issue_path_mentions(issue_text)
-    if len(mentions) >= 3:
-        changed_set = set(changed)
-        uncovered = [
-            mention
-            for mention in mentions
-            if not any(mention == path or path.endswith("/" + mention) or path.endswith(mention) for path in changed_set)
-        ]
-        needed = max(2, (len(mentions) + 1) // 2)
-        if touched < needed:
-            return ("paths", touched, len(mentions), added_lines, uncovered[:8])
-
-    criteria = _extract_acceptance_criteria(issue_text)
-    if (
-        len(criteria) >= _UNDERIMPL_BROAD_SCOPE_MIN_CRITERIA
-        and touched <= _UNDERIMPL_BROAD_SCOPE_MAX_TOUCHED
-        and added_lines <= _UNDERIMPL_BROAD_SCOPE_MAX_ADDED_LINES
-    ):
-        return ("criteria", touched, len(criteria), added_lines, [c[:120] for c in criteria[:6]])
-
-    if (
-        len(issue_text) >= _UNDERIMPL_LONG_ISSUE_MIN_CHARS
-        and touched <= _UNDERIMPL_LONG_ISSUE_MAX_TOUCHED
-        and added_lines <= _UNDERIMPL_LONG_ISSUE_MAX_ADDED_LINES
-    ):
-        return ("size", touched, 0, added_lines, [])
-
-    return None
-
-
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines, surfaced before <final> so the model can close missing work.
@@ -2970,6 +2898,7 @@ brief summary of what changed
 Read the full issue before issuing a command. In the SAME response as your first command, emit a short `<plan>` block:
 - Requirement: restate every explicit task requirement.
 - Requirement: mirror each numbered bullet, checkbox item, acceptance criterion, "also", "and", "unless", "only", "should", or edge-case clause as its own row.
+- Integration: if the requested behavior spans UI, routes, state, API, config, callers, tests, or docs, list the required owner surfaces before editing.
 - Likely target: name likely files/functions/classes/modules to inspect.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test/check expected after patching.
@@ -3352,48 +3281,6 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
-    )
-
-
-def build_underimplementation_nudge_prompt(
-    kind: str,
-    touched: int,
-    scope: int,
-    added_lines: int,
-    items: List[str],
-    issue_text: str,
-) -> str:
-    """Prompt for broad tasks where a tiny patch is probably incomplete."""
-    if kind == "paths":
-        bullets = "\n  ".join(f"- {p}" for p in items[:8]) or "(none listed)"
-        detail = (
-            f"The task mentions {scope} path(s), but the current patch touches "
-            f"only {touched} file(s). Paths not yet touched:\n  {bullets}"
-        )
-    elif kind == "criteria":
-        bullets = "\n  ".join(f"- {c}" for c in items[:6]) or "(none listed)"
-        detail = (
-            f"The task has {scope} acceptance-criterion checkpoints, but the "
-            f"current patch touches only {touched} file(s) with {added_lines} "
-            f"added line(s). Sample checkpoints:\n  {bullets}"
-        )
-    else:
-        detail = (
-            f"The issue text is long and detailed, but the current patch touches "
-            f"only {touched} file(s) with {added_lines} added line(s)."
-        )
-    return (
-        "Underimplementation check: the current patch looks smaller than the "
-        "task shape suggests.\n\n"
-        f"{detail}\n\n"
-        "Before finalizing, re-read the task and identify any independent "
-        "requirements that still lack a concrete code change. If the patch is "
-        "complete because the issue is narrower than it appears, finish with "
-        "<final>summary</final> and state why. Otherwise issue the minimal "
-        "additional edit command(s) needed to cover the missing requirement(s). "
-        "Do not add placeholders, comments-only changes, or unrelated files.\n\n"
-        "Task (for reference):\n"
-        f"{issue_text[:1800]}\n"
     )
 
 
@@ -4000,7 +3887,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     missing_class_turns_used = 0
     visible_surface_nudges_used = 0
-    underimplementation_nudges_used = 0
     integration_nudges_used = 0
     artifact_nudges_used = 0
     dependency_nudges_used = 0
@@ -4034,20 +3920,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
             1. patch-safety — remove unsafe review-process wording
-            2. coverage-nudge — name issue-mentioned paths still untouched
-            3. criteria-nudge — name issue acceptance bullets not addressed
-            4. missing-class — create explicitly requested class declarations
-            5. visible-surface — ensure UI/page tasks touch rendered surfaces
-            6. underimplementation — expand tiny patches on broad tasks
-            7. test — actually run the companion test if one exists; if it
+            2. polish — drop low-signal hunks before further repair
+            3. syntax — quote parser errors back at the model
+            4. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            8. failed-verification — repair the latest concrete failed check
-            9. contract — preserve public symbols still referenced by callers
-            10. integration/artifact/dependency — close common missing pieces
-            11. polish/syntax/empty-arg/lint — remove churn and parser/tool errors
-            12. self-check — show the diff and ask "did you cover everything?"
+            5. failed-verification — repair the latest concrete failed check
+            6. coverage/criteria — name explicit issue gaps
+            7. missing-class/visible-surface — close direct task-shape gaps
+            8. contract/integration/artifact/dependency — close common missing pieces
+            9. empty-arg/lint — remove malformed calls and tool errors
+            10. self-check — show the diff and ask "did you cover everything?"
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, visible_surface_nudges_used, underimplementation_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, missing_class_turns_used, visible_surface_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4086,6 +3970,61 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"PATCH_SAFETY_QUEUED:\n  {safety}",
                 )
                 return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if (
+            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
+            and last_failed_verification_command
+            and last_failed_verification_observation
+        ):
+            failed_verification_fix_turns_used += 1
+            total_refinement_turns_used += 1
+            command = last_failed_verification_command
+            observation = last_failed_verification_observation
+            last_failed_verification_command = ""
+            last_failed_verification_observation = ""
+            queue_refinement_turn(
+                assistant_text,
+                build_failed_verification_prompt(command, observation),
+                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
+            )
+            return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
@@ -4134,50 +4073,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             )
             return True
 
-        if underimplementation_nudges_used < MAX_UNDERIMPLEMENTATION_NUDGES:
-            shortfall = _underimplementation_shortfall(patch, issue)
-            if shortfall:
-                kind, touched, scope, added_lines, items = shortfall
-                underimplementation_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_underimplementation_nudge_prompt(kind, touched, scope, added_lines, items, issue),
-                    f"UNDERIMPLEMENTATION_NUDGE_QUEUED:\n  {kind}",
-                )
-                return True
-
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        if (
-            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
-            and last_failed_verification_command
-            and last_failed_verification_observation
-        ):
-            failed_verification_fix_turns_used += 1
-            total_refinement_turns_used += 1
-            command = last_failed_verification_command
-            observation = last_failed_verification_observation
-            last_failed_verification_command = ""
-            last_failed_verification_observation = ""
-            queue_refinement_turn(
-                assistant_text,
-                build_failed_verification_prompt(command, observation),
-                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
-            )
-            return True
-
         if contract_turns_used < MAX_CONTRACT_TURNS:
             contract_findings = _contract_preservation_gap_summary(repo, patch)
             if contract_findings:
@@ -4223,30 +4118,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_dependency_nudge_prompt(dependency, issue),
                     f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
-                )
-                return True
-
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -4352,14 +4223,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
-                    step_llm_timeout = _adaptive_llm_timeout(solve_started_at)
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
-                        timeout=step_llm_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
@@ -4430,8 +4299,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                cmd_timeout = _adaptive_command_timeout(solve_started_at, command_timeout)
-                result = run_command(command, repo, timeout=cmd_timeout)
+                result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
