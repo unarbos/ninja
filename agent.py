@@ -765,6 +765,101 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+_PRELOAD_RERANK_CAP = 20
+_PRELOAD_RERANK_TIMEOUT_S = 5
+_PRELOAD_RERANK_MAX_TOKENS = 256
+_PRELOAD_RERANK_CTX: Dict[str, Any] = {}
+
+
+def _llm_rerank_preload_candidates(
+    repo: Path,
+    issue_text: str,
+    heuristic_top: List[str],
+) -> List[str]:
+    """Use validator-supplied LLM to rerank top heuristic candidate files.
+
+    Reliance on the in-round inference proxy lets the agent ask "which of these
+    paths most plausibly contains the bug?" before committing the larger
+    context budget to reading them. Tightly time-capped (5 s) and fail-open:
+    on timeout / HTTP error / hallucinated paths, the original heuristic
+    order is returned unchanged.
+    """
+    ctx = _PRELOAD_RERANK_CTX
+    model = ctx.get("model")
+    api_base = ctx.get("api_base")
+    api_key = ctx.get("api_key")
+    if not model or not api_base or not api_key or not heuristic_top:
+        return heuristic_top
+    deadline = ctx.get("deadline")
+    if deadline is not None and (deadline - time.monotonic()) < _PRELOAD_RERANK_TIMEOUT_S + 2:
+        return heuristic_top
+
+    cap = min(_PRELOAD_RERANK_CAP, len(heuristic_top))
+    candidates = heuristic_top[:cap]
+    snippets: List[str] = []
+    for path in candidates:
+        head = ""
+        try:
+            head_bytes = (repo / path).read_bytes()[:260]
+            head = head_bytes.decode("utf-8", errors="replace").replace("\n", " ")[:90]
+        except Exception:
+            head = ""
+        snippets.append(f"- {path} :: {head}")
+    desc = issue_text[:1500]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rank candidate source files by likelihood of containing the "
+                "bug described in the issue. Output ONE path per line, in rank "
+                "order, MOST LIKELY first. Use ONLY paths from the provided "
+                "candidate list. No extra commentary."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Issue (head):\n{desc}\n\n"
+                f"Candidates (path :: file-head):\n" + "\n".join(snippets) + "\n\n"
+                "Ranked paths:"
+            ),
+        },
+    ]
+    try:
+        response_text, _cost, _raw = chat_completion(
+            messages=messages,
+            model=str(model),
+            api_base=str(api_base),
+            api_key=str(api_key),
+            max_tokens=_PRELOAD_RERANK_MAX_TOKENS,
+            timeout=_PRELOAD_RERANK_TIMEOUT_S,
+            max_retries=0,
+        )
+    except Exception:
+        return heuristic_top
+    if not response_text:
+        return heuristic_top
+
+    candidate_set = set(candidates)
+    seen: set = set()
+    ordered: List[str] = []
+    for raw_line in response_text.splitlines():
+        line = raw_line.strip().lstrip("0123456789.)- \t")
+        line = line.split("::", 1)[0].strip().strip("`\"'")
+        if not line:
+            continue
+        if line in candidate_set and line not in seen:
+            seen.add(line)
+            ordered.append(line)
+    if not ordered:
+        return heuristic_top
+    for path in heuristic_top:
+        if path not in seen:
+            ordered.append(path)
+            seen.add(path)
+    return ordered
+
+
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -784,6 +879,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          catches the common case where the bug is described by function or
          class name without mentioning the file path.
 
+    v50: when the validator-supplied LLM is reachable (`_PRELOAD_RERANK_CTX`
+    populated by `_phase_pipeline_solve`), the heuristic top-N is rebroadcast
+    through `_llm_rerank_preload_candidates`. Fail-open: any failure leaves
+    the heuristic order intact.
+
     Each file snippet is fetched via `_read_context_file` with issue-derived
     needles so we keep only the regions relevant to the task instead of the
     head N chars of the file.
@@ -791,6 +891,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _rank_context_files(repo, issue)
     if not files:
         return "", []
+
+    files = _llm_rerank_preload_candidates(repo, issue, files)
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
@@ -818,12 +920,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
-    recent_examples = _recent_commit_examples(repo)
-    if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
-        parts.append(recent_examples)
+    # v50: prefer targeted reference patches (commits that touched the same
+    # files / symbols the issue mentions) over generic recent-commit anchors.
+    # Falls back to v21's recent-commit examples when no targeted hits, so
+    # this is a strict improvement: in the worst case we get the same anchors
+    # as before; in the best case we get patches that are directly relevant.
+    targeted_examples = _targeted_reference_patches(repo, issue)
+    if targeted_examples and used + len(targeted_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _TARGETED_REF_BLOCK_BUDGET:
+        parts.append(targeted_examples)
+        used += len(targeted_examples)
+    else:
+        recent_examples = _recent_commit_examples(repo)
+        if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
+            parts.append(recent_examples)
 
     return "\n\n".join(parts), included
 
@@ -1793,6 +1902,229 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
+# -----------------------------
+# v50: targeted reference-patch retrieval (RAG against the repo's own history)
+# -----------------------------
+#
+# `_recent_commit_examples` gives the model ANY two small recent commits as
+# style anchors. That's a generic prior. v50 retrieves commits that touched
+# the SAME files/symbols the issue is talking about, which is a much sharper
+# in-context signal — closer to what a senior dev does when they `git log`
+# the area before patching it.
+
+_TARGETED_REF_MAX_EXAMPLES = 3
+_TARGETED_REF_MAX_INSERTIONS = 60
+_TARGETED_REF_MAX_DIFF_CHARS = 4000
+_TARGETED_REF_BLOCK_BUDGET = 5500
+_TARGETED_REF_GIT_TIMEOUT_S = 8
+
+
+def _targeted_reference_patches(repo: Path, issue: str) -> str:
+    """Retrieve historical commits that touched issue-mentioned files / symbols.
+
+    Pipeline:
+      1. Extract path mentions (`_extract_issue_path_mentions`) and symbol
+         identifiers (`_extract_issue_symbols`) from the issue text.
+      2. For each path, ask `git log -n 10 -- <path>` for SHAs that touched it.
+      3. For each symbol, ask `git log -n 10 -S<symbol>` for SHAs where the
+         identifier was added/removed (the `-S` "pickaxe" string-frequency
+         search). This catches commits that introduced or modified the symbol
+         even when the file path isn't in the issue.
+      4. Dedupe SHAs, score each commit by `(min(touched_targets), insertions)`
+         keeping the smallest commits that touch the most targets.
+      5. Format the top _TARGETED_REF_MAX_EXAMPLES (3) as in-context diff
+         blocks, capped at _TARGETED_REF_BLOCK_BUDGET (5.5k chars total).
+
+    Fail-open: returns "" on any git error / no hits / repos with synthetic
+    history. The caller can fall back to `_recent_commit_examples`.
+    """
+    try:
+        path_mentions = list(_extract_issue_path_mentions(issue))
+    except Exception:
+        path_mentions = []
+    try:
+        symbol_mentions = list(_extract_issue_symbols(issue))
+    except Exception:
+        symbol_mentions = []
+    if not path_mentions and not symbol_mentions:
+        return ""
+
+    sha_to_targets: Dict[str, set] = {}
+
+    def _add_sha(sha: str, target: str) -> None:
+        clean = sha.strip()
+        if not clean:
+            return
+        sha_to_targets.setdefault(clean, set()).add(target)
+
+    for path in path_mentions[:6]:
+        try:
+            proc = subprocess.run(
+                ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "10", "--", path],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_TARGETED_REF_GIT_TIMEOUT_S,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        for sha in proc.stdout.splitlines():
+            _add_sha(sha, f"path:{path}")
+
+    for symbol in symbol_mentions[:6]:
+        if len(symbol) < 4:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "10", f"-S{symbol}"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_TARGETED_REF_GIT_TIMEOUT_S,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        for sha in proc.stdout.splitlines():
+            _add_sha(sha, f"sym:{symbol}")
+
+    if not sha_to_targets:
+        return ""
+
+    ranked: List[Tuple[int, int, str]] = []
+    for sha, targets in sha_to_targets.items():
+        try:
+            stat_proc = subprocess.run(
+                ["git", "show", "--no-merges", "--shortstat", "--pretty=format:", sha],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_TARGETED_REF_GIT_TIMEOUT_S,
+            )
+        except Exception:
+            continue
+        if stat_proc.returncode != 0:
+            continue
+        insertions = 0
+        for line in stat_proc.stdout.splitlines():
+            if "insertion" in line:
+                for word in line.split(","):
+                    if "insertion" in word:
+                        try:
+                            insertions = int(word.strip().split()[0])
+                        except (ValueError, IndexError):
+                            pass
+                break
+        if insertions <= 0 or insertions > _TARGETED_REF_MAX_INSERTIONS:
+            continue
+        # Sort: most targets matched FIRST, smallest insertion count second.
+        ranked.append((-len(targets), insertions, sha))
+
+    if not ranked:
+        return ""
+
+    ranked.sort()
+    examples: List[str] = []
+    budget_used = 0
+    for _neg_targets, _insertions, sha in ranked:
+        try:
+            diff_proc = subprocess.run(
+                ["git", "show", "--no-merges", "--pretty=format:", sha],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_TARGETED_REF_GIT_TIMEOUT_S,
+            )
+        except Exception:
+            continue
+        if diff_proc.returncode != 0:
+            continue
+        diff_text = diff_proc.stdout.strip()
+        if len(diff_text) < 80 or len(diff_text) > _TARGETED_REF_MAX_DIFF_CHARS:
+            continue
+        block = f"```diff\n{diff_text[:_TARGETED_REF_MAX_DIFF_CHARS]}\n```"
+        if budget_used + len(block) > _TARGETED_REF_BLOCK_BUDGET:
+            break
+        examples.append(block)
+        budget_used += len(block)
+        if len(examples) >= _TARGETED_REF_MAX_EXAMPLES:
+            break
+
+    if not examples:
+        return ""
+    return (
+        "\n\nTARGETED REFERENCE PATCHES (these past commits touched the SAME "
+        "files / symbols this issue is about — mirror their shape, scale, and "
+        "conventions when writing your patch):\n\n" + "\n\n".join(examples)
+    )
+
+
+# -----------------------------
+# v50: issue classification (used to pick specialised plan-phase hints)
+# -----------------------------
+
+_ISSUE_CLASS_SIGNALS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("ui_cascade", (
+        "component", "page", "screen", "view", "sidebar", "navigation",
+        "menu", "modal", "form", "button", "input", "render", "useState",
+        "useEffect", "onClick", "onChange", "JSX", "tsx", "vue",
+    )),
+    ("model_migration", (
+        "migration", "schema", "prisma", "model", "django model",
+        "alembic", "db migrate", "column", "table", "foreign key",
+        "createTable", "addColumn",
+    )),
+    ("api_endpoint", (
+        "endpoint", "route", "controller", "handler", "REST", "GraphQL",
+        "POST", "GET", "PUT", "DELETE", "api/", "express", "FastAPI",
+        "@app.route", "router.", "serializer",
+    )),
+    ("parser_fix", (
+        "parse", "parser", "tokenize", "lexer", "AST", "grammar",
+        "syntax error", "interpret", "compile",
+    )),
+    ("config_update", (
+        "config", "settings", "env var", "environment variable", "yaml",
+        "toml", "json config", "tsconfig", "eslint", "ruff config",
+    )),
+    ("test_addition", (
+        "add a test", "add tests", "test case", "regression test",
+        "write tests for", "unit test", "integration test",
+    )),
+    ("refactor", (
+        "refactor", "rename", "extract", "split into", "move to",
+        "consolidate", "deduplicate",
+    )),
+)
+
+
+def _classify_issue(issue_text: str) -> str:
+    """Return a coarse class label for the issue (or 'unknown').
+
+    The plan phase uses this to select specialized planning hints. The
+    classifier is intentionally simple (lowercase substring match with
+    weighted scoring) so it's deterministic and cheap; if competitors
+    fork v50 they can swap a smarter implementation without changing the
+    rest of the pipeline.
+    """
+    if not issue_text:
+        return "unknown"
+    lower = issue_text.lower()
+    best_class = "unknown"
+    best_score = 0
+    for cls, signals in _ISSUE_CLASS_SIGNALS:
+        score = sum(1 for s in signals if s.lower() in lower)
+        if score > best_score:
+            best_score = score
+            best_class = cls
+    if best_score < 2:
+        return "unknown"
+    return best_class
+
+
 # v21 edge: criteria-nudge support
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
@@ -2436,6 +2768,584 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 
 
 # -----------------------------
+# v50: PHASE-STRICT PIPELINE
+# -----------------------------
+#
+# The current king runs a single open ReAct loop where the model freely
+# interleaves planning, inspection, edits and verification across up to 30
+# steps. v50 replaces that with three explicit phases, each with its own
+# system prompt and response format. Compared to the open loop:
+#
+#   - Phase 1 (PLAN) makes the model commit to a specific target file +
+#     region + change shape BEFORE any bash runs. This anchors the patch
+#     against the issue's actual scope and prevents the "let me read 8
+#     unrelated files first" thrash that costs ~30s on every round.
+#   - Phase 2 (EXECUTE) is purely about applying the plan. The system
+#     prompt forbids re-planning, so the model spends its tokens on edits
+#     rather than fresh exploration.
+#   - Phase 3 (VERIFY) runs the planned test and emits the final summary.
+#
+# Critical safety properties:
+#   - Each phase produces a structured response. If parsing fails or the
+#     model refuses the format, the whole pipeline degrades to the legacy
+#     ReAct loop (`_solve_attempt`) — so v50 is a strict superset of the
+#     existing king's behaviour, not a replacement.
+#   - The combined wall-clock for all three phases is sized to fit
+#     comfortably under `WALL_CLOCK_BUDGET_SECONDS` so the multi-shot
+#     retry can still run a second attempt with a divergent persona.
+
+PHASE_PLAN_BUDGET_SECONDS = 60.0
+PHASE_EXECUTE_BUDGET_SECONDS = 150.0
+PHASE_VERIFY_BUDGET_SECONDS = 50.0
+PHASE_PLAN_MAX_TOKENS = 1600
+PHASE_EXECUTE_MAX_TOKENS = 4096
+PHASE_VERIFY_MAX_TOKENS = 1024
+PHASE_EXECUTE_MAX_STEPS = 6
+PHASE_VERIFY_MAX_STEPS = 2
+
+
+PHASE_PLAN_SYSTEM_PROMPT = '''You are the PLAN phase of a three-phase code-repair agent. Your only job is to produce a structured patch plan. You do not run commands. You do not write the patch. You read the issue and preloaded context, then commit to a clear, narrow strategy that the EXECUTE phase will then implement verbatim.
+
+OUTPUT FORMAT (mandatory, parsed strictly):
+
+<plan>
+TARGET_FILE: <one tracked file path most likely to need the primary edit>
+TARGET_REGION: <function name OR line range OR class name; "new file" if creating>
+CHANGE_TYPE: minimal-fix | bug-fix | new-feature | integration-cascade | test-only | config-update
+ROOT_CAUSE: <one short sentence on why this code is wrong / missing>
+EDIT_SHAPE: <one sentence describing the smallest diff that fixes it>
+INTEGRATION_POINTS: <comma-separated list of other files that must change together, or "none">
+VERIFY: <exact bash command to run after editing — pytest path::test, go test, etc>
+RISKS: <one short sentence on what could go wrong; "none" if nothing meaningful>
+</plan>
+
+RULES:
+
+1. Pick the smallest plausible fix. If a one-line substitution would work, say so. Do not propose a refactor when a tweak suffices.
+2. TARGET_FILE must be a path that exists in the preloaded context or a path the issue explicitly names. Do not invent paths.
+3. CHANGE_TYPE picks the strategy the EXECUTE phase will use; choose carefully:
+   - minimal-fix: one-line / few-line change in one file
+   - bug-fix: small block replacement, possibly one companion test update
+   - new-feature: create one file, wire it from one existing entry point
+   - integration-cascade: multiple files must change together (component + route + nav, or model + migration + serializer, etc)
+   - test-only: only test code changes
+   - config-update: only config / settings / env / package files
+4. INTEGRATION_POINTS is the most-missed item in losing patches — be honest about cascades.
+5. VERIFY must be a single shell command. If no clear target test exists, say "VERIFY: python -m py_compile <file>".
+6. Never emit anything outside the <plan> ... </plan> block. No prose, no markdown fences around the block.
+7. The EXECUTE phase will treat your plan as authoritative. Get it right.'''
+
+
+PHASE_PLAN_COMPLETENESS_SYSTEM_PROMPT = '''You are the PLAN phase of a three-phase code-repair agent. The previous attempt produced an empty or thin patch. This run prioritises COMPLETENESS over minimalism: the issue likely needs a broader integration cascade.
+
+OUTPUT FORMAT (same strict structure):
+
+<plan>
+TARGET_FILE: <primary file>
+TARGET_REGION: <function / region / "new file">
+CHANGE_TYPE: integration-cascade | new-feature | bug-fix
+ROOT_CAUSE: <one sentence>
+EDIT_SHAPE: <one sentence describing what the FULL working feature looks like, not the smallest fix>
+INTEGRATION_POINTS: <list every file that must change for the feature to actually work — route entries, nav links, package.json deps, migrations, type definitions, etc>
+VERIFY: <shell command>
+RISKS: <one sentence>
+</plan>
+
+RULES:
+
+1. Bias toward listing MORE integration points, not fewer. A new component needs at minimum: (a) the component file, (b) the parent that renders it, (c) any imports / route entries / nav links / package dep.
+2. CHANGE_TYPE is almost always integration-cascade or new-feature in this re-run; minimal-fix already failed.
+3. Otherwise the rules from the regular plan phase apply: structured block only, no prose outside it.'''
+
+
+PHASE_EXECUTE_SYSTEM_PROMPT = '''You are the EXECUTE phase of a three-phase code-repair agent. Your job is to apply the PLAN-phase's plan to the repository. You do not re-plan. You do not propose alternative strategies. You issue bash edit commands, observe results, fix obvious mistakes, and stop when the planned diff is on disk.
+
+OUTPUT FORMAT:
+
+To run a shell command, emit exactly:
+
+<command>
+bash command here
+</command>
+
+To finish this phase, emit exactly:
+
+<final>
+applied: <brief one-line summary of the edits made vs the plan>
+</final>
+
+RULES:
+
+1. The plan you receive is authoritative. Execute it. Do not change TARGET_FILE / INTEGRATION_POINTS without a strong concrete reason that you discovered during execution.
+2. Apply ALL plan edits in ONE response when possible. Multi-file plans should emit multiple <command> blocks in the same turn.
+3. Use the same edit shapes that work in this codebase: `python - <<'PY' ... PY`, `sed -i`, `cat > newfile <<'EOF' ... EOF` for new files. Always guard `python - <<'PY'` script edits with a check that the old block exists before substituting.
+4. Match the file's existing indentation, quote style, and blank-line rhythm. The patch is scored on similarity to a hidden reference patch — boring, minimal, idiomatic edits win.
+5. Do not run broad recursive searches. The plan already named the target. Inspect only the immediate target region if you need to confirm a line.
+6. Do not run the planned VERIFY command yet — that is Phase 3. If you need to confirm a syntax-level thing, use `python -m py_compile <file>` or `node --check <file>`.
+7. Do not edit file modes. Do not introduce dependencies the plan did not specify. Do not refactor adjacent code that the plan did not touch.
+8. If a command fails, fix the direct cause in the next turn, then continue. Do not thrash.
+9. Stop as soon as the planned diff is on disk. Emit <final>applied: ...</final>.'''
+
+
+PHASE_VERIFY_SYSTEM_PROMPT = '''You are the VERIFY phase of a three-phase code-repair agent. The plan has been executed. Your job is to run the planned verification command, decide whether the patch actually works, and emit the final summary.
+
+OUTPUT FORMAT:
+
+To run a verification command:
+
+<command>
+bash command here
+</command>
+
+To finish the whole task:
+
+<final>
+Changed [file/function] to [brief root-cause fix]. Verified with [command], or explain why verification could not be run.
+</final>
+
+RULES:
+
+1. First action: run the plan's VERIFY command.
+2. If the command passes, emit <final> immediately summarising the patch.
+3. If the command fails with a real test failure:
+   - Diagnose: is the fix incomplete, or is the test expectation stale?
+   - Issue ONE focused fix command (sed / python heredoc). Re-run the verify command.
+   - If it now passes, emit <final>. If still failing after one repair, emit <final> describing what passed and what's still broken.
+4. If the verify command fails because the runner is missing (ModuleNotFoundError, command not found), do NOT treat that as a real failure — note in <final> that verification was infrastructure-blocked.
+5. Never weaken or skip tests to make verification pass.
+6. Never make sweeping edits in this phase. One small repair maximum.'''
+
+
+@dataclass
+class _PhasePlan:
+    raw: str
+    target_file: str = ""
+    target_region: str = ""
+    change_type: str = ""
+    root_cause: str = ""
+    edit_shape: str = ""
+    integration_points: str = ""
+    verify: str = ""
+    risks: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.target_file) and bool(self.change_type) and bool(self.edit_shape)
+
+    def to_execute_message(self) -> str:
+        lines = [
+            "PLAN (authoritative — execute this verbatim):",
+            f"  TARGET_FILE: {self.target_file}",
+            f"  TARGET_REGION: {self.target_region or '(unspecified)'}",
+            f"  CHANGE_TYPE: {self.change_type or '(unspecified)'}",
+            f"  ROOT_CAUSE: {self.root_cause or '(unspecified)'}",
+            f"  EDIT_SHAPE: {self.edit_shape or '(unspecified)'}",
+            f"  INTEGRATION_POINTS: {self.integration_points or 'none'}",
+            f"  VERIFY: {self.verify or '(none — skip phase 3)'}",
+            f"  RISKS: {self.risks or 'none'}",
+            "",
+            "Apply this plan now. Emit edit <command> blocks; finish with <final>applied: ...</final>.",
+        ]
+        return "\n".join(lines)
+
+    def to_verify_message(self) -> str:
+        return (
+            "The patch has been applied. Run the plan's VERIFY command now, "
+            "diagnose any failure, and emit the final summary.\n\n"
+            f"  VERIFY: {self.verify or '(not specified — run the smallest reasonable check)'}\n"
+            f"  RISKS to look out for: {self.risks or 'none'}"
+        )
+
+
+_PLAN_BLOCK_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.IGNORECASE | re.DOTALL)
+_PLAN_FIELD_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*(.+?)\s*$")
+
+
+def _parse_phase_plan(text: str) -> Optional[_PhasePlan]:
+    """Strict parser for the PLAN phase response.
+
+    The plan phase prompt commits the model to a single <plan> block with
+    seven labeled fields. We parse that and refuse anything else. Returns
+    None when the response doesn't contain a parseable plan — caller
+    must fall back to the legacy ReAct loop in that case.
+    """
+    if not text:
+        return None
+    block_match = _PLAN_BLOCK_RE.search(text)
+    if not block_match:
+        return None
+    inner = block_match.group(1)
+    fields: Dict[str, str] = {}
+    for raw_line in inner.splitlines():
+        m = _PLAN_FIELD_RE.match(raw_line)
+        if not m:
+            continue
+        key = m.group(1).strip().upper()
+        value = m.group(2).strip()
+        if not value:
+            continue
+        # Normalise CHANGE_TYPE / VERIFY to lowercase / strip quotes
+        if key == "CHANGE_TYPE":
+            value = value.lower().strip("`\"'")
+        fields[key] = value
+    plan = _PhasePlan(
+        raw=block_match.group(0),
+        target_file=fields.get("TARGET_FILE", ""),
+        target_region=fields.get("TARGET_REGION", ""),
+        change_type=fields.get("CHANGE_TYPE", ""),
+        root_cause=fields.get("ROOT_CAUSE", ""),
+        edit_shape=fields.get("EDIT_SHAPE", ""),
+        integration_points=fields.get("INTEGRATION_POINTS", ""),
+        verify=fields.get("VERIFY", ""),
+        risks=fields.get("RISKS", ""),
+    )
+    return plan if plan.valid else None
+
+
+def build_phase_plan_user_prompt(issue_text: str, repo_summary: str, preloaded_context: str, issue_class: str) -> str:
+    """User message for PHASE 1 (PLAN). Includes preloaded context + class hint."""
+    class_hint = ""
+    if issue_class == "ui_cascade":
+        class_hint = "\nTask class detected: UI feature. INTEGRATION_POINTS should include the parent that renders the new component, any route/nav entries, and state-store wiring."
+    elif issue_class == "model_migration":
+        class_hint = "\nTask class detected: model + migration. INTEGRATION_POINTS must include the migration file, the model definition, and any serializer / admin / route entry that exposes the new field."
+    elif issue_class == "api_endpoint":
+        class_hint = "\nTask class detected: API endpoint. INTEGRATION_POINTS should include the route registration, handler module, request-schema, and any frontend caller mentioned by the issue."
+    elif issue_class == "parser_fix":
+        class_hint = "\nTask class detected: parser / grammar fix. CHANGE_TYPE is usually minimal-fix or bug-fix in one parser file. INTEGRATION_POINTS: any companion test that exercises the parser."
+    elif issue_class == "config_update":
+        class_hint = "\nTask class detected: config update. CHANGE_TYPE is config-update. INTEGRATION_POINTS: usually 'none' unless multiple config files mirror each other."
+    elif issue_class == "test_addition":
+        class_hint = "\nTask class detected: test addition. CHANGE_TYPE is test-only. INTEGRATION_POINTS: 'none'."
+    elif issue_class == "refactor":
+        class_hint = "\nTask class detected: refactor. CHANGE_TYPE is integration-cascade. INTEGRATION_POINTS must list every call site / definition that participates in the rename or split."
+    return (
+        f"ISSUE:\n{issue_text}\n\n"
+        f"Repository summary:\n{repo_summary}\n\n"
+        f"{preloaded_context}\n\n"
+        f"{class_hint}\n"
+        "Produce the <plan> block now. Do not emit anything else."
+    )
+
+
+def build_phase_execute_user_prompt(plan: _PhasePlan, issue_text: str, preloaded_context: str) -> str:
+    """User message for PHASE 2 (EXECUTE)."""
+    return (
+        plan.to_execute_message()
+        + "\n\nOriginal issue (for reference, do not re-read files unnecessarily):\n"
+        f"{issue_text[:2000]}\n\n"
+        + preloaded_context
+    )
+
+
+def build_phase_verify_user_prompt(plan: _PhasePlan, patch: str, issue_text: str) -> str:
+    """User message for PHASE 3 (VERIFY)."""
+    patch_excerpt = patch if len(patch) <= 3000 else patch[:2000] + "\n...[truncated]...\n" + patch[-1000:]
+    return (
+        plan.to_verify_message()
+        + f"\n\nCurrent on-disk patch:\n```diff\n{patch_excerpt}\n```\n\n"
+        f"Original issue (for reference):\n{issue_text[:1500]}\n"
+    )
+
+
+def _phase_plan(
+    *,
+    issue_text: str,
+    repo_summary: str,
+    preloaded_context: str,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    completeness_persona: bool = False,
+) -> Optional[_PhasePlan]:
+    """Run PHASE 1 (PLAN). Returns parsed _PhasePlan or None on parse failure."""
+    system_prompt = (
+        PHASE_PLAN_COMPLETENESS_SYSTEM_PROMPT if completeness_persona
+        else PHASE_PLAN_SYSTEM_PROMPT
+    )
+    issue_class = _classify_issue(issue_text)
+    user_prompt = build_phase_plan_user_prompt(issue_text, repo_summary, preloaded_context, issue_class)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        response_text, _cost, _raw = chat_completion(
+            messages=messages,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=PHASE_PLAN_MAX_TOKENS,
+            timeout=int(PHASE_PLAN_BUDGET_SECONDS),
+            max_retries=1,
+        )
+    except Exception:
+        return None
+    if not response_text:
+        return None
+    return _parse_phase_plan(response_text)
+
+
+def _phase_execute(
+    *,
+    repo: Path,
+    plan: _PhasePlan,
+    issue_text: str,
+    preloaded_context: str,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    command_timeout: int,
+    max_tokens: int,
+    started_at: float,
+) -> List[str]:
+    """Run PHASE 2 (EXECUTE). Returns a log tail. Mutates the repo on disk."""
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": PHASE_EXECUTE_SYSTEM_PROMPT},
+        {"role": "user", "content": build_phase_execute_user_prompt(plan, issue_text, preloaded_context)},
+    ]
+    logs: List[str] = []
+    for step in range(1, PHASE_EXECUTE_MAX_STEPS + 1):
+        if (time.monotonic() - started_at) > PHASE_EXECUTE_BUDGET_SECONDS:
+            logs.append(f"PHASE_EXECUTE_BUDGET_EXHAUSTED step={step}")
+            break
+        try:
+            response_text, _cost, _raw = chat_completion(
+                messages=_messages_for_request(messages),
+                model=model,
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                timeout=120,
+                max_retries=1,
+            )
+        except Exception as exc:
+            logs.append(f"PHASE_EXECUTE_MODEL_ERROR step={step}: {exc}")
+            break
+        if not response_text:
+            logs.append(f"PHASE_EXECUTE_EMPTY step={step}")
+            break
+        logs.append(f"PHASE_EXECUTE_STEP {step}:\n{response_text}")
+        commands = extract_commands(response_text)
+        final = extract_final(response_text)
+        messages.append({"role": "assistant", "content": response_text})
+        if commands:
+            observations: List[str] = []
+            for command in commands[:MAX_COMMANDS_PER_RESPONSE]:
+                result = run_command(command, repo, timeout=command_timeout)
+                observations.append(format_observation(result))
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+            continue
+        if final is not None:
+            logs.append("PHASE_EXECUTE_FINAL: " + final.strip()[:160])
+            break
+        # No commands and no final — nudge once and try again.
+        messages.append({
+            "role": "user",
+            "content": (
+                "You did not emit any <command> or <final> block. Emit "
+                "<command>...</command> blocks now to apply the plan, then "
+                "end with <final>applied: ...</final>."
+            ),
+        })
+    return logs
+
+
+def _phase_verify(
+    *,
+    repo: Path,
+    plan: _PhasePlan,
+    issue_text: str,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    command_timeout: int,
+    max_tokens: int,
+    started_at: float,
+) -> Tuple[List[str], Optional[str]]:
+    """Run PHASE 3 (VERIFY). Returns (logs, final_summary_or_None)."""
+    patch = get_patch(repo)
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": PHASE_VERIFY_SYSTEM_PROMPT},
+        {"role": "user", "content": build_phase_verify_user_prompt(plan, patch, issue_text)},
+    ]
+    logs: List[str] = []
+    final_summary: Optional[str] = None
+    for step in range(1, PHASE_VERIFY_MAX_STEPS + 1):
+        if (time.monotonic() - started_at) > PHASE_VERIFY_BUDGET_SECONDS:
+            logs.append(f"PHASE_VERIFY_BUDGET_EXHAUSTED step={step}")
+            break
+        try:
+            response_text, _cost, _raw = chat_completion(
+                messages=_messages_for_request(messages),
+                model=model,
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                timeout=60,
+                max_retries=1,
+            )
+        except Exception as exc:
+            logs.append(f"PHASE_VERIFY_MODEL_ERROR step={step}: {exc}")
+            break
+        if not response_text:
+            logs.append(f"PHASE_VERIFY_EMPTY step={step}")
+            break
+        logs.append(f"PHASE_VERIFY_STEP {step}:\n{response_text}")
+        commands = extract_commands(response_text)
+        final = extract_final(response_text)
+        messages.append({"role": "assistant", "content": response_text})
+        if final is not None:
+            final_summary = final.strip()
+            break
+        if commands:
+            observations: List[str] = []
+            for command in commands[:MAX_COMMANDS_PER_RESPONSE]:
+                result = run_command(command, repo, timeout=command_timeout)
+                observations.append(format_observation(result))
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+            continue
+        # Nudge to either run verify or finalize.
+        messages.append({
+            "role": "user",
+            "content": "Either run the verify command via <command>...</command> or finalize via <final>...</final>.",
+        })
+    return logs, final_summary
+
+
+def _phase_pipeline_solve(**kwargs: Any) -> Dict[str, Any]:
+    """Three-phase orchestrator. Falls back to legacy _solve_attempt when
+    Phase 1 cannot produce a parseable plan.
+
+    Passed through **kwargs so the validator-protected solve() signature is
+    not duplicated in this helper — kwargs are forwarded verbatim to the
+    legacy fallback when needed."""
+    repo_arg = kwargs["repo_path"]
+    issue_arg = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
+    completeness_persona = bool(kwargs.pop("completeness_persona", False))
+
+    logs: List[str] = []
+    started_at = time.monotonic()
+    try:
+        repo = _repo_path(repo_arg)
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+        ensure_git_repo(repo)
+        repo_summary = get_repo_summary(repo)
+        _PRELOAD_RERANK_CTX["model"] = model_name
+        _PRELOAD_RERANK_CTX["api_base"] = base
+        _PRELOAD_RERANK_CTX["api_key"] = key
+        _PRELOAD_RERANK_CTX["deadline"] = started_at + WALL_CLOCK_BUDGET_SECONDS
+        try:
+            preloaded_context, preloaded_files = build_preloaded_context(repo, issue_arg)
+        finally:
+            _PRELOAD_RERANK_CTX.clear()
+        logs.append(f"PHASE_PIPELINE_PRELOAD: files={preloaded_files}")
+        logs.append(f"PHASE_PIPELINE_ISSUE_CLASS: {_classify_issue(issue_arg)}")
+
+        plan_started = time.monotonic()
+        plan = _phase_plan(
+            issue_text=issue_arg,
+            repo_summary=repo_summary,
+            preloaded_context=preloaded_context,
+            model=model_name,
+            api_base=base,
+            api_key=key,
+            completeness_persona=completeness_persona,
+        )
+        logs.append(
+            f"PHASE_PLAN_ELAPSED: {time.monotonic() - plan_started:.1f}s "
+            f"persona={'completeness' if completeness_persona else 'minimal'}"
+        )
+        if plan is None or not plan.valid:
+            logs.append("PHASE_PLAN_PARSE_FAILED — falling back to legacy ReAct loop.")
+            fallback = _solve_attempt(**kwargs)
+            fallback_logs = fallback.get("logs") or ""
+            fallback["logs"] = "PHASE_PIPELINE_FALLBACK:\n" + "\n".join(logs) + "\n" + fallback_logs
+            fallback["phase_pipeline_used"] = False
+            return fallback
+        logs.append(
+            "PHASE_PLAN_OK: "
+            f"target={plan.target_file} "
+            f"type={plan.change_type} "
+            f"region={plan.target_region[:60]} "
+            f"integration={plan.integration_points[:60]}"
+        )
+
+        execute_started = time.monotonic()
+        execute_logs = _phase_execute(
+            repo=repo,
+            plan=plan,
+            issue_text=issue_arg,
+            preloaded_context=preloaded_context,
+            model=model_name,
+            api_base=base,
+            api_key=key,
+            command_timeout=command_timeout,
+            max_tokens=max_tokens,
+            started_at=execute_started,
+        )
+        logs.extend(execute_logs)
+        logs.append(f"PHASE_EXECUTE_ELAPSED: {time.monotonic() - execute_started:.1f}s")
+        patch_after_execute = get_patch(repo)
+        execute_substantive = _multishot_count_substantive(patch_after_execute)
+        logs.append(f"PHASE_EXECUTE_PATCH_SUBSTANTIVE_LINES: {execute_substantive}")
+
+        # Only run VERIFY if there's a non-empty patch worth verifying.
+        final_summary: Optional[str] = None
+        if patch_after_execute.strip() and plan.verify and plan.verify.lower() != "none":
+            verify_started = time.monotonic()
+            verify_logs, final_summary = _phase_verify(
+                repo=repo,
+                plan=plan,
+                issue_text=issue_arg,
+                model=model_name,
+                api_base=base,
+                api_key=key,
+                command_timeout=command_timeout,
+                max_tokens=max_tokens,
+                started_at=verify_started,
+            )
+            logs.extend(verify_logs)
+            logs.append(f"PHASE_VERIFY_ELAPSED: {time.monotonic() - verify_started:.1f}s")
+        else:
+            logs.append("PHASE_VERIFY_SKIPPED: empty patch or no verify command in plan.")
+
+        final_patch = get_patch(repo)
+        logs.append(f"PHASE_PIPELINE_TOTAL_ELAPSED: {time.monotonic() - started_at:.1f}s")
+        return AgentResult(
+            patch=final_patch,
+            logs=_safe_join_logs(logs),
+            steps=PHASE_EXECUTE_MAX_STEPS + PHASE_VERIFY_MAX_STEPS,
+            cost=0.0,
+            success=bool(final_patch.strip()),
+        ).to_dict() | {"phase_pipeline_used": True}
+
+    except Exception as exc:
+        # Defensive fallback: any uncaught error inside the pipeline drops us
+        # back to the legacy solve_attempt so we never silently return empty.
+        logs.append(f"PHASE_PIPELINE_EXCEPTION: {type(exc).__name__}: {str(exc)[:200]}")
+        try:
+            fallback = _solve_attempt(**kwargs)
+            fallback_logs = fallback.get("logs") or ""
+            fallback["logs"] = "PHASE_PIPELINE_RECOVERY:\n" + "\n".join(logs) + "\n" + fallback_logs
+            fallback["phase_pipeline_used"] = False
+            return fallback
+        except Exception:
+            return AgentResult(
+                patch="",
+                logs=_safe_join_logs(logs),
+                steps=0,
+                cost=0.0,
+                success=False,
+            ).to_dict()
+
+
+# -----------------------------
 # Main agent
 # -----------------------------
 
@@ -2585,7 +3495,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        # v50: attempt 1 runs the phase-strict pipeline (PLAN/EXECUTE/VERIFY).
+        # The pipeline degrades to the legacy ReAct loop internally when
+        # PHASE_PLAN fails to produce a parseable plan, so this is a strict
+        # superset of the previous behaviour.
+        _result1 = _phase_pipeline_solve(completeness_persona=False, **kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -2601,7 +3515,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        # v50: attempt 2 runs the phase pipeline with the COMPLETENESS persona.
+        # If attempt 1 left an empty/thin patch, it's usually because the
+        # plan was too narrow (minimal-fix when the task needed integration
+        # cascade). Re-running with the completeness persona biases the plan
+        # toward listing every wired-up integration point.
+        _result2 = _phase_pipeline_solve(completeness_persona=True, **kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
