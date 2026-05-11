@@ -91,7 +91,7 @@ MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 36000
-MAX_PRELOADED_FILES = 12
+MAX_PRELOADED_FILES = 14
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -115,10 +115,17 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_SCOPE_NUDGES = 1       # broad issue but patch lacks owner-surface closure
+MAX_REWRITE_NUDGES = 1     # stop destructive rewrites on non-architecture tasks
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 4  # syntax + coverage + correctness + cleanup, still bounded
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+_ARCHITECTURE_ISSUE_HINTS = (
+    "extract", "package", "library", "shared", "migrate", "migration", "module",
+    "plugin", "workspace", "monorepo", "design system", "component library",
+    "refactor", "split", "scaffold", "entrypoint", "exports", "generated",
+    "regenerate", "ffi", "bridge", "batch", "upload",
+)
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -766,27 +773,16 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Preload the highest-ranked tracked files plus their companion tests.
+    """Preload ranked owner files, sibling surfaces, and companion tests.
 
     Returns `(context_text, included_files)` so the caller can later strip the
     bulky snippet block but still keep the file-name breadcrumb.
 
-    Two improvements over a vanilla rank-and-read loop:
-
-      1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
-         X_test.go for X.go, etc.) are slotted in right after their source
-         partner. Real GitHub-derived tasks almost always need source+test
-         changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
-
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
+    The current king already ranks direct path/symbol matches and slots tests.
+    The missing general behavior is owner-surface coverage: feature tasks often
+    require store+consumer, schema+client, prompt+runtime, route+page, or
+    config+use-site edits. We add a small, generic sibling expansion before
+    reading snippets so the first model turn can plan the complete owner set.
     """
     files = _rank_context_files(repo, issue)
     if not files:
@@ -794,6 +790,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
+    files = _augment_with_owner_surfaces(files, tracked_set, issue)
 
     needles = _preload_needles(issue)
 
@@ -826,6 +823,115 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
+
+
+_OWNER_SURFACE_RULES: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+    (
+        ("page", "route", "navigation", "screen", "view", "dashboard", "admin", "form"),
+        ("page", "route", "router", "nav", "layout", "dashboard", "admin", "form", "component"),
+    ),
+    (
+        ("cache", "offline", "persist", "localstorage", "refresh", "stale", "sync", "reload"),
+        ("cache", "storage", "store", "state", "hook", "sync", "provider", "context"),
+    ),
+    (
+        ("schema", "migration", "policy", "rpc", "database", "sql", "record", "field"),
+        ("schema", "migration", "model", "entity", "repository", "serializer", "sql", "fixture"),
+    ),
+    (
+        ("prompt", "classifier", "agent", "ai", "email", "intent", "example"),
+        ("prompt", "example", "classifier", "orchestrator", "service", "schema", "fixture"),
+    ),
+    (
+        ("notification", "reminder", "schedule", "background", "token", "quiet", "push"),
+        ("notification", "reminder", "schedule", "background", "token", "preference", "setting"),
+    ),
+    (
+        ("auth", "profile", "social", "post", "comment", "follow", "feed"),
+        ("auth", "profile", "social", "post", "comment", "follow", "feed", "api", "route"),
+    ),
+    (
+        ("editor", "clipboard", "selection", "paste", "copy", "shortcut", "keyboard"),
+        ("editor", "clipboard", "selection", "input", "textarea", "shortcut", "keymap"),
+    ),
+    (
+        ("simulation", "animation", "canvas", "three", "progress", "scrub", "play", "pause"),
+        ("simulation", "animation", "canvas", "three", "progress", "state", "control"),
+    ),
+    (
+        ("extract", "package", "library", "shared", "plugin", "workspace", "exports", "entrypoint"),
+        ("package", "library", "shared", "plugin", "workspace", "exports", "entry", "index", "config"),
+    ),
+    (
+        ("docs", "documentation", "readme", "smoke", "unit", "test", "coverage"),
+        ("readme", "docs", "test", "spec", "smoke", "unit", "fixture"),
+    ),
+    (
+        ("parser", "parse", "yaml", "openapi", "schema", "generated", "regenerate", "handler"),
+        ("parser", "schema", "generated", "handler", "spec", "openapi", "fixture", "test"),
+    ),
+    (
+        ("ffi", "bridge", "ios", "android", "mobile", "client", "core", "binding"),
+        ("ffi", "bridge", "ios", "android", "client", "core", "binding", "wrapper"),
+    ),
+    (
+        ("batch", "upload", "file", "photo", "compress", "storage", "multipart"),
+        ("batch", "upload", "file", "photo", "storage", "route", "endpoint", "service"),
+    ),
+    (
+        ("theme", "light mode", "dark mode", "palette", "color", "css", "style", "tailwind", "responsive"),
+        ("theme", "provider", "layout", "css", "style", "tailwind", "component", "navbar"),
+    ),
+)
+
+
+def _augment_with_owner_surfaces(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Add likely sibling owner files without hardcoding benchmark tasks.
+
+    This is intentionally small and generic. It catches common real-world
+    implementation shapes while leaving final edit decisions to the model.
+    """
+    if not files or not tracked:
+        return files
+
+    issue_lower = issue.lower()
+    active_needles: List[str] = []
+    for triggers, needles in _OWNER_SURFACE_RULES:
+        if any(trigger in issue_lower for trigger in triggers):
+            active_needles.extend(needles)
+    if not active_needles:
+        return files
+
+    ranked_roots = {Path(p).parts[0].lower() for p in files if Path(p).parts}
+    issue_terms = set(_issue_terms(issue))
+    seen = set(files)
+    candidates: List[Tuple[int, str]] = []
+
+    for relative_path in tracked:
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        score = 0
+        score += sum(5 for needle in active_needles if needle in path_lower)
+        score += sum(2 for term in issue_terms if term in path_lower)
+        if path.parts and path.parts[0].lower() in ranked_roots:
+            score += 4
+        if "test" in path.name.lower() or "spec" in path.name.lower():
+            score += 2
+        if score:
+            candidates.append((score, relative_path))
+
+    if not candidates:
+        return files
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:8]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+    return augmented
 
 
 def _preload_needles(issue: str) -> List[str]:
@@ -1217,7 +1323,7 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
 
 
 def _diff_low_signal_summary(patch: str) -> str:
-    """Human-readable summary of low-signal hunks for the polish prompt."""
+    """Human-readable summary of low-signal or scope-risky diff shapes."""
     if not patch.strip():
         return ""
 
@@ -1235,6 +1341,46 @@ def _diff_low_signal_summary(patch: str) -> str:
             notes.append(f"{current_file}: whitespace-only hunk")
         elif _hunk_is_comment_only(current_added, current_removed):
             notes.append(f"{current_file}: comment-only hunk")
+
+    changed_files = _patch_changed_files(patch)
+    if changed_files:
+        lockish = [
+            p for p in changed_files
+            if Path(p).name.lower() in {
+                "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+                "poetry.lock", "cargo.lock", "gemfile.lock",
+            }
+            or Path(p).suffix.lower() == ".lock"
+        ]
+        if lockish:
+            notes.append("package-manager artifact changed: " + ", ".join(lockish[:4]))
+
+        generated_parts = {"dist", "build", "coverage", ".next", "node_modules", "__pycache__"}
+        generated = [
+            p for p in changed_files
+            if any(part.lower() in generated_parts for part in Path(p).parts)
+            or Path(p).suffix.lower() in {".pyc", ".map"}
+        ]
+        if generated:
+            notes.append("generated/cache output changed: " + ", ".join(generated[:4]))
+
+        config_names = {
+            "package.json", "vite.config.ts", "vite.config.js", "tailwind.config.js",
+            "tailwind.config.ts", "tsconfig.json", "index.html", "eslint.config.js",
+        }
+        config_like = [p for p in changed_files if Path(p).name.lower() in config_names]
+        new_file_count = len(re.findall(r"^new file mode ", patch, flags=re.MULTILINE))
+        if len(changed_files) >= 8 and (new_file_count >= 3 or len(config_like) >= 3):
+            notes.append(
+                f"broad scaffold-like churn ({len(changed_files)} files, "
+                f"{new_file_count} new files); acceptable only for explicit architecture/package/migration tasks"
+            )
+
+        if len(changed_files) >= 12:
+            notes.append(f"very broad patch touches {len(changed_files)} files; verify every file maps to a requirement")
+
+    if "GIT binary patch" in patch or re.search(r"^Binary files ", patch, flags=re.MULTILINE):
+        notes.append("binary diff present; keep only if explicitly required")
 
     for line in patch.splitlines():
         if line.startswith("diff --git "):
@@ -1271,6 +1417,61 @@ def _patch_changed_files(patch: str) -> List[str]:
         if path and path not in seen:
             seen.append(path)
     return seen
+
+
+def _patch_line_stats(patch: str) -> List[Tuple[str, int, int]]:
+    stats: List[Tuple[str, int, int]] = []
+    current_file = ""
+    added = 0
+    removed = 0
+
+    def flush() -> None:
+        nonlocal added, removed, current_file
+        if current_file:
+            stats.append((current_file, added, removed))
+        added = 0
+        removed = 0
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            tokens = line.split()
+            current_file = tokens[3][2:] if len(tokens) >= 4 and tokens[3].startswith("b/") else "?"
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            body = line[1:].strip()
+            if body and not _line_is_comment(body):
+                added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            body = line[1:].strip()
+            if body and not _line_is_comment(body):
+                removed += 1
+    flush()
+    return stats
+
+
+def _rewrite_risk_summary(patch: str, issue_text: str) -> str:
+    if not patch.strip() or _issue_scale(issue_text) == "architecture":
+        return ""
+    risky: List[str] = []
+    total_added = 0
+    total_removed = 0
+    for path, added, removed in _patch_line_stats(patch):
+        total_added += added
+        total_removed += removed
+        if removed >= 80 and removed > added:
+            risky.append(f"{path}: removed {removed} substantive lines, added {added}")
+        elif removed >= 45 and removed >= added * 2:
+            risky.append(f"{path}: deletion-heavy rewrite ({removed} removed vs {added} added)")
+
+    changed = _patch_changed_files(patch)
+    if total_removed >= 140 and total_removed > total_added:
+        risky.insert(0, f"whole patch removes {total_removed} substantive lines and adds {total_added}")
+    if len(changed) <= 3 and total_removed >= 120 and total_added >= 60:
+        risky.append("large in-place rewrite in a small file set; likely lower similarity than a narrow owner patch")
+    if not risky:
+        return ""
+    return "; ".join(risky[:5])
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -1460,6 +1661,106 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _extract_balanced_block(source: str, brace_index: int) -> str:
+    depth = 0
+    i = brace_index
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace_index + 1:i]
+        i += 1
+    return source[brace_index + 1:]
+
+
+def _check_ts_private_member_leak_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Catch a common TS refactor bug without requiring project deps.
+
+    LLMs often extract a base class, leave a member `private`, then access
+    `this._member` from a subclass. TypeScript rejects that, but many task
+    sandboxes lack node_modules/typecheck scripts. This lightweight scan only
+    reports when a subclass uses an underscore/private-looking member that is
+    declared private in another class but not declared in the subclass itself.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    classes: List[Tuple[str, Optional[str], str]] = []
+    for match in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)\s*(?:extends\s+([A-Za-z_$][\w$]*))?[^{]*\{", source):
+        body = _extract_balanced_block(source, match.end() - 1)
+        classes.append((match.group(1), match.group(2), body))
+    if len(classes) < 2:
+        return None
+
+    private_by_class: Dict[str, set[str]] = {}
+    for name, _parent, body in classes:
+        private_by_class[name] = set(re.findall(r"\bprivate\s+([A-Za-z_$][\w$]*)\b", body))
+    globally_private = set().union(*private_by_class.values()) if private_by_class else set()
+    if not globally_private:
+        return None
+
+    for name, parent, body in classes:
+        if not parent:
+            continue
+        declared_here = set(re.findall(r"\b(?:private|protected|public)\s+([A-Za-z_$][\w$]*)\b", body))
+        used = set(re.findall(r"\bthis\.([A-Za-z_$][\w$]*)\b", body))
+        leaked = sorted((used & globally_private) - declared_here)
+        for member in leaked:
+            owners = [owner for owner, members in private_by_class.items() if owner != name and member in members]
+            if owners:
+                return f"{relative_path}: class {name} extends {parent} but accesses private member this.{member} declared in {owners[0]}"
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1482,10 +1783,170 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+            if result is None and suffix in {".ts", ".tsx"}:
+                result = _check_ts_private_member_leak_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
     return errors
+
+
+_STATIC_CHECK_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
+_STATIC_CHECK_TIMEOUT = 28
+
+
+def _nearest_package_dir(repo: Path, relative_path: str) -> Optional[Path]:
+    """Return the closest ancestor with package.json for a touched file."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if full.is_file():
+        cur = full.parent
+    else:
+        cur = full
+    root = repo.resolve()
+    while True:
+        if (cur / "package.json").exists():
+            return cur
+        if cur == root or cur.parent == cur:
+            return None
+        cur = cur.parent
+
+
+def _package_static_command(package_json: Path) -> Optional[str]:
+    """Pick one cheap package-level static check from existing scripts.
+
+    We intentionally do not invent install/build steps. If the repo provides a
+    type/check script, a quick run catches the exact class of LLM mistakes that
+    loses judge rounds: missing state definitions, invalid private access,
+    broken JSX/Vue templates, and incomplete interface updates.
+    """
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+
+    preferred = (
+        "typecheck",
+        "type-check",
+        "check-types",
+        "check",
+        "tsc",
+        "lint",
+        "build",
+    )
+    lowered = {str(name).lower(): str(name) for name in scripts}
+    for key in preferred:
+        if key in lowered:
+            return f"npm run -s {_shell_quote(lowered[key])}"
+    for name in scripts:
+        low = str(name).lower()
+        if any(token in low for token in ("type", "check")):
+            return f"npm run -s {_shell_quote(str(name))}"
+    return None
+
+
+def _output_mentions_touched_file(output: str, changed_files: List[str]) -> bool:
+    low = output.lower()
+    for relative_path in changed_files:
+        p = relative_path.lower()
+        stem = Path(relative_path).stem.lower()
+        name = Path(relative_path).name.lower()
+        if p and p in low:
+            return True
+        if name and name in low:
+            return True
+        if stem and len(stem) >= 5 and stem in low:
+            return True
+    return False
+
+
+def _select_static_check_failure(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    """Run one existing package static check when changed frontend files need it.
+
+    Returns `(command, output)` only when the failure appears to implicate
+    touched files. Dependency-missing or unrelated project-wide failures are
+    ignored so the agent does not waste a refinement on environmental noise.
+    """
+    if not _has_executable("npm"):
+        return None
+
+    changed = [
+        path for path in _patch_changed_files(patch)
+        if Path(path).suffix.lower() in _STATIC_CHECK_SUFFIXES
+    ]
+    if not changed or len(changed) > 14:
+        return None
+
+    package_dirs: List[Path] = []
+    seen: set[str] = set()
+    for relative_path in changed:
+        package_dir = _nearest_package_dir(repo, relative_path)
+        if package_dir is None:
+            continue
+        key = str(package_dir)
+        if key not in seen:
+            package_dirs.append(package_dir)
+            seen.add(key)
+    if not package_dirs:
+        return None
+
+    # Prefer the package that contains most changed files.
+    package_dirs.sort(
+        key=lambda d: -sum(
+            1 for p in changed
+            if str((repo / p).resolve()).startswith(str(d.resolve()) + os.sep)
+        )
+    )
+    package_dir = package_dirs[0]
+    cmd = _package_static_command(package_dir / "package.json")
+    if not cmd:
+        return None
+
+    relative_changed = []
+    for path in changed:
+        try:
+            relative_changed.append(str((repo / path).resolve().relative_to(package_dir.resolve())))
+        except Exception:
+            relative_changed.append(path)
+
+    result = run_command(cmd, package_dir, timeout=_STATIC_CHECK_TIMEOUT)
+    if result.exit_code == 0:
+        return None
+
+    output = (result.stdout + "\n" + result.stderr).strip()
+    noisy = output.lower()
+    env_noise = (
+        "node_modules" in noisy and "not found" in noisy,
+        "missing script" in noisy,
+        "could not determine executable" in noisy,
+        "enoent" in noisy and "package.json" in noisy,
+    )
+    if any(env_noise):
+        return None
+    if not _output_mentions_touched_file(output, relative_changed + changed):
+        return None
+
+    rel_cmd = cmd if package_dir == repo else f"(cd {_shell_quote(str(package_dir.relative_to(repo)))} && {cmd})"
+    return rel_cmd, _truncate(output, 5000)
+
+
+def build_static_fix_prompt(command: str, output: str) -> str:
+    return (
+        "Static verification failed on your changed frontend/package files:\n"
+        f"Command: {command}\n\n"
+        f"{output[:5000]}\n\n"
+        "Fix the reported root cause in the touched owner surface. Typical causes: "
+        "new JSX/Vue state names without matching definitions, imports missing after moving logic, "
+        "private/protected member access, changed public signatures without all call sites, "
+        "or template bindings not wired to the composable/store. "
+        "Do NOT broaden scope or rewrite unrelated code. After the minimal fix, end with <final>summary</final>."
+    )
 
 
 def _has_executable(name: str) -> bool:
@@ -1831,7 +2292,7 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     if bullets:
         return bullets
     fallback_re = re.compile(
-        r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
+        r"\b(must|should|implement|add|support|ensure|return|raise|expect|preserve|wire|route|endpoint|batch|bridge|ffi|generated|regenerate|docs?|tests?|smoke|migration|extract|package)\b",
         re.IGNORECASE,
     )
     for raw in re.split(r"(?<=[.!?])\s+", issue_text):
@@ -1903,6 +2364,158 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
+
+
+def _issue_scale(issue_text: str) -> str:
+    """Heuristic task scale: micro, integration, or architecture."""
+    lower = issue_text.lower()
+    if any(hint in lower for hint in _ARCHITECTURE_ISSUE_HINTS):
+        return "architecture"
+    surface_groups = (
+        ("ui", "page", "screen", "component", "dashboard", "admin", "form", "modal"),
+        ("api", "endpoint", "route", "controller", "service", "repository"),
+        ("store", "state", "context", "hook", "composable", "localstorage", "cache"),
+        ("schema", "model", "migration", "field", "database", "serializer"),
+        ("test", "spec", "fixture", "docs", "readme"),
+        ("mobile", "ios", "android", "ffi", "bridge", "client"),
+    )
+    hits = sum(1 for group in surface_groups if any(term in lower for term in group))
+    criteria_count = len(_extract_acceptance_criteria(issue_text))
+    if hits >= 2 or criteria_count >= 3:
+        return "integration"
+    return "micro"
+
+
+def _path_looks_like_ui_surface(relative_path: str) -> bool:
+    lower = relative_path.lower()
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in {".vue", ".svelte", ".jsx", ".tsx", ".css", ".scss", ".html"}:
+        return True
+    parts = {part.lower() for part in Path(relative_path).parts}
+    if parts & {"frontend", "client", "web", "app", "pages", "page", "views", "view", "components", "component", "templates", "template", "screens", "screen"}:
+        return True
+    return False
+
+
+def _path_looks_like_server_surface(relative_path: str) -> bool:
+    lower = relative_path.lower()
+    suffix = Path(relative_path).suffix.lower()
+    if suffix == ".sql":
+        return True
+    parts = {part.lower() for part in Path(relative_path).parts}
+    if parts & {"api", "server", "backend", "controllers", "controller", "routes", "route", "services", "service", "models", "model", "serializers", "serializer", "repositories", "repository", "migrations", "migration"}:
+        return True
+    return any(term in lower for term in ("/api/", "/server/", "/backend/", "controller", "serializer", "repository", "migration"))
+
+
+def _issue_requests_visible_surface(issue_text: str) -> bool:
+    lower = issue_text.lower()
+    return any(
+        term in lower
+        for term in (
+            "ui", "page", "screen", "component", "dashboard", "admin", "form",
+            "modal", "button", "view", "visible", "display", "shown", "show",
+            "list", "detail", "table", "column", "field", "card", "menu",
+        )
+    )
+
+
+def _scope_gap_summary(patch: str, issue_text: str) -> str:
+    """Return a message when a broad issue lacks integration closure."""
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return ""
+    scale = _issue_scale(issue_text)
+    if scale == "micro":
+        return ""
+
+    lower = issue_text.lower()
+    likely: List[str] = []
+    surface_map = (
+        (("ui", "page", "screen", "component", "dashboard", "admin", "form", "modal"), "UI/page/component wiring"),
+        (("api", "endpoint", "route", "controller"), "API route/controller"),
+        (("service", "repository", "database", "model", "schema", "field"), "service/repository/schema"),
+        (("store", "state", "context", "hook", "composable", "cache", "localstorage"), "shared state/store/cache"),
+        (("test", "spec", "fixture", "docs", "readme"), "tests/docs/fixtures"),
+        (("ffi", "bridge", "ios", "android", "client", "mobile"), "bridge/client/platform layer"),
+        (("generated", "regenerate", "handler", "openapi"), "generated/spec artifacts"),
+    )
+    for terms, label in surface_map:
+        if any(term in lower for term in terms):
+            likely.append(label)
+    likely_text = ", ".join(likely[:6]) or "all owner surfaces implied by the requirements"
+
+    min_files = 4 if scale == "architecture" else 2
+    if len(changed) < min_files:
+        return (
+            f"{scale} issue but patch touches only {len(changed)} file(s): "
+            f"{', '.join(changed[:6])}. Likely missing: {likely_text}."
+        )
+
+    changed_text = "\n".join(changed).lower()
+    ui_changed = any(_path_looks_like_ui_surface(path) for path in changed)
+    server_changed = any(_path_looks_like_server_surface(path) for path in changed)
+    added_text = _patch_added_text(patch)
+    closure_gaps: List[str] = []
+    if any(term in lower for term in ("state", "store", "context", "composable", "hook", "cache", "localstorage", "persist")):
+        if not any(term in changed_text for term in ("state", "store", "context", "composable", "hook", "cache", "storage", "provider")):
+            closure_gaps.append("state/store/cache owner not touched")
+    if any(term in lower for term in ("ui", "page", "screen", "component", "dashboard", "admin", "form", "modal")):
+        if not ui_changed:
+            closure_gaps.append("visible UI/template surface not touched")
+    data_owner_terms = ("api", "endpoint", "route", "controller", "service", "repository", "database", "schema", "migration")
+    if any(term in lower for term in data_owner_terms):
+        api_hit = server_changed or any(term in changed_text for term in ("api", "route", "controller", "service", "repo", "model", "schema", "migration", "entity"))
+        ui_requested = _issue_requests_visible_surface(issue_text)
+        if not api_hit:
+            closure_gaps.append("server/data owner not touched")
+        if ui_requested and not ui_changed:
+            closure_gaps.append("server change lacks requested UI/client consumer")
+    if server_changed and _issue_requests_visible_surface(issue_text) and not ui_changed:
+        closure_gaps.append("backend/data patch lacks visible page/component consumer")
+    if any(term in lower for term in ("parser", "parse", "schema", "generated", "regenerate", "openapi")):
+        if "parser" not in changed_text and "parse" not in changed_text and "generated" in lower:
+            closure_gaps.append("generated/spec update without parser owner")
+        if "generated" not in changed_text and "regenerate" in lower:
+            closure_gaps.append("tracked generated/spec output may be missing")
+    if any(term in lower for term in ("clipboard", "editor", "selection", "paste", "copy")):
+        if "core/" in changed_text and not any(p.startswith("projects/") or "/projects/" in p for p in changed):
+            closure_gaps.append("global core edited without project/local editor surface")
+
+    # Issues frequently name owner components/classes/functions without full
+    # paths (DashboardAdmin, useCalendar, AuthInterstitial). If the draft
+    # never touches a matching path and never adds that symbol, it likely
+    # skipped an explicit owner surface.
+    named_owner_tokens: List[str] = []
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_]{4,}\b", issue_text):
+        if token.lower() in _SYMBOL_STOP:
+            continue
+        if (
+            re.search(r"[A-Z].*[A-Z]", token)
+            or token.startswith(("use", "get", "set", "is", "has"))
+            or token.lower().endswith(("page", "modal", "dashboard", "provider", "controller", "service", "schema", "config"))
+        ):
+            named_owner_tokens.append(token)
+    missing_named = []
+    seen_named: set[str] = set()
+    for token in named_owner_tokens:
+        key = token.lower()
+        if key in seen_named:
+            continue
+        seen_named.add(key)
+        if key not in changed_text and key not in added_text:
+            missing_named.append(token)
+    if missing_named:
+        closure_gaps.append("explicit named owner(s) not touched: " + ", ".join(missing_named[:6]))
+
+    if not closure_gaps:
+        return ""
+
+    return (
+        f"{scale} issue changed {len(changed)} file(s) but owner closure is suspect: "
+        f"{'; '.join(closure_gaps[:4])}. Changed: {', '.join(changed[:8])}. "
+        f"Expected owner surfaces: {likely_text}."
+    )
 
 
 # -----------------------------
@@ -2011,7 +2624,7 @@ def _symbol_grep_hits(
 #   - a single source of truth for scope, style, verification, safety
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
-You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
+You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: the smallest COMPLETE owner-surface change a senior maintainer would accept. "Small" means no unrelated churn; it does not mean stopping after one file when the feature spans state, schema, prompt, route, UI, and tests.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -2034,12 +2647,14 @@ Your first response MUST contain a `<plan>` block followed immediately by one fo
 First response format:
 
 <plan>
-- Requirement: restate every explicit issue requirement.
-- Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
-- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
-- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
-- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Patch scale: choose exactly one: MICRO (single owner bug), INTEGRATION (several existing surfaces), or ARCHITECTURE (package/extraction/migration/new entrypoints). Explain why.
+- Requirement ledger: restate every explicit issue requirement.
+- Requirement ledger: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
+- Requirement ledger: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Owner map: identify the source of truth and required consumers (state/store, schema/model, service/API, prompt/example, route/page, UI, test/fixture).
+- Edit set: name the files/functions/classes/modules likely to inspect or modify, and why each belongs.
+- Non-goals: name artifacts to avoid (generated output, package-manager files, unrelated scaffold, cosmetic churn). For ARCHITECTURE tasks, distinguish required source scaffolding from forbidden generated output.
+- Strategy: smallest complete root-cause fix likely to satisfy every requirement.
 - Verification: targeted test command expected after patching.
 </plan>
 <command>
@@ -2054,37 +2669,75 @@ Never emit `<final>` before a required code change has been made and verificatio
 ISSUE CONTRACT
 ====================================================================
 
-Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
+Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, persistence/storage clauses, routing/UI clauses, schema/data clauses, prompt/example clauses, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
 
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
 Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
 
+If the issue requests exact file paths, names, extensions, exported identifiers, route paths, command names, or JSON keys, honor them exactly. Do not substitute `.jsx` for requested `.js`, rename files for taste, or move artifacts to a cleaner location unless the issue explicitly allows it. Reference similarity heavily rewards exact requested filenames.
+
+Completeness rule: fix every required owner surface together. If a UI setting persists, update the shared state and every live consumer. If a schema or API shape changes, update server/client/tests/fixtures together. If behavior is prompt-driven, update the prompt/example source and the runtime boundary that consumes it. If a route/page is added, wire route, navigation, data load, empty/error states, and tests as required. If background work changes, cover scheduling, filtering, token/preference handling, and requested operational artifacts.
+
+Patch-scale rule:
+- MICRO: one broken function or small API. Keep edits tiny.
+- INTEGRATION: feature crosses existing surfaces. Patch every existing surface needed for runtime behavior.
+- ARCHITECTURE: issue explicitly asks for extraction, package/library creation, migration, plugin/workspace split, broad refactor, new entrypoints/exports, or docs/tests around that package. In this mode, source scaffolding, package metadata, exports, config, and consumer migration are required scope. Still do not commit generated build output, cache files, package-manager artifacts from installs, or unrelated sample apps.
+
+====================================================================
+COMMON MULTI-SURFACE PLAYBOOKS
+====================================================================
+
+Use these only when the issue matches the domain. They prevent shallow patches:
+
+- Shared UI state: one source of truth (store/context/composable), every live consumer subscribes to it, settings writes update the same source, dismissal/reset rules are keyed to the real content, and root/global render path is wired.
+- Offline/cache hydration: cached data must initialize component/hook state synchronously (lazy `useState`/initial store value) so first render is not blank; background refresh happens after that. Never call React/Vue/Svelte state setters during render to hydrate cache. Mutations must update both live state and cache. Loading should be false when valid cached data is already displayed.
+- Cache/local persistence fixes: patch every data hook/store that owns the affected domain, not only the first one inspected. If the issue says courses, events, calendar, semester, profile, settings, or similar plural domains, each domain needs cache read, cache write, mutation persistence, and background refresh behavior where applicable.
+- Page/route feature: route registration, navigation/link entry, page component, data service call, loading/empty/error states, permission/status behavior, and tests/fixtures when nearby.
+- Parser/codegen: fix parser for the general grammar, add parser tests/fixtures, and update generated handlers/spec/schema outputs when the repo tracks generated artifacts. Do not stop at only the parser if checked-in outputs are expected.
+- Generated-output tasks: if the issue says regenerate, generated, OpenAPI, schema, route handlers, compiled docs, or tracked artifacts, run or inspect the existing generator command and update the tracked outputs in the same patch. Parser-only is incomplete when the acceptance criteria explicitly name generated files.
+- Bridge/FFI/mobile: preserve existing public methods by delegating to new option-bearing methods, update core client, FFI/binding declarations, platform wrapper, player/caller code, and fallback/retry behavior together.
+- Low-level kernels/native math: preserve dynamic shapes/strides, pass dimensions instead of hard-coding tile sizes, update host launch/signature/tests together, and verify indexing across M/N/K boundaries. Do not replace a general kernel with a visible-example-only shape.
+- Batch upload/file processing: validate array/file shape before processing, enforce limits before writes, compress/transform before upload when required, clean temp files on failure, update route/service/client flow, and add/adjust tests.
+- Package/library extraction: create source package, entrypoints, exports, config, docs/tests, and migrate consumers. Do not commit built dist/cache output unless explicitly requested.
+- Package/library extraction: copy or move the real shared source modules, create package entrypoints for components/hooks/styles/utils, wire peer dependencies and build config, and migrate at least the primary consumer imports. A package skeleton with only config/CSS is incomplete.
+- Reactive toolbar/focus/hover behavior: state must be shared between preview and creation/edit modes, event handlers must be wired at the element that actually receives focus/hover, CSS removal must be replaced with runtime state, and uniqueness keys must include enough context.
+- Project-local editor behavior: prefer the feature/project-local editor, canvas, shader, or page owner before changing a global core utility. Touch global core only when the issue is clearly cross-project or every local caller should change.
+- Keyboard/editor shortcuts: implement explicit modifier shortcuts only. Do not hijack plain typing keys like `c`, `x`, or `v`; preserve normal text input and browser/editor defaults unless the issue explicitly says otherwise. Paste/copy/cut flows must re-run existing parse/render/sync paths after clipboard actions.
+- Class extraction/refactor: preserve public fields, methods, constructor behavior, and status/id/name-like attributes expected by existing callers. If the task moves logic into a class/module, keep compatibility adapters or update every call site in the same patch.
+- Frontend integration closure: every new template/JSX binding must have matching state, setters, imports, handlers, and persistence/load paths. If you add a button/form field/menu item, wire the backing function and data round-trip in the same patch.
+- Full-stack user action: if the issue asks for visible actions, detail views, quick actions, admin screens, history, or status displays, implement the backend owner plus the route/service/client/UI consumer. Backend-only is incomplete unless the issue is explicitly backend-only.
+- Theme/style migration: keep behavior and data/API contracts stable. Change root theme provider/toggle only when requested, then update global styles and affected components. Do not rewrite unrelated business logic, database/API routes, props, or data fetching for a palette/layout task.
+
 ====================================================================
 INSPECTION STRATEGY
 ====================================================================
 
-Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
+Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then required sibling owner surfaces from the plan, then nearby tests, then call sites only if a signature/public API may change.
 
-Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, package-manager churn, project scaffolding, broad test suites before a targeted fix exists.
+
+Before editing, make the owner decision explicit in your head: "source of truth is X; consumers are Y/Z." Patch the source of truth first, then every consumer needed for the issue to actually work. Do not patch only the visible UI if persisted/shared behavior stays wrong. Do not patch only a caller if the reusable service still has the bug.
+
+For repeated UI instances, find the reusable section/block/card component before wiring page-local copies. Page-level edits are correct only when the behavior is genuinely scoped to that page; if two modes render the same component, the shared component/store is usually the owner.
 
 ====================================================================
 ROOT CAUSE RULE
 ====================================================================
 
-Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input -> fix parser. Serializer omits field -> fix serializer. Cache returns stale value -> fix invalidation. CLI option ignored -> fix option parsing. Validation rejects valid case -> fix validation rule, not caller workaround.
+Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input -> fix parser. Serializer omits field -> fix serializer. Cache returns stale value -> fix invalidation and refresh/persistence path. CLI option ignored -> fix option parsing. Validation rejects valid case -> fix validation rule, not caller workaround. Prompt-driven classification wrong -> fix prompt/example source and runtime boundary. UI toggle ineffective -> fix state owner, persistence, and component wiring.
 
 Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
 
-When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
+When several fixes are correct, choose the one that changes the smallest complete owner set, smallest owning functions, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious maintainer patch. A one-file patch that leaves required sibling behavior broken is not smaller; it is incomplete.
 
 ====================================================================
 SURGICAL EDITING
 ====================================================================
 
-Change the fewest lines necessary. Allowed: one-line substitution, small guarded block replacement, one narrow branch, focused companion-test update, required call-site updates when a signature change is unavoidable.
+Change the fewest lines necessary for the complete owner set. Allowed: one-line substitution, small guarded block replacement, one narrow branch, focused companion-test update, required call-site updates when a signature/schema/state change is unavoidable, and a required artifact file when the issue explicitly asks for one.
 
-Forbidden unless explicitly required: whole-file or whole-function rewrites when 1-5 lines suffice, formatting churn, whitespace/comment-only edits, code reordering, import sorting, renames for taste, new helpers/abstractions/files, dependency or lockfile changes, vendor/generated edits.
+Forbidden unless explicitly required: whole-file or whole-function rewrites when a narrow owner change suffices, formatting churn, whitespace/comment-only edits, code reordering, import sorting, renames for taste, new helpers/abstractions/files that do not reduce complexity, dependency or lockfile changes, vendor/generated edits, unrelated frontend/backend setup. Do create new source files/config/exports when the issue is an ARCHITECTURE extraction/migration task; do not create built `dist` output unless the issue explicitly says to commit generated artifacts.
 
 When editing with scripts, always guard replacements:
 
@@ -2101,9 +2754,13 @@ PY
 
 Use `sed -i 's/exact old/exact new/' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
 
-When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair, store+consumer, route+page, prompt+orchestrator, migration+client, service+test/fixture), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+
+Before final on JS/TS/Vue/React edits, scan the patch for every newly used identifier in templates/JSX and every changed method/property access. Each must resolve in the same component, import, composable/store, class, or preserved public API. Missing state/function definitions lose harder than a narrower but correct patch.
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
+
+Diff hygiene before final: inspect `git diff --stat` or the exact diff whenever the patch touches multiple files. If it creates many new project files, changes a package-manager artifact, touches generated/cache output, or shows mode-only churn, revert that scope unless the issue explicitly required it. Hidden judges strongly punish scaffold churn.
 
 ====================================================================
 TESTS AND VERIFICATION
@@ -2153,7 +2810,7 @@ FAILURE RECOVERY AND COMMAND ECONOMY
 
 If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
 
-A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + required owner siblings + nearest test, (3) apply ALL related edits together in ONE response, (4) focused `git diff --stat` or exact diff inspection when multi-file, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs, persistence, hidden edge cases, or explicit artifacts are at risk.
 
 ====================================================================
 FINAL ANSWER
@@ -2167,7 +2824,7 @@ Changed [file/function] to [brief root-cause fix]. Added/updated [test] if appli
 
 Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
 
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.'''
+You are producing the smallest complete owner-surface patch most likely to match the hidden reference and pass hidden validators. Build the requirement ledger, map the owner set, edit all required surfaces together, remove scope creep, verify narrowly, finish.'''
 
 _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
@@ -2183,6 +2840,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {preloaded_context}
 {_PRELOAD_END_MARKER}
 """
+    issue_lower = issue.lower()
+    scale_hint = ""
+    if any(hint in issue_lower for hint in _ARCHITECTURE_ISSUE_HINTS):
+        scale_hint = """
+Scale hint: the issue language suggests ARCHITECTURE scope. Do not stop at a narrow local patch if the task asks for extraction/package/library/migration/plugin/workspace/refactor/entrypoint/exports. Build the source package/config/exports and migrate consumers end-to-end, while avoiding generated output and package-manager artifacts.
+"""
 
     return f"""Fix this issue:
 
@@ -2192,15 +2855,25 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{scale_hint}
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions more harshly than a slightly larger but coherent owner-surface patch.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy:
+- Choose patch scale up front: MICRO, INTEGRATION, or ARCHITECTURE. If the issue says package/library/extract/migrate/plugin/workspace/exports/entrypoints/refactor, treat it as ARCHITECTURE and plan the full source package plus consumer migration.
+- Build a requirement ledger first. Include every bullet, "also", persistence/storage requirement, UI+state requirement, schema/data requirement, prompt/example requirement, and edge case.
+- Build an owner map. Identify the source of truth and required consumers; do not patch only the first visible symptom.
+- Edit the smallest COMPLETE owner set. One file is ideal only when one file truly owns the full behavior.
+- Honor exact requested filenames, extensions, exports, route paths, command names, and schema keys.
+- Prefer project-local feature owners over global core utilities unless the issue is clearly cross-project.
+- For UI/template edits, make sure every new binding/function/state value is defined and round-trips through the existing data owner.
+- For theme/style requests, preserve data/API/business logic unless the task explicitly asks for functional behavior changes.
+- Avoid generated/build output, package-manager artifacts, unrelated app scaffolds, and cosmetic churn. Required ARCHITECTURE source scaffolding is not churn.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the target code and owner siblings, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include EVERY independent edit command in the SAME response. Keep related files consistent in one pass.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+After patching, inspect the diff if it touches multiple files, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness, then finish with <final>...</final>.
 """
 
 
@@ -2259,14 +2932,62 @@ def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
+            "Your next command must edit the most likely owner file using what you already know from the issue and preloaded snippets. "
+            "If the requirement clearly spans sibling surfaces, include those edits in the same command. "
             "A precise sed or python -c is better than another grep. Stop exploring."
         )
     return (
         "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
+        "Your next command MUST make a code change to the owner surface — even a best-effort minimal edit to the most obvious location. "
+        "Do not read files, inspect status, or run tests until after a patch exists. "
         "Use `sed -i` or a python one-liner to make the targeted edit now."
+    )
+
+
+_INSPECTION_COMMAND_RE = re.compile(
+    r"^\s*(?:"
+    r"cat\b|"
+    r"sed\s+-n\b|"
+    r"grep\b|"
+    r"rg\b|"
+    r"find\b|"
+    r"ls\b|"
+    r"pwd\b|"
+    r"git\s+(?:status|diff|show|log|ls-files|grep)\b|"
+    r"head\b|"
+    r"tail\b|"
+    r"wc\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_inspection_command(command: str) -> bool:
+    stripped = command.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    edit_markers = (
+        " > ", ">>", "python - <<", "python3 - <<", "node - <<",
+        "sed -i", "perl -i", "apply_patch", "git apply", "mv ", "cp ",
+        "touch ", "mkdir ", "rm ", "npm run", "pytest", "go test", "cargo test",
+        "dotnet test", "mvn ", "gradle ", "pnpm ", "yarn ",
+    )
+    if any(marker in lowered for marker in edit_markers):
+        return False
+    return bool(_INSPECTION_COMMAND_RE.match(stripped))
+
+
+def build_inspection_loop_break_prompt(step: int, issue_text: str) -> str:
+    return (
+        f"Stop inspecting. You are at step {step} and there is still no patch.\n"
+        "Your previous command was another read/search command, which will forfeit the round on time. "
+        "Use the issue, preloaded snippets, and observations already present to make the best owner-surface edit now. "
+        "If several surfaces are explicitly required, edit them in the same response. "
+        "Do not run grep/sed/cat/status/diff again until after a real patch exists.\n\n"
+        "Task reminder:\n"
+        f"{issue_text[:1400]}\n\n"
+        "Emit one or more edit commands now."
     )
 
 
@@ -2279,24 +3000,49 @@ def build_polish_prompt(junk_summary: str) -> str:
     revert and what to keep.
     """
     return (
-        "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
+        "Scope cleanup pass — your draft contains changes that hurt diff quality or look outside the owner set:\n"
         f"  {junk_summary}\n\n"
-        "Revert ONLY those hunks (sed/cat/python to restore the original "
-        "lines). Do not add new edits, do not refactor, do not reorder "
-        "imports, do not touch unrelated lines.\n\n"
-        "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (the diff judge consistently penalises these as "
-        "'unrelated' or 'unnecessary churn'):\n"
+        "First decide whether each listed change is explicitly required by the issue. "
+        "If it is not required, revert ONLY that scope (sed/cat/python to restore "
+        "the original lines or remove the stray file). Do not add new features, "
+        "do not refactor, do not reorder imports, do not touch unrelated lines.\n\n"
+        "Specifically REMOVE the following kinds of edits unless the issue clearly "
+        "requires them. For ARCHITECTURE/package/migration tasks, keep required "
+        "source scaffolding/config/exports and consumer migration, but still remove generated output:\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
+        "  - Package-manager artifacts created by running install commands\n"
+        "  - Generated/cache output or whole project scaffolds\n"
         "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
         "  - Cosmetic refactors not asked for by the task\n\n"
-        "Keep substantive code changes. After cleanup, end with "
+        "Keep substantive owner-surface code changes. If a broad source package/migration "
+        "is explicitly required, keep it and only remove generated/cache/lock/cosmetic churn. "
+        "After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
         "patch as-is."
+    )
+
+
+def build_rewrite_risk_prompt(risk_summary: str, issue_text: str) -> str:
+    return (
+        "Rewrite-risk cleanup pass — your draft looks like a broad destructive rewrite, "
+        "but this task does not read like an architecture/extraction/migration request:\n"
+        f"  {risk_summary}\n\n"
+        "High-deletion rewrites often lose to the reference patch because they replace working "
+        "code instead of making the maintainer-sized owner fix. Before finalizing, reduce this "
+        "to the smallest complete patch that satisfies the issue.\n\n"
+        "Do this now:\n"
+        "1. Revert any over-edited file or block that was not explicitly required.\n"
+        "2. Re-apply only the narrow owner-surface changes needed for the issue.\n"
+        "3. Preserve public API, existing helpers, tests, fixtures, and unrelated behavior.\n"
+        "4. Run `git diff --stat`; if the patch is now tight, end with <final>summary</final>.\n\n"
+        "If the issue truly requires the large rewrite, keep it and explain why in <final>. "
+        "Otherwise use `git checkout -- path` or guarded python edits to restore and patch narrowly.\n\n"
+        "Task reminder:\n"
+        f"{issue_text[:1600]}\n"
     )
 
 
@@ -2309,13 +3055,14 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
-        "Coverage gap — the task explicitly mentions these path(s) but your "
+        "Explicit-path coverage gap — the task mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
+        "Do not finalize yet. Open each listed path now (cat -n or sed -n), "
+        "then issue the edit commands needed to satisfy the task for it. "
+        "If a listed path is an artifact the issue explicitly requested, create/update "
+        "that artifact in the same pass. If inspection proves no edit is required, "
+        "say why in the final summary after inspection. Do not start unrelated work.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2330,19 +3077,27 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
+        "Owner-surface self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
+        "  - Does the state/schema/prompt/service owner still agree with every consumer?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Are explicit paths/artifacts from the issue touched or deliberately inspected?\n"
+        "  - Are required sibling surfaces wired (route/page, store/consumer, schema/client, prompt/runtime, test/fixture)?\n"
+        "  - If this is package/extraction/migration work: are source entrypoints, exports, config, docs/tests, and consumers migrated end-to-end?\n"
+        "  - If this is parser/codegen work: are generated outputs/spec/schema updated when tracked?\n"
+        "  - If this is bridge/FFI/mobile work: are core client, bindings, platform wrapper, and old public APIs preserved?\n"
+        "  - If this is batch/file upload work: are array validation, limit checks, temp cleanup, backend route, and frontend flow correct?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No package-manager artifacts, generated output, cache files, or project scaffolds unless explicitly required\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
@@ -2381,14 +3136,40 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "the task are NOT clearly reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
         "For each one, decide:\n"
-        "  (a) you already addressed it but the keywords differ -> respond "
-        "with <final>summary</final> and explain why in the summary; OR\n"
-        "  (b) it really IS missing -> issue the additional <command> blocks "
-        "needed to satisfy it, then end with <final>summary</final>.\n\n"
-        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
-        "code. Add only what is required to cover the listed criteria.\n\n"
+        "  (a) already addressed by existing changed owner code but the keywords differ -> respond "
+        "with <final>summary</final> and explain the mapping; OR\n"
+        "  (b) truly missing -> issue the additional <command> blocks needed to satisfy it "
+        "in the owning source/state/schema/prompt/test surface, then end with <final>summary</final>.\n\n"
+        "This is a refinement turn, not a fresh investigation. Do not page through large files. "
+        "If a missing criterion points to a known component/service/platform file, use one compact "
+        "`rg -n` for the exact method/state names at most, then patch. Prefer editing from the "
+        "already observed context over spending turns on more reads.\n\n"
+        "Do NOT add unrelated scope. Do NOT rewrite working code. Add only what is required "
+        "to cover the listed criteria across the correct owner surface.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_scope_nudge_prompt(scope_summary: str, issue_text: str) -> str:
+    return (
+        "Integration-closure gap — the draft patch does not yet form a working owner-surface change:\n"
+        f"  {scope_summary}\n\n"
+        "Do not finalize yet. This is a late refinement turn; spend it closing the missing owner, not browsing. "
+        "If the missing file/surface is already known from the issue, plan, or previous observations, patch it now. "
+        "If you must locate an insertion point, run only one compact `rg -n` for exact symbols, then edit. "
+        "Do NOT walk a large file with repeated `sed -n` chunks.\n\n"
+        "Owner priority: "
+        "shared component before page copies, local project/editor before global core, "
+        "state/store before visible controls, API/service before client-only UI, "
+        "parser before generated/spec artifacts. Then make the smallest edit that closes the loop.\n\n"
+        "Hard rule: no half-wired UI or API. Every new template/JSX binding must have its state/function/import; "
+        "every changed public method must keep old callers working or update all call sites; "
+        "every new persisted/schema field must be loaded, saved, and displayed where requested.\n\n"
+        "Keep this targeted: do not add unrelated scaffolds or generated/cache output. "
+        "After the additional edits, run the most relevant targeted verification and end with <final>summary</final>.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1800]}\n"
     )
 
 
@@ -2658,9 +3439,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    static_fix_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    scope_nudges_used = 0
+    rewrite_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2695,18 +3479,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
+            1. polish — drop low-signal or broad-scope hunks the model still emitted
+            2. coverage-nudge — name issue-mentioned paths still untouched
+            3. criteria-nudge — name issue acceptance bullets not addressed
+            4. syntax — quote any parser error back at the model
+            5. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
             6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
+        Each refinement runs at most once per cycle. Coverage/criteria fire
+        early because many losing patches are runnable but incomplete. Syntax
+        and companion tests still run before the final generic self-check.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, static_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, scope_nudges_used, rewrite_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2724,12 +3508,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        # Syntax/static correctness beats every broad completion heuristic.
+        # A syntactically broken patch loses even when it touches the right
+        # files, so do not let the refinement cap suppress parse repairs.
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if static_fix_turns_used < 1:
+            static_failure = _select_static_check_failure(repo, patch)
+            if static_failure is not None:
+                command, output = static_failure
+                static_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_static_fix_prompt(command, output),
+                    f"STATIC_FIX_QUEUED:\n  {command}",
+                )
+                return True
+
+        # Hard-stop broad/completion refinements if we've already used the cap
+        # (hail-mary and syntax/static repairs don't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
+        # Allow completion nudges until the true reserve is near. Previous
+        # threshold was too conservative: it accepted incomplete patches with
+        # 40-60s left, exactly when a single missing owner edit could win.
+        allow_broad_refinement = time_remaining() > 35.0
+
+        if allow_broad_refinement and polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
@@ -2741,41 +3556,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
+        if allow_broad_refinement and rewrite_nudges_used < MAX_REWRITE_NUDGES:
+            rewrite_risk = _rewrite_risk_summary(patch, issue)
+            if rewrite_risk:
+                rewrite_nudges_used += 1
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                    build_rewrite_risk_prompt(rewrite_risk, issue),
+                    "REWRITE_RISK_QUEUED:\n  " + rewrite_risk,
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+        if allow_broad_refinement and coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
             if missing:
                 coverage_nudges_used += 1
@@ -2787,13 +3580,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+        if allow_broad_refinement and scope_nudges_used < MAX_SCOPE_NUDGES:
+            scope_summary = _scope_gap_summary(patch, issue)
+            if scope_summary:
+                scope_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_scope_nudge_prompt(scope_summary, issue),
+                    "SCOPE_NUDGE_QUEUED:\n  " + scope_summary,
+                )
+                return True
+
+        if allow_broad_refinement and criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
@@ -2802,6 +3601,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # Runtime correctness signal: if any edited file has a partner test
+        # that actually fails, surface the failure tail to the model as one
+        # bounded fix turn.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
 
@@ -2938,6 +3753,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_no_command_repair_prompt()})
                 continue
 
+            if (
+                not get_patch(repo).strip()
+                and step >= 4
+                and all(_is_pure_inspection_command(command) for command in commands[:MAX_COMMANDS_PER_RESPONSE])
+            ):
+                logs.append(
+                    "\nINSPECTION_LOOP_BREAK:\nNo patch exists and model issued only read/search commands; "
+                    "skipping execution and forcing an edit turn."
+                )
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": build_inspection_loop_break_prompt(step, issue)})
+                continue
+
             consecutive_no_command = 0
             messages.append({"role": "assistant", "content": response_text})
             observations: List[str] = []
@@ -3012,7 +3840,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not get_patch(repo).strip() and step in {2, 3, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
