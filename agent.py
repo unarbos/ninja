@@ -127,16 +127,24 @@ MAX_DEAD_HELPER_TURNS = 1
 MAX_LINT_TURNS = 1
 MAX_DELIVERABLE_TURNS = 1
 MAX_FRONTEND_GAP_TURNS = 1
-# Cap at 5, not 2. The king's original cap=2 was calibrated against ~8 gates
-# (25% of gates allowed to fire per task). The current chain has ~19 gates;
-# holding cap=2 starves 17 of them and leaves only ~10% effective capacity,
-# which is why per-task patches were thin on the gates added after the king's
-# baseline. Cap=5 restores the original ~26% gate-firing ratio (5/19) without
-# crossing into the empirically-flagged 5-7 danger band: 5 sits at the *lower*
-# edge of that band, and per-turn cost is bounded by the 120s round budget
-# (challenger_agent_timeout_seconds in the duel JSON) minus the initial solve
-# and hail-mary reserve. Raising beyond 5 (closer to 7) consumes the full
-# 120s budget in worst-case chains and triggers time_limit_exceeded.
+# Cap at 5 is PROVISIONAL — has not been validated against measured wall-clock.
+#
+# What we have: structural reasoning (king's cap=2 was calibrated for ~8
+# gates ≈ 25% capacity; with ~19 gates today, cap=2 leaves ~10% capacity,
+# starving most new gates) and the 120s per-round budget exposed as
+# challenger_agent_timeout_seconds in the duel JSON.
+#
+# What we DON'T have: empirical per-refinement-turn wall-clock cost, real
+# refinement-turn count distribution, or a measured timeout-rate comparison
+# between cap=2 and cap=5. The "5-7 blows budget" note in the solve loop is
+# observational from an earlier author, not from a controlled measurement.
+#
+# To replace this comment with measured numbers: each solve() run emits
+# REFINEMENT_TURN_TIMING log lines (see queue_refinement_turn). Aggregate
+# them across a representative task batch to derive the actual per-turn cost
+# and the worst-case chain length; if cap=5 routinely consumes the budget,
+# revert to cap=2 or cap=3. Until then this value is a judgement call, not
+# a measurement, and should be treated as such.
 MAX_TOTAL_REFINEMENT_TURNS = 5  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # cap detected-style block; oversized style hints crowd out actual code context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
@@ -3572,7 +3580,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         prompt_text: str,
         marker: str,
     ) -> None:
-        """Append assistant + corrective user message and journal it."""
+        """Append assistant + corrective user message and journal it.
+
+        Emits a REFINEMENT_TURN_TIMING log line capturing wall-clock at queue
+        time. The delta between successive entries is the cost of one
+        refinement turn (model round-trip plus tool exec on the next step).
+        Used to empirically validate MAX_TOTAL_REFINEMENT_TURNS — grep
+        ``REFINEMENT_TURN_TIMING`` out of the logs from a real solve and
+        derive the actual per-turn budget consumption.
+        """
+        _elapsed = time.monotonic() - solve_started_at
+        _gate = marker.split(":", 1)[0].strip() if ":" in marker else marker.strip()[:32]
+        logs.append(
+            f"REFINEMENT_TURN_TIMING: total_turn={total_refinement_turns_used} "
+            f"elapsed_s={_elapsed:.2f} gate={_gate}\n"
+        )
         logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
