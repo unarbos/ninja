@@ -125,8 +125,7 @@ MAX_CORRUPTION_TURNS = 1   # remove leaked heredoc/control markers from source
 MAX_CONTRACT_NUDGES = 1    # catch route/import/rename propagation gaps
 MAX_DELIVERABLE_NUDGES = 1  # catch named files/modules from issue not touched
 MAX_UI_BINDING_NUDGES = 1  # catch stale UI selectors/actions after visible UI edits
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1466,12 +1465,7 @@ def _check_corruption(patch: str) -> List[str]:
 
 
 def _hazard_review_summary(patch: str) -> str:
-    """Spot cheap-to-fix patch hazards before the final self-check.
-
-    Examples: generated/binary churn, malformed component insertion, parsers
-    that only split on blank lines, UI actions that only toggle a dialog flag,
-    or fallback code that both resets state and still reports an error.
-    """
+    """Spot cheap-to-fix patch hazards before the final self-check."""
     if not patch.strip():
         return ""
 
@@ -1497,11 +1491,6 @@ def _hazard_review_summary(patch: str) -> str:
             notes.append(f"{path}: line parser appears to require blank-line separators; verify normal single-newline records still parse")
         if re.search(r"\b(error|err)\.message\b", added_text) and re.search(r"\b(res\.json|json\s*\(|return\s+)", added_text):
             notes.append(f"{path}: raw internal error message appears in an API/client response")
-        if re.search(r"\bsetShow[A-Za-z0-9_]*\s*\(\s*true\s*\)|\bset(?:Open|Visible|Modal|Dialog)\s*\(\s*true\s*\)", added_text):
-            has_visible_surface = re.search(r"<(?:Modal|Dialog|Confirm|Alert|Form|Sheet|Drawer)\b|show[A-Za-z0-9_]*\s*&&|open=\{|visible=\{", added_text)
-            has_completion = re.search(r"\b(?:dispatch|onConfirm|onSubmit|handleSubmit|fetch|axios|mutate|delete|remove|save|create|update)\b", added_text)
-            if not (has_visible_surface and has_completion):
-                notes.append(f"{path}: UI action toggles state but lacks visible confirmation/form plus completion handler")
         if re.search(r"\b(?:catch|except|onError|parse\s*failure|parse\s*error|fallback)\b", added_text, re.IGNORECASE):
             if re.search(r"\b(?:empty|initial|default|reset|fallback)\b", added_text, re.IGNORECASE) and re.search(r"\b(?:throw|raise|error\(|setError|st\.error|alert)\b", added_text):
                 notes.append(f"{path}: fallback path both resets state and surfaces an error; verify graceful fallback semantics")
@@ -2690,12 +2679,7 @@ _BACKEND_EXTS = {".py", ".java", ".kt", ".go", ".rb", ".php", ".rs", ".cs"}
 
 
 def _ui_binding_gap_summary(patch: str, issue_text: str) -> str:
-    """Find visible UI edits whose state/action/selector binding may be stale.
-
-    Examples: dispatch used without a context binding, a new collection rendered
-    without definition/import, or a style key used without a matching style
-    definition.
-    """
+    """Find visible UI edits whose state/action/selector binding may be stale."""
     if not patch.strip():
         return ""
     notes: List[str] = []
@@ -3479,8 +3463,7 @@ def build_hazard_review_prompt(hazard_summary: str, issue_text: str) -> str:
         "PID/port fallbacks, and timeout semantics. For frontend/browser code "
         "guard browser globals, avoid exposing secret/hash fields, and avoid "
         "timezone-shifting local date logic. For data algorithms preserve "
-        "initialization order, paired-input state, and normal single-record parsing. "
-        "For fallback/error handling, either recover silently with complete canonical empty state or report the error intentionally, not both by accident. Do not add unrelated scope.\n\n"
+        "initialization order, paired-input state, and normal single-record parsing. Do not add unrelated scope.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
