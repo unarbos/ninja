@@ -122,14 +122,20 @@ MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_CONTRACT_TURNS = 1
 MAX_PATCH_SAFETY_TURNS = 1
 MAX_FAILED_VERIFICATION_FIX_TURNS = 1
+MAX_CASCADE_TURNS = 1
+MAX_CRITICAL_TAG_TURNS = 1
 MAX_TOTAL_REFINEMENT_TURNS = 4  # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 _CONTRACT_GREP_TIMEOUT_SECONDS = 8
 _CONTRACT_MAX_FINDINGS = 4
+_CASCADE_GREP_TIMEOUT_SECONDS = 6
+_CASCADE_MAX_FINDINGS = 4
+_CASCADE_MAX_NAMES = 6
 _CONTRACT_NAME_DENYLIST = frozenset({
     "default", "main", "index", "module", "exports",
     "describe", "test", "it", "expect", "beforeEach", "afterEach",
     "True", "False", "None", "self", "cls",
+    "as", "from", "type", "import", "return", "function",
 })
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -615,6 +621,14 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         )
         if mode_only:
             continue
+        if (
+            block.startswith("diff --git ")
+            and "\nold mode " in block
+            and "\nnew mode " in block
+            and "\n@@ " in block
+        ):
+            block = re.sub(r"^old mode \d+\n", "", block, count=1, flags=re.MULTILINE)
+            block = re.sub(r"^new mode \d+\n", "", block, count=1, flags=re.MULTILINE)
         kept.append(block)
 
     result = "".join(kept)
@@ -1528,7 +1542,7 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
     findings: List[str] = list(_extract_duplicate_imports(patch))
     if len(findings) >= _CONTRACT_MAX_FINDINGS:
         return findings
-    names = _extract_removed_public_symbol_names(patch)
+    names = _extract_removed_public_symbol_names(patch)[:8]
     if not names:
         return findings
     changed_paths = set(_patch_changed_files(patch))
@@ -1564,6 +1578,106 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
     return findings
 
 
+_SIGNATURE_LINE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\b(?:def|class)\s+([A-Za-z_][\w]*)\s*\("),
+    re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\("),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?\("),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\("),
+)
+
+
+def _changed_signature_names(patch: str) -> List[str]:
+    plus_names: set = set()
+    minus_names: set = set()
+    for line in patch.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            content = line[1:]
+            target = plus_names
+        elif line.startswith("-"):
+            content = line[1:]
+            target = minus_names
+        else:
+            continue
+        for pattern in _SIGNATURE_LINE_PATTERNS:
+            m = pattern.search(content)
+            if m:
+                name = m.group(1)
+                if name and name not in _CONTRACT_NAME_DENYLIST:
+                    target.add(name)
+    return sorted(plus_names & minus_names)[:_CASCADE_MAX_NAMES]
+
+
+def _cascade_gap_summary(repo: Path, patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    names = _changed_signature_names(patch)
+    if not names:
+        return []
+    changed_paths = set(_patch_changed_files(patch))
+    findings: List[str] = []
+    for name in names:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "--name-only", "-E", "--", rf"\b{re.escape(name)}\("],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CASCADE_GREP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for hit in proc.stdout.splitlines():
+            relative_path = hit.strip()
+            if not relative_path or relative_path in changed_paths:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            callers.append(relative_path)
+            if len(callers) >= 3:
+                break
+        if callers:
+            findings.append(f"{name}(...): callers in {', '.join(callers[:3])}")
+            if len(findings) >= _CASCADE_MAX_FINDINGS:
+                break
+    return findings
+
+
+_CRITICAL_CLOSING_TAGS: Tuple[str, ...] = (
+    "</template>", "</script>", "</style>",
+    "</html>", "</body>", "</head>",
+    "</main>", "</nav>", "</footer>",
+)
+
+
+def _critical_tag_removal_summary(patch: str) -> List[str]:
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for tag in _CRITICAL_CLOSING_TAGS:
+        added = 0
+        removed = 0
+        for line in patch.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if tag in line:
+                if line.startswith("+"):
+                    added += 1
+                elif line.startswith("-"):
+                    removed += 1
+        if removed > added:
+            findings.append(f"net removal of {tag} ({removed} removed, {added} added)")
+            if len(findings) >= 4:
+                break
+    return findings
+
+
 _PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
     re.compile(r"^\+(?!\+\+).*grader", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\+(?!\+\+).*scoring\s+rubric", re.IGNORECASE | re.MULTILINE),
@@ -1572,9 +1686,22 @@ _PATCH_SAFETY_PATTERNS: Tuple["re.Pattern[str]", ...] = (
     re.compile(r"^\+(?!\+\+).*judge\s+(?:model|prompt|rubric)", re.IGNORECASE | re.MULTILINE),
 )
 
+_PATCH_SAFETY_TRIGGER_TOKENS: Tuple[str, ...] = (
+    "grader", "scoring rubric", "reference patch",
+    "oracle answer", "oracle solution", "oracle patch",
+    "judge model", "judge prompt", "judge rubric",
+)
 
-def _patch_safety_gap_summary(patch: str) -> List[str]:
+
+def _issue_invokes_patch_safety_terms(issue_text: str) -> bool:
+    lowered = issue_text.lower()
+    return any(tok in lowered for tok in _PATCH_SAFETY_TRIGGER_TOKENS)
+
+
+def _patch_safety_gap_summary(patch: str, issue_text: str = "") -> List[str]:
     if not patch.strip():
+        return []
+    if issue_text and _issue_invokes_patch_safety_terms(issue_text):
         return []
     hits: List[str] = []
     for pattern in _PATCH_SAFETY_PATTERNS:
@@ -1590,33 +1717,35 @@ _FAILED_VERIFICATION_CMD_RE = re.compile(
     r"\b(pytest|npm\s+(?:run\s+)?(?:test|build|lint|typecheck)|"
     r"yarn\s+(?:test|build|lint|typecheck)|jest|vitest|mocha|"
     r"tsc(?:\s|$)|node\s+--check|"
-    r"python\s+-m\s+(?:pytest|unittest|mypy|compileall)|"
+    r"python3?\s+-m\s+(?:pytest|unittest|mypy|compileall)|"
     r"ruff\s+check|eslint|prettier\s+--check|"
     r"go\s+(?:test|build|vet)|cargo\s+(?:test|build|check)|"
     r"make\s+(?:test|check)|mvn\s+test|gradle\s+(?:test|build))\b"
+)
+
+_OBSERVATION_BLOCK_RE = re.compile(
+    r"COMMAND:\n(?P<cmd>.+?)\n+EXIT_CODE:\n(?P<exit>-?\d+).*?"
+    r"(?:STDOUT:\n(?P<stdout>.*?))?"
+    r"(?:\n+STDERR:\n(?P<stderr>.*?))?"
+    r"(?=\n(?:OBSERVATION \d+/\d+:|===== STEP \d+ =====|\Z))",
+    re.DOTALL,
 )
 
 
 def _last_failed_verification_in_logs(logs_buffer: List[str]) -> Optional[Tuple[str, str]]:
     joined = "".join(logs_buffer)
     last_match: Optional[Tuple[str, str]] = None
-    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", joined):
-        cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
-        exit_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
-        if not cmd_match or not exit_match:
+    for m in _OBSERVATION_BLOCK_RE.finditer(joined):
+        if m.group("exit") == "0":
             continue
-        if exit_match.group(1) == "0":
-            continue
-        cmd = cmd_match.group(1).strip()
+        cmd = (m.group("cmd") or "").strip()
         if not _FAILED_VERIFICATION_CMD_RE.search(cmd):
             continue
-        stdout_match = re.search(r"STDOUT:\n(.*?)(?=\n[A-Z_]+:\n|\Z)", chunk, re.DOTALL)
-        stderr_match = re.search(r"STDERR:\n(.*?)(?=\n[A-Z_]+:\n|\Z)", chunk, re.DOTALL)
         tail_parts: List[str] = []
-        if stdout_match:
-            tail_parts.append(stdout_match.group(1).strip())
-        if stderr_match:
-            tail_parts.append(stderr_match.group(1).strip())
+        if m.group("stdout"):
+            tail_parts.append(m.group("stdout").strip())
+        if m.group("stderr"):
+            tail_parts.append(m.group("stderr").strip())
         tail = "\n".join(p for p in tail_parts if p)[-1800:]
         last_match = (cmd[:200], tail)
     return last_match
@@ -2790,6 +2919,31 @@ def build_patch_safety_prompt(hits: List[str]) -> str:
     )
 
 
+def build_cascade_gap_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch modifies the signature of functions/methods that have "
+        "callers in files you did NOT touch:\n\n"
+        f"{body}\n\n"
+        "Either update each listed caller to match the new signature, or "
+        "restore a compatibility wrapper at the old signature that delegates "
+        "to the new one. Do not introduce unrelated behavior. Emit the "
+        "minimal <command> block(s), then end with <final>done</final>."
+    )
+
+
+def build_critical_tag_prompt(findings: List[str]) -> str:
+    body = "\n".join(f"  - {f}" for f in findings)
+    return (
+        "Your patch removes structural closing tags without re-adding them, "
+        "which will break template/markup parsing:\n\n"
+        f"{body}\n\n"
+        "Add back the missing closing tags in the correct place, or check "
+        "that the surrounding hunks already provide the closing tag in a "
+        "different shape. Then end with <final>done</final>."
+    )
+
+
 def build_failed_verification_prompt(command: str, output_tail: str) -> str:
     tail = output_tail[-1500:] if len(output_tail) > 1500 else output_tail
     return (
@@ -3060,18 +3214,15 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _issue = kwargs.get("issue", "")
-        _unaddressed1 = _unaddressed_criteria(_patch1, _issue) if _patch1.strip() else []
+        _unaddressed1 = _unaddressed_criteria(_patch1, _issue)
         _result2 = _solve_attempt(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
-        _unaddressed2 = _unaddressed_criteria(_patch2, _issue) if _patch2.strip() else []
+        _unaddressed2 = _unaddressed_criteria(_patch2, _issue)
 
-        # Quality-aware tiebreak: prefer attempt 2 when it addresses MORE issue
-        # bullets, or when bullets tie and it has at least as many substantive
-        # lines. Falls back to line-count rule when no extractable bullets.
         _u1 = len(_unaddressed1)
         _u2 = len(_unaddressed2)
-        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 >= _n1)
+        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 > _n1 and _u1 > 0)
 
         if _retry_wins:
             _result2["multishot_attempts"] = 2
@@ -3137,6 +3288,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     contract_turns_used = 0
     patch_safety_turns_used = 0
     failed_verification_turns_used = 0
+    cascade_turns_used = 0
+    critical_tag_turns_used = 0
     total_refinement_turns_used = 0  # cap total refinement turns across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
@@ -3181,7 +3334,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, contract_turns_used, patch_safety_turns_used, failed_verification_turns_used, cascade_turns_used, critical_tag_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -3251,7 +3404,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if patch_safety_turns_used < MAX_PATCH_SAFETY_TURNS:
-            safety_hits = _patch_safety_gap_summary(patch)
+            safety_hits = _patch_safety_gap_summary(patch, issue)
             if safety_hits:
                 patch_safety_turns_used += 1
                 total_refinement_turns_used += 1
@@ -3271,6 +3424,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_contract_preservation_prompt(contract_findings),
                     "CONTRACT_QUEUED:\n  " + " | ".join(f[:80] for f in contract_findings[:3]),
+                )
+                return True
+
+        if failed_verification_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS:
+            failed = _last_failed_verification_in_logs(logs)
+            if failed is not None:
+                failed_cmd, failed_tail = failed
+                failed_verification_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_failed_verification_prompt(failed_cmd, failed_tail),
+                    "FAILED_VERIFICATION_QUEUED:\n  " + failed_cmd[:120],
+                )
+                return True
+
+        if cascade_turns_used < MAX_CASCADE_TURNS:
+            cascade_findings = _cascade_gap_summary(repo, patch)
+            if cascade_findings:
+                cascade_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cascade_gap_prompt(cascade_findings),
+                    "CASCADE_QUEUED:\n  " + " | ".join(f[:80] for f in cascade_findings[:3]),
+                )
+                return True
+
+        if critical_tag_turns_used < MAX_CRITICAL_TAG_TURNS:
+            tag_findings = _critical_tag_removal_summary(patch)
+            if tag_findings:
+                critical_tag_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_critical_tag_prompt(tag_findings),
+                    "CRITICAL_TAG_QUEUED:\n  " + " | ".join(f[:80] for f in tag_findings[:3]),
                 )
                 return True
 
@@ -3337,19 +3527,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_dependency_nudge_prompt(dependency_summary, issue),
                     "DEPENDENCY_NUDGE_QUEUED:\n  " + dependency_summary[:120],
-                )
-                return True
-
-        if failed_verification_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS:
-            failed = _last_failed_verification_in_logs(logs)
-            if failed is not None:
-                failed_cmd, failed_tail = failed
-                failed_verification_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_failed_verification_prompt(failed_cmd, failed_tail),
-                    "FAILED_VERIFICATION_QUEUED:\n  " + failed_cmd[:120],
                 )
                 return True
 
