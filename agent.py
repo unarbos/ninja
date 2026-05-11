@@ -873,7 +873,12 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
 
 def _preload_needles(issue: str) -> List[str]:
-    """Deduped needles for issue-aware snippets: symbols, path stems, terms."""
+    """Build a deduped needle list for issue-aware partial file loading.
+
+    Order: explicit identifiers (`_extract_issue_symbols`) first since they
+    are the strongest signal, then file-stem mentions (so `foo.py` in the
+    issue picks out lines referencing `foo`), then general issue terms.
+    """
     out: List[str] = []
     seen: set = set()
 
@@ -899,15 +904,13 @@ def _preload_needles(issue: str) -> List[str]:
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
-_BACKTICK_PATH_HITS_MAX = 5
+_BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
+                              # dozens of unrelated files — only treat as
+                              # "mentioned" when an identifier picks out a
+                              # specific small handful in the tracked set.
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
-    """Rank tracked implementation files for relevance to the issue.
-
-    Companion tests are merged in later by `build_preloaded_context` so this
-    ranker stays source-centric and top-K is not dominated by test paths.
-    """
     tracked = _tracked_files(repo)
     if not tracked:
         return []
@@ -921,6 +924,13 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
+    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
+    # `email_notificacoes`) are deliberate signals from the task author about
+    # the code surface that matters. When they pick out a small specific set
+    # of tracked files by path-substring, treat those files as explicit
+    # mentions so they get the same +100 ranking boost as path-mentioned
+    # files. Skipped when the identifier matches too many files (filters out
+    # generic identifiers like `basic.py` or `any2txt`).
     seen_mentioned = set(mentioned)
     for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
@@ -930,7 +940,9 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
                     mentioned.append(m)
                     seen_mentioned.add(m)
 
-    # Tracebacks in the issue: boost matching paths (deepest frame strongest) and symbols.
+    # Traceback paste in the issue body: promote matching tracked paths (deepest
+    # frame gets the strongest score bump) and fold extracted function symbols
+    # into the same term pool used for path-substring scoring.
     trace_paths, trace_symbols = _extract_traceback_paths_and_symbols(issue)
     trace_path_score: Dict[str, int] = {}
     if trace_paths:
@@ -1064,7 +1076,11 @@ _TRACE_NODE_INTERNAL_PREFIXES = (
 def _extract_traceback_paths_and_symbols(
     issue: str
 ) -> Tuple[List[str], List[str]]:
-    """(paths, symbols) from tracebacks in the issue; stdlib/vendor frames dropped."""
+    """Return (ordered paths, function/symbol names) from tracebacks in the issue.
+
+    Stdlib / vendored frames are filtered so application paths and symbols feed
+    preload ranking without noise from site-packages, node_modules, etc.
+    """
     paths: List[str] = []
     seen_paths: set[str] = set()
     symbols: List[str] = []
@@ -1145,10 +1161,12 @@ def _read_context_file(
     max_chars: int,
     needles: Optional[List[str]] = None,
 ) -> str:
-    """Read a tracked text file from `repo`.
+    """Read a tracked file, optionally returning only issue-relevant windows.
 
-    With `needles` and large files, returns merged windows around hits; otherwise
-    head/tail truncation via `_truncate`.
+    When `needles` is provided and the file is larger than `max_chars`, we
+    extract regions around lines that match any needle (case-insensitive
+    substring) plus a few lines of context, instead of head/tail truncation.
+    Falls back to `_truncate` when no needles match or the file already fits.
     """
     path = (repo / relative_path).resolve()
     try:
@@ -1175,7 +1193,14 @@ def _extract_relevant_regions(
     ctx_before: int = 8,
     ctx_after: int = 12,
 ) -> str:
-    """Merged line windows around needle hits, else truncate."""
+    """Return windows around lines matching any needle, capped at `max_chars`.
+
+    When the file already fits within `max_chars`, the whole file is returned
+    verbatim. When no needles match, fall back to `_truncate` (head/tail
+    summary). Otherwise produce a concatenation of merged windows around each
+    matching line, prefixed with line-range headers so the model can reason
+    about location.
+    """
     if not text:
         return text
     if len(text) <= max_chars:
@@ -1411,13 +1436,16 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# Naive delimiter scan for `_check_syntax` (see ``brace_balance_fixtures_verify.py``);
-# skips some C++/JS/Swift raw-template patterns that false-positive.
+# Brace / delimiter balance for `_check_syntax`: stack-based lexer with //, /* */,
+# "", '', and Go-style `` ` `` raw spans. See ``brace_balance_fixtures_verify.py``.
+# `_should_skip_naive_brace_scan` avoids some C++ raw-string / JS template /
+# Swift raw-string shapes that false-positive. Suffix allowlist is
+# `_BRACE_BALANCE_SUFFIXES` (orthogonal to language-specific parsers above).
 _CXX_RAW_LITERAL_START = re.compile(r'R"[^"]*\(')
 _JS_TEMPLATE_INTERP_START = re.compile(r"`[\s\S]*?\$\{")
 _SWIFT_RAW_STRING_HINT = re.compile(r'#+"')
 
-_BRACE_LANG_SUFFIXES = frozenset(
+_BRACE_BALANCE_SUFFIXES = frozenset(
     {
         ".java",
         ".go",
@@ -1558,8 +1586,13 @@ def _delimiter_balance_error(source: str) -> Optional[Tuple[int, str]]:
 
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Cheap delimiter balance when no parser ran for this suffix.
+
+    Best-effort comment/string skipping via `_delimiter_balance_error`; skipped
+    entirely when `_should_skip_naive_brace_scan` matches known lexer blind spots.
+    """
     suffix = Path(relative_path).suffix.lower()
-    if suffix not in _BRACE_LANG_SUFFIXES:
+    if suffix not in _BRACE_BALANCE_SUFFIXES:
         return None
     full = (repo / relative_path).resolve()
     try:
@@ -1584,6 +1617,9 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
+#
+# Per touched file: cheapest parse check available (Python ast, node --check,
+# json.loads) plus `_check_brace_balance_one` for suffixes in `_BRACE_BALANCE_SUFFIXES`.
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
@@ -1647,7 +1683,12 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
-    """Parse checks + naive delimiter balance on touched files; list of errors."""
+    """Best-effort multi-language syntax check on touched files.
+
+    Returns a flat list of error strings. An empty list means every file we
+    know how to check parsed or had no checker; unsupported languages skip here.
+    `_check_brace_balance_one` adds delimiter balance for configured suffixes.
+    """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
@@ -1917,7 +1958,12 @@ def _select_companion_test_failure(
     patch: str,
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
-    """First failing companion test for an edited file, or None."""
+    """For files touched by the patch, find the first companion test that fails.
+
+    Returns (test_path, output_tail) on the first non-None failure, else None.
+    Stops at the first failure to keep the refinement budget tight (one fix
+    turn maximum per cycle).
+    """
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -1935,7 +1981,12 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """Optional small recent commit diffs for preload, or empty string."""
+    """Recent small-diff commits from ``git log`` / ``git show`` for preload.
+
+    Returns "" when history is too shallow or commands fail. Uses
+    ``--pretty=format:`` on ``git show`` so headers do not mix into the diff
+    body (see NOTE before the ``git show`` call in the loop).
+    """
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1973,6 +2024,13 @@ def _recent_commit_examples(repo: Path) -> str:
                     break
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
+            # NOTE: previous version passed --pretty=format:%s which caused
+            # `git show` to emit the commit subject in place of the standard
+            # header but git still appended the diff. After the >=100 char
+            # filter the only commits that survived were those with very long
+            # subjects (e.g. squash messages); their wrapped output was a mix
+            # of subject + diff, which is noise. --pretty=format: empties the
+            # header entirely so we keep just the diff body.
             diff_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -2016,6 +2074,12 @@ _CRITERIA_STOP = frozenset({
 
 
 def _extract_acceptance_criteria(issue: str) -> List[str]:
+    """Pull acceptance-criterion checkpoints from the issue text.
+
+    Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
+    `•`) first; fallback to imperative sentences (must/should/implement/add/
+    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
+    so the nudge prompt stays compact."""
     if not issue:
         return []
     bullets: List[str] = []
@@ -2346,7 +2410,14 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """Swap the HTML preloaded snippet block for a short breadcrumb (saves tokens)."""
+    """Replace the bulky preloaded snippet block with a short breadcrumb.
+
+    Triggered after step 4 to free token budget for later iterations: the
+    model has already seen the snippets in earlier turns and only needs to
+    know which files were preloaded (and which it has already touched) so it
+    can re-open them on demand instead of re-reading the whole block on
+    every request.
+    """
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -2573,7 +2644,7 @@ After patching, run the most targeted test available (`pytest tests/test_X.py -x
 
 
 def _build_planning_user_message(repo: Path, issue_text: str, repo_summary: str, preloaded_context: str) -> str:
-    """Initial user message with multi-file / language hints."""
+    """First user message: base prompt plus multi-file / language strategy lines."""
     base = build_initial_user_prompt(issue_text, repo_summary, preloaded_context)
     multi_file = _detect_multi_file_task(issue_text)
     lang_block = ""
@@ -2626,7 +2697,11 @@ def build_budget_pressure_prompt(step: int) -> str:
 
 
 def build_polish_prompt(junk_summary: str) -> str:
-    """Prompt to drop low-signal hunks."""
+    """Ask the model to revert specific low-signal hunks before final.
+
+    Be explicit about which classes of edits count as scope creep so the model
+    knows what to revert and what to keep.
+    """
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
         f"  {junk_summary}\n\n"
@@ -2649,7 +2724,7 @@ def build_polish_prompt(junk_summary: str) -> str:
 
 
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
-    """Nudge for issue paths not yet in the patch."""
+    """Tell the model which issue-mentioned paths are still untouched."""
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
         "Coverage gap — the task explicitly mentions these path(s) but your "
@@ -2666,7 +2741,7 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
 
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
-    """Nudge for criteria not reflected in the patch."""
+    """Tell the model which acceptance-criteria checkpoints look unaddressed."""
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
         "Criterion-coverage gap — these acceptance-criterion checkpoints from "
@@ -2685,7 +2760,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
 
 
 def build_hail_mary_prompt(issue_text: str) -> str:
-    """Force a minimal edit when the patch is still empty."""
+    """Last-resort instruction when all refinement turns still yielded no patch."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
         "Refinement did not produce an on-disk code change yet. You still need at least "
@@ -2700,7 +2775,7 @@ def build_hail_mary_prompt(issue_text: str) -> str:
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Self-review of draft vs issue."""
+    """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 4000
@@ -2734,7 +2809,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
-    """Syntax errors → minimal fix."""
+    """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
         f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
@@ -2745,7 +2820,7 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 
 
 def build_lint_fix_prompt(errors: List[str]) -> str:
-    """Lint-only fix prompt."""
+    """Ask for minimal lint-only fixes (ruff/eslint), no behaviour change."""
     body = "\n".join(f"  - {e}" for e in errors[:6])
     return (
         "Lint issues were found in your patch. Keep changes lint-clean where project tooling enforces it:\n\n"
@@ -2757,7 +2832,11 @@ def build_lint_fix_prompt(errors: List[str]) -> str:
 
 
 def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """Companion test failure → one fix turn."""
+    """When the companion-test gate fails, hand the model the exact failure tail.
+
+    Pairs with `_run_companion_test`. The model gets one fix turn to extend
+    the source patch or update the stale test, then must finalize.
+    """
     tail = output[-2400:] if len(output) > 2400 else output
     return (
         f"Companion test is failing after your patch: `{test_path}`.\n\n"
@@ -3072,9 +3151,12 @@ def solve(
     """
     Main portable interface for validators.
 
-    `_solve_with_safety_net`: on unexpected exception from the multishot body,
-    return the current unified diff from disk when possible so a partial patch
-    is not replaced by empty output.
+    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
+    body raises (timeout, network, OOM, anything), we capture whatever's on
+    disk at the time and return it as the patch. The validator scores empty
+    patches at zero — any non-empty diff beats empty. Production data shows
+    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
+    the safety net converts those to "whatever partial work survived".
     """
     return _solve_with_safety_net(
         repo_path=repo_path,
@@ -3090,94 +3172,121 @@ def solve(
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating."""
+    the on-disk patch state instead of propagating.
+
+    Design notes for the next forker (these were called out in earlier
+    review rounds, recording them here so the choices are not silently
+    inherited):
+
+    1. Two full `_solve_attempt` runs stay under `_MULTISHOT_TOTAL_BUDGET`
+       alongside `WALL_CLOCK_BUDGET_SECONDS` per inner attempt. A third full
+       inner loop would usually be too short to help or would risk exceeding
+       validator soft caps. When attempt 1 is empty (including after repeated
+       model errors), `_solve_emergency_single_shot` may run once before the
+       repo is reverted for attempt 2: it is a narrow one-command salvage, not
+       a third inner loop. Empty patches *inside* an attempt still go through
+       hail-mary inside `maybe_queue_refinement`. Any uncaught exception is
+       handled by the `except Exception` arm below, which returns the on-disk
+       patch verbatim.
+
+    2. Syntax plus optional ruff/eslint live in `maybe_queue_refinement` as
+       refinement turns after polish and before the companion-test gate (see
+       MAX_SYNTAX_FIX_TURNS, MAX_LINT_TURNS, MAX_TOTAL_REFINEMENT_TURNS). That
+       keeps unsupported languages from being hard-blocked pre-final while still
+       surfacing parse/lint issues when checkers exist.
+    """
     repo_path = kwargs["repo_path"]
-    repo_obj: Optional[Path] = None
+    _multishot_repo_obj = None
     try:
-        repo_obj = _repo_path(repo_path)
+        _multishot_repo_obj = _repo_path(repo_path)
     except Exception:
         pass
 
     try:
-        started = time.monotonic()
+        _multishot_started = time.monotonic()
         issue = kwargs["issue"]
-        multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
-        initial_head = _multishot_capture_head(repo_obj) if repo_obj else None
+        _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
+        _multishot_initial_head = (
+            _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
+        )
 
-        result1 = _solve_attempt(**kwargs)
-        patch1 = result1.get("patch", "") or ""
-        n1 = _multishot_count_substantive(patch1)
+        _result1 = _solve_attempt(**kwargs)
+        _patch1 = _result1.get("patch", "") or ""
+        _n1 = _multishot_count_substantive(_patch1)
 
         # Retry when empty, or low-substance diff that still misses issue-mentioned paths.
-        covered_required = bool(patch1.strip()) and not _uncovered_required_paths(patch1, issue)
-        should_retry = (not patch1.strip()) or (
-            n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not covered_required
+        covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
+        should_retry = (not _patch1.strip()) or (
+            _n1 < _MULTISHOT_LOW_SIGNAL_THRESHOLD and not covered_required
         )
         if not should_retry:
-            result1["multishot_attempts"] = 1
-            return result1
+            _result1["multishot_attempts"] = 1
+            return _result1
 
-        elapsed = time.monotonic() - started
+        _elapsed = time.monotonic() - _multishot_started
 
         # Emergency salvage on empty attempt 1 (including repeated model errors).
-        attempt1_logs = result1.get("logs", "") or ""
+        attempt1_logs = _result1.get("logs", "") or ""
         attempt1_was_error_failure = (
-            not patch1.strip() and attempt1_logs.count("MODEL_ERROR") >= 2
+            not _patch1.strip() and attempt1_logs.count("MODEL_ERROR") >= 2
         )
-        attempt1_was_plain_empty = not patch1.strip()
+        attempt1_was_plain_empty = not _patch1.strip()
         should_fire_emergency = attempt1_was_error_failure or attempt1_was_plain_empty
-        if should_fire_emergency and (multishot_total_budget - elapsed) > 60.0 and repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-            result_emergency = _solve_emergency_single_shot(**kwargs)
-            patch_emergency = result_emergency.get("patch", "") or ""
-            if _multishot_count_substantive(patch_emergency) > 0:
-                result_emergency["multishot_attempts"] = 2
-                result_emergency["multishot_winner"] = "emergency"
-                return result_emergency
-            elapsed = time.monotonic() - started
+        if (
+            should_fire_emergency
+            and (_multishot_total_budget - _elapsed) > 60.0
+            and _multishot_repo_obj is not None
+        ):
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            _result_emergency = _solve_emergency_single_shot(**kwargs)
+            _patch_emergency = _result_emergency.get("patch", "") or ""
+            if _multishot_count_substantive(_patch_emergency) > 0:
+                _result_emergency["multishot_attempts"] = 2
+                _result_emergency["multishot_winner"] = "emergency"
+                return _result_emergency
+            _elapsed = time.monotonic() - _multishot_started
 
-        if (multishot_total_budget - elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            result1["multishot_attempts"] = 1
-            result1["multishot_skipped_retry"] = "insufficient_time"
-            return result1
+        if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
 
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        result2 = _solve_attempt(
+        if _multishot_repo_obj is not None:
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        _result2 = _solve_attempt(
             **kwargs,
-            _multishot_memo=_build_multishot_memo(result1, issue),
+            _multishot_memo=_build_multishot_memo(_result1, issue),
         )
-        patch2 = result2.get("patch", "") or ""
-        n2 = _multishot_count_substantive(patch2)
+        _patch2 = _result2.get("patch", "") or ""
+        _n2 = _multishot_count_substantive(_patch2)
 
-        if n2 >= n1:
-            result2["multishot_attempts"] = 2
-            result2["multishot_winner"] = "retry"
-            return result2
+        if _n2 >= _n1:
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry"
+            return _result2
 
-        if repo_obj is not None:
-            _multishot_revert(repo_obj, initial_head)
-        if patch1 and repo_obj is not None:
-            _multishot_apply_patch(repo_obj, patch1)
-        result1["multishot_attempts"] = 2
-        result1["multishot_winner"] = "primary"
-        return result1
+        if _multishot_repo_obj is not None:
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        if _patch1 and _multishot_repo_obj is not None:
+            _multishot_apply_patch(_multishot_repo_obj, _patch1)
+        _result1["multishot_attempts"] = 2
+        _result1["multishot_winner"] = "primary"
+        return _result1
 
     except Exception as exc:
-        # Return on-disk patch instead of propagating (BaseException not caught).
+        # v43 safety net: ANY uncaught exception from the multi-shot body
+        # should not propagate. Instead, return whatever patch is on disk
+        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
+        # do their thing so the validator can clean-kill the process.)
         salvaged = ""
         try:
-            if repo_obj is not None:
-                salvaged = get_patch(repo_obj)
+            if _multishot_repo_obj is not None:
+                salvaged = get_patch(_multishot_repo_obj)
         except Exception:
             salvaged = ""
         return AgentResult(
             patch=salvaged or "",
-            logs=(
-                "FATAL_SAFETY_NET:\n"
-                f"{type(exc).__name__}: {str(exc)[:500]}\n"
-                f"Returning on-disk patch ({len(salvaged.splitlines())} lines)."
-            ),
+            logs=f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\nReturning on-disk patch ({len(salvaged.splitlines())} lines).",
             steps=0,
             cost=0.0,
             success=bool(salvaged.strip()),
@@ -3185,7 +3294,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Inner agent loop; kwargs mirror `solve` inputs."""
+    """Original solve loop, callable through kwargs to avoid re-stating the
+    validator-protected parameter signature outside of solve()."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -3230,16 +3340,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """Return True if a refinement user message was queued.
+        """If the current patch warrants a refinement turn, queue it.
 
-        Order: polish → syntax → lint → companion test → path coverage → criteria
-        → self-check. Empty patch uses hail-mary outside MAX_TOTAL_REFINEMENT_TURNS.
+        Returns True when the loop should continue (a turn was queued); False
+        means the caller can declare success. The order is:
+            0. hail-mary — patch empty after everything: force one real edit
+            1. polish — drop low-signal hunks the model still emitted
+            2. syntax — quote any parser error back at the model
+            3. lint — optional ruff/eslint when repo tools exist
+            4. test — actually run the companion test if one exists; if it
+                      fails, feed the failure tail back via build_test_fix_prompt
+            5. coverage-nudge — name issue-mentioned paths still untouched
+            6. criteria-nudge — name issue acceptance bullets not addressed
+            7. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per cycle. Test fires AFTER syntax
+        and lint (we know the patch parses) but BEFORE coverage/criteria/self-check
+        (those are heuristic; test is ground truth from a real runner).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used
         nonlocal lint_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used
         nonlocal hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
+        # v20 edge — close the architectural hole at the empty-patch early
+        # exit. Hail-mary is exempt from the total-refinement cap because
+        # it's the only thing standing between us and a guaranteed-zero
+        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
