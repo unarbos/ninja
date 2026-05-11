@@ -4031,8 +4031,8 @@ def _v65_multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[s
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
-    # Retry only for clear weak first attempts: empty, tiny and off-target, or
-    # still missing several extracted acceptance criteria.
+    # Retry for clear weak first attempts: empty, tiny/off-target, or missing
+    # several extracted acceptance criteria.
     _covered_required = bool(_patch1.strip()) and not _uncovered_required_paths(_patch1, issue)
     _unaddressed1 = _unaddressed_criteria(_patch1, issue) if _patch1.strip() else []
     _criteria_starved = len(_unaddressed1) >= 3
