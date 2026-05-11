@@ -898,6 +898,7 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    criteria_hits = _criteria_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -920,6 +921,11 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Acceptance-criteria keywords are weaker than exact symbols, but they
+        # expose behavior-focused files for multi-bullet issues before the
+        # first model turn instead of waiting for a late refinement nudge.
+        if relative_path in criteria_hits:
+            score += 28 + min(48, 6 * criteria_hits[relative_path])
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1993,6 +1999,61 @@ def _symbol_grep_hits(
     return hits
 
 
+def _criteria_grep_hits(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Dict[str, int]:
+    """Boost context files that contain acceptance-criteria keywords.
+
+    Unlike the symbol grep, this consumes the structured criteria extractor used
+    later by refinement gates. Multi-bullet issues often name behavior rather
+    than exact files; this pulls files mentioning those checkpoint words into
+    the preloaded context before the first model turn.
+    """
+    criteria = _extract_acceptance_criteria(issue_text)
+    if not criteria:
+        return {}
+    keywords: List[str] = []
+    seen: set = set()
+    for criterion in criteria:
+        for keyword in _criterion_keywords(criterion):
+            if len(keyword) < 4 or keyword in seen:
+                continue
+            seen.add(keyword)
+            keywords.append(keyword)
+            if len(keywords) >= 16:
+                break
+        if len(keywords) >= 16:
+            break
+    if not keywords:
+        return {}
+
+    hits: Dict[str, int] = {}
+    for keyword in keywords:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-il", "-F", "--", keyword],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 1
+    return hits
+
+
 # -----------------------------
 # Prompting
 # -----------------------------
@@ -2173,6 +2234,17 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
+def _format_initial_acceptance_checklist(issue: str) -> str:
+    criteria = _extract_acceptance_criteria(issue)
+    if not criteria:
+        return ""
+    lines = ["Acceptance checklist inferred from the issue:"]
+    for index, criterion in enumerate(criteria, 1):
+        cleaned = " ".join(criterion.split())
+        lines.append(f"{index}. {cleaned}")
+    return "\n".join(lines)
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2184,6 +2256,11 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
+    checklist = _format_initial_acceptance_checklist(issue)
+    checklist_section = f"""
+{checklist}
+""" if checklist else ""
+
     return f"""Fix this issue:
 
 {issue}
@@ -2191,7 +2268,7 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
+{context_section}{checklist_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
