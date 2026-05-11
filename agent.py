@@ -3835,14 +3835,19 @@ def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
     )
 
 
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """Single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
+def _solve_emergency_single_shot(
+    repo_path: str,
+    issue: str,
+    model: Optional[str] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> Dict[str, Any]:
+    """Single-call fallback for empty-patch runs."""
+    repo_path_value = repo_path
+    task_text = issue
 
     logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
     repo: Optional[Path] = None
@@ -4053,11 +4058,10 @@ def _format_multishot_memo(memo: Dict[str, Any]) -> str:
 # Main agent (multi-shot wrapper around _solve_inner)
 # -----------------------------
 
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
+# MINER-EDITABLE: validator entry point. Multi-shot wrapper around the inner
+# attempt, with revert-and-retry on a low-signal first attempt. Internal
+# helpers carry explicit signatures matching solve's params so static
+# checkers can verify call sites.
 def solve(
     repo_path: str,
     issue: str,
@@ -4076,13 +4080,21 @@ def solve(
     preserving useful progress when possible.
     """
     return _solve_with_safety_net(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
+        repo_path, issue, model, api_base, api_key,
+        max_steps, command_timeout, max_tokens,
     )
 
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+def _solve_with_safety_net(
+    repo_path: str,
+    issue: str,
+    model: Optional[str] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> Dict[str, Any]:
     """Outer envelope around the multishot driver.
 
     Envelope layers (outermost in):
@@ -4109,7 +4121,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
          syntax-fix are cap-exempt because empty and non-parsing patches
          are guaranteed losses regardless of scope.
     """
-    repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
         _multishot_repo_obj = _repo_path(repo_path)
@@ -4117,7 +4128,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         pass
 
     try:
-        return _multishot_driver(kwargs, _multishot_repo_obj)
+        return _multishot_driver(
+            repo_path, issue, model, api_base, api_key,
+            max_steps, command_timeout, max_tokens,
+            _multishot_repo_obj,
+        )
     except Exception as exc:
         salvaged = ""
         try:
@@ -4134,29 +4149,28 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
-def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, Any]:
+def _multishot_driver(
+    repo_path: str,
+    issue: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    max_steps: int,
+    command_timeout: int,
+    max_tokens: int,
+    _multishot_repo_obj,
+) -> Dict[str, Any]:
     """Multishot logic, separated so the safety-net try/except wraps it cleanly."""
-    repo_path = kwargs["repo_path"]
-    issue = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-    max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
-    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
-    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-
     _multishot_started = time.monotonic()
     _multishot_total_budget = 540.0  # reserves 60s headroom for safety net before docker kill at 600s
-    _multishot_args = dict(
-        repo_path=repo_path, issue=issue, model=model,
-        api_base=api_base, api_key=api_key,
-        max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
-    )
     if _multishot_repo_obj is None:
         _multishot_repo_obj = _repo_path(repo_path)
     _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj)
 
-    _result1 = _solve_attempt(**_multishot_args)
+    _result1 = _solve_attempt(
+        repo_path, issue, model, api_base, api_key,
+        max_steps, command_timeout, max_tokens,
+    )
     _patch1 = _result1.get("patch", "") or ""
     _n1 = _multishot_count_substantive(_patch1)
 
@@ -4206,7 +4220,10 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     _should_fire_emergency = _attempt1_was_error_failure or _attempt1_was_plain_empty
     if _should_fire_emergency and (_multishot_total_budget - _elapsed) > 60.0:
         _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result_emergency = _solve_emergency_single_shot(**_multishot_args)
+        _result_emergency = _solve_emergency_single_shot(
+            repo_path, issue, model, api_base, api_key,
+            max_steps, command_timeout, max_tokens,
+        )
         _patch_emergency = _result_emergency.get("patch", "") or ""
         if _multishot_count_substantive(_patch_emergency) > 0:
             _result_emergency["multishot_attempts"] = 2
@@ -4220,7 +4237,11 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
         return _result1
 
     _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-    _result2 = _solve_attempt(**_multishot_args, _multishot_memo=_build_multishot_memo(_result1, issue))
+    _result2 = _solve_attempt(
+        repo_path, issue, model, api_base, api_key,
+        max_steps, command_timeout, max_tokens,
+        _multishot_memo=_build_multishot_memo(_result1, issue),
+    )
     _patch2 = _result2.get("patch", "") or ""
     _n2 = _multishot_count_substantive(_patch2)
 
@@ -4258,18 +4279,19 @@ def _multishot_driver(kwargs: Dict[str, Any], _multishot_repo_obj) -> Dict[str, 
     return _result1
 
 
-def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Original solve loop, callable through kwargs to avoid re-stating the
-    validator-protected parameter signature outside of solve()."""
-    repo_path = kwargs["repo_path"]
-    issue = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-    max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
-    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
-    max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-    _multishot_memo: Optional[Dict[str, Any]] = kwargs.get("_multishot_memo")
+def _solve_attempt(
+    repo_path: str,
+    issue: str,
+    model: Optional[str] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    *,
+    _multishot_memo: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Original solve loop."""
 
     repo: Optional[Path] = None
     logs: List[str] = []
