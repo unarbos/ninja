@@ -126,15 +126,6 @@ MAX_ARTIFACT_NUDGES = 1    # add explicitly requested tests/docs/version/config 
 MAX_DEPENDENCY_NUDGES = 1  # add manifest entries for newly introduced packages
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_CASCADE_TURNS = 1      # patch modifies a callable's signature; consumers in unpatched files
-MAX_EXT_STUB_TURNS = 1     # JSX className={}, style={{}}, // TODO, empty arrow body — stub patterns
-MAX_PLACEHOLDER_TURNS = 1  # hardcoded placeholder URLs / credentials / test endpoints
-MAX_UNDERSIZED_TURNS = 1   # issue mentions 3+ files, patch touches <2
-MAX_CORRUPTION_TURNS = 1   # heredoc / harness-tag markers leaked into source
-MAX_DUP_IMPORT_TURNS = 1   # duplicate import lines in a touched file
-MAX_TAG_TURNS = 1          # removed top-level HTML/Vue closing tags (template/script/style)
-MAX_PHP_SYNTAX_TURNS = 1   # `php -l` syntax error in a touched .php / .blade.php
-MAX_CSTYLE_BRACE_TURNS = 1 # brace imbalance in C-family/Java/Kotlin/Scala/Swift
-MAX_REQUIRED_FILE_TURNS = 1  # issue requires creating a new file/component but patch missing it
 MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates.
                                 # Sized to leave room for both a syntax/lint repair and a
                                 # scope nudge (coverage or criteria) on multi-file tasks
@@ -2020,34 +2011,8 @@ _EXT_STUB_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _check_extended_stubs(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _EXT_STUB_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip().splitlines()[0]
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:160]}")
-            if len(findings) >= 5:
-                return findings
-    return findings
 
 
-def build_extended_stub_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains stub-shaped expressions that read as unfinished:"
-        f"\n\n{body}\n\n"
-        "Emit ONE bash command that fills in the intended value, removes the "
-        "stub, or replaces the placeholder with real code. Do NOT add new "
-        "behavior beyond closing the stub. Then end with "
-        "`<final>stubs filled</final>`."
-    )
 
 
 # Placeholder-endpoint gate: hardcoded test URLs, credentials, or localhost
@@ -2088,350 +2053,50 @@ _PLACEHOLDER_ENDPOINT_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _check_placeholder_endpoints(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _PLACEHOLDER_ENDPOINT_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip().splitlines()[0]
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:200]}")
-            if len(findings) >= 4:
-                return findings
-    return findings
 
 
-def build_placeholder_endpoint_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains hardcoded placeholder URLs / credentials that "
-        "read as leftover dev artifacts rather than real configuration:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that either (a) reads the value from the "
-        "appropriate env var (`process.env.X`, `os.environ.get('X')`, "
-        "`import.meta.env.X`, etc.) using the convention of nearby code, or "
-        "(b) replaces the placeholder with the issue-required real value. "
-        "Then end with `<final>endpoint wired</final>`."
-    )
 
 
 # Undersized-patch gate: when the issue text mentions multiple distinct file
 # paths but the patch only touches one or zero of them, push for a
 # comprehensive multi-file pass before finalize.
 
-def _check_undersized_patch(patch: str, issue_text: str) -> Optional[Tuple[List[str], List[str]]]:
-    if not patch.strip() or not issue_text:
-        return None
-    mentioned = _extract_issue_path_mentions(issue_text)
-    distinct_mentions = list({p.strip("./") for p in mentioned if len(p.strip("./")) > 3})
-    if len(distinct_mentions) < 3:
-        return None
-    touched = _patch_changed_files(patch)
-    if len(touched) >= 2:
-        return None
-    return (distinct_mentions[:6], touched)
 
 
-def build_undersized_patch_fix_prompt(mentioned: List[str], touched: List[str]) -> str:
-    mention_list = "\n  ".join(f"- {m}" for m in mentioned)
-    touch_list = ", ".join(touched) or "(none)"
-    return (
-        "Coverage gap — the issue mentions multiple distinct files, but your "
-        "patch only touches a small subset of them:\n\n"
-        f"Issue-mentioned paths:\n  {mention_list}\n\n"
-        f"Files touched in current patch: {touch_list}\n\n"
-        "When an issue lists three or more concrete files, the reference "
-        "patch typically touches all of them. Open each unaddressed path "
-        "now and emit the edit commands needed to satisfy the task across "
-        "every file in the SAME response. Do not start unrelated work. "
-        "Then end with `<final>coverage extended</final>`."
-    )
 
 
-_CORRUPTION_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    (
-        "shell heredoc marker leaked into source",
-        re.compile(
-            r"^\+(?!\+\+).*<<['\"]?(?:EOF|PYEOF|TXT|END|SCRIPT|HEREDOC)['\"]?\s*$",
-            re.MULTILINE,
-        ),
-    ),
-    (
-        "agent control tag leaked into source",
-        re.compile(
-            r"^\+(?!\+\+).*</?(?:command|final|plan)>\s*$",
-            re.MULTILINE,
-        ),
-    ),
-    (
-        "raw shell prompt marker leaked into source",
-        re.compile(
-            r"^\+(?!\+\+).*\$\s+[a-z]+\s+\S+.*\$\s*$",
-            re.MULTILINE,
-        ),
-    ),
-)
 
 
-def _check_corruption(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    seen: set = set()
-    for label, pattern in _CORRUPTION_PATTERNS:
-        for match in pattern.finditer(patch):
-            sample = match.group(0).strip().splitlines()[0]
-            key = (label, sample[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(f"{label}: {sample[:160]}")
-            if len(findings) >= 4:
-                return findings
-    return findings
 
 
-def build_corruption_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch contains markers that belong to your shell or agent "
-        "harness, NOT to the source file being edited:\n\n"
-        f"{body}\n\n"
-        "These leak into source typically when a heredoc edit ran past its "
-        "terminator or when the model's `<command>` / `<plan>` blocks were "
-        "captured verbatim into the file. Emit ONE bash command that either "
-        "(a) reverts the file to its original content for the affected "
-        "region, or (b) re-applies the intended edit cleanly without any "
-        "harness markup. Then end with `<final>corruption removed</final>`."
-    )
 
 
-_DUP_IMPORT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java", ".rb"}
 
 
-def _check_duplicate_imports(repo: Path, patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        if suffix not in _DUP_IMPORT_SUFFIXES:
-            continue
-        try:
-            file_path = repo / relative_path
-            if not file_path.exists() or not file_path.is_file():
-                continue
-            text = file_path.read_text(errors="ignore")
-        except Exception:
-            continue
-        seen_imports: Dict[str, int] = {}
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            is_import = (
-                stripped.startswith("import ")
-                or stripped.startswith("from ")
-                or stripped.startswith("require(")
-                or (suffix == ".go" and stripped.startswith('import "'))
-            )
-            if not is_import:
-                continue
-            seen_imports[stripped] = seen_imports.get(stripped, 0) + 1
-        for imp, count in seen_imports.items():
-            if count > 1:
-                findings.append(f"{relative_path}: {imp[:120]} appears {count}x")
-                if len(findings) >= 4:
-                    return findings
-    return findings
 
 
-def build_duplicate_imports_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch results in duplicate import lines in these files:\n\n"
-        f"{body}\n\n"
-        "Duplicate imports are a code-quality red flag and may even break "
-        "the parser depending on the language. Emit ONE bash command that "
-        "removes the redundant import lines, keeping exactly one occurrence "
-        "of each. Then end with `<final>imports deduplicated</final>`."
-    )
 
 
-_CRITICAL_TAGS = ("</template>", "</script>", "</style>", "</html>", "</body>", "</head>")
 
 
-def _check_critical_tag_removals(patch: str) -> List[str]:
-    if not patch.strip():
-        return []
-    findings: List[str] = []
-    for tag in _CRITICAL_TAGS:
-        removed_count = 0
-        added_count = 0
-        for line in patch.splitlines():
-            if line.startswith("---") or line.startswith("+++"):
-                continue
-            if tag in line:
-                if line.startswith("-"):
-                    removed_count += 1
-                elif line.startswith("+"):
-                    added_count += 1
-        if removed_count > added_count:
-            net = removed_count - added_count
-            findings.append(f"net {net} `{tag}` tag(s) removed without re-adding")
-    return findings
 
 
-def build_critical_tag_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch removes top-level closing tags that templates rely on:"
-        f"\n\n{body}\n\n"
-        "These tags terminate template / script / style sections; removing "
-        "them silently breaks the file. Emit ONE bash command that re-adds "
-        "the missing closing tag(s) at the correct position(s). Then end "
-        "with `<final>tags restored</final>`."
-    )
 
 
-def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
-    if not _has_executable("php"):
-        return None
-    proc = run_command(
-        f"php -l {_shell_quote(relative_path)}",
-        repo,
-        timeout=_SYNTAX_TIMEOUT,
-    )
-    if proc.exit_code == 0:
-        return None
-    output = (proc.stderr or proc.stdout or "").strip()
-    if not output:
-        return None
-    first_line = output.splitlines()[0].strip()[:240]
-    return f"{relative_path}: {first_line}"
 
 
-def _check_php_syntax(repo: Path, patch: str) -> List[str]:
-    findings: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        if suffix == ".php" or relative_path.endswith(".blade.php"):
-            err = _check_php_syntax_one(repo, relative_path)
-            if err:
-                findings.append(err)
-                if len(findings) >= 4:
-                    break
-    return findings
 
 
-def build_php_syntax_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Your patch produces a PHP / Blade syntax error in these files:\n\n"
-        f"{body}\n\n"
-        "Emit ONE bash command that fixes ONLY the syntax error (most often "
-        "a missing semicolon, mismatched `{` / `}`, unclosed `@if` / "
-        "`@foreach`, or stray `<?php` markers). Do NOT change unrelated "
-        "lines. Then end with `<final>php syntax fixed</final>`."
-    )
 
 
-_CSTYLE_BRACE_SUFFIXES = {
-    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-    ".java", ".cs", ".kt", ".scala",
-}
 # .swift intentionally omitted: already handled by _check_brace_balance_one
 # via _BRACE_BALANCE_SUFFIXES; running both would double-report.
 
 
-def _check_brace_balance_cstyle_one(repo: Path, relative_path: str) -> Optional[str]:
-    try:
-        text = (repo / relative_path).read_text(errors="ignore")
-    except Exception:
-        return None
-    stripped = re.sub(r"'(?:\\.|[^'\\])'", "", text)
-    counts = {"{": 0, "}": 0, "(": 0, ")": 0, "[": 0, "]": 0}
-    in_string = False
-    in_block_comment = False
-    in_line_comment = False
-    i = 0
-    while i < len(stripped):
-        ch = stripped[i]
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-        if in_block_comment:
-            if ch == "*" and i + 1 < len(stripped) and stripped[i + 1] == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_string:
-            if ch == "\\" and i + 1 < len(stripped):
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-            i += 1
-            continue
-        if ch == "/" and i + 1 < len(stripped):
-            if stripped[i + 1] == "/":
-                in_line_comment = True
-                i += 2
-                continue
-            if stripped[i + 1] == "*":
-                in_block_comment = True
-                i += 2
-                continue
-        if ch == '"':
-            in_string = True
-            i += 1
-            continue
-        if ch in counts:
-            counts[ch] += 1
-        i += 1
-    diffs: List[str] = []
-    for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
-        delta = counts[opener] - counts[closer]
-        if delta != 0:
-            diffs.append(f"{opener}/{closer} delta={delta:+d}")
-    if diffs:
-        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
-    return None
 
 
-def _check_cstyle_brace_balance(repo: Path, patch: str) -> List[str]:
-    findings: List[str] = []
-    for relative_path in _patch_changed_files(patch):
-        suffix = Path(relative_path).suffix.lower()
-        if suffix in _CSTYLE_BRACE_SUFFIXES:
-            err = _check_brace_balance_cstyle_one(repo, relative_path)
-            if err:
-                findings.append(err)
-                if len(findings) >= 4:
-                    break
-    return findings
 
 
-def build_cstyle_brace_fix_prompt(findings: List[str]) -> str:
-    body = "\n".join(f"  - {f}" for f in findings)
-    return (
-        "Brace imbalance detected in C-family files:\n\n"
-        f"{body}\n\n"
-        "These files now have unmatched `{` / `}`, `(` / `)`, or `[` / `]` "
-        "after your edit, which will fail to compile. Emit ONE bash command "
-        "that adds the missing closing token(s) or removes the extra "
-        "opener(s). Do NOT touch unrelated lines. Then end with "
-        "`<final>braces balanced</final>`."
-    )
 
 
 _REQUIRED_FILE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
@@ -2455,52 +2120,8 @@ _REQUIRED_FILE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
 )
 
 
-def _check_required_file(patch: str, issue_text: str) -> Optional[List[str]]:
-    if not patch.strip() or not issue_text:
-        return None
-    expected: List[str] = []
-    seen: set = set()
-    for pattern in _REQUIRED_FILE_PATTERNS:
-        for match in pattern.finditer(issue_text):
-            name = match.group(1).strip(" `\"'")
-            if name and name not in seen:
-                seen.add(name)
-                expected.append(name)
-    if not expected:
-        return None
-    added_paths: set = set()
-    for line in patch.splitlines():
-        if line.startswith("+++ b/"):
-            added_paths.add(line[len("+++ b/"):].strip())
-    matched: set = set()
-    for path in added_paths:
-        path_lower = path.lower()
-        for name in expected:
-            if name.lower() in path_lower:
-                matched.add(name)
-    missing = [n for n in expected if n not in matched]
-    if not missing:
-        return None
-    return missing[:4]
 
 
-def build_required_file_fix_prompt(missing: List[str], issue_text: str) -> str:
-    items = "\n".join(f"  - {m}" for m in missing)
-    snippet = issue_text.strip()
-    if len(snippet) > 800:
-        snippet = snippet[:800].rstrip() + " [...]"
-    return (
-        "The issue explicitly requires creating these new file(s) / "
-        "module(s) / component(s), but your patch does NOT add them:\n\n"
-        f"{items}\n\n"
-        "When the issue says 'create a new X' or 'add a Y component', the "
-        "reference patch typically introduces those files. Emit ONE bash "
-        "command (heredoc / `python -c` write_text) that creates each "
-        "missing file with the requested implementation. Place each file "
-        "in the directory the codebase already uses for files of that "
-        "kind. Then end with `<final>required files added</final>`.\n\n"
-        f"Issue (for reference):\n{snippet}"
-    )
 
 
 
@@ -3941,155 +3562,6 @@ def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
                 results.append(key)
     return results[:8]
 
-# v66: emergency single-shot constants (adapted from PR518)
-_EMERGENCY_MAX_TOKENS = 1024
-_EMERGENCY_TIMEOUT_SECONDS = 45
-_EMERGENCY_COMMAND_TIMEOUT = 30
-_EMERGENCY_PROMPT_TARGET_CHARS = 2000
-
-
-def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """v66: pick the single most-likely-to-need-editing tracked file."""
-    mentioned_paths = _extract_issue_path_mentions(task_text)
-    tracked = set(_tracked_files(repo))
-    for mention in mentioned_paths:
-        normalized = mention.strip("./")
-        if normalized in tracked and _context_file_allowed(normalized):
-            return normalized
-    ranked = _rank_context_files(repo, task_text)
-    for relative_path in ranked:
-        if relative_path in tracked and _context_file_allowed(relative_path):
-            return relative_path
-    for relative_path in tracked:
-        if _context_file_allowed(relative_path):
-            return relative_path
-    return None
-
-
-def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """v66: stripped-down single-shot prompt: one command, one final, nothing else."""
-    task_view = task_text[:1500]
-    return (
-        "You are a one-shot patch generator. Time and tokens are extremely "
-        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
-        f"TASK:\n{task_view}\n\n"
-        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
-        "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in the target file consistent with the task. Use "
-        "`sed -i`, a `python -c` one-liner, or a heredoc. Do NOT add comments "
-        "only. Do NOT change file modes. Make a real code edit.\n\n"
-        "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
-    )
-
-
-def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
-    """v66: single-call fallback for empty-patch + MODEL_ERROR runs.
-    Adapted from PR518 (UID 20)."""
-    repo_path_value = kwargs["repo_path"]
-    task_text = kwargs["issue"]
-    model = kwargs.get("model")
-    api_base = kwargs.get("api_base")
-    api_key = kwargs.get("api_key")
-
-    logs: List[str] = ["EMERGENCY_SINGLE_SHOT: invoked"]
-    repo: Optional[Path] = None
-    try:
-        repo = _repo_path(repo_path_value)
-        ensure_git_repo(repo)
-        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-
-        target = _emergency_pick_target(repo, task_text)
-        if target is None:
-            logs.append("EMERGENCY_NO_TARGET: no editable tracked file found")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict()
-
-        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-        prompt = _emergency_build_prompt(target, snippet, task_text)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a one-shot patch generator. Output exactly one "
-                    "bash command then <final>summary</final>. Nothing else."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response_text, _, _ = chat_completion(
-                messages=messages,
-                model=model_name,
-                api_base=base,
-                api_key=key,
-                max_tokens=_EMERGENCY_MAX_TOKENS,
-                timeout=_EMERGENCY_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-        except Exception as exc:
-            logs.append(f"EMERGENCY_CHAT_FAIL: {exc}")
-            patch_text = get_patch(repo) if repo is not None else ""
-            return AgentResult(
-                patch=patch_text, logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=bool(patch_text.strip()),
-            ).to_dict()
-
-        logs.append("EMERGENCY_RESPONSE:\n" + response_text)
-        commands = extract_commands(response_text)
-        if not commands:
-            logs.append("EMERGENCY_NO_COMMAND: model returned no <command> block")
-        for cmd in commands[:2]:
-            result = run_command(cmd, repo, timeout=_EMERGENCY_COMMAND_TIMEOUT)
-            logs.append(format_observation(result))
-
-        patch_text = get_patch(repo)
-        return AgentResult(
-            patch=patch_text,
-            logs=_safe_join_logs(logs),
-            steps=1,
-            cost=0.0,
-            success=bool(patch_text.strip()),
-        ).to_dict()
-    except Exception:
-        logs.append("EMERGENCY_FATAL:\n" + traceback.format_exc())
-        patch_text = ""
-        if repo is not None:
-            try:
-                patch_text = get_patch(repo)
-            except Exception:
-                pass
-        return AgentResult(
-            patch=patch_text, logs=_safe_join_logs(logs),
-            steps=0, cost=None, success=False,
-        ).to_dict()
-
-
-_ERR_LOC_PATTERNS = [
-    re.compile(r'File "([^"]+)", line (\d+)'),
-    re.compile(r"([\w./][\w./-]*\.(?:ts|tsx|js|jsx))[:(](\d+)[:,)]"),
-    re.compile(r"([\w./][\w./-]*\.go):(\d+)"),
-    re.compile(r"\(([\w]+\.java):(\d+)\)"),
-    re.compile(r"([\w./][\w./-]*\.rs):(\d+):\d+"),
-    re.compile(r"([\w./][\w./-]*\.(?:c|cc|cpp|h|hpp)):(\d+):\d+:"),
-]
-
-
-def _extract_error_locations(text: str) -> List[Tuple[str, str]]:
-    """Extract (path, line) pairs from compiler/test error output."""
-    seen: set = set()
-    results: List[Tuple[str, str]] = []
-    for pat in _ERR_LOC_PATTERNS:
-        for m in pat.finditer(text):
-            key = (m.group(1), m.group(2))
-            if key not in seen:
-                seen.add(key)
-                results.append(key)
-    return results[:8]
-
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -4388,15 +3860,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     lint_turns_used = 0
     empty_arg_turns_used = 0
     cascade_turns_used = 0
-    ext_stub_turns_used = 0
-    placeholder_turns_used = 0
-    undersized_turns_used = 0
-    corruption_turns_used = 0
-    dup_import_turns_used = 0
-    tag_turns_used = 0
-    php_syntax_turns_used = 0
-    cstyle_brace_turns_used = 0
-    required_file_turns_used = 0
     contract_turns_used = 0
     test_fix_turns_used = 0
     failed_verification_fix_turns_used = 0
@@ -4451,7 +3914,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         guaranteed losses; the LLM judge often penalises broken code harder
         than missing scope (see duel 004362, ~half of losses).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, ext_stub_turns_used, placeholder_turns_used, undersized_turns_used, corruption_turns_used, dup_import_turns_used, tag_turns_used, php_syntax_turns_used, cstyle_brace_turns_used, required_file_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, lint_turns_used, empty_arg_turns_used, cascade_turns_used, contract_turns_used, test_fix_turns_used, failed_verification_fix_turns_used, patch_safety_turns_used, coverage_nudges_used, criteria_nudges_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hail_mary_turns_used, total_refinement_turns_used, last_failed_verification_command, last_failed_verification_observation
         patch = get_patch(repo)
 
         # Hail-mary is exempt from the total-refinement cap: it guards the
@@ -4576,20 +4039,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Placeholder-endpoint: hardcoded test URLs / credentials / localhost
-        # without env-var fallback that read as forgotten dev artifacts.
-        if placeholder_turns_used < MAX_PLACEHOLDER_TURNS:
-            placeholder_findings = _check_placeholder_endpoints(patch)
-            if placeholder_findings:
-                placeholder_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_placeholder_endpoint_fix_prompt(placeholder_findings),
-                    "PLACEHOLDER_FIX_QUEUED:\n  " + "\n  ".join(placeholder_findings),
-                )
-                return True
-
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -4599,18 +4048,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_polish_prompt(junk),
                     f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
 
@@ -4654,36 +4091,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if (
-            failed_verification_fix_turns_used < MAX_FAILED_VERIFICATION_FIX_TURNS
-            and last_failed_verification_command
-            and last_failed_verification_observation
-        ):
-            failed_verification_fix_turns_used += 1
-            total_refinement_turns_used += 1
-            command = last_failed_verification_command
-            observation = last_failed_verification_observation
-            last_failed_verification_command = ""
-            last_failed_verification_observation = ""
-            queue_refinement_turn(
-                assistant_text,
-                build_failed_verification_prompt(command, observation),
-                f"FAILED_VERIFICATION_REPAIR_QUEUED:\n  {command[:160]}",
-            )
-            return True
-
-        if contract_turns_used < MAX_CONTRACT_TURNS:
-            contract_findings = _contract_preservation_gap_summary(repo, patch)
-            if contract_findings:
-                contract_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_contract_preservation_prompt(contract_findings),
-                    "CONTRACT_FIX_QUEUED:\n  " + "\n  ".join(contract_findings),
-                )
-                return True
-
         # Cascade-gap: contract preservation only catches REMOVED public
         # symbols. The cascade gate catches the distinct case where a
         # callable's declaration line was MODIFIED and consumers in OTHER
@@ -4712,190 +4119,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_integration_nudge_prompt(integration, issue),
                     f"INTEGRATION_NUDGE_QUEUED:\n  {integration}",
-                )
-                return True
-
-        if artifact_nudges_used < MAX_ARTIFACT_NUDGES:
-            artifact = _requested_artifact_gap_summary(patch, issue)
-            if artifact:
-                artifact_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_artifact_nudge_prompt(artifact, issue),
-                    f"ARTIFACT_NUDGE_QUEUED:\n  {artifact}",
-                )
-                return True
-
-        if dependency_nudges_used < MAX_DEPENDENCY_NUDGES:
-            dependency = _dependency_metadata_gap_summary(patch)
-            if dependency:
-                dependency_nudges_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_dependency_nudge_prompt(dependency, issue),
-                    f"DEPENDENCY_NUDGE_QUEUED:\n  {dependency}",
-                )
-                return True
-
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if empty_arg_turns_used < MAX_EMPTY_ARG_TURNS:
-            empty_arg_findings = _check_empty_args(patch)
-            if empty_arg_findings:
-                empty_arg_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_empty_args_fix_prompt(empty_arg_findings),
-                    "EMPTY_ARG_FIX_QUEUED:\n  " + "\n  ".join(empty_arg_findings),
-                )
-                return True
-
-        # Extended-stub: catches the broader stub family `_check_empty_args`
-        # misses — JSX `className={}`, `style={{}}`, `// TODO` comments, and
-        # empty arrow-function bodies.
-        if ext_stub_turns_used < MAX_EXT_STUB_TURNS:
-            ext_stub_findings = _check_extended_stubs(patch)
-            if ext_stub_findings:
-                ext_stub_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_extended_stub_fix_prompt(ext_stub_findings),
-                    "EXT_STUB_QUEUED:\n  " + "\n  ".join(ext_stub_findings),
-                )
-                return True
-
-        # Corruption: heredoc / `<command>` / `<plan>` markers leaked into
-        # source. A patch that contains harness markup is a guaranteed
-        # parse-or-runtime failure — fire ahead of style/lint gates.
-        if corruption_turns_used < MAX_CORRUPTION_TURNS:
-            corruption_findings = _check_corruption(patch)
-            if corruption_findings:
-                corruption_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_corruption_fix_prompt(corruption_findings),
-                    "CORRUPTION_QUEUED:\n  " + "\n  ".join(corruption_findings),
-                )
-                return True
-
-        # Critical-tag removal: net deletion of </template>, </script>,
-        # </style>, </html>, </body>, </head> without re-adding leaves
-        # templates structurally broken.
-        if tag_turns_used < MAX_TAG_TURNS:
-            tag_findings = _check_critical_tag_removals(patch)
-            if tag_findings:
-                tag_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_critical_tag_fix_prompt(tag_findings),
-                    "CRITICAL_TAG_QUEUED:\n  " + "\n  ".join(tag_findings),
-                )
-                return True
-
-        # C-family brace balance: covers .c/.cpp/.h*/.java/.cs/.kt/.scala
-        # which the existing _check_brace_balance_one (TS/JSX/Swift) skips.
-        # Char-literal stripping ('a') avoids C-specific false positives.
-        if cstyle_brace_turns_used < MAX_CSTYLE_BRACE_TURNS:
-            cstyle_findings = _check_cstyle_brace_balance(repo, patch)
-            if cstyle_findings:
-                cstyle_brace_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_cstyle_brace_fix_prompt(cstyle_findings),
-                    "CSTYLE_BRACE_QUEUED:\n  " + "\n  ".join(cstyle_findings),
-                )
-                return True
-
-        # PHP / Blade syntax: `php -l` is fast and authoritative when php
-        # is installed. Fills the language gap left by _check_syntax.
-        if php_syntax_turns_used < MAX_PHP_SYNTAX_TURNS:
-            php_findings = _check_php_syntax(repo, patch)
-            if php_findings:
-                php_syntax_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_php_syntax_fix_prompt(php_findings),
-                    "PHP_SYNTAX_QUEUED:\n  " + "\n  ".join(php_findings),
-                )
-                return True
-
-        # Duplicate imports: a common artifact of repeated edits to the
-        # imports block. Different axis from lint (lint may be unavailable).
-        if dup_import_turns_used < MAX_DUP_IMPORT_TURNS:
-            dup_findings = _check_duplicate_imports(repo, patch)
-            if dup_findings:
-                dup_import_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_duplicate_imports_fix_prompt(dup_findings),
-                    "DUP_IMPORT_QUEUED:\n  " + "\n  ".join(dup_findings),
-                )
-                return True
-
-        # Required-file: issue says "create a new <Component>" but the
-        # patch's `+++ b/...` lines reference no path matching that name.
-        # Different signal from undersized — keyed on creation phrasing,
-        # not on path-mention count.
-        if required_file_turns_used < MAX_REQUIRED_FILE_TURNS:
-            missing_files = _check_required_file(patch, issue)
-            if missing_files:
-                required_file_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_required_file_fix_prompt(missing_files, issue),
-                    "REQUIRED_FILE_QUEUED:\n  " + "\n  ".join(missing_files),
-                )
-                return True
-
-        # Lint pass — runs ruff/eslint when project tooling is available.
-        # Different axis from syntax (which proves the file parses); lint
-        # catches style issues that make the patch look unfinished.
-        if lint_turns_used < MAX_LINT_TURNS:
-            lint_errors = _check_lint(repo, patch)
-            if lint_errors:
-                lint_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_lint_fix_prompt(lint_errors),
-                    "LINT_QUEUED:\n  " + "\n  ".join(lint_errors),
-                )
-                return True
-
-        # Undersized-patch: when the issue mentions ≥3 distinct file paths
-        # but the patch only touches <2 files. Different signal from the
-        # coverage_nudge path-mention check — keys on file count rather
-        # than specific path coverage.
-        if undersized_turns_used < MAX_UNDERSIZED_TURNS:
-            undersized = _check_undersized_patch(patch, issue)
-            if undersized is not None:
-                mentioned, touched = undersized
-                undersized_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_undersized_patch_fix_prompt(mentioned, touched),
-                    f"UNDERSIZED_QUEUED: {len(mentioned)} mentioned, {len(touched)} touched",
                 )
                 return True
 
