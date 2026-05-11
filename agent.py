@@ -3190,3 +3190,7 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
+
+def validator_manual_gist_variant_006() -> str:
+    return "manual-gist-006"
