@@ -3122,10 +3122,15 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _issue_text = kwargs.get("issue", "") or ""
         _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
         _estimated_files = _estimate_issue_file_count(_issue_text)
+        # Underdelivered = attempt 1 has enough lines AND the task heuristically
+        # wants >=4 files AND actual file count is at least 2 below the
+        # estimate. Tolerance of 1 file (actual + 1 == estimated still ships)
+        # avoids over-retrying borderline cases while catching the common
+        # "wrote 3 files when 5 were needed" scenario.
         _underdelivered = (
             _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
             and _estimated_files >= 4
-            and _actual_files * 2 < _estimated_files
+            and _actual_files + 1 < _estimated_files
         )
 
         if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
