@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# CL-GPT-v24: king PR#1298 + integration_nudge + file_cache + _truncate_around_error + SANDBOX_FORBIDDEN_RULES + test-mention coverage
 """
 Portable single-file SWE-style coding agent harness.
 
@@ -92,6 +93,9 @@ MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
 MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modules
+
+FILE_CACHE_TOTAL_BYTES = 32 * 1024 * 1024    # 32 MB total cap
+FILE_CACHE_PER_FILE_BYTES = 256 * 1024        # 256 KB per-file cap
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -170,6 +174,47 @@ DANGEROUS_PATTERNS = [
     # receives a blank patch even though source files were changed correctly.
     r"\bgit\s+commit\b",
 ]
+SANDBOX_FORBIDDEN_RULES: Tuple[Tuple[str, str], ...] = (
+    # ---- INSTALL (package managers / network installs) ----
+    (r"\bpip3?\s+install\b", "install"),
+    (r"\bpython3?\s+-m\s+pip\s+install\b", "install"),
+    (r"\beasy_install\b", "install"),
+    (r"\bpoetry\s+(install|add|update|lock)\b", "install"),
+    (r"\buv\s+pip\s+install\b", "install"),
+    (r"\bconda\s+install\b", "install"),
+    (r"\bnpm\s+(install|i|ci|update|add)\b", "install"),
+    (r"\bpnpm\s+(install|i|add|update)\b", "install"),
+    (r"\byarn\s+(add|install|upgrade|remove)\b", "install"),
+    (r"^\s*yarn\s*$", "install"),
+    (r"\bbun\s+(install|i|add)\b", "install"),
+    (r"\bcargo\s+(add|install|update)\b", "install"),
+    (r"\bgo\s+(get|install)\b", "install"),
+    (r"\bgo\s+mod\s+(download|tidy)\b", "install"),
+    (r"\bbundle\s+(install|update)\b", "install"),
+    (r"\bgem\s+install\b", "install"),
+    (r"\bmvn\s+(install|dependency:resolve|dependency:tree)\b", "install"),
+    (r"\b(apt|apt-get|yum|dnf|brew|pacman|zypper)\s+install\b", "install"),
+    (r"\bpacman\s+-S\b", "install"),
+    (r"\bcomposer\s+(install|require|update)\b", "install"),
+    # ---- REMOTE GIT (any operation that contacts a remote) ----
+    (r"\bgit\s+clone\b", "remote_git"),
+    (r"\bgit\s+fetch\b", "remote_git"),
+    (r"\bgit\s+pull\b", "remote_git"),
+    (r"\bgit\s+push\b", "remote_git"),
+    (r"\bgit\s+remote\s+(update|add|set-url)\b", "remote_git"),
+)
+
+_SANDBOX_HINTS: Dict[str, str] = {
+    "install": (
+        "Sandbox has no network and no on-demand installs. If a dependency is "
+        "missing, do NOT try to install it. Skip that verification path and edit "
+        "source files based on what is already available."
+    ),
+    "remote_git": (
+        "Sandbox has no network. Use local-only git: `git status`, `git diff`, "
+        "`git log`, `git show`. The repo is already cloned for you."
+    ),
+}
 
 
 # -----------------------------
@@ -221,6 +266,50 @@ def _truncate(text: str, max_chars: int) -> str:
         + text[-half:]
     )
 
+
+
+
+# Markers that flag the actionable failure body of long observations (pytest,
+# compiler stacks). Plain head/tail truncation drops them in the middle while
+# preserving the boilerplate header + summary at the ends.
+_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "RuntimeError",
+    "FAIL ",
+    "FAILED ",
+    "panic:",
+)
+
+
+def _truncate_around_error(text: str, max_chars: int) -> str:
+    """Like _truncate() but centers the window on the first error marker when
+    one would otherwise be lost in the middle of the text. Falls through to
+    plain head/tail when no marker is found or when the marker already falls
+    inside the head half.
+    """
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker < half or first_marker > len(text) - half:
+        return _truncate(text, max_chars)
+    start = max(0, first_marker - max_chars // 3)
+    end = min(len(text), start + max_chars)
+    prefix = "" if start == 0 else f"...[head {start} chars]...\n"
+    suffix = "" if end == len(text) else f"\n...[tail {len(text) - end} chars]..."
+    return prefix + text[start:end] + suffix
 
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
@@ -421,6 +510,18 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             blocked=True,
         )
 
+    # v24: sandbox-policy block (network-dependent commands useless in sandbox)
+    for _sb_pattern, _sb_category in SANDBOX_FORBIDDEN_RULES:
+        if re.search(_sb_pattern, command):
+            return CommandResult(
+                command=command,
+                exit_code=1,
+                stdout="",
+                stderr=_SANDBOX_HINTS.get(_sb_category, "Command blocked by sandbox policy."),
+                duration_sec=0.0,
+                blocked=True,
+            )
+
     start = time.time()
 
     try:
@@ -439,8 +540,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -455,8 +556,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -1371,6 +1472,90 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
+
+def build_file_cache(repo: Path) -> Dict[str, Tuple[str, float]]:
+    """Pre-read every tracked text file into a path -> (content, mtime) dict.
+
+    Used by `_try_serve_cat_from_cache` to short-circuit plain `cat <path>`
+    reads when the file hasn't been written since cache time.
+    """
+    cache: Dict[str, Tuple[str, float]] = {}
+    total = 0
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return cache
+    repo_resolved = repo.resolve()
+    for relative_path in tracked:
+        if total >= FILE_CACHE_TOTAL_BYTES:
+            break
+        if not _context_file_allowed(relative_path):
+            continue
+        full_path = (repo / relative_path).resolve()
+        try:
+            full_path.relative_to(repo_resolved)
+        except ValueError:
+            continue
+        try:
+            stat = full_path.stat()
+            if stat.st_size > FILE_CACHE_PER_FILE_BYTES:
+                continue
+            data = full_path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:4096]:
+            continue
+        try:
+            content = data.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        cache[relative_path] = (content, stat.st_mtime)
+        total += len(content)
+    return cache
+
+
+# Plain `cat <path>` only - no flags, pipes, redirects, or shell metachars.
+_CAT_CACHE_PATTERN = re.compile(r'^\s*cat\s+([^\s|;&<>`"\'\\]+)\s*$')
+
+
+def _try_serve_cat_from_cache(
+    command: str,
+    repo: Path,
+    cache: Optional[Dict[str, Tuple[str, float]]],
+) -> Optional[str]:
+    """Return cached file content if `command` is a plain `cat <path>` whose
+    target is unchanged since cache time. None otherwise (caller falls
+    through to real subprocess)."""
+    if not cache:
+        return None
+    match = _CAT_CACHE_PATTERN.match(command.strip())
+    if not match:
+        return None
+    raw = match.group(1)
+    rel = raw.lstrip("./")
+    entry = cache.get(rel)
+    if entry is None:
+        return None
+    content, cached_mtime = entry
+    try:
+        current_mtime = (repo / rel).stat().st_mtime
+    except OSError:
+        return None
+    if current_mtime != cached_mtime:
+        return None
+    return content
+
+
+def _make_cached_command_result(command: str, content: str) -> CommandResult:
+    return CommandResult(
+        command=command,
+        exit_code=0,
+        stdout=_truncate(content, MAX_OBSERVATION_CHARS),
+        stderr="",
+        duration_sec=0.0,
+    )
+
+
 # -----------------------------
 # Hunk classifiers + diff hygiene
 # -----------------------------
@@ -1535,6 +1720,13 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     return not _uncovered_required_paths(patch, issue_text)
 
 
+
+_TEST_MENTION_RE = re.compile(
+    r"\b(test|spec|coverage|regression|unit\s+test|integration\s+test|e2e|end.to.end)\b",
+    re.IGNORECASE,
+)
+_TEST_FILE_RE = re.compile(r"(test|spec)[^/]*\.(py|ts|js|tsx|jsx|java|kt|rb|go|rs)$", re.I)
+
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
@@ -1551,6 +1743,12 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     for req in required:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
+    if _TEST_MENTION_RE.search(issue_text):
+        patch_files = _patch_changed_files(patch)
+        if not any(_TEST_FILE_RE.search(f) for f in patch_files):
+            missing.append(
+                "a test/spec file (issue implies testing but no test file is in the patch)"
+            )
     return missing
 
 
@@ -2452,6 +2650,8 @@ After patching, run the most targeted meaningful verification available — one 
 
 If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests.
 
+When the issue context implies testing (words like 'test', 'spec', 'regression', or 'unit test'), include a test file update in your patch -- the judge consistently penalizes patches that omit test coverage when the issue expects it. For every new helper, component, route, or endpoint you add, wire it to its caller or router in the same patch -- isolated additions are penalized as incomplete. When you replace or refactor something, delete the old version in the same patch that adds the new one.
+
 ====================================================================
 STYLE, COMMENTS, AND PUBLIC API
 ====================================================================
@@ -2667,6 +2867,40 @@ def build_coverage_nudge_prompt(
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
+    )
+
+
+
+_FRONTEND_EXT_RE = re.compile(r"\.(tsx?|vue|jsx?|svelte|css|scss)$", re.I)
+_BACKEND_EXT_RE = re.compile(r"\.(py|go|rs|java|kt|rb|php|cs|cpp|c)$", re.I)
+
+
+def _integration_gap_summary(patch: str, issue_text: str) -> List[str]:
+    """Detect structural wiring gaps: frontend-only patch on full-stack issue, or vice versa."""
+    gaps = []
+    changed_files = _patch_changed_files(patch)
+    has_frontend = any(_FRONTEND_EXT_RE.search(f) for f in changed_files)
+    has_backend = any(_BACKEND_EXT_RE.search(f) for f in changed_files)
+    issue_needs_both = bool(re.search(
+        r"\b(api|endpoint|route|server|backend|frontend|client|ui)\b",
+        issue_text, re.I
+    ))
+    if issue_needs_both and has_frontend and not has_backend:
+        gaps.append("patch touches only frontend files but issue spans frontend+backend -- add server/API changes")
+    if issue_needs_both and has_backend and not has_frontend:
+        gaps.append("patch touches only backend files but issue spans frontend+backend -- add UI/client changes")
+    return gaps
+
+
+def build_integration_nudge_prompt(gaps: List[str], issue: str, changed_files: List[str]) -> str:
+    gap_lines = "\n".join(f"  * {g}" for g in gaps)
+    files_str = ", ".join(changed_files[:6]) or "(none)"
+    return (
+        f"Your patch appears to have an integration gap:\n{gap_lines}\n\n"
+        f"Files changed so far: {files_str}\n\n"
+        f"The issue requires changes on BOTH sides of the stack. Add the missing "
+        f"layer's changes to complete the patch. Wire every new endpoint, component, "
+        f"or handler to its caller in the same patch."
     )
 
 
@@ -3076,6 +3310,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    integration_nudges_used = 0
+    MAX_INTEGRATION_NUDGES = 1
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3347,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, integration_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3251,6 +3487,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if integration_nudges_used < MAX_INTEGRATION_NUDGES:
+            gaps = _integration_gap_summary(patch, issue)
+            if gaps:
+                integration_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_integration_nudge_prompt(gaps, issue, _patch_changed_files(patch)),
+                    "INTEGRATION_NUDGE_QUEUED:\n  " + " | ".join(g[:80] for g in gaps[:3]),
+                )
+                return True
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -3281,6 +3531,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        file_cache = build_file_cache(repo)
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3292,7 +3543,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3402,7 +3653,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                _cached = _try_serve_cat_from_cache(command, repo, file_cache)
+                if _cached is not None:
+                    result = _make_cached_command_result(command, _cached)
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
