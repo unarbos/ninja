@@ -116,9 +116,8 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
-_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+MAX_TOTAL_REFINEMENT_TURNS = 2
+_STYLE_HINT_BUDGET = 600
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -791,12 +790,18 @@ _INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
     "controllers",
     "context",
     "db",
+    "factories",
+    "factory",
+    "fixture",
+    "fixtures",
     "form",
     "handler",
     "handlers",
     "layout",
     "migration",
     "migrations",
+    "mock",
+    "mocks",
     "model",
     "models",
     "page",
@@ -817,6 +822,9 @@ _INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
     "view",
     "views",
 )
+
+_DATA_FIXTURE_TOKENS = frozenset({"fixture", "fixtures", "factory", "factories", "mock", "mocks"})
+_DATA_FIXTURE_ISSUE_HINTS = frozenset({"fixture", "fixtures", "mock", "mocks", "data", "factory", "factories"})
 
 _INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
     "Dockerfile",
@@ -935,9 +943,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1087,6 +1092,7 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
         path_lower = relative_path.lower()
         parent = str(path.parent).replace("\\", "/")
         parts = path.parts
+        path_tokens = _split_path_tokens(relative_path)
         score = 0
 
         if parent in anchor_dirs:
@@ -1098,6 +1104,8 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
         score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
+        if path_tokens & _DATA_FIXTURE_TOKENS and issue_tokens & _DATA_FIXTURE_ISSUE_HINTS:
+            score += 4
         if "test" in path_lower or "spec" in path_lower:
             score -= 2  # companion-test loading already handles tests.
 
@@ -1705,11 +1713,6 @@ def _run_companion_test(
 
     Pairs with build_test_fix_prompt — when this returns a non-None failure
     tail, that tail is fed back to the model as one extra refinement turn.
-    Companion-test execution was scaffolded by previous king alexlange1 (the
-    constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
-    co-loading templates _TEST_PARTNER_TEMPLATES) but never wired up; the
-    massive PR #185 rewrite preserved the dead scaffolding without using it.
-    This re-introduces the runtime-correctness signal as a refinement gate.
     """
     full = repo / test_path
     if not full.exists() or not full.is_file():
@@ -1811,14 +1814,9 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
-
-    The model imitates concrete examples better than abstract rules. Showing the
-    model 1-2 real recent commits gives it a concise local style anchor."""
+    """Read recent small-diff commits from the staged repo and format them as
+    in-context style anchors. Returns empty string when the repo has no real
+    history."""
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1893,7 +1891,7 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# v21 edge: criteria-nudge support
+# criteria-nudge support
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
@@ -2218,6 +2216,8 @@ Error messages are often tested exactly. When changing one, match capitalization
 
 Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
 
+Preserve every observable behavior pre-edit unless the issue explicitly requires changing it: log output, error messages, default values, edge-case handling, side-effects, ordering, return shapes.
+
 Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
 
 ====================================================================
@@ -2525,7 +2525,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 # -----------------------------
-# v28 multi-shot helpers
+# multi-shot helpers
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
@@ -2595,8 +2595,49 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _last_failed_commands_summary(result: Dict[str, Any]) -> str:
+    logs_text = result.get("logs", "") or ""
+    last_fail = ""
+    for chunk in re.split(r"\n\n===== STEP \d+ =====\n", logs_text):
+        if "EXIT_CODE:\n" in chunk:
+            ec_match = re.search(r"EXIT_CODE:\n(-?\d+)", chunk)
+            if ec_match and ec_match.group(1) != "0":
+                cmd_match = re.search(r"COMMAND:\n(.+?)(?:\n|$)", chunk)
+                if cmd_match:
+                    last_fail = cmd_match.group(1).strip()[:200]
+    return last_fail
+
+
+def _build_multishot_memo(result: Dict[str, Any], issue: str) -> Dict[str, Any]:
+    patch = result.get("patch", "") or ""
+    return {
+        "attempt1_files_touched": _patch_changed_files(patch),
+        "attempt1_substantive_lines": _multishot_count_substantive(patch),
+        "attempt1_unaddressed_paths": _uncovered_required_paths(patch, issue),
+        "attempt1_last_failed_command": _last_failed_commands_summary(result),
+    }
+
+
+def _format_multishot_memo(memo: Dict[str, Any]) -> str:
+    files = memo.get("attempt1_files_touched") or []
+    lines = memo.get("attempt1_substantive_lines", 0)
+    missing = memo.get("attempt1_unaddressed_paths") or []
+    last_fail = memo.get("attempt1_last_failed_command", "")
+    parts = [
+        "PRIOR ATTEMPT NOTES (a previous solve attempt was reverted; take a different angle):",
+        f"  Files touched: {', '.join(files) if files else 'none'}",
+        f"  Substantive lines added: {lines}",
+    ]
+    if missing:
+        parts.append(f"  Paths NOT yet touched that the issue mentions: {', '.join(missing)}")
+    if last_fail:
+        parts.append(f"  Last failing command: {last_fail}")
+    parts.append("  Strategy: focus on the paths/functions listed above that were missed; do not repeat the same approach.")
+    return "\n".join(parts)
+
+
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent (multi-shot wrapper around _solve_inner)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2656,11 +2697,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _issue = kwargs.get("issue", "")
+        _unaddressed1 = _unaddressed_criteria(_patch1, _issue)
+        _result2 = _solve_attempt(**kwargs, _multishot_memo=_build_multishot_memo(_result1, _issue))
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _unaddressed2 = _unaddressed_criteria(_patch2, _issue)
 
-        if _n2 >= _n1:
+        _u1 = len(_unaddressed1)
+        _u2 = len(_unaddressed2)
+        _retry_wins = (_u2 < _u1) or (_u2 == _u1 and _n2 > _n1)
+
+        if _retry_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -2703,6 +2751,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+    _multishot_memo = kwargs.get("_multishot_memo")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2716,12 +2765,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0
     consecutive_model_errors = 0
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     solve_started_at = time.monotonic()
+    _tle_warn_threshold = max(WALL_CLOCK_BUDGET_SECONDS * 0.55, 50.0)
+    _tle_emergency_threshold = max(WALL_CLOCK_BUDGET_SECONDS - 60.0, 60.0)
+    _tle_warn_injected = False
+    _tle_emergency_injected = False
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2773,10 +2826,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2788,8 +2837,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -2817,15 +2864,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -2853,12 +2891,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
@@ -2892,9 +2924,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
+        _initial_user = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        if _multishot_memo:
+            _initial_user = _format_multishot_memo(_multishot_memo) + "\n\n" + _initial_user
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": _initial_user},
         ]
         initial_preload_stripped = False
 
@@ -2928,6 +2964,57 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            elapsed = time.monotonic() - solve_started_at
+
+            if (
+                elapsed >= _tle_warn_threshold
+                and not _tle_warn_injected
+                and not _tle_emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                _tle_warn_injected = True
+                logs.append(
+                    f"TLE_WARN_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_warn_threshold:.1f}s "
+                    "patch still empty -- nudging model to narrow scope."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Time check: more than half the budget is used and your "
+                        "draft diff is still empty. Stop exploring further files. "
+                        "Pick ONE file that owns the most central requirement in "
+                        "the issue and make a real edit on it now (a focused "
+                        "narrow fix is better than nothing). You can still refine "
+                        "afterwards if budget allows. Do NOT list files, do NOT "
+                        "broaden inspection -- go straight to an edit command."
+                    ),
+                })
+
+            if (
+                elapsed >= _tle_emergency_threshold
+                and not _tle_emergency_injected
+                and not get_patch(repo).strip()
+            ):
+                _tle_emergency_injected = True
+                logs.append(
+                    f"TLE_EMERGENCY_EMIT:\nelapsed={elapsed:.1f}s threshold={_tle_emergency_threshold:.1f}s "
+                    "patch still empty -- forcing minimal emit prompt before docker kill."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EMERGENCY -- less than 60 seconds remain before timeout and your "
+                        "draft diff is still empty. Make one minimal, issue-motivated edit "
+                        "to preserve useful progress before time runs out.\n\n"
+                        "In your NEXT response: pick ONE file and ONE edit that addresses "
+                        "the most central requirement in the issue. Use a single `sed -i` or "
+                        "a single `python -c \"open(...).write(...)\"`. Do not explore. Do "
+                        "not run grep. Do not list files. After the edit command, end your "
+                        "response with `<final>emergency edit</final>`. Do this in ONE "
+                        "response."
+                    ),
+                })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
