@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -61,7 +62,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # -----------------------------
@@ -108,6 +109,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_REFINEMENT_MIN_BUDGET = 30.0  # skip refinement gates when budget this low
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -1624,6 +1626,124 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _iter_patch_file_blocks(patch: str) -> List[Tuple[str, str]]:
+    blocks: List[Tuple[str, str]] = []
+    current_path = ""
+    current_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            if current_path:
+                blocks.append((current_path, "\n".join(current_lines)))
+            current_path = ""
+            current_lines = [line]
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_path = tokens[3][2:]
+        else:
+            current_lines.append(line)
+    if current_path:
+        blocks.append((current_path, "\n".join(current_lines)))
+    return blocks
+
+
+_JS_MANIFEST_RE = re.compile(
+    r"(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$",
+    re.IGNORECASE,
+)
+
+_JS_EXTERNAL_IMPORT_RE = re.compile(
+    r"""^\+\s*(?:import\s+(?:type\s+)?(?:[^'"]+\s+from\s+)?["']([^"'./][^"']*)["']|"""
+    r"""import\s*\(\s*["']([^"'./][^"']*)["']\s*\)|"""
+    r"""require\s*\(\s*["']([^"'./][^"']*)["']\s*\))""",
+    re.MULTILINE,
+)
+
+_NODE_BUILTINS: set = {
+    "assert", "buffer", "child_process", "cluster", "crypto", "dns", "events",
+    "fs", "http", "https", "net", "os", "path", "process", "querystring",
+    "readline", "stream", "string_decoder", "timers", "tls", "tty", "url",
+    "util", "vm", "zlib",
+}
+
+
+def _package_name_from_spec(spec: str) -> str:
+    spec = spec.strip()
+    if spec.startswith("node:"):
+        spec = spec[5:]
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else spec
+    return spec.split("/", 1)[0]
+
+
+def _package_json_declares(repo: Path, package_name: str) -> bool:
+    package_json = repo / "package.json"
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return True
+    for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        deps = data.get(section)
+        if isinstance(deps, dict) and package_name in deps:
+            return True
+    return False
+
+
+def _dependency_manifest_gap_summary(repo: Path, patch: str) -> str:
+    """Catch JS/TS patches that add a new external package import without manifest support."""
+    if not (repo / "package.json").exists():
+        return ""
+    changed = _patch_changed_files(patch)
+    if any(_JS_MANIFEST_RE.search(path) for path in changed):
+        return ""
+    missing: List[str] = []
+    for raw_spec in (m.group(1) or m.group(2) or m.group(3) or "" for m in _JS_EXTERNAL_IMPORT_RE.finditer(patch)):
+        package_name = _package_name_from_spec(raw_spec)
+        if (
+            not package_name
+            or package_name in _NODE_BUILTINS
+            or package_name.startswith(("@/", "~", "#"))
+            or _package_json_declares(repo, package_name)
+        ):
+            continue
+        if package_name not in missing:
+            missing.append(package_name)
+    if not missing:
+        return ""
+    return (
+        "patch adds external JS/TS package import(s) not declared in package.json "
+        f"and does not update a package manifest/lockfile: {', '.join(missing[:6])}"
+    )
+
+
+def _js_ts_patch_hazard_summary(patch: str) -> str:
+    """Spot tiny JS/TS diff-shape hazards seen in duel artifacts."""
+    notes: List[str] = []
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    if ";rror\")" in added or ";rror')" in added:
+        notes.append("patch contains a malformed edit fragment like `;rror\")`, likely from a damaged catch block")
+    if (
+        "line.match(/^event:" in added
+        and "line.match(/^data:" in added
+        and "eventMatch && dataMatch" in added
+    ):
+        notes.append("SSE parser appears to require `event:` and `data:` on the same line; parse multi-line SSE events instead")
+    for path, block in _iter_patch_file_blocks(patch):
+        if not re.search(r"\.(jsx|tsx)$", path, re.IGNORECASE):
+            continue
+        lines = block.splitlines()
+        for idx, line in enumerate(lines):
+            if line.startswith("+import ") and not line.startswith("+++"):
+                window = lines[idx + 1: idx + 8]
+                if any(re.match(r"^[ +][\"']use client[\"'];?\s*$", candidate) for candidate in window):
+                    notes.append(f"{path}: import added before `'use client'`; keep the directive first in client components")
+                    break
+    return "; ".join(notes[:4])
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -2954,7 +3074,8 @@ def build_completeness_nudge_prompt(summary: str, issue_text: str) -> str:
     return (
         "Completeness check: your patch may solve a local piece of the task "
         "without making it reachable, or it may omit an explicitly requested "
-        "supporting artifact.\n\n"
+        "supporting artifact/manifest update, or it may contain a small JS/TS "
+        "diff-shape hazard that breaks runtime behavior.\n\n"
         f"{summary}\n\n"
         "Before finalizing, inspect the relevant convention and make only the "
         "minimal missing edit: route/router/sidebar/menu wiring, API/controller/"
@@ -3056,6 +3177,9 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
+# Grace window added on top of the cooperative budget so a blocking I/O stall
+# that slips past the budget check still gets cut before the docker hard wall.
+_DEADLINE_GRACE_SECONDS = 8.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -3152,6 +3276,41 @@ def solve(
     )
 
 
+def _run_with_deadline(
+    fn: Callable[[], Dict[str, Any]],
+    deadline: float,
+    repo: Optional[Path],
+) -> Dict[str, Any]:
+    """Run an attempt in a worker and return the on-disk patch if it stalls."""
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="solve-deadline"
+    )
+    future = executor.submit(fn)
+    try:
+        result = future.result(timeout=deadline)
+        executor.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        salvage = ""
+        try:
+            if repo is not None:
+                salvage = get_patch(repo)
+        except Exception:
+            salvage = ""
+        cleaned = _sanitize_patch(salvage) if salvage else ""
+        executor.shutdown(wait=False)
+        return AgentResult(
+            patch=cleaned,
+            logs=(
+                f"DEADLINE_SALVAGE: hit hard deadline {deadline:.0f}s; "
+                f"returning on-disk patch ({len(cleaned.splitlines())} lines)."
+            ),
+            steps=0,
+            cost=0.0,
+            success=bool(cleaned.strip()),
+        ).to_dict()
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Run multi-shot solving, salvaging the current patch on unexpected errors."""
     repo_path = kwargs["repo_path"]
@@ -3165,7 +3324,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_started = time.monotonic()
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        _deadline1 = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS)) + _DEADLINE_GRACE_SECONDS
+        _result1 = _run_with_deadline(lambda: _solve_attempt(**kwargs), _deadline1, _multishot_repo_obj)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -3197,7 +3357,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
+        _kwargs2 = {**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap}
+        _result2 = _run_with_deadline(lambda: _solve_attempt(**_kwargs2), _attempt2_budget + _DEADLINE_GRACE_SECONDS, _multishot_repo_obj)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -3340,6 +3501,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
+        remaining = time_remaining()
+        if remaining < _REFINEMENT_MIN_BUDGET:
+            logs.append(
+                f"REFINEMENT_BUDGET_EXHAUSTED: {remaining:.1f}s remaining "
+                f"< _REFINEMENT_MIN_BUDGET={_REFINEMENT_MIN_BUDGET}s; "
+                "skipping refinement gates to preserve patch return."
+            )
+            return False
+
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
@@ -3449,7 +3619,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if completeness_nudges_used < MAX_COMPLETENESS_NUDGES:
-            completeness_summary = _integration_gap_summary(patch, issue) or _requested_artifact_gap_summary(patch, issue)
+            completeness_summary = (
+                _integration_gap_summary(patch, issue)
+                or _requested_artifact_gap_summary(patch, issue)
+                or _dependency_manifest_gap_summary(repo, patch)
+                or _js_ts_patch_hazard_summary(patch)
+            )
             if completeness_summary:
                 completeness_nudges_used += 1
                 total_refinement_turns_used += 1
