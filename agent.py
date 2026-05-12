@@ -987,6 +987,15 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
+    # Preflight failing-test execution. Surfaces the actual AssertionError /
+    # stack trace from issue-named pytest targets so the model diagnoses from
+    # ground truth instead of inferring from test source alone. No-op when
+    # pytest isn't available, when the issue doesn't name a target, or when
+    # the named test is already green.
+    preflight = _preflight_failing_tests(repo, issue)
+    if preflight:
+        parts.append(preflight)
+
     return "\n\n".join(parts), included
 
 
@@ -1917,6 +1926,108 @@ def _select_companion_test_failure(
     return None
 
 
+# Preflight failing-test runner. The companion-test gate runs AFTER the model
+# patches; this runs BEFORE. When the issue explicitly names a pytest target
+# (file path or file::test_name), running the test up-front captures the actual
+# AssertionError / stack trace as ground truth — much more diagnostic than the
+# test source alone. Strict 18s total cap so a misfire can't eat the inner
+# wall budget.
+_PREFLIGHT_TEST_TOTAL_BUDGET_SECONDS = 18
+_PREFLIGHT_TEST_PER_TARGET_TIMEOUT = 9
+_PREFLIGHT_TEST_MAX_TARGETS = 2
+_PREFLIGHT_TEST_TAIL_CHARS = 1500
+_PYTEST_TARGET_RE = re.compile(
+    r"(?<![\w])("
+    r"(?:[\w./-]+/)?test_[\w-]+\.py(?:::[\w]+)?"
+    r"|"
+    r"(?:[\w./-]+/)?[\w-]+_test\.py(?:::[\w]+)?"
+    r")(?![\w/-])"
+)
+
+
+def _extract_pytest_targets(issue_text: str) -> List[str]:
+    """Pull pytest target strings (file or file::testname) from issue text.
+
+    Conservative — only matches canonical test_*.py / *_test.py naming.
+    Ordering preserved so the issue's first reference wins when capped.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for m in _PYTEST_TARGET_RE.finditer(issue_text):
+        target = m.group(1).strip("`'\"()[]{}:,;").rstrip(".")
+        if target and target not in seen:
+            seen.add(target)
+            out.append(target)
+    return out
+
+
+def _preflight_failing_tests(repo: Path, issue_text: str) -> str:
+    """Run pytest targets named in the issue and return a preload block with
+    the actual failure output, or empty string when no useful signal is
+    available. Skipped when pytest is unavailable, no target is named, or
+    pytest itself is unrunnable in this repo.
+    """
+    if not _has_executable("pytest"):
+        return ""
+    targets = _extract_pytest_targets(issue_text)[:_PREFLIGHT_TEST_MAX_TARGETS]
+    if not targets:
+        return ""
+
+    failures: List[str] = []
+    started = time.monotonic()
+    for target in targets:
+        if time.monotonic() - started > _PREFLIGHT_TEST_TOTAL_BUDGET_SECONDS:
+            break
+        path_part = target.split("::", 1)[0]
+        full = (repo / path_part).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+
+        try:
+            proc = subprocess.run(
+                ["pytest", target, "-x", "--tb=short", "-q", "--no-header"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_PREFLIGHT_TEST_PER_TARGET_TIMEOUT,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            continue
+
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        unrunnable_markers = (
+            "No module named pytest",
+            "No module named 'pytest'",
+            "command not found",
+        )
+        if any(marker in output for marker in unrunnable_markers):
+            return ""
+        if proc.returncode == 0:
+            continue
+        tail = output[-_PREFLIGHT_TEST_TAIL_CHARS:] if len(output) > _PREFLIGHT_TEST_TAIL_CHARS else output
+        failures.append(f"```\n$ pytest {target}\n{tail}\n```")
+
+    if not failures:
+        return ""
+    return (
+        "PREFLIGHT TEST RESULTS — running the test target(s) named in the "
+        "issue confirms the current failure(s). Use these exact error "
+        "messages and stack traces to diagnose the root cause; do not "
+        "guess from the test source alone:\n\n"
+        + "\n\n".join(failures)
+    )
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -2799,6 +2910,30 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+# Quality vector for the FINAL multi-shot picker — compared lexicographically,
+# higher wins: (syntax_clean, covers_paths, -files, -lines). Among
+# correctness-equivalent patches the smaller one wins, since Cursor-baseline
+# similarity rewards surgical patches and the LLM judge explicitly penalises
+# scope creep. Replaces the previous raw substantive-line compare that
+# preferred LARGER patches when both were valid.
+def _multishot_quality(
+    repo: Optional[Path], patch: str, issue_text: str
+) -> Tuple[int, int, int, int]:
+    if not patch.strip():
+        return (0, 0, 0, 0)
+    syntax_clean = 1
+    if repo is not None:
+        try:
+            if _check_syntax(repo, patch):
+                syntax_clean = 0
+        except Exception:
+            pass
+    covers = 1 if _patch_covers_required_paths(patch, issue_text) else 0
+    files = len(_patch_changed_files(patch))
+    lines = _multishot_count_substantive(patch)
+    return (syntax_clean, covers, -files, -lines)
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2876,11 +3011,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _issue_text = kwargs.get("issue", "") or ""
+        _q1 = _multishot_quality(_multishot_repo_obj, _patch1, _issue_text)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
+        _q2 = _multishot_quality(_multishot_repo_obj, _patch2, _issue_text)
 
-        if _n2 >= _n1:
+        # Quality-vector compare instead of raw line count. Empty retry must
+        # never overwrite a non-empty primary even when quality ties.
+        _retry_wins = _q2 > _q1 or (_q2 == _q1 and bool(_patch2.strip()) and not _patch1.strip())
+        if _retry_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3143,8 +3283,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -3321,8 +3459,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+            if not get_patch(repo).strip():
+                if step in {2, 4}:
+                    messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+                elif step == 12 and hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                    # Anti-thrash: 12 model rounds with no edit indicates the
+                    # model is stuck inspecting. The existing hail-mary only
+                    # fires after a <final> tag, which a thrashing model never
+                    # emits — so the full step budget gets burned on inspection
+                    # and the wrapper ships an empty patch. Fire the hail-mary
+                    # prompt here too so the model is forced to synthesise an
+                    # edit while there's still budget for it to land.
+                    hail_mary_turns_used += 1
+                    logs.append(
+                        "\nANTI_THRASH_HAIL_MARY_QUEUED:\n"
+                        "patch empty at step 12 — surfacing hail-mary prompt early."
+                    )
+                    messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
