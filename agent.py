@@ -2014,42 +2014,64 @@ _CRITERIA_STOP = frozenset({
 })
 
 
+_PROSE_IMPERATIVE_RE = re.compile(
+    r"\b(must|should|implement|add|support|ensure|return|raise|expect|"
+    r"create|build|wire|register|expose|persist|generate|enforce|require|"
+    r"preserve|strip|hook(?:\s*up)?)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     """Pull acceptance-criterion checkpoints from the issue text.
 
     Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `•`) first; fallback to imperative sentences (must/should/implement/add/
-    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
-    so the nudge prompt stays compact."""
+    `•`) first, then prose imperative sentences (must/should/implement/add/
+    build/wire/register/hook up/...) merged into the same list. The earlier
+    version only fell back to prose imperatives when zero bullets existed,
+    which misses the common pattern of issues that bullet some requirements
+    while stating others as imperative prose — the LLM judge then dings the
+    king for "misses the core requirement" or "misses major requested work"
+    on exactly those prose-only items. Caps at _CRITERIA_MAX_BULLETS so the
+    nudge prompt stays compact."""
     if not issue_text:
         return []
     bullets: List[str] = []
+    seen_norm: set = set()
+
+    def _add(text: str) -> bool:
+        text = text.strip()[:_CRITERIA_MAX_TEXT]
+        if len(text) < 6:
+            return False
+        norm = re.sub(r"\s+", " ", text).lower()
+        if norm in seen_norm:
+            return False
+        seen_norm.add(norm)
+        bullets.append(text)
+        return len(bullets) >= _CRITERIA_MAX_BULLETS
+
     bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
+    non_bullet_lines: List[str] = []
     for line in issue_text.splitlines():
         m = bullet_re.match(line)
-        if not m:
-            continue
-        text = m.group(1).strip()
-        if len(text) < 6:
-            continue
-        bullets.append(text[:_CRITERIA_MAX_TEXT])
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
-            break
-    if bullets:
-        return bullets
-    fallback_re = re.compile(
-        r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
-        re.IGNORECASE,
-    )
-    for raw in re.split(r"(?<=[.!?])\s+", issue_text):
+        if m:
+            if _add(m.group(1)):
+                return bullets
+        else:
+            non_bullet_lines.append(line)
+
+    # Prose pass runs on non-bullet lines only so bullet-block multi-line
+    # chunks (which never contain sentence terminators) aren't captured
+    # whole. Sentence-splits on ., !, ?, AND on blank lines as a soft delim.
+    prose_text = "\n".join(non_bullet_lines)
+    for raw in re.split(r"(?<=[.!?])\s+|\n\s*\n", prose_text):
         text = raw.strip()
         if not text or len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
             continue
-        if not fallback_re.search(text):
+        if not _PROSE_IMPERATIVE_RE.search(text):
             continue
-        bullets.append(text)
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
-            break
+        if _add(text):
+            return bullets
     return bullets
 
 
@@ -3142,8 +3164,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
