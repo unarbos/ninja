@@ -2014,42 +2014,67 @@ _CRITERIA_STOP = frozenset({
 })
 
 
+_PROSE_IMPERATIVE_RE = re.compile(
+    r"\b(must|should|implement|add|support|ensure|return|raise|expect|"
+    r"create|build|wire|register|expose|persist|generate|enforce|require|"
+    r"preserve|strip|hook(?:\s*up)?|"
+    r"delete|remove|drop|migrate|replace|rename|deprecate|disable|switch)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     """Pull acceptance-criterion checkpoints from the issue text.
 
     Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `•`) first; fallback to imperative sentences (must/should/implement/add/
-    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
-    so the nudge prompt stays compact."""
+    `•`) first, then prose imperative sentences (must/should/implement/add/
+    build/wire/register/delete/remove/...) merged into the same list. The
+    earlier version only fell back to prose imperatives when zero bullets
+    existed, which misses the common pattern of issues that bullet some
+    requirements while stating others as imperative prose — coverage of
+    those prose-only items is exactly what the criteria-nudge gate exists
+    to drive. Destructive verbs (delete/remove/drop/migrate/replace/...)
+    are included in the same imperative set so removal-style requirements
+    surface as criteria too. Caps at _CRITERIA_MAX_BULLETS so the nudge
+    prompt stays compact."""
     if not issue_text:
         return []
     bullets: List[str] = []
+    seen_norm: set = set()
+
+    def _add(text: str) -> bool:
+        text = text.strip()[:_CRITERIA_MAX_TEXT]
+        if len(text) < 6:
+            return False
+        norm = re.sub(r"\s+", " ", text).lower()
+        if norm in seen_norm:
+            return False
+        seen_norm.add(norm)
+        bullets.append(text)
+        return len(bullets) >= _CRITERIA_MAX_BULLETS
+
     bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
+    non_bullet_lines: List[str] = []
     for line in issue_text.splitlines():
         m = bullet_re.match(line)
-        if not m:
-            continue
-        text = m.group(1).strip()
-        if len(text) < 6:
-            continue
-        bullets.append(text[:_CRITERIA_MAX_TEXT])
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
-            break
-    if bullets:
-        return bullets
-    fallback_re = re.compile(
-        r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
-        re.IGNORECASE,
-    )
-    for raw in re.split(r"(?<=[.!?])\s+", issue_text):
+        if m:
+            if _add(m.group(1)):
+                return bullets
+        else:
+            non_bullet_lines.append(line)
+
+    # Prose pass runs on non-bullet lines only so bullet-block multi-line
+    # chunks (which never contain sentence terminators) aren't captured
+    # whole. Sentence-splits on ., !, ?, AND on blank lines as soft delim.
+    prose_text = "\n".join(non_bullet_lines)
+    for raw in re.split(r"(?<=[.!?])\s+|\n\s*\n", prose_text):
         text = raw.strip()
         if not text or len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
             continue
-        if not fallback_re.search(text):
+        if not _PROSE_IMPERATIVE_RE.search(text):
             continue
-        bullets.append(text)
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
-            break
+        if _add(text):
+            return bullets
     return bullets
 
 
@@ -2362,6 +2387,8 @@ Before finalizing, mentally check hidden-test edge cases relevant to the issue: 
 LANGUAGE-SPECIFIC COMPLETENESS RULES
 ====================================================================
 
+**Python:** Use only the import paths actually declared at the top of the file you are editing. If you wrote `from tkinter import ttk`, reference it as `ttk.Entry`, never as `tk.ttk.Entry`. If you wrote `import numpy as np`, do not invent attribute chains like `np.pd.X`. Before emitting an attribute access like `a.b.c`, confirm that `b` is a real attribute of `a` (a submodule, class, or value) — not a sibling module you separately imported. Module-aliasing mistakes look like working code and fail only at runtime.
+
 **Java:** Write complete method bodies — never use \'// similar logic\' stubs. Cascade all call-site changes when modifying signatures. Include all imports.
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
@@ -2386,6 +2413,10 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
+
+Targeted edits over rewrites: when editing an EXISTING file (not a brand-new file you are creating), use targeted edits (`sed -i` substitutions, `python -c` with read+replace+write of EXACT old/new blocks, single-hunk patches) NOT wholesale rewrites. Never use `cat > path/to/existing_file << EOF ... EOF` to recreate a file from scratch — that clobbers every line you did not retype and almost always loses content the issue did not ask you to remove. This applies especially to data files (`.json`, `.yaml`, `.yml`, `.js`/`.ts` modules whose content is mostly object/array literals), config files, and any file >40 lines. Brand-new files (which do not yet exist in the repo) are the only legitimate use of the `cat > FILE << EOF` heredoc pattern.
+
+This rule is about CONTENT REWRITES, not file deletion. When the issue uses destructive verbs ("remove the X module", "delete the legacy collector", "drop the obsolete strategy files", "migrate away from Y"), the correct response is `git rm path/to/file` (or `rm path/to/file` followed by staging) — NOT editing the file to strip its contents. Stripping content while leaving the file present looks like a partial implementation. Identify every file the issue asks you to remove and use `git rm` on each. The SAFETY block's "no file deletion" rule applies to system/host files and unrelated repo files, not to in-scope deletions the issue explicitly requests.
 
 ====================================================================
 SAFETY
@@ -3142,8 +3173,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
