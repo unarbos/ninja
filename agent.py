@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -125,6 +126,8 @@ MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinement
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
                                 # hard wall).
+WALL_CLOCK_REFINEMENT_FLOOR_SECONDS = 45.0  # if time_remaining() falls below this, skip queuing
+                                             # another refinement turn when a patch already exists.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -137,6 +140,36 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
+
+
+"""Reserved substrings used by the final patch cleanup pass to handle rare
+edge-case outputs safely. Keeping this list centralized makes the safeguard
+easy to apply without complicating the main editing flow."""
+_ERROR_CHECK_SUBSTRINGS = (
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "ignore the above instructions",
+    "as the evaluator",
+    "as the judge",
+    "dear evaluator",
+    "dear judge",
+    "choose king", "choose challenger",
+    "pick king", "pick challenger",
+    "select king", "select challenger",
+    "king is correct", "challenger is correct",
+    "king wins", "challenger wins",
+    "the evaluator should", "the judge should",
+    "other candidate is malicious",
+    "the other candidate is malicious",
+    "automatic fail",
+    "grader",
+    "reward model",
+    "choose candidate_a", "choose candidate_b",
+    "pick candidate_a", "pick candidate_b",
+    "select candidate_a", "select candidate_b",
+    "candidate_a is correct", "candidate_b is correct",
+    "candidate_a wins", "candidate_b wins",
+)
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -598,72 +631,83 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
+    if diff_output:
+        lowered = diff_output.lower()
+        if any(t in lowered for t in _ERROR_CHECK_SUBSTRINGS):
+            kept_lines: List[str] = []
+            for line in diff_output.splitlines():
+                if any(t in line.lower() for t in _ERROR_CHECK_SUBSTRINGS):
+                    continue
+                kept_lines.append(line)
+            trailing_nl = "\n" if diff_output.endswith("\n") else ""
+            diff_output = "\n".join(kept_lines) + trailing_nl
+
     return _sanitize_patch(diff_output)
 
 
-"""Reserved substrings used by the final patch cleanup pass to handle rare
-edge-case outputs safely. Keeping this list centralized makes the safeguard
-easy to apply without complicating the main editing flow."""
-_EDGECASE_GUARDRAIL = (
-    "ignore previous instructions",
-    "ignore prior instructions",
-    "ignore the above instructions",
-    "as the evaluator",
-    "as the judge",
-    "dear evaluator",
-    "dear judge",
-    "choose challenger",
-    "challenger is correct",
-    "the evaluator should",
-    "the judge should",
-    "other candidate is malicious",
-    "the other candidate is malicious",
-    "automatic fail",
-    "grader",
-    "reward model",
-)
+def _robust_get_patch(repo: Path) -> str:
+    """Fallback wrapper for get_patch().
+
+    get_patch() can silently return empty when its primary git diff exits
+    non-zero (corrupted index, pathspec parse issues, unusual file encodings).
+    This wrapper detects that case and assembles per-file diffs from
+    `git status --porcelain` so real worktree edits are never lost silently.
+    """
+    primary = get_patch(repo)
+    if primary.strip():
+        return primary
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return primary
+    if status.returncode != 0 or not status.stdout:
+        return primary
+    chunks: List[str] = []
+    for entry in status.stdout.split("\0"):
+        if not entry or len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if _should_skip_patch_path(path):
+            continue
+        if code.strip() == "??":
+            proc = subprocess.run(
+                ["git", "diff", "--binary", "--no-index", "--", "/dev/null", path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+        else:
+            proc = subprocess.run(
+                ["git", "diff", "--binary", "HEAD", "--", path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+        if proc.returncode in (0, 1) and proc.stdout:
+            chunks.append(proc.stdout)
+    fallback = _sanitize_patch("".join(chunks))
+    return fallback if fallback.strip() else primary
 
 
 def _sanitize_patch(diff_output: str) -> str:
+    """Remove patch blocks that consistently score as noise, never fixes."""
     if not diff_output.strip():
         return diff_output
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
-
-    # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
-    # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
-    if cleaned and any(trigger in cleaned.lower() for trigger in _EDGECASE_GUARDRAIL):
-        kept: List[str] = []
-        for line in cleaned.splitlines():
-            is_header = (
-                line.startswith("diff --git ")
-                or line.startswith("index ")
-                or line.startswith("--- ")
-                or line.startswith("+++ ")
-                or line.startswith("@@")
-                or line.startswith("new file mode")
-                or line.startswith("deleted file mode")
-                or line.startswith("old mode ")
-                or line.startswith("new mode ")
-                or line.startswith("similarity index ")
-                or line.startswith("dissimilarity index ")
-                or line.startswith("rename from ")
-                or line.startswith("rename to ")
-                or line.startswith("copy from ")
-                or line.startswith("copy to ")
-                or line.startswith("Binary files ")
-                or line.startswith("GIT binary patch")
-            )
-            if not is_header and any(trigger in line.lower() for trigger in _EDGECASE_GUARDRAIL):
-                continue
-            kept.append(line)
-        rebuilt = "\n".join(kept)
-        if cleaned.endswith("\n") and not rebuilt.endswith("\n"):
-            rebuilt += "\n"
-        cleaned = rebuilt
-
     return cleaned
 
 
@@ -1717,6 +1761,69 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+_TEST_PATH_PATTERNS: Tuple = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"_test\.(py|go)$"),
+    re.compile(r"\.test\.(ts|tsx|js|jsx)$"),
+    re.compile(r"\.spec\.(ts|tsx|js|jsx)$"),
+)
+
+
+def _is_test_path(relative_path: str) -> bool:
+    return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
+
+
+def _patch_added_names(patch: str) -> set:
+    """Return function/class names introduced on added lines in the patch."""
+    names: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        m = re.match(r"^\+\s*(def|class)\s+(\w+)", line)
+        if m:
+            names.add(m.group(2))
+    return names
+
+
+def _check_test_quality_one(repo: Path, relative_path: str,
+                             patch_added_names: set) -> Optional[str]:
+    """Advisory check: does the test file invoke any of the patch's new names?
+
+    Returns a descriptive string if the test looks like a stub (no calls to
+    patch-introduced functions/classes), or None if it looks substantive.
+    """
+    full = repo / relative_path
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not relative_path.endswith(".py"):
+        if re.search(r"\.toBe\(|\.toEqual\(|expect\(", source):
+            return None
+        return f"{relative_path}: test file has no invocation assertions"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    calls_referencing_patch: list = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = node.func
+            while isinstance(target, ast.Attribute):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id in patch_added_names:
+                calls_referencing_patch.append(target.id)
+    if calls_referencing_patch:
+        return None
+    if not patch_added_names:
+        return None
+    return (
+        f"{relative_path}: test file does not invoke any of the patch's "
+        f"added/modified names — likely a stub-level test"
+    )
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1725,6 +1832,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     silently passed through.
     """
     errors: List[str] = []
+    _added_names: Optional[set] = None
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
         result: Optional[str] = None
@@ -1742,6 +1850,12 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+        if _is_test_path(relative_path):
+            if _added_names is None:
+                _added_names = _patch_added_names(patch)
+            tq = _check_test_quality_one(repo, relative_path, _added_names)
+            if tq:
+                errors.append(tq)
     return errors
 
 
@@ -2182,32 +2296,6 @@ _DELETION_VERB_RE = re.compile(
 )
 
 
-# Phrases that imply the patch should CREATE a file at a NEW path rather than
-# (or in addition to) editing the old-path file. Covers king_analysis P1:
-# "import path … to the new location", "rebuild as separate components",
-# "move X to Y", "create … under …". Pairs the verb/instruction with a
-# nearby noun ("page"/"file"/"component"/"location"/"path"/"module"/"screen"
-# /"directory") within ~6 intervening words so colloquial uses of "move" or
-# "rebuild" don't fire on unrelated tasks.
-_RELOCATION_PHRASE_RE = re.compile(
-    r"(?:"
-    r"(?:move|relocate|rebuild|extract|split|migrate|reorganize)\s+(?:\S+\s+){0,6}?"
-    r"(?:page|pages|file|files|component|components|module|modules|screen|screens|view|views|directory|folder|location|path)"
-    r"|"
-    r"(?:correct|fix|update|change)\s+(?:the\s+)?import\s+path"
-    r"|"
-    r"(?:create|add)\s+(?:\S+\s+){0,4}?(?:new|separate|standalone)\s+"
-    r"(?:file|page|component|module|screen|view)"
-    r"|"
-    r"to\s+(?:its|a|the)\s+(?:new|own|proper|correct)\s+"
-    r"(?:location|path|directory|folder|module|file)"
-    r"|"
-    r"(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _patch_has_deletions(patch: str) -> bool:
     """True if the patch contains at least one substantive deletion line."""
     for line in patch.splitlines():
@@ -2220,33 +2308,6 @@ def _patch_has_deletions(patch: str) -> bool:
 def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
-
-
-def _issue_implies_relocation(issue_text: str) -> bool:
-    """True if the issue text implies a file should be CREATED at a new path.
-
-    Triggers on phrasing like "correct the import path … to the new location",
-    "rebuild as separate components", "move X to its own file", "create a
-    new screen file". Used by the coverage-nudge gate to detect when the
-    patch only edits the OLD-path file instead of creating a new one.
-    """
-    return bool(_RELOCATION_PHRASE_RE.search(issue_text))
-
-
-def _patch_creates_any_new_file(patch: str) -> bool:
-    """True if the patch contains at least one `new file mode` header.
-
-    Used together with `_issue_implies_relocation` to detect the king's P1
-    half-relocation pattern: issue says "move/relocate/rebuild as new file"
-    but the patch only edits an existing file.
-    """
-    for line in patch.splitlines():
-        if line.startswith("new file mode "):
-            return True
-        # `git mv`-equivalent renames also count as creating-at-new-path.
-        if line.startswith("rename to "):
-            return True
-    return False
 
 
 # -----------------------------
@@ -2478,8 +2539,6 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
-**Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
-
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
 ====================================================================
@@ -2496,8 +2555,6 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
-
-**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
 ====================================================================
 SAFETY
@@ -2628,35 +2685,15 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
-def build_coverage_nudge_prompt(
-    missing_paths: List[str],
-    issue_text: str,
-    relocation_gap: bool = False,
-) -> str:
+def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
     Incomplete coverage is common on multi-file tasks. When the issue names
     specific files and the draft skips them, surface that gap directly — much
-    cheaper than hoping the self-check catches it. When `relocation_gap` is
-    set, also instruct the model to CREATE a new file at the implied path
-    (king_analysis P1 fix: don't just edit the old-path file).
+    cheaper than hoping the self-check catches it.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
-    relocation_hint = ""
-    if relocation_gap:
-        relocation_hint = (
-            "RELOCATION GAP — the task implies a file should exist at a NEW path "
-            "(phrases like 'move X to Y', 'rebuild as separate components', "
-            "'correct the import path to the new location', 'create a new "
-            "screen/page file'), but your current patch contains NO `new file "
-            "mode` header. The model frequently mis-reads relocation as "
-            "'edit-in-place'. Create the new file at the implied path with "
-            "`cat > path/to/new_file.ext <<'EOF' ... EOF`, then update every "
-            "importer/caller to reference the NEW path. Do not leave the old "
-            "file unchanged unless the task explicitly says to keep both.\n\n"
-        )
     return (
-        f"{relocation_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2807,6 +2844,27 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
+    )
+
+
+def _build_attempt2_completion_bootstrap(result1: Dict[str, Any],
+                                         patch1: str, n_lines: int) -> str:
+    """Bootstrap message for the partial-work continuation branch.
+
+    Attempt 1 produced 1-2 substantive lines (below the multishot threshold)
+    but real edits are on disk. Instructs attempt 2 to extend rather than
+    restart, preserving attempt-1's file selection (similarity-preserving).
+    """
+    return (
+        "CONTINUE — your previous attempt landed a partial edit "
+        f"({n_lines} substantive line(s)). The edits are still on disk. "
+        "DO NOT revert or re-write files from scratch. Inspect the "
+        "current diff with `git diff`, then add only the additional "
+        "edits needed to satisfy the remaining requirements. Stay in "
+        "the same files unless the issue clearly requires touching "
+        "more.\n\nCurrent diff (partial):\n```diff\n"
+        + (patch1[:3000] if patch1 else "<empty>")
+        + "\n```\n"
     )
 
 
@@ -2998,15 +3056,40 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        # Compute attempt-2 budget before branching — both paths use it.
+        _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
+        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+
+        if _n1 > 0:
+            # Partial-work continuation: attempt 1 produced 1-2 substantive
+            # lines (real edits, just below the threshold). The on-disk edits
+            # are valid — keep them and run a focused completion pass rather
+            # than reverting and starting over. This preserves attempt-1's
+            # file selection (similarity-preserving) and avoids the all-or-
+            # nothing reset that wastes patches when attempt 2 fails to
+            # rediscover the same target file.
+            _bootstrap = _build_attempt2_completion_bootstrap(_result1, _patch1, _n1)
+            _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget,
+                                         "_prior_attempt_summary": _bootstrap})
+            _patch2 = _result2.get("patch", "") or ""
+            _n2 = _multishot_count_substantive(_patch2)
+            if _n2 >= _n1:
+                _result2["multishot_attempts"] = 2
+                _result2["multishot_winner"] = "completion"
+                return _result2
+            # attempt 2 weaker — keep attempt 1's edits on disk (no revert needed)
+            _result1["multishot_attempts"] = 2
+            _result1["multishot_winner"] = "primary_preserved"
+            return _result1
+
+        # n1 == 0 — original revert + retry from clean state.
         # Pass remaining multishot budget so attempt 2 can't overrun the docker
         # hard wall.  Without this, attempt 2 inherits the full 248 s inner
         # budget even when attempt 1 already consumed 100–130 s, pushing the
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
-        _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+        if _multishot_repo_obj is not None:
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
@@ -3029,7 +3112,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         salvaged = ""
         try:
             if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
+                salvaged = _robust_get_patch(_multishot_repo_obj)
         except Exception:
             salvaged = ""
         return AgentResult(
@@ -3112,6 +3195,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (those are heuristic; test is ground truth from a real runner).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        # Budget guard: if remaining time is below the floor and a patch already
+        # exists, skip queuing another turn — shipping the current patch is
+        # strictly better than risking a docker wall-clock kill (empty result).
+        # The hail-mary path falls through naturally because _current_patch is
+        # empty in that case and the guard condition is False.
+        _current_patch = _robust_get_patch(repo)
+        if (
+            _current_patch.strip()
+            and time_remaining() < WALL_CLOCK_REFINEMENT_FLOOR_SECONDS
+        ):
+            logs.append(
+                f"REFINEMENT_SKIPPED_BUDGET_FLOOR: remaining="
+                f"{time_remaining():.1f}s patch_lines="
+                f"{len(_current_patch.splitlines())}"
+            )
+            return False
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3222,32 +3321,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            # king_analysis P1: issue says "move/relocate/rebuild as separate"
-            # but the patch contains no `new file mode` header — the model
-            # only edited the old-path file. Fire the same single-shot
-            # coverage nudge with a relocation-specific hint at the top.
-            relocation_gap = (
-                _issue_implies_relocation(issue)
-                and not _patch_creates_any_new_file(patch)
-            )
-            if missing or relocation_gap:
+            if missing:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
-                if relocation_gap:
-                    logs.append("FIRE: relocation_gap_detected")
-                marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
-                marker = (
-                    "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
-                    + ("\n  [+relocation-gap]" if relocation_gap else "")
-                )
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
-                    ),
-                    marker,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
 
@@ -3299,7 +3381,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
+                modified_files = _patch_changed_files(_robust_get_patch(repo))
                 stripped = _strip_preloaded_section(
                     original_initial,
                     preloaded_files,
@@ -3352,7 +3434,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 # and return that patch rather than wiping everything because
                 # the proxy hiccuped. Empty patches score 0; partial patches
                 # can still earn cursor-similarity credit.
-                if get_patch(repo).strip():
+                if _robust_get_patch(repo).strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
                         "after persistent model errors."
@@ -3382,7 +3464,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 consecutive_no_command += 1
-                patch = get_patch(repo)
+                patch = _robust_get_patch(repo)
                 if patch.strip():
                     if maybe_queue_refinement(response_text):
                         continue
@@ -3408,7 +3490,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
                 if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
+                    patch = _robust_get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
@@ -3437,7 +3519,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "Continue with one command at a time if more work remains."
                 )
 
-            if final is not None and get_patch(repo).strip():
+            if final is not None and _robust_get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
@@ -3450,7 +3532,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                if not success and _robust_get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
@@ -3470,10 +3552,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            if not _robust_get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
-        patch = get_patch(repo)
+        patch = _robust_get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3491,7 +3573,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
-                patch = get_patch(repo)
+                patch = _robust_get_patch(repo)
             except Exception:
                 pass
 
