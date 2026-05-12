@@ -2892,9 +2892,9 @@ def _integration_gap_summary(patch: str, issue_text: str) -> List[str]:
     return gaps
 
 
-def _build_integration_nudge(gaps: List[str], issue: str, changed_files: List[str]) -> str:
-    gap_lines = "\n".join(f"  * {g}" for g in gaps)
-    files_str = ", ".join(changed_files[:6]) or "(none)"
+def _v24_integration_nudge_text(gap_items: list, issue_context: str, files_so_far: list) -> str:
+    gap_lines = "\n".join(f"  * {g}" for g in gap_items)
+    files_str = ", ".join(files_so_far[:6]) or "(none)"
     return (
         f"Your patch appears to have an integration gap:\n{gap_lines}\n\n"
         f"Files changed so far: {files_str}\n\n"
@@ -3496,7 +3496,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
-                    _build_integration_nudge(gaps, issue, _patch_changed_files(patch)),
+                    _v24_integration_nudge_text(gaps, issue, _patch_changed_files(patch)),
                     "INTEGRATION_NUDGE_QUEUED:\n  " + " | ".join(g[:80] for g in gaps[:3]),
                 )
                 return True
