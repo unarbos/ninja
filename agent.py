@@ -2494,14 +2494,13 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
-        "COVERAGE GAP — JUDGE-CRITICAL: The task explicitly mentions these path(s) "
-        "but your current patch does NOT touch them:\n"
+        "Coverage gap — the task explicitly mentions these path(s) but your "
+        "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "WHY THIS MATTERS: The LLM diff judge will score this as 'incomplete' if "
-        "task-mentioned files are skipped. This is the #1 reason for a lower judge score. "
-        "You MUST edit every listed file or confirm via inspection that no edit is needed.\n\n"
-        "ACTION: For each path above, open it (cat -n) and issue the edit "
-        "commands needed. Do not start unrelated work. Do not stop early.\n\n"
+        "Open each of those paths now (cat -n) and then issue the edit "
+        "commands needed to satisfy the task for them. Do not start "
+        "unrelated work and do not stop early until you have either edited "
+        "each path or confirmed via inspection that no edit is required.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2520,16 +2519,13 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are ALL edge cases mentioned in the issue handled (empty input, null values, boundaries)?\n"
+        "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is REQUIRED evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — HIGHEST impact):\n"
-        "  - List every requirement from the task: numbered items, bullets, secondary clauses. "
-        "Is EACH ONE explicitly addressed by your patch?\n"
-        "  - Companion tests: are ALL tests that cover the changed behavior updated?\n"
-        "  - No syntax errors or broken imports introduced\n"
-        "  - Have you touched ALL files the issue explicitly mentions?\n"
-        "  - Missing even one criterion = lower score. Completeness > perfection.\n\n"
+        "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Companion tests broken by the source change are updated\n"
+        "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
@@ -2566,18 +2562,16 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
-        "CRITERIA GAP — JUDGE-CRITICAL: These acceptance-criterion checkpoints from "
-        "the task are NOT reflected in your patch's added lines:\n"
+        "Criterion-coverage gap — these acceptance-criterion checkpoints from "
+        "the task are NOT clearly reflected in your patch's added lines:\n"
         f"  {bullets}\n\n"
-        "WHY THIS MATTERS: The LLM diff judge checks EVERY criterion. Missing "
-        "even one criterion lowers the completeness score. "
-        "Completeness beats scope perfection.\n\n"
-        "DECISION for each unaddressed criterion:\n"
-        "  (a) Already addressed (different keywords) -> end with <final>summary</final> "
-        "and explain why; OR\n"
-        "  (b) Really IS missing -> issue <command> blocks to satisfy it, then <final>.\n\n"
-        "SAFETY: Do NOT add scope the task did not ask for. Do NOT rewrite working code. "
-        "Add ONLY what is required to cover the listed criteria.\n\n"
+        "For each one, decide:\n"
+        "  (a) you already addressed it but the keywords differ -> respond "
+        "with <final>summary</final> and explain why in the summary; OR\n"
+        "  (b) it really IS missing -> issue the additional <command> blocks "
+        "needed to satisfy it, then end with <final>summary</final>.\n\n"
+        "Do NOT add scope the task did not ask for. Do NOT rewrite working "
+        "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -2644,8 +2638,16 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+# Tau docker_solver hard wall is max(per-task-timeout, 300s) from exec start.
+# A 580s outer budget invited "retry" starts with only seconds left, then the
+# process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
+# failure mode observed in duel #4544). Keep outer budget under ~300s.
+_MULTISHOT_TOTAL_BUDGET = 278.0
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
+# If attempt 1 already consumed this much wall clock, skip attempt 2 even when
+# attempt 1 was low-signal — otherwise the process often dies before the retry
+# finishes, which is worse than shipping the first (possibly thin) patch.
+_MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2767,6 +2769,14 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
+
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
+            # Attempt 1 already burned the outer budget — starting attempt 2
+            # invites a docker_solver kill (hard wall ~300s from exec start),
+            # which is strictly worse than shipping attempt 1's thin patch.
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
         if _multishot_repo_obj is not None:
