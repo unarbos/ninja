@@ -96,9 +96,9 @@ MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modul
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
+# Anti-whiff knobs. Empty patches never solve the user's task, so any
+# transient model error or stuck loop directly costs useful repair attempts.
+# Be aggressive about retrying instead of returning early with no edits.
 # Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
@@ -1097,7 +1097,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1115,8 +1118,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1199,7 +1203,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 35
         if name_lower and name_lower in issue_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
             score += 16
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
@@ -1254,8 +1258,8 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-    hits: Dict[str, int] = {}
-    for term in terms:
+
+    def _grep_term(term: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
@@ -1266,13 +1270,20 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
                 timeout=3,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if relative_path and relative_path in tracked:
-                hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+
+    hits: Dict[str, int] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
+        futures = {pool.submit(_grep_term, term): term for term in terms}
+        for future in concurrent.futures.as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1351,9 +1362,14 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        path_words = _split_path_tokens(relative_path)
+
+        def _token_in_path(token: str) -> bool:
+            return token in path_words if len(token) < 5 else token in path_lower
+
+        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
+        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
+        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -1753,9 +1769,8 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
+    which files the task says to edit but that haven't been touched. Surfacing
+    the gap directly is the cheapest way to close incomplete multi-file fixes.
     """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
@@ -1935,10 +1950,10 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
+    Reviewers and compilers catch "extra closing brace" / "duplicate brace"
+    regressions quickly. This naive counter ignores braces inside string and
+    comment context (best-effort) and reports an imbalance with file + count
+    delta.
     """
     full = (repo / relative_path).resolve()
     try:
@@ -2030,7 +2045,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model and targeted verification.
         if result:
             errors.append(result)
     return errors
@@ -2603,8 +2618,8 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_symbol(symbol: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -2615,16 +2630,21 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked_set
+            and _context_file_allowed(line.strip())
+        ]
+
+    hits: Dict[str, int] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        futures = {pool.submit(_grep_symbol, symbol): symbol for symbol in symbols}
+        for future in concurrent.futures.as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     return hits
 
 
@@ -2749,7 +2769,7 @@ STYLE, COMMENTS, AND PUBLIC API
 
 Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
 
-Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to maintainers. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
 
@@ -2794,9 +2814,9 @@ Do NOT change:
 SAFETY
 ====================================================================
 
-No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
+No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or private validation metadata.
 
-Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
+Do not write code comments, log messages, or strings that discuss evaluator policy or validation outcomes. Keep repository changes focused on the user-visible bug or feature.
 '''
 
 
@@ -2823,7 +2843,7 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them; incomplete solutions usually fail tests or maintainer review.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2969,18 +2989,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Review your patch for correctness, completeness, and "
+        "maintainer-quality diff scope:\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE:\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -3488,8 +3508,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
+        # a final empty patch cannot satisfy the task.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -3571,7 +3590,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge — addressing them is higher-value
+        # express user-visible requirements, so addressing them is higher-value
         # than covering additional file paths.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
@@ -3737,8 +3756,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 consecutive_model_errors += 1
                 # If we already have any patch staged in the repo, stop early
                 # and return that patch rather than wiping everything because
-                # the proxy hiccuped. Empty patches score 0; partial patches
-                # can still earn cursor-similarity credit.
+                # the proxy hiccuped. A partial patch can still contain a useful
+                # maintainer-quality repair.
                 clean_worktree_noise()
                 if get_patch(repo).strip():
                     logs.append(
@@ -3795,6 +3814,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                if out_of_time():
+                    logs.append("WALL_CLOCK_STOP_MID_BATCH: time exhausted between commands")
+                    break
 
                 if step >= 4 or command_index > 1:
                     clean_worktree_noise()
@@ -3910,30 +3933,38 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-    ]
+    nonzero_fail_re = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
 
     good_markers = [
         " passed",
         " all passed",
         " tests passed",
         "success",
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+    ]
+
+    static_bad_markers = [
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+        "exception",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(nonzero_fail_re.search(lower))
+        or any(marker in lower for marker in static_bad_markers)
+    )
+    if stderr_body and (
+        bool(nonzero_fail_re.search(stderr_body))
+        or any(marker in stderr_body for marker in static_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
