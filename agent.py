@@ -943,6 +943,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
+    # Needles + 2x budget for path-mentioned files.
+    needles = _preload_needles(issue)
+    path_mentioned = {p.strip("./") for p in _extract_issue_path_mentions(issue)}
+
     parts: List[str] = []
     included: List[str] = []
     used = 0
@@ -965,7 +969,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        file_budget = per_file_budget * 2 if relative_path in path_mentioned else per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -988,6 +993,52 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
+
+
+# Needle-based context windowing helpers.
+_QUOTED_NEEDLE_RE = re.compile(r'["\']([^"\']{4,80})["\']')
+_FENCED_CODE_RE = re.compile(r"```[A-Za-z]*\n(.*?)```", re.DOTALL)
+
+
+def _preload_needles(issue: str) -> List[str]:
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for quoted in _QUOTED_NEEDLE_RE.findall(issue):
+        if not any(c.isalpha() for c in quoted):
+            continue
+        if len(quoted.split()) > 8:
+            continue
+        add(quoted.strip())
+    for block in _FENCED_CODE_RE.findall(issue):
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if len(line) < 8 or len(line) > 120:
+                continue
+            if not any(c.isalnum() for c in line):
+                continue
+            if line.startswith(("#", "//", "/*", "*")):
+                continue
+            add(line)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1300,7 +1351,12 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1313,7 +1369,77 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
+
+
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    # Return line-numbered windows around needle-matching lines, capped at max_chars.
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -3142,8 +3268,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
