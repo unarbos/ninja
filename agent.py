@@ -3848,8 +3848,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = get_patch(repo)
         _forbidden_pat = _scan_patch_for_forbidden_strings(patch)
         if _forbidden_pat:
-            patch = re.sub(_forbidden_pat, "checker", patch, flags=re.IGNORECASE)
-            logs.append("FORBIDDEN_SCAN: replaced forbidden pattern in patch output")
+            logs.append(f"FORBIDDEN_SCAN: patch contains suspicious pattern (review before submit): {_forbidden_pat}")
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
