@@ -1748,9 +1748,25 @@ def _js_ts_patch_hazard_summary(patch: str) -> str:
     ):
         notes.append("SSE parser appears to require `event:` and `data:` on the same line; parse multi-line SSE events instead")
     for path, block in _iter_patch_file_blocks(patch):
-        if not re.search(r"\.(jsx|tsx)$", path, re.IGNORECASE):
+        if not re.search(r"\.(js|jsx|ts|tsx)$", path, re.IGNORECASE):
             continue
         lines = block.splitlines()
+        added_lines = [
+            line[1:] for line in lines
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        added_block = "\n".join(added_lines)
+        if re.search(r"\bf[\"'][^\"'\n]*\{[^\"'\n]*\}", added_block):
+            notes.append(
+                f"{path}: Python-style f-string syntax appears in JS/TS; use template literals/backticks or normal string concatenation"
+            )
+        if (
+            re.search(r"^\s*export\s+\{\s*default\s*\}\s+from\s+", added_block, re.MULTILINE)
+            and re.search(r"^\s*export\s+default\b", added_block, re.MULTILINE)
+        ):
+            notes.append(
+                f"{path}: file appears to add both a default re-export and another default export; keep exactly one default export"
+            )
         for idx, line in enumerate(lines):
             if line.startswith("+import ") and not line.startswith("+++"):
                 window = lines[idx + 1: idx + 8]
@@ -2726,6 +2742,8 @@ When several fixes are correct, choose the one that changes fewest files, smalle
 
 When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
 
+When adding property access on an existing API object, inspect the type/interface, serializer, or nearby existing usage first. Prefer established fields such as `thumbnail_url` / `image_url` over invented aliases like `thumbnail`, and update every consumer only when the data model truly changes.
+
 ====================================================================
 SURGICAL EDITING
 ====================================================================
@@ -2785,7 +2803,7 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
 
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Before using a new object property, inspect the declared type or adjacent existing usage; do not guess field names from UI labels. Missing one = lower score.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
@@ -2848,6 +2866,8 @@ Before planning, read the ENTIRE issue above and identify every requirement (the
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+
+Before adding a property access on an existing response/model object, verify the exact field name from the type/interface or adjacent usage. Do not invent aliases from UI wording.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
@@ -3101,6 +3121,8 @@ def build_completeness_nudge_prompt(summary: str, issue_text: str) -> str:
         "minimal missing edit: route/router/sidebar/menu wiring, API/controller/"
         "service registration, main/index entrypoint, tests/specs, docs/README, "
         "version/package metadata, migration/schema, locale file, or fixture. "
+        "For JS/TS data objects, verify field names against local types or "
+        "nearby usage before changing property access. "
         "If the patch is already complete through an existing convention, finish "
         "with <final>summary</final> and name that convention. Do not broaden the "
         "feature beyond the task.\n\n"
