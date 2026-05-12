@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -1051,6 +1052,56 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+_TERM_RARITY_BASE = 3  # the prior flat per-term weight; preserved as the floor
+_TERM_RARITY_CAP = 8
+_DOC_FREQUENCY_TERM_CAP = 12
+_DOC_FREQUENCY_GREP_TIMEOUT = 3.0
+_DOC_FREQUENCY_MIN_TERM_LEN = 3
+
+
+def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """Document frequency per term: how many tracked files contain it.
+
+    Used to give a rarity bonus on top of the flat per-term ranking score,
+    never a penalty. One fixed-string case-insensitive git-grep per term,
+    capped at _DOC_FREQUENCY_TERM_CAP terms with a short per-call timeout
+    so a wide issue cannot stall the ranker. Returns {} on any failure;
+    callers fall back to _TERM_RARITY_BASE (the prior flat weight).
+    """
+    df: Dict[str, int] = {}
+    for term in terms[:_DOC_FREQUENCY_TERM_CAP]:
+        if not term or len(term) < _DOC_FREQUENCY_MIN_TERM_LEN:
+            df[term] = 0
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+                check=False,
+            )
+            df[term] = proc.stdout.count("\n") if proc.returncode == 0 else 0
+        except Exception:
+            df[term] = 0
+    return df
+
+
+def _term_bonus(term: str, df: Dict[str, int]) -> int:
+    """Rarity bonus per term hit on a candidate path.
+
+    Floor at _TERM_RARITY_BASE (= 3, the prior flat weight) so common
+    words never score below the king's behavior. Cap at _TERM_RARITY_CAP
+    (= 8) so a single rare-term hit cannot overwhelm an explicit-mention
+    boost (+100). When df is unknown or zero, falls back to the floor.
+    """
+    hits = df.get(term)
+    if hits is None or hits <= 0:
+        return _TERM_RARITY_BASE
+    bonus = 6.0 / math.log(2 + hits)
+    return max(_TERM_RARITY_BASE, min(_TERM_RARITY_CAP, int(round(bonus))))
+
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
@@ -1089,6 +1140,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # Rarity bonus floor-clamped at the prior flat weight (3). Common UI/
+    # business words still score the king-equivalent +3 per match; rare
+    # task-specific identifiers can pull up to +8. Pareto-improvement: no
+    # path can score lower than the king's flat weighting on this signal.
+    term_df = _doc_frequency(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1105,7 +1161,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
