@@ -118,8 +118,9 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_RISK_AUDIT_TURNS = 1   # one compact pre-final repair for high-confidence hidden-test risks
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # allow one risk-audit turn without reopening long refinement chains
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
@@ -680,6 +681,104 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".bin",
     }
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
+
+
+def _safe_repo_child(repo: Path, relative_path: str) -> Optional[Path]:
+    """Resolve a repo-relative path without allowing cleanup to escape repo."""
+    try:
+        root = repo.resolve()
+        full = (repo / relative_path).resolve()
+        full.relative_to(root)
+        return full
+    except Exception:
+        return None
+
+
+def _run_git_quiet(repo: Path, args: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _is_mode_only_diff(repo: Path, relative_path: str) -> bool:
+    try:
+        numstat = _run_git_quiet(repo, ["diff", "--numstat", "--", relative_path], timeout=8)
+        summary = _run_git_quiet(repo, ["diff", "--summary", "--", relative_path], timeout=8)
+    except Exception:
+        return False
+    return (
+        numstat.returncode == 0
+        and not (numstat.stdout or "").strip()
+        and "mode change" in (summary.stdout or "")
+    )
+
+
+def _prune_empty_generated_parents(repo: Path, relative_path: str) -> None:
+    generated_parts = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    path = Path(relative_path)
+    for idx in range(len(path.parts), 0, -1):
+        parent = Path(*path.parts[:idx])
+        if not any(part in generated_parts for part in parent.parts):
+            continue
+        full = _safe_repo_child(repo, str(parent))
+        if full is None or not full.exists() or not full.is_dir():
+            continue
+        try:
+            full.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_noise_worktree_paths(repo: Path) -> List[str]:
+    """Physically remove patch noise before tau collects the raw repo diff.
+
+    get_patch() filters generated/mode-only blocks in the returned patch, but
+    the docker harness prefers the container's raw git diff. Cleaning the actual
+    worktree prevents cache files and chmod churn from leaking into scoring.
+    """
+    cleaned: List[str] = []
+
+    try:
+        untracked = _run_git_quiet(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    except Exception:
+        untracked = None
+    if untracked is not None and untracked.returncode == 0:
+        for relative_path in [item for item in untracked.stdout.split("\0") if item]:
+            if not _should_skip_patch_path(relative_path):
+                continue
+            full = _safe_repo_child(repo, relative_path)
+            if full is None or not full.exists():
+                continue
+            try:
+                if full.is_dir():
+                    shutil.rmtree(full)
+                else:
+                    full.unlink()
+                cleaned.append(f"removed-untracked:{relative_path}")
+                _prune_empty_generated_parents(repo, relative_path)
+            except Exception:
+                continue
+
+    try:
+        changed = _run_git_quiet(repo, ["diff", "--name-only", "-z"])
+    except Exception:
+        changed = None
+    if changed is not None and changed.returncode == 0:
+        for relative_path in [item for item in changed.stdout.split("\0") if item]:
+            if _should_skip_patch_path(relative_path) or _is_mode_only_diff(repo, relative_path):
+                try:
+                    restored = _run_git_quiet(repo, ["checkout", "--", relative_path], timeout=10)
+                    if restored.returncode == 0:
+                        cleaned.append(f"restored-noise:{relative_path}")
+                except Exception:
+                    continue
+
+    return cleaned[:30]
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -2101,6 +2200,147 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+_RISK_AUDIT_SOURCE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".php", ".java",
+    ".kt", ".swift", ".cs", ".c", ".cc", ".cpp", ".h", ".hpp", ".vue", ".svelte",
+}
+
+
+def _patch_new_file_paths(patch: str) -> List[str]:
+    paths: List[str] = []
+    for block in re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE):
+        if not block.startswith("diff --git ") or "\nnew file mode " not in block:
+            continue
+        path = _diff_block_path(block)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _looks_like_test_or_doc_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    lowered = relative_path.lower()
+    if path.suffix.lower() in {".md", ".rst", ".txt"}:
+        return True
+    return any(part in {"test", "tests", "__tests__", "spec", "specs", "docs", "doc"} for part in path.parts) or (
+        ".test." in lowered or ".spec." in lowered or lowered.startswith("test_") or lowered.endswith("_test.py")
+    )
+
+
+def _new_source_without_owner_touch(patch: str) -> List[str]:
+    new_files = set(_patch_new_file_paths(patch))
+    if not new_files:
+        return []
+    changed = _patch_changed_files(patch)
+    new_source = [
+        path for path in changed
+        if path in new_files
+        and Path(path).suffix.lower() in _RISK_AUDIT_SOURCE_SUFFIXES
+        and not _looks_like_test_or_doc_path(path)
+    ]
+    if not new_source:
+        return []
+    existing_source_touch = [
+        path for path in changed
+        if path not in new_files
+        and Path(path).suffix.lower() in _RISK_AUDIT_SOURCE_SUFFIXES
+        and not _looks_like_test_or_doc_path(path)
+    ]
+    if existing_source_touch:
+        return []
+    return new_source[:4]
+
+
+def _patch_corruption_risks(patch: str) -> List[str]:
+    risks: List[str] = []
+    added_lines = [line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    added_text = "\n".join(added_lines)
+    markers = (
+        ("merge conflict marker", ("<<<<<<<", ">>>>>>>", "\n=======")),
+        ("placeholder implementation", ("YOUR CODE HERE", "TODO: implement", "NotImplementedError", "throw new Error(\"TODO")),
+        ("debugger left in patch", ("debugger;", "pdb.set_trace()", "console.log(\"debug")),
+    )
+    for label, needles in markers:
+        if any(needle in added_text for needle in needles):
+            risks.append(label)
+    return risks
+
+
+def _extract_issue_literals(issue_text: str, *, max_literals: int = 8) -> List[str]:
+    literals: List[str] = []
+    seen: set = set()
+    for match in re.finditer(r"[`'\"]([^`'\"\n]{3,80})[`'\"]", issue_text):
+        literal = match.group(1).strip()
+        if not literal or literal in seen:
+            continue
+        lowered = literal.lower()
+        if "/" in literal or "\\" in literal or Path(literal).suffix:
+            continue
+        if lowered in {"true", "false", "none", "null", "undefined", "error", "warning"}:
+            continue
+        if len(re.findall(r"[A-Za-z0-9]", literal)) < 3:
+            continue
+        seen.add(literal)
+        literals.append(literal)
+        if len(literals) >= max_literals:
+            break
+    return literals
+
+
+def _literal_present_in_changed_files(repo: Path, patch: str, literal: str) -> bool:
+    for relative_path in _patch_changed_files(patch):
+        full = _safe_repo_child(repo, relative_path)
+        if full is None or not full.exists() or not full.is_file():
+            continue
+        try:
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if literal in text:
+            return True
+    return False
+
+
+def _missing_exact_literals(repo: Path, patch: str, issue_text: str) -> List[str]:
+    literals = _extract_issue_literals(issue_text)
+    if not literals:
+        return []
+    added_text = "\n".join(
+        line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
+    missing: List[str] = []
+    for literal in literals:
+        if literal in added_text or _literal_present_in_changed_files(repo, patch, literal):
+            continue
+        missing.append(literal)
+    return missing[:4]
+
+
+def _pre_final_risk_summary(repo: Path, patch: str, issue_text: str) -> str:
+    """Return high-confidence risks that justify one compact repair turn."""
+    notes: List[str] = []
+
+    corruption = _patch_corruption_risks(patch)
+    if corruption:
+        notes.append("Obvious patch corruption markers: " + ", ".join(corruption[:4]))
+
+    inactive_new_files = _new_source_without_owner_touch(patch)
+    if inactive_new_files:
+        notes.append(
+            "New implementation file(s) may be inactive because no existing owner/route/export/registry file changed: "
+            + ", ".join(inactive_new_files)
+        )
+
+    missing_literals = _missing_exact_literals(repo, patch, issue_text)
+    if missing_literals:
+        notes.append(
+            "Issue-requested exact literal(s) are not present in changed files: "
+            + ", ".join(repr(item) for item in missing_literals)
+        )
+
+    return "\n  ".join(f"- {note}" for note in notes[:6])
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2564,6 +2804,23 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_risk_audit_prompt(risk_summary: str, issue_text: str) -> str:
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Pre-final risk audit — your draft has one or more high-confidence "
+        "risks that often lose hidden-test or diff-judge rounds:\n"
+        f"  {risk_summary}\n\n"
+        "Resolve these risks with the smallest targeted edit(s). In particular, "
+        "wire newly added implementation files into the existing owner/route/"
+        "export/registry path, preserve exact literals requested by the issue, "
+        "and remove any corruption/debug/placeholder markers. If inspection "
+        "proves a listed risk is already satisfied, do not refactor; end with "
+        "<final>summary</final> and name the evidence.\n\n"
+        "Task reminder:\n"
+        f"{short}\n"
+    )
+
+
 def build_gap_edit_prompt(issue_text: str) -> str:
     short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
     return (
@@ -2789,6 +3046,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         salvaged = ""
         try:
             if _multishot_repo_obj is not None:
+                _cleanup_noise_worktree_paths(_multishot_repo_obj)
                 salvaged = get_patch(_multishot_repo_obj)
         except Exception:
             salvaged = ""
@@ -2827,6 +3085,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    risk_audit_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2863,12 +3122,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. risk-audit — compact check for inactive files/literals/corruption
+            7. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, risk_audit_turns_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        cleaned_noise = _cleanup_noise_worktree_paths(repo)
+        if cleaned_noise:
+            logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -2982,6 +3245,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if risk_audit_turns_used < MAX_RISK_AUDIT_TURNS:
+            risk_summary = _pre_final_risk_summary(repo, patch, issue)
+            if risk_summary:
+                risk_audit_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_risk_audit_prompt(risk_summary, issue),
+                    "RISK_AUDIT_QUEUED:\n  " + risk_summary,
                 )
                 return True
 
@@ -3191,6 +3466,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        cleaned_noise = _cleanup_noise_worktree_paths(repo)
+        if cleaned_noise:
+            logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
@@ -3209,6 +3487,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
+                cleaned_noise = _cleanup_noise_worktree_paths(repo)
+                if cleaned_noise:
+                    logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
                 patch = get_patch(repo)
             except Exception:
                 pass
