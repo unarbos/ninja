@@ -676,6 +676,11 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".exe",
         ".bin",
     }
+    # Build wrapper scripts — mode/permission changes on these are never
+    # part of a coding task and consistently score as unrelated churn.
+    build_wrappers = {"mvnw", "gradlew", "gradlew.bat", "mvnw.cmd"}
+    if path.name in build_wrappers:
+        return True
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
 
 
@@ -2194,6 +2199,8 @@ Use `sed -i \'s/exact old/exact new/\' path/to/file` only when the substitution 
 
 When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
 
+When the task explicitly says to REMOVE or DELETE a file (e.g., "remove server.ts", "delete the backend file", "eliminate the custom Express server"), you MUST actually delete it using `git rm <file>` — do NOT simply remove its imports or references and leave the dead file on disk. Leaving the file in place when the task requires its removal is scored as a major incompleteness.
+
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
 ====================================================================
@@ -2248,12 +2255,16 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
+- Build wrapper scripts not mentioned in the task (mvnw, gradlew, gradlew.bat, mvnw.cmd — never chmod or modify these)
+- Content, copy, or visual layout of pages/components the task does not explicitly mention (e.g., when adding SEO metadata, do NOT rewrite unrelated case-study text, hero copy, or marketing page content)
 
 ====================================================================
 SAFETY
 ====================================================================
 
-No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
+No sudo. No chmod. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
+
+File deletion: delete a file ONLY when the task explicitly asks you to remove or delete it. Use `git rm <file>` (preferred) or `rm <file>` for task-required deletions — do NOT leave orphaned files in the repository when the task says to delete them.
 '''
 
 
@@ -2388,10 +2399,10 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
+        "For each path: inspect it briefly, then decide whether the task wants "
+        "you to EDIT it (issue the edit commands) or DELETE it (use `git rm <file>`). "
+        "Do not stop early until you have either edited/deleted each path or "
+        "confirmed via inspection that no change is required.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2415,6 +2426,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - If the task says to DELETE or REMOVE a file, confirm you used `git rm <file>` to actually delete it — leaving it on disk is a major incompleteness\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
