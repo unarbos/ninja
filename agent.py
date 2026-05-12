@@ -2963,6 +2963,61 @@ def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
     return max(0, base + covers - syntax_penalty)
 
 
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic: estimate how many files an integration-style task likely needs.
+
+    Counts acceptance-criteria-style bullet lines and explicit path mentions in
+    the issue, then maps that to an expected file count. Used by
+    _solve_with_safety_net to detect "attempt 1 under-delivered" — line count
+    looks healthy (>= 3) but file count is well below what the task implies.
+    A natural-language task with 10 bullets typically wants 5+ files; a
+    one-line bug fix wants 1.
+    """
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    # Each path mention is strong signal of a discrete file; bullets are softer
+    # so we count them at roughly 1 file per 2 bullets. Take the larger of the
+    # two signals, bounded.
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any], n_lines: int, actual_files: int, estimated_files: int
+) -> str:
+    """Bootstrap variant for the "wrote enough lines but too few files" case.
+
+    The default bootstrap (build_attempt2_bootstrap) tells the model to diverge
+    on approach. When the actual failure mode is file-count under-delivery —
+    common on integration tasks with many acceptance criteria — that generic
+    nudge can produce the same approach with the same few files. This
+    variant surfaces the file-count gap explicitly and asks the model to add
+    files for each acceptance-criterion bullet rather than rewriting.
+    """
+    steps = result1.get("steps", 0)
+    return (
+        f"⚠ RETRY ATTEMPT: A prior attempt at this task wrote {n_lines} "
+        f"substantive line(s) across {actual_files} file(s) in {steps} step(s), "
+        f"but the task appears to require ~{estimated_files} files based on its "
+        f"acceptance criteria. Re-read the task and ensure EACH bullet "
+        f"or required path corresponds to a concrete file in your patch. "
+        f"Common omissions: separate test files per module, config files, "
+        f"new route/controller files, mock modules. Do not re-edit files "
+        f"the prior attempt already covered; add the MISSING files first.\n\n"
+    )
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -3058,7 +3113,22 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # Under-delivery detection: attempt 1 wrote enough lines (>= 3) but
+        # touched far fewer files than the task's acceptance criteria imply.
+        # On integration tasks the king's existing early-exit gate ships such
+        # attempts blindly, locking in a low-file-count loss. We treat this
+        # as a low-signal first attempt for retry purposes and feed a
+        # targeted "you missed files" bootstrap to attempt 2.
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= 4
+            and _actual_files * 2 < _estimated_files
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
@@ -3085,7 +3155,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        if _underdelivered:
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files, _estimated_files
+            )
+        else:
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
