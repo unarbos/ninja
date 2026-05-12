@@ -94,6 +94,7 @@ MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
 MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modules
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PLAN_REPAIRS = 1  # one repair turn when step-1 response has no substantive <plan>
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -655,7 +656,9 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
@@ -668,6 +671,11 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".idea",
+        ".vscode",
+        ".next",
+        ".turbo",
+        ".tox",
     }
     generated_suffixes = {
         ".class",
@@ -1464,6 +1472,18 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _patch_added_names(patch: str) -> set:
+    """Return identifiers introduced on `+` lines (def/class) across the patch."""
+    names: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        m = re.match(r"^\+\s*(def|class|async\s+def)\s+(\w+)", line)
+        if m:
+            names.add(m.group(2))
+    return names
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1700,6 +1720,28 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+_PLAN_TAG_RE = re.compile(r"<plan>(.*?)</plan>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_plan(text: str) -> Optional[str]:
+    """Return the <plan>...</plan> body if present and non-trivial.
+
+    A plan that is <40 chars or has no newline/bullet/number is treated as
+    missing — the model emitted a placeholder rather than a real plan.
+    """
+    if not text:
+        return None
+    m = _PLAN_TAG_RE.search(text)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    if len(body) < 40:
+        return None
+    if not re.search(r"[\n\-\*]|\d[.)]", body):
+        return None
+    return body
+
+
 # -----------------------------
 # Companion-test discovery + execution
 # -----------------------------
@@ -1775,6 +1817,59 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+_TEST_PATH_PATTERNS = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"_test\.(py|go)$"),
+    re.compile(r"\.test\.(ts|tsx|js|jsx)$"),
+    re.compile(r"\.spec\.(ts|tsx|js|jsx)$"),
+)
+
+
+def _is_test_path(relative_path: str) -> bool:
+    return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
+
+
+def _check_test_quality_one(
+    repo: Path, relative_path: str, patch_added_names: set
+) -> Optional[str]:
+    """Return a warning string if the test file looks like a stub rather than
+    a real invocation test. Returns None when the test looks substantive or
+    when we cannot determine quality (non-Python files with assertions).
+    """
+    import ast as _ast
+
+    full = repo / relative_path
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not relative_path.endswith(".py"):
+        if re.search(r"\.toBe\(|\.toEqual\(|expect\(", source):
+            return None
+        return f"{relative_path}: test file has no invocation assertions"
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return None
+    calls_referencing_patch: list = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            target = node.func
+            while isinstance(target, _ast.Attribute):
+                target = target.value
+            if isinstance(target, _ast.Name) and target.id in patch_added_names:
+                calls_referencing_patch.append(target.id)
+    if calls_referencing_patch:
+        return None
+    if not patch_added_names:
+        return None
+    return (
+        f"{relative_path}: test file does not invoke any of the patch's "
+        f"added/modified names — likely a stub-level test"
+    )
 
 
 def _run_companion_test(
@@ -2416,6 +2511,21 @@ def _strip_preloaded_section(
     return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
+def build_plan_repair_prompt(issue: str) -> str:
+    """Repair prompt for step-1 response that is missing a substantive <plan> block."""
+    short = issue[:1200] if len(issue) > 1200 else issue
+    return (
+        "Your first response must begin with a <plan>...</plan> block that enumerates "
+        "every numbered/bulleted requirement in the task before proceeding to commands. "
+        "The plan ensures you address ALL deliverables without missing items.\n\n"
+        "RE-READ THE TASK:\n\n"
+        f"{short}\n\n"
+        "Respond now with:\n"
+        "1. A <plan> block listing each requirement as a numbered bullet.\n"
+        "2. The first <command> block to start solving."
+    )
+
+
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
@@ -2616,6 +2726,21 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_patch_repair_prompt(err_tail: str) -> str:
+    """When the final patch fails `git apply --check`, surface the exact error."""
+    tail = err_tail[-800:] if len(err_tail) > 800 else err_tail
+    return (
+        "PATCH_INVALID: the patch you produced does not apply cleanly on a fresh checkout.\n\n"
+        "git apply --check error:\n```\n"
+        f"{tail}\n```\n\n"
+        "Common causes: mismatched context lines (your edit drifted from the actual file), "
+        "a half-emitted hunk header, or overlapping hunks. Correct the diff:\n"
+        "1. Re-read the target file(s) with `cat -n` or `sed -n` to confirm the exact current content.\n"
+        "2. Re-issue the edit command(s) with the correct context lines.\n"
+        "3. Verify with `git diff` and then emit <final>fixed</final>."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -2699,6 +2824,31 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _validate_patch_applies(repo: Path, patch_text: str) -> Tuple[bool, str]:
+    """Return (ok, err_tail). Runs `git apply --check` against the patch.
+
+    Returns ok=True on empty patch — empty is handled separately by the
+    hail-mary gate, not treated as a corrupt patch.
+    """
+    if not patch_text.strip():
+        return True, ""
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn"],
+            cwd=str(repo),
+            input=patch_text,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        return False, (proc.stderr or proc.stdout or "")[-400:]
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2729,6 +2879,44 @@ def solve(
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+
+
+def _files_touched_in_patch(patch_text: str) -> List[str]:
+    """Return list of file paths mentioned on +++ b/ lines in the patch."""
+    touched: List[str] = []
+    for line in (patch_text or "").splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if path:
+                touched.append(path)
+    return touched
+
+
+def _diversify_retry_kwargs(kwargs: Dict[str, Any], first_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a modified kwargs dict for the second multishot attempt.
+
+    Diversification levers (no validator-contract changes):
+      - bump max_tokens by 50% to give the model more headroom for a
+        different reasoning path
+      - prepend a DIVERSIFY_HINT to the issue naming files already touched
+        and instructing the model to broaden scope
+      - mark _retry_attempt=2 so downstream helpers can branch if needed
+    """
+    new_kwargs = dict(kwargs)
+    new_kwargs["max_tokens"] = int(kwargs.get("max_tokens", DEFAULT_MAX_TOKENS) * 1.5)
+    issue = new_kwargs.get("issue", "") or ""
+    touched = _files_touched_in_patch(first_result.get("patch", "") or "")
+    if touched:
+        hint = (
+            "DIVERSIFY_HINT (retry attempt 2): the first attempt produced a "
+            "thin patch (<3 substantive lines). Reconsider scope: "
+            f"files touched were [{', '.join(touched[:5])}]. Look for "
+            "additional files in the issue that were not edited, and verify "
+            "you addressed every numbered bullet/checkbox in the task.\n\n"
+        )
+        new_kwargs["issue"] = hint + issue
+    new_kwargs["_retry_attempt"] = 2
+    return new_kwargs
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
@@ -2768,7 +2956,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _retry_kwargs = _diversify_retry_kwargs(kwargs, _result1)
+        _result2 = _solve_attempt(**_retry_kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2833,6 +3022,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
+    plan_repairs_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -2950,6 +3140,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
+            # Surface stub-level test files added/modified directly by the patch.
+            _added_names = _patch_added_names(patch)
+            for _tpath in _patch_changed_files(patch):
+                if not _is_test_path(_tpath):
+                    continue
+                _quality_warn = _check_test_quality_one(repo, _tpath, _added_names)
+                if _quality_warn:
+                    test_fix_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_test_fix_prompt(_tpath, _quality_warn),
+                        f"TEST_QUALITY_QUEUED:\n  {_quality_warn[:80]}",
+                    )
+                    return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
@@ -3092,6 +3297,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             commands = extract_commands(response_text)
             final = extract_final(response_text)
 
+            # Step-1 plan enforcement: if the model's first response has neither
+            # commands nor a final nor a substantive <plan>, spend one repair turn
+            # to instill planning discipline before the agent starts acting.
+            if (
+                step == 1
+                and not commands
+                and final is None
+                and _extract_plan(response_text) is None
+                and plan_repairs_used < MAX_PLAN_REPAIRS
+                and not out_of_time()
+            ):
+                plan_repairs_used += 1
+                logs.append("PLAN_REPAIR_QUEUED: step-1 response has no <plan> block")
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": build_plan_repair_prompt(issue)})
+                continue
+
             if not commands:
                 if final is not None:
                     if maybe_queue_refinement(response_text):
@@ -3195,6 +3417,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+
+        # Validate the final patch applies cleanly; attempt one targeted repair if not.
+        if repo is not None and patch.strip():
+            _patch_ok, _patch_err = _validate_patch_applies(repo, patch)
+            if not _patch_ok:
+                logs.append(f"\nPATCH_INVALID: {_patch_err}")
+                _repair_eligible = (
+                    total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS
+                    and not out_of_time()
+                    and any(kw in _patch_err.lower() for kw in ("hunk", "corrupt", "does not apply", "apply"))
+                )
+                if _repair_eligible:
+                    total_refinement_turns_used += 1
+                    _last_asst = next(
+                        (m["content"] for m in reversed(messages) if m.get("role") == "assistant"),
+                        "",
+                    )
+                    messages.append({"role": "assistant", "content": _last_asst})
+                    messages.append({"role": "user", "content": build_patch_repair_prompt(_patch_err)})
+                    try:
+                        _repair_resp, _repair_cost, _ = chat_completion(
+                            messages=_messages_for_request(messages),
+                            model=model_name,
+                            api_base=api_base,
+                            api_key=api_key,
+                            max_tokens=max_tokens,
+                        )
+                        if _repair_cost is not None and total_cost is not None:
+                            total_cost += _repair_cost
+                        logs.append("PATCH_REPAIR_RESPONSE:\n" + (_repair_resp or ""))
+                        for _rcmd in extract_commands(_repair_resp or "")[:MAX_COMMANDS_PER_RESPONSE]:
+                            _rres = run_command(_rcmd, repo, timeout=command_timeout)
+                            logs.append("PATCH_REPAIR_OBS:\n" + format_observation(_rres))
+                    except Exception as _rex:
+                        logs.append(f"PATCH_REPAIR_ERROR: {_rex}")
+                    patch = get_patch(repo)
+
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
