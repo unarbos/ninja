@@ -64,16 +64,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# -----------------------------
-# Config
-# -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
-# validator wiring. During real validation the validator passes model, api_base,
-# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
