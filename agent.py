@@ -119,8 +119,10 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # v19: increased from 2 to 3 to allow criteria+import+route gates to fire;
                                 # cap total refinement turns across all gates (hail-mary excepted)
+MAX_ROUTE_NUDGE = 1        # v19: route/nav wiring gate (fires at most once per solve)
+MAX_IMPORT_NUDGE = 1       # v19: import completeness gate (fires at most once per solve)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -2346,6 +2348,17 @@ Do NOT change:
 - File permissions or mode bits (chmod is forbidden)
 
 ====================================================================
+MULTI-FILE WIRING
+====================================================================
+
+For features spanning multiple integration points (route+handler+model+migration,
+or component+type+test+export): identify ALL required integration files upfront in
+your plan and patch EVERY one in a single response. Incomplete wiring (adding a
+component but missing its route, or adding a model field without updating its
+serializer) scores lower than a focused single-file fix even when the root
+cause is correct. Wire all required integration points before calling <final>.
+
+====================================================================
 SAFETY
 ====================================================================
 
@@ -2600,6 +2613,74 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def _detect_missing_route_wiring(task_text: str, patch: str) -> list:
+    """v19: Detect when a new page/component is added but no route file is touched.
+
+    Fires at most once per solve (MAX_ROUTE_NUDGE). Returns a list of gap
+    descriptions; empty list means no gap detected.
+    """
+    route_signals = ['route', 'navigation', 'nav', 'page', 'url', 'link',
+                     'router', 'redirect', 'path', 'endpoint', 'menu item',
+                     'req.params', ':param', 'controller', 'handler']
+    if sum(1 for s in route_signals if s in task_text.lower()) < 2:
+        return []
+    import re as _re_rw
+    touched = set(_re_rw.findall(r'^(?:\+\+\+|---) [ab]/(.+)$', patch, _re_rw.M))
+    touched_lower = {f.lower() for f in touched}
+    route_file_pats = ['router', 'routes', 'navigation', 'nav', 'menu',
+                       'sidebar', 'app.py', 'urls.py', 'index.ts']
+    has_new_page = any('page' in f or 'view' in f or 'component' in f for f in touched_lower)
+    has_route_file = any(p in f for f in touched_lower for p in route_file_pats)
+    if has_new_page and not has_route_file:
+        return ["New page/component added but no route file touched -- wire URL route + nav menu"]
+    return []
+
+
+def build_route_wiring_prompt(gaps: list) -> str:
+    """v19: Prompt the model to wire route + nav for a new page/component."""
+    gap_text = "; ".join(gaps[:3])
+    return (
+        f"Route gap detected: {gap_text}\n\n"
+        "Connect the new page/component to the router and navigation:\n"
+        "  (a) URL route registration (router file, urls.py, app routes, etc.)\n"
+        "  (b) Nav/menu link (sidebar, navbar, or menu component)\n"
+        "  (c) View registration if applicable\n\n"
+        "Missing any one of the three loses the round. "
+        "Add the wiring now and end with <final>summary</final>."
+    )
+
+
+def _detect_missing_imports(patch: str) -> list:
+    """v19: Detect likely missing imports in the patch's added Python lines.
+
+    Returns list of warning strings; empty = no issue detected.
+    """
+    import re as _re_mi
+    added = [l[1:] for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++')]
+    added_text = '\n'.join(added)
+    used_modules = set(_re_mi.findall(r'\b([A-Z][a-zA-Z]+)\b(?!\s*[:(=])', added_text))
+    import_lines = _re_mi.findall(r'^(?:from|import)\s+\S+', added_text, _re_mi.M)
+    imported = set(_re_mi.findall(r'\b([A-Z][a-zA-Z]+)\b', ' '.join(import_lines)))
+    suspect = used_modules - imported
+    missing = []
+    if len(suspect) > 3:
+        missing.append(f"Possible missing imports for: {', '.join(sorted(suspect)[:5])}")
+    return missing
+
+
+def build_import_nudge_prompt(missing: list) -> str:
+    """v19: Prompt the model to add missing import statements."""
+    bullets = "\n  ".join(f"- {m}" for m in missing[:5]) or "(none)"
+    return (
+        "Import completeness check -- your patch may be missing imports:\n"
+        f"  {bullets}\n\n"
+        "Add the missing import statements at the top of the relevant file(s). "
+        "If they are already imported elsewhere in the file, respond with "
+        "<final>already imported</final>. "
+        "Otherwise add the minimal import lines and end with <final>summary</final>."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2828,6 +2909,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    route_nudge_used = 0      # v19: route/nav wiring gate
+    import_nudge_used = 0     # v19: import completeness gate
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -2868,7 +2951,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, route_nudge_used, import_nudge_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -2905,71 +2988,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
+        # v19 gate chain (reordered for max impact within turn cap of 3):
+        # Gate 1: criteria_nudge  - acceptance-criterion checkpoints not addressed (highest impact)
+        # Gate 2: import_nudge    - missing import statements in added lines
+        # Gate 3: route_wiring    - new page/component added but route file not touched
+        # Gate 4: test_fix        - companion test failure (ground truth signal)
+        # Gate 5: syntax_fix      - repair parse errors
+        # Gate 6: coverage_nudge  - issue-mentioned paths still untouched
+        # Gate 7: polish          - strip whitespace/comment/blank-only hunks
+        # Gate 8: self_check      - full review of patch vs issue (fires last)
 
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
-            if missing:
-                coverage_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                queue_refinement_turn(
-                    assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
-                )
-                return True
-
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
+        # Gate 1: criteria nudge FIRST - fixes scope losses
+        # Coverage gates on FILES; criteria gates on acceptance-criterion CHECKPOINTS
+        # (numbered list / bullets / imperative sentences). Surfacing unaddressed
         # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
@@ -2985,6 +3016,86 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Gate 2: import completeness - detect likely missing imports in added lines
+        if import_nudge_used < MAX_IMPORT_NUDGE and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            _missing_imps = _detect_missing_imports(patch)
+            if _missing_imps:
+                import_nudge_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(assistant_text, build_import_nudge_prompt(_missing_imps), "IMPORT_NUDGE_QUEUED")
+                return True
+
+        # Gate 3: route/nav wiring - new page/component added without route wiring
+        if route_nudge_used < MAX_ROUTE_NUDGE and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS:
+            _route_gaps = _detect_missing_route_wiring(issue, patch)
+            if _route_gaps:
+                route_nudge_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(assistant_text, build_route_wiring_prompt(_route_gaps), "ROUTE_NUDGE_QUEUED")
+                return True
+
+        # Gate 4: companion-test execution gate (ground truth signal from real runner)
+        # The previous king alexlange1 (PR #44) shipped MAX_TEST_FIX_TURNS,
+        # build_test_fix_prompt, and the _TEST_PARTNER_TEMPLATES preloading list,
+        # but never invoked any of them from solve(). The +1269 line PR #185
+        # rewrite kept the dead scaffolding without using it. We re-introduce the
+        # runtime correctness signal: if any edited file has a partner test that
+        # actually fails, surface the failure tail to the model as one fix turn.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        # Gate 5: syntax fix
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Gate 6: coverage nudge - issue-mentioned paths still untouched
+        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            missing = _uncovered_required_paths(patch, issue)
+            if missing:
+                coverage_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        # Gate 7: polish - strip whitespace/comment/blank-only hunks
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
+
+        # Gate 8: self_check - full review (fires last to avoid wasting early turns)
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
@@ -3010,7 +3121,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
