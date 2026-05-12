@@ -120,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_BACKEND_REQUIRED_NUDGES = 1  # surface backend/data-layer work the patch only addressed frontend-side
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2250,6 +2251,73 @@ def _patch_creates_any_new_file(patch: str) -> bool:
 
 
 # -----------------------------
+# Backend / data-layer requirement detection
+# -----------------------------
+#
+# Loss-rationale analysis shows ~24% of recent king-lost rounds cite
+# missing backend/data-layer work — e.g. "does not update database
+# schema/persistence", "no server-side route", "missing migration",
+# "service logic that must preserve and transfer the key". The model
+# frequently ships a frontend-only patch when the task spans frontend
+# + backend, and the diff judge dings hard for the gap. This gate
+# fires when the issue text contains a strong backend marker but the
+# patch's modified-file list contains no backend-shaped paths.
+
+_BACKEND_REQUIRED_RE = re.compile(
+    r"\b(database|migration|schema|endpoint|backend|server[-\s]?side|"
+    r"persist(?:ence|ed|s|ing)?|controller|"
+    r"sql\b|(?:rest|graphql|http)\s+api|"
+    r"\bapi\s+(?:route|endpoint|call|response|return)|"
+    r"\borm\b)\b",
+    re.IGNORECASE,
+)
+
+# Path segments that strongly indicate a backend / data-layer file.
+# Matched as either a whole filename or a slash-bounded directory token.
+_BACKEND_PATH_SEGMENT_RE = re.compile(
+    r"(?:(?<=/)|^)("
+    r"migrations?"
+    r"|models?\.py|models?"
+    r"|schemas?\.py|schemas?"
+    r"|api\.py|api"
+    r"|routes?\.py|routes?"
+    r"|urls?\.py"
+    r"|controllers?|.+\.controller\.[a-z]+"
+    r"|services?|.+\.service\.[a-z]+"
+    r"|views?\.py|views?"
+    r"|serializers?\.py|serializers?"
+    r"|handlers?"
+    r"|repositor(?:y|ies)|.+\.repository\.[a-z]+"
+    r"|database\.py|db\.py|db"
+    r"|server\.py|server"
+    r"|backend"
+    r")(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def _issue_requires_backend(issue_text: str) -> bool:
+    """True if issue text contains a strong backend / data-layer marker."""
+    return bool(_BACKEND_REQUIRED_RE.search(issue_text))
+
+
+def _patch_touches_backend(patch: str) -> bool:
+    """True if any modified path looks like a backend/data-layer file."""
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        m = re.search(r" b/(.+?)$", line)
+        if not m:
+            continue
+        path = m.group(1)
+        if path.lower().endswith(".sql"):
+            return True
+        if _BACKEND_PATH_SEGMENT_RE.search(path):
+            return True
+    return False
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2779,6 +2847,45 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_backend_required_nudge_prompt(issue_text: str) -> str:
+    """Tell the model the task spans backend but the patch is frontend-only.
+
+    Loss-rationale analysis cites cases like `does not update database
+    schema/persistence`, `service logic that must preserve and transfer
+    the key`, `missing server-side route`, `no migration`. The model
+    ships UI/frontend changes and assumes the backend already supports
+    them, but the reference patch updates both layers together. This
+    nudge fires only when the issue text explicitly mentions
+    database/schema/migration/endpoint/server-side/persistence/controller
+    and the patch's modified-file list contains zero backend-shaped
+    paths.
+    """
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Backend gap — the task mentions backend / data-layer work "
+        "(database, schema, migration, endpoint, server-side route, "
+        "persistence, controller, ORM, REST/GraphQL/HTTP API), but "
+        "your current patch only touches non-backend files (no "
+        "migration/, models/, schemas/, api/, routes/, controllers/, "
+        "services/, views/, handlers/, repositories/, db/, server/, "
+        "or .sql files).\n\n"
+        "Add the matching backend changes the task implies. Common "
+        "patterns:\n"
+        "  - schema/model change → also create or edit the migration\n"
+        "  - new field on UI → update model, serializer, and database column\n"
+        "  - new endpoint → add route, handler, and any helper service\n"
+        "  - changed payload shape → update the server-side validator/parser\n\n"
+        "Locate the backend layer with `git grep -l \"<symbol>\" "
+        "<likely_dir>/` or by inspecting project structure. Do NOT "
+        "stub a backend change that the codebase actually exposes "
+        "differently (e.g. don't add a Flask route if the project uses "
+        "Django views). Emit <final>summary</final> once the backend "
+        "side is in place.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -3076,6 +3183,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    backend_required_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3219,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, backend_required_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3203,6 +3311,26 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Backend-required gap: same structural-omission family as deletion
+        # and relocation gates. Issue text marks backend/data-layer work
+        # (database/schema/migration/endpoint/persistence/controller),
+        # but the patch's modified-file list contains no backend-shaped
+        # paths. Surface so the model adds the matching backend side
+        # before the criteria/coverage gates spend refinement budget on
+        # frontend-only concerns.
+        if backend_required_nudges_used < MAX_BACKEND_REQUIRED_NUDGES:
+            if _issue_requires_backend(issue) and not _patch_touches_backend(patch):
+                backend_required_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_backend_required_nudge_prompt(issue),
+                    "BACKEND_NUDGE_QUEUED: issue requires backend/data-layer work but patch only touches non-backend files",
+                )
+                return True
+
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
         # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
@@ -3291,8 +3419,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
