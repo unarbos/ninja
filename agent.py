@@ -912,11 +912,24 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          the direct hits. This improves file targeting on feature tasks without
          displacing the primary target files.
     """
-    files = _rank_context_files(repo, issue)
+    files, top_score = _rank_context_files(repo, issue)
+    tracked_set = set(_tracked_files(repo))
+
+    # Rescue-ranker: weak top_score means no path mention and no symbol-grep
+    # hit landed, so the top-ranked file is essentially random — this is
+    # the dominant catastrophic-floor failure mode. Run a cheap broad-grep
+    # over the full tracked set (no context-file filter) and surface the
+    # 1-3 files that match the most issue terms.
+    rescue_files: List[str] = []
+    if top_score < _RESCUE_RANKER_TOP_SCORE_THRESHOLD:
+        rescue_files = _broad_grep_fallback(repo, issue, tracked_set)
+        if rescue_files:
+            existing = set(files)
+            files = [f for f in rescue_files if f not in existing] + files
+
     if not files:
         return "", []
 
-    tracked_set = set(_tracked_files(repo))
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
@@ -924,6 +937,20 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+
+    if rescue_files:
+        # Banner is small and high-leverage; surface BEFORE the snippet
+        # blocks so the model reads it before any file content.
+        rescue_banner = (
+            "### rescue-ranker hint\n"
+            "The issue does not directly name a file or identifier present in "
+            "this repository. The following file(s) matched the most issue "
+            "terms via a broad text search and are the most likely targets — "
+            "inspect them first before running broader searches:\n"
+            + "".join(f"  - {p}\n" for p in rescue_files)
+        )
+        parts.append(rescue_banner)
+        used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
@@ -958,10 +985,15 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
+    """Returns (ranked_paths, top_score). top_score is the highest computed
+    score in the scoring pass; callers use it to detect "weak ranking"
+    rounds where no path/identifier signal hit, so the top file is
+    functionally random and the rescue-ranker fallback should fire.
+    """
     tracked = _tracked_files(repo)
     if not tracked:
-        return []
+        return [], 0
 
     issue_lower = issue.lower()
     path_mentions = _extract_issue_path_mentions(issue)
@@ -1023,7 +1055,64 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             continue
         seen.add(relative_path)
         ranked.append(relative_path)
-    return ranked
+    top_score = scored[0][0] if scored else 0
+    if mentioned:
+        # Explicit path or backtick-ident match: ranking is strong even if
+        # the scored list is empty (mentioned files bypass the score loop).
+        top_score = max(top_score, 100)
+    return ranked, top_score
+
+
+# Threshold below which _rank_context_files is treated as "weak signal" and
+# the rescue-ranker broad-grep fallback fires. 60 = the floor of the
+# symbol-grep boost (60 + 8*hits); below it means no path mention and no
+# symbol-grep hit landed.
+_RESCUE_RANKER_TOP_SCORE_THRESHOLD = 60
+_RESCUE_RANKER_MAX_FALLBACK_FILES = 3
+_RESCUE_RANKER_MIN_TERM_LEN = 5
+_RESCUE_RANKER_MAX_TERMS = 6
+
+
+def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]:
+    """Rescue-ranker: when _rank_context_files produces no strong signal,
+    scan tracked files by raw issue-term match count. Catches tasks where
+    the issue references concepts that don't appear as identifiers (e.g.
+    natural-language bug description with no class/function names). Distinct
+    from _symbol_grep_hits which only searches for code-shaped tokens; this
+    one treats the issue as plain English, lower-cased, fixed-string, and
+    counts the number of distinct issue terms each file matches.
+
+    Returns up to _RESCUE_RANKER_MAX_FALLBACK_FILES paths that matched at
+    least 2 distinct issue terms. Empty when the issue is too generic to
+    yield multi-term matches.
+    """
+    if not tracked:
+        return []
+    terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
+    if not terms:
+        return []
+    hits: Dict[str, int] = {}
+    for term in terms:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-i", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if relative_path and relative_path in tracked:
+                hits[relative_path] = hits.get(relative_path, 0) + 1
+    candidates = [(count, path) for path, count in hits.items() if count >= 2]
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
 
 
 def _split_path_tokens(relative_path: str) -> set:
@@ -2189,6 +2278,8 @@ Never hardcode the visible example unless the issue explicitly requests that exa
 
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
 
+When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
+
 ====================================================================
 SURGICAL EDITING
 ====================================================================
@@ -2940,18 +3031,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
@@ -3030,6 +3109,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
                     "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                )
+                return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
 
