@@ -3227,7 +3227,7 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(issue_text: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -3240,7 +3240,7 @@ Preloaded likely relevant tracked-file snippets (already read for you - do not r
 
     return f"""Fix this issue:
 
-{issue_text}
+{issue}
 
 Repository summary:
 
