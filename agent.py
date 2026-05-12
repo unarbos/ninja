@@ -87,13 +87,14 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
 MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modules
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
+MAX_PLAN_REPAIRS = 1  # one repair turn when step-1 response has no substantive <plan>
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -119,12 +120,8 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
-MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted).
-                                # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
-                                # bounded budget so extra turns can't push the process past the docker
-                                # hard wall).
+MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+                                # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -162,13 +159,6 @@ DANGEROUS_PATTERNS = [
     r"\bnc\b",
     r"\bncat\b",
     r"\btelnet\b",
-    # Bulk-staging hides working-tree changes from get_patch() (which uses
-    # git diff, not git diff HEAD) and can include .pyc / __pycache__ files
-    # in the submitted patch.  Individual `git add <file>` is not blocked.
-    r"\bgit\s+add\s+(-A|--all|\.)(\s|$)",
-    # Committing advances HEAD so git diff returns empty — the validator
-    # receives a blank patch even though source files were changed correctly.
-    r"\bgit\s+commit\b",
 ]
 
 
@@ -666,7 +656,9 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
@@ -679,6 +671,11 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".idea",
+        ".vscode",
+        ".next",
+        ".turbo",
+        ".tox",
     }
     generated_suffixes = {
         ".class",
@@ -1475,6 +1472,18 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _patch_added_names(patch: str) -> set:
+    """Return identifiers introduced on `+` lines (def/class) across the patch."""
+    names: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        m = re.match(r"^\+\s*(def|class|async\s+def)\s+(\w+)", line)
+        if m:
+            names.add(m.group(2))
+    return names
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1711,6 +1720,28 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+_PLAN_TAG_RE = re.compile(r"<plan>(.*?)</plan>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_plan(text: str) -> Optional[str]:
+    """Return the <plan>...</plan> body if present and non-trivial.
+
+    A plan that is <40 chars or has no newline/bullet/number is treated as
+    missing — the model emitted a placeholder rather than a real plan.
+    """
+    if not text:
+        return None
+    m = _PLAN_TAG_RE.search(text)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    if len(body) < 40:
+        return None
+    if not re.search(r"[\n\-\*]|\d[.)]", body):
+        return None
+    return body
+
+
 # -----------------------------
 # Companion-test discovery + execution
 # -----------------------------
@@ -1786,6 +1817,59 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+_TEST_PATH_PATTERNS = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"_test\.(py|go)$"),
+    re.compile(r"\.test\.(ts|tsx|js|jsx)$"),
+    re.compile(r"\.spec\.(ts|tsx|js|jsx)$"),
+)
+
+
+def _is_test_path(relative_path: str) -> bool:
+    return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
+
+
+def _check_test_quality_one(
+    repo: Path, relative_path: str, patch_added_names: set
+) -> Optional[str]:
+    """Return a warning string if the test file looks like a stub rather than
+    a real invocation test. Returns None when the test looks substantive or
+    when we cannot determine quality (non-Python files with assertions).
+    """
+    import ast as _ast
+
+    full = repo / relative_path
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not relative_path.endswith(".py"):
+        if re.search(r"\.toBe\(|\.toEqual\(|expect\(", source):
+            return None
+        return f"{relative_path}: test file has no invocation assertions"
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return None
+    calls_referencing_patch: list = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            target = node.func
+            while isinstance(target, _ast.Attribute):
+                target = target.value
+            if isinstance(target, _ast.Name) and target.id in patch_added_names:
+                calls_referencing_patch.append(target.id)
+    if calls_referencing_patch:
+        return None
+    if not patch_added_names:
+        return None
+    return (
+        f"{relative_path}: test file does not invoke any of the patch's "
+        f"added/modified names — likely a stub-level test"
+    )
 
 
 def _run_companion_test(
@@ -2113,35 +2197,6 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
-# Deletion-gap detection
-# -----------------------------
-#
-# Duel data shows the king loses rounds where the issue says "remove X" or
-# "delete Y" but the patch contains zero deletion lines — the model added
-# the new behaviour without removing the old one.  This gate detects that
-# mismatch cheaply and surfaces a targeted nudge before <final>.
-
-_DELETION_VERB_RE = re.compile(
-    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b",
-    re.IGNORECASE,
-)
-
-
-def _patch_has_deletions(patch: str) -> bool:
-    """True if the patch contains at least one substantive deletion line."""
-    for line in patch.splitlines():
-        if line.startswith("-") and not line.startswith("---"):
-            if line[1:].strip():  # ignore blank-line removals
-                return True
-    return False
-
-
-def _issue_requires_deletion(issue_text: str) -> bool:
-    """True if the issue contains explicit removal/replacement verbs."""
-    return bool(_DELETION_VERB_RE.search(issue_text))
-
-
-# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2305,8 +2360,6 @@ Never hardcode the visible example unless the issue explicitly requests that exa
 
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
 
-When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
-
 ====================================================================
 SURGICAL EDITING
 ====================================================================
@@ -2392,8 +2445,6 @@ SAFETY
 ====================================================================
 
 No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
-
-Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
 '''
 
 
@@ -2458,6 +2509,21 @@ def _strip_preloaded_section(
         )
     replacement = "\n".join(lines) if lines else "[Preloaded context omitted to save token budget.]"
     return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
+
+
+def build_plan_repair_prompt(issue: str) -> str:
+    """Repair prompt for step-1 response that is missing a substantive <plan> block."""
+    short = issue[:1200] if len(issue) > 1200 else issue
+    return (
+        "Your first response must begin with a <plan>...</plan> block that enumerates "
+        "every numbered/bulleted requirement in the task before proceeding to commands. "
+        "The plan ensures you address ALL deliverables without missing items.\n\n"
+        "RE-READ THE TASK:\n\n"
+        f"{short}\n\n"
+        "Respond now with:\n"
+        "1. A <plan> block listing each requirement as a numbered bullet.\n"
+        "2. The first <command> block to start solving."
+    )
 
 
 def build_no_command_repair_prompt() -> str:
@@ -2622,62 +2688,6 @@ def build_gap_edit_prompt(issue_text: str) -> str:
     )
 
 
-def build_deletion_nudge_prompt(issue_text: str) -> str:
-    """Tell the model it forgot to remove code the issue explicitly requires gone.
-
-    Duel data (round 064855): the issue said remove three old pages; the king
-    added the new unified page but left the old pages in place, losing the round.
-    The patch had zero deletion lines even though the task demanded removals.
-    """
-    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
-    return (
-        "Deletion gap — the task explicitly requires removing, deleting, or "
-        "replacing existing code, but your current patch contains NO deletion "
-        "lines.\n\n"
-        "Review the task and act on each removal requirement:\n"
-        "  - Files, routes, or views that should be deleted outright\n"
-        "  - Old implementations that must be replaced (not just augmented)\n"
-        "  - Pages, components, or endpoints that should no longer exist\n"
-        "  - Hardcoded values, keys, or logic the task says to remove\n\n"
-        "Issue the necessary removal commands now (delete statements, remove "
-        "files, revert old code), then run a quick verification and emit "
-        "<final>summary</final>.\n\n"
-        "Task:\n"
-        f"{short}\n"
-    )
-
-
-def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
-    """Inject into attempt 2's first user message so it takes a different path.
-
-    Attempt 2 is blind to what attempt 1 tried — it starts a fresh conversation
-    and often repeats the exact same failed approach.  This prefix tells the model
-    what went wrong so it actively diverges: reads more files, picks a different
-    fix site, uses a different library call, etc.
-    """
-    steps = result1.get("steps", 0)
-    logs_text = result1.get("logs", "") or ""
-
-    reasons: List[str] = []
-    if "WALL_CLOCK_STOP" in logs_text:
-        reasons.append("ran out of wall-clock time")
-    if "MODEL_ERROR_GIVE_UP" in logs_text:
-        reasons.append("model errors stopped the loop")
-    if n_lines == 0:
-        reasons.append("produced an empty patch")
-    elif n_lines < 3:
-        reasons.append(f"produced only {n_lines} substantive line(s)")
-    reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
-
-    return (
-        f"⚠ RETRY ATTEMPT: A prior attempt at this task {reason_str} "
-        f"({steps} steps). Do NOT repeat the same approach.\n"
-        "Before writing any code: re-read the issue, check which files "
-        "you haven't looked at yet, and choose a different fix strategy "
-        "if the previous one produced little output.\n\n"
-    )
-
-
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2713,6 +2723,21 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
         "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
         "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
         "then end with <final>summary</final>."
+    )
+
+
+def build_patch_repair_prompt(err_tail: str) -> str:
+    """When the final patch fails `git apply --check`, surface the exact error."""
+    tail = err_tail[-800:] if len(err_tail) > 800 else err_tail
+    return (
+        "PATCH_INVALID: the patch you produced does not apply cleanly on a fresh checkout.\n\n"
+        "git apply --check error:\n```\n"
+        f"{tail}\n```\n\n"
+        "Common causes: mismatched context lines (your edit drifted from the actual file), "
+        "a half-emitted hunk header, or overlapping hunks. Correct the diff:\n"
+        "1. Re-read the target file(s) with `cat -n` or `sed -n` to confirm the exact current content.\n"
+        "2. Re-issue the edit command(s) with the correct context lines.\n"
+        "3. Verify with `git diff` and then emit <final>fixed</final>."
     )
 
 
@@ -2799,6 +2824,31 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _validate_patch_applies(repo: Path, patch_text: str) -> Tuple[bool, str]:
+    """Return (ok, err_tail). Runs `git apply --check` against the patch.
+
+    Returns ok=True on empty patch — empty is handled separately by the
+    hail-mary gate, not treated as a corrupt patch.
+    """
+    if not patch_text.strip():
+        return True, ""
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn"],
+            cwd=str(repo),
+            input=patch_text,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        return False, (proc.stderr or proc.stdout or "")[-400:]
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2829,6 +2879,44 @@ def solve(
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+
+
+def _files_touched_in_patch(patch_text: str) -> List[str]:
+    """Return list of file paths mentioned on +++ b/ lines in the patch."""
+    touched: List[str] = []
+    for line in (patch_text or "").splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if path:
+                touched.append(path)
+    return touched
+
+
+def _diversify_retry_kwargs(kwargs: Dict[str, Any], first_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a modified kwargs dict for the second multishot attempt.
+
+    Diversification levers (no validator-contract changes):
+      - bump max_tokens by 50% to give the model more headroom for a
+        different reasoning path
+      - prepend a DIVERSIFY_HINT to the issue naming files already touched
+        and instructing the model to broaden scope
+      - mark _retry_attempt=2 so downstream helpers can branch if needed
+    """
+    new_kwargs = dict(kwargs)
+    new_kwargs["max_tokens"] = int(kwargs.get("max_tokens", DEFAULT_MAX_TOKENS) * 1.5)
+    issue = new_kwargs.get("issue", "") or ""
+    touched = _files_touched_in_patch(first_result.get("patch", "") or "")
+    if touched:
+        hint = (
+            "DIVERSIFY_HINT (retry attempt 2): the first attempt produced a "
+            "thin patch (<3 substantive lines). Reconsider scope: "
+            f"files touched were [{', '.join(touched[:5])}]. Look for "
+            "additional files in the issue that were not edited, and verify "
+            "you addressed every numbered bullet/checkbox in the task.\n\n"
+        )
+        new_kwargs["issue"] = hint + issue
+    new_kwargs["_retry_attempt"] = 2
+    return new_kwargs
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
@@ -2868,15 +2956,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
-        _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
+        _retry_kwargs = _diversify_retry_kwargs(kwargs, _result1)
+        _result2 = _solve_attempt(**_retry_kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2923,8 +3004,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_steps = kwargs.get("max_steps", DEFAULT_MAX_STEPS)
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-    wall_clock_budget = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
-    prior_attempt_summary = kwargs.get("_prior_attempt_summary", "")
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -2943,11 +3022,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
-    deletion_nudges_used = 0
+    plan_repairs_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
-        return wall_clock_budget - (time.monotonic() - solve_started_at)
+        return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
 
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
@@ -2979,7 +3058,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3016,10 +3095,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
-        # Correctness gates (ground-truth or structural) consume refinement budget
-        # before cosmetic gates (polish), so we don't waste a capped turn on
-        # low-signal hunk cleanup when a real failure is still present.
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                )
+                return True
 
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
             syntax_errors = _check_syntax(repo, patch)
@@ -3054,39 +3140,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
-
-        # Deletion gap: issue says remove/delete/replace but patch has no deletions.
-        # Fires before criteria/coverage: a missing removal is a structural omission,
-        # not a coverage gap — surface it while refinement budget remains.
-        if deletion_nudges_used < MAX_DELETION_NUDGES:
-            if _issue_requires_deletion(issue) and not _patch_has_deletions(patch):
-                deletion_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                queue_refinement_turn(
-                    assistant_text,
-                    build_deletion_nudge_prompt(issue),
-                    "DELETION_NUDGE_QUEUED: issue requires removal but patch has no deletion lines",
-                )
-                return True
-
-        # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge — addressing them is higher-value
-        # than covering additional file paths.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
+            # Surface stub-level test files added/modified directly by the patch.
+            _added_names = _patch_added_names(patch)
+            for _tpath in _patch_changed_files(patch):
+                if not _is_test_path(_tpath):
+                    continue
+                _quality_warn = _check_test_quality_one(repo, _tpath, _added_names)
+                if _quality_warn:
+                    test_fix_turns_used += 1
+                    total_refinement_turns_used += 1
+                    queue_refinement_turn(
+                        assistant_text,
+                        build_test_fix_prompt(_tpath, _quality_warn),
+                        f"TEST_QUALITY_QUEUED:\n  {_quality_warn[:80]}",
+                    )
+                    return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
@@ -3102,15 +3170,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
+        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
+        # FILES the issue mentions; criteria gates on the acceptance-criterion
+        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
+        # judge's "missing N of M criteria" complaint is the most common reason
+        # the king loses on multi-bullet issues — surfacing the unaddressed
+        # bullets directly is much cheaper than hoping self-check catches them.
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -3133,13 +3209,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
-        _initial_user_content = (
-            (prior_attempt_summary if prior_attempt_summary else "")
-            + build_initial_user_prompt(issue, repo_summary, preloaded_context)
-        )
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _initial_user_content},
+            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
         ]
         initial_preload_stripped = False
 
@@ -3224,6 +3296,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
+
+            # Step-1 plan enforcement: if the model's first response has neither
+            # commands nor a final nor a substantive <plan>, spend one repair turn
+            # to instill planning discipline before the agent starts acting.
+            if (
+                step == 1
+                and not commands
+                and final is None
+                and _extract_plan(response_text) is None
+                and plan_repairs_used < MAX_PLAN_REPAIRS
+                and not out_of_time()
+            ):
+                plan_repairs_used += 1
+                logs.append("PLAN_REPAIR_QUEUED: step-1 response has no <plan> block")
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": build_plan_repair_prompt(issue)})
+                continue
 
             if not commands:
                 if final is not None:
@@ -3328,6 +3417,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+
+        # Validate the final patch applies cleanly; attempt one targeted repair if not.
+        if repo is not None and patch.strip():
+            _patch_ok, _patch_err = _validate_patch_applies(repo, patch)
+            if not _patch_ok:
+                logs.append(f"\nPATCH_INVALID: {_patch_err}")
+                _repair_eligible = (
+                    total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS
+                    and not out_of_time()
+                    and any(kw in _patch_err.lower() for kw in ("hunk", "corrupt", "does not apply", "apply"))
+                )
+                if _repair_eligible:
+                    total_refinement_turns_used += 1
+                    _last_asst = next(
+                        (m["content"] for m in reversed(messages) if m.get("role") == "assistant"),
+                        "",
+                    )
+                    messages.append({"role": "assistant", "content": _last_asst})
+                    messages.append({"role": "user", "content": build_patch_repair_prompt(_patch_err)})
+                    try:
+                        _repair_resp, _repair_cost, _ = chat_completion(
+                            messages=_messages_for_request(messages),
+                            model=model_name,
+                            api_base=api_base,
+                            api_key=api_key,
+                            max_tokens=max_tokens,
+                        )
+                        if _repair_cost is not None and total_cost is not None:
+                            total_cost += _repair_cost
+                        logs.append("PATCH_REPAIR_RESPONSE:\n" + (_repair_resp or ""))
+                        for _rcmd in extract_commands(_repair_resp or "")[:MAX_COMMANDS_PER_RESPONSE]:
+                            _rres = run_command(_rcmd, repo, timeout=command_timeout)
+                            logs.append("PATCH_REPAIR_OBS:\n" + format_observation(_rres))
+                    except Exception as _rex:
+                        logs.append(f"PATCH_REPAIR_ERROR: {_rex}")
+                    patch = get_patch(repo)
+
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
