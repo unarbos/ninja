@@ -2885,6 +2885,28 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
+    """Pick-between-attempts scorer richer than raw line count.
+
+    Adds a coverage bonus when the patch touches every issue-mentioned path,
+    and a per-syntax-error penalty so a broken longer patch loses to a
+    correct shorter one. Returns >= 0. Used only to break the tie between
+    attempt 1 and attempt 2 at decision time; early-exit + bootstrap still
+    use the raw line count for stable behavior matching the prior multishot.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    covers = 4 if _patch_covers_required_paths(patch, issue_text) else 0
+    syntax_penalty = 0
+    if repo is not None:
+        try:
+            syntax_penalty = 3 * len(_check_syntax(repo, patch))
+        except Exception:
+            syntax_penalty = 0
+    return max(0, base + covers - syntax_penalty)
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -3012,7 +3034,14 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        # Compare attempts on coverage+syntax-aware score, strict inequality
+        # (prefer primary on ties). Falls back to raw line count if scoring
+        # itself errors. The strict tie-break also reduces co-edit overlap
+        # with the prior multishot's >= behavior on identical attempts.
+        _issue = kwargs.get("issue", "") or ""
+        _s1 = _multishot_score(_multishot_repo_obj, _patch1, _issue)
+        _s2 = _multishot_score(_multishot_repo_obj, _patch2, _issue)
+        if _s2 > _s1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
