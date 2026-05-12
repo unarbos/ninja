@@ -108,6 +108,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_SOFT_BUDGET_RATIO = 0.60   # gentle advisory threshold
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -2852,6 +2853,28 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Main agent
 # -----------------------------
 
+
+def _soft_budget_advisory(elapsed: float, patch: str) -> Optional[str]:
+    """Returns an advisory message if we're at 60% budget with a thin patch.
+    Non-blocking -- the model chooses to act on it or not.
+    Only fires once (caller tracks whether it has been sent).
+    """
+    timeout = WALL_CLOCK_BUDGET_SECONDS or 300.0
+    if elapsed < timeout * _SOFT_BUDGET_RATIO:
+        return None
+    real_lines = sum(
+        1 for l in patch.splitlines()
+        if l.startswith(('+', '-')) and not l.startswith(('+++', '---'))
+    )
+    if real_lines >= 5:
+        return None  # patch looks healthy
+    return (
+        "You are at 60% of your time budget and your current patch is thin. "
+        "If you have identified the fix, write the complete implementation now. "
+        "If you still need to explore, continue normally."
+    )
+
+
 # -----------------------------
 # v28 multi-shot helpers
 # -----------------------------
@@ -3077,6 +3100,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
     solve_started_at = time.monotonic()
+    _advisory_sent = False
 
     def time_remaining() -> float:
         return wall_clock_budget - (time.monotonic() - solve_started_at)
@@ -3292,7 +3316,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3406,6 +3430,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                # Soft budget advisory: fire once at 60% elapsed if patch is thin
+                if not _advisory_sent:
+                    _elapsed = time.monotonic() - solve_started_at
+                    _advisory_msg = _soft_budget_advisory(_elapsed, get_patch(repo))
+                    if _advisory_msg:
+                        _advisory_sent = True
+                        observations.append(f"[Budget advisory]: {_advisory_msg}")
+                        logs.append(f"\nSOFT_BUDGET_ADVISORY_FIRED: elapsed={_elapsed:.1f}s")
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
