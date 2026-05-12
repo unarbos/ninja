@@ -120,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_LITERAL_EVIDENCE_NUDGES = 1  # surface paraphrased literals when issue spells them out
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2250,6 +2251,91 @@ def _patch_creates_any_new_file(patch: str) -> bool:
 
 
 # -----------------------------
+# Literal-evidence detection
+# -----------------------------
+#
+# Loss-rationale analysis shows ~25-30% of king-lost rounds cite the
+# model paraphrasing issue-supplied literal tokens: issue specifies
+# `./src/*` (with `./` prefix) but the patch has only `src/*`; issue
+# names `coverImage` and `title` but the patch binds `cover` and
+# `bookName`; issue keeps route param `:id` but the patch unilaterally
+# renames to `:staffCode` while controllers still read `req.params.id`
+# and break. The reference patch always preserves the exact strings the
+# issue spells out. Backticks and quoted strings are the highest-signal
+# evidence — issue authors use them precisely when they want a literal
+# value. (Path-shaped evidence is already handled by the existing
+# `_uncovered_required_paths` gate, so we don't duplicate it here.)
+
+_EVIDENCE_BACKTICK_RE = re.compile(r"`([^`\n]{2,80})`")
+_EVIDENCE_QUOTED_STR_RE = re.compile(
+    r'''(?<!\w)(?:"([^"\n]{2,60})"|'([^'\n]{2,60})')(?!\w)'''
+)
+
+# Tokens too common to be useful evidence — would generate noise rather
+# than signal. Sourced from frequent false-positive shapes (language
+# stop-words, URL prefixes, trivial booleans).
+_EVIDENCE_STOP = frozenset({
+    "True", "False", "None", "null", "undefined", "NULL", "nil",
+    "self", "this", "console.log", "print", "return", "import", "from",
+    "if", "else", "elif", "for", "while", "def", "class", "function",
+    "yes", "no", "ok", "error", "warning", "TODO", "FIXME",
+    "https", "http", "www", "com", "org", "net", "io",
+    "true", "false", "void", "let", "var", "const",
+})
+_EVIDENCE_CAP = 8         # cap — longer tokens are prioritized
+_EVIDENCE_TOK_MIN_LEN = 3
+_EVIDENCE_LINES_FLOOR = 4  # skip thin patches; hail-mary handles those
+
+
+def _extract_evidence_tokens(issue_text: str) -> List[str]:
+    """Pull literal-form tokens (backticked, quoted) from the issue.
+
+    These are the strings the LLM judge expects the patch to preserve
+    verbatim — backticks signal exact-value tokens, quotes signal string
+    literals. Sorted by length descending so longer/more-distinctive
+    tokens fire first when we hit the per-nudge cap.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+
+    def add(token: str) -> None:
+        token = token.strip("`\"' \t")
+        if len(token) < _EVIDENCE_TOK_MIN_LEN or token in _EVIDENCE_STOP:
+            return
+        if token in seen:
+            return
+        seen.add(token)
+        out.append(token)
+
+    for m in _EVIDENCE_BACKTICK_RE.finditer(issue_text):
+        add(m.group(1))
+    for m in _EVIDENCE_QUOTED_STR_RE.finditer(issue_text):
+        v = m.group(1) if m.group(1) is not None else m.group(2)
+        if v:
+            add(v)
+
+    out.sort(key=lambda t: (-len(t), t))  # longer = more distinctive
+    return out[:_EVIDENCE_CAP]
+
+
+def _patch_missing_evidence(patch: str, issue_text: str) -> List[str]:
+    """Return evidence tokens from the issue that the patch's `+` lines don't contain verbatim."""
+    evidence = _extract_evidence_tokens(issue_text)
+    if not evidence:
+        return []
+    added_raw_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added_raw_lines.append(line[1:])
+    if len(added_raw_lines) < _EVIDENCE_LINES_FLOOR:
+        return []  # too thin to judge; hail-mary owns the empty/near-empty regime
+    added_raw = "\n".join(added_raw_lines)
+    return [t for t in evidence if t not in added_raw]
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2779,6 +2865,37 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_literal_evidence_nudge_prompt(missing: List[str], issue_text: str) -> str:
+    """Tell the model it paraphrased issue-supplied literal tokens.
+
+    Diff-judge rationales repeatedly cite literal mismatches: issue says
+    `./src/*` but the patch has only `src/*`; issue names `coverImage`
+    but the patch binds `cover`; issue keeps route param `:id` but the
+    patch unilaterally renames to `:staffCode` and breaks callers.
+    Surface the missing literals directly so the model can fix the
+    paraphrase without a self-check round trip.
+    """
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    bullets = "\n  ".join(f"- `{t}`" for t in missing[:6])
+    return (
+        "Literal-evidence gap — the task uses these exact-form tokens "
+        "(backticked, quoted, or as file paths), but your current patch "
+        "does NOT contain them verbatim:\n"
+        f"  {bullets}\n\n"
+        "The reference patch uses the exact strings the task spells "
+        "out. Common failure mode: the task says `./src/*` (with `./` "
+        "prefix) but your patch has only `src/*`; the task names "
+        "`coverImage` but your patch binds `cover`. Re-read each missing "
+        "literal in context, decide whether it is required by the task, "
+        "and update the patch to use the exact form. Do NOT add unrelated "
+        "lines just to mention a literal; if the literal is in a comment "
+        "or example the task does not require, ignore it. Emit "
+        "<final>summary</final> once the literals are in place.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -3076,6 +3193,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    literal_evidence_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3229,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, literal_evidence_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3203,6 +3321,26 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Literal-evidence gap: the issue marks exact-form tokens
+        # (backticked, quoted, path-shaped), but the patch's `+` lines
+        # do not contain them verbatim. Fires before criteria/coverage
+        # because a paraphrased literal frequently makes the patch wrong
+        # in a way the LLM judge will catch (`./src/*` vs `src/*`,
+        # `coverImage` vs `cover`, `:staffCode` vs `:id`).
+        if literal_evidence_nudges_used < MAX_LITERAL_EVIDENCE_NUDGES:
+            missing_lit = _patch_missing_evidence(patch, issue)
+            if missing_lit:
+                literal_evidence_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_literal_evidence_nudge_prompt(missing_lit, issue),
+                    "LITERAL_EVIDENCE_NUDGE_QUEUED:\n  " + ", ".join(missing_lit[:6]),
+                )
+                return True
+
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
         # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
@@ -3291,8 +3429,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
