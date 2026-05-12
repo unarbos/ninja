@@ -119,6 +119,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_STRICT_CRITERIA_TURNS = 1  # 2nd pass over acceptance items after a first criteria nudge
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -926,6 +927,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
             existing = set(files)
             files = [f for f in rescue_files if f not in existing] + files
 
+    per_item_files = _per_item_rescue_files(repo, issue, tracked_set, files)
+    if per_item_files:
+        existing_after_rescue = set(files)
+        files = files + [f for f in per_item_files if f not in existing_after_rescue]
+
     if not files:
         return "", []
 
@@ -1072,6 +1078,67 @@ _RESCUE_RANKER_TOP_SCORE_THRESHOLD = 60
 _RESCUE_RANKER_MAX_FALLBACK_FILES = 3
 _RESCUE_RANKER_MIN_TERM_LEN = 5
 _RESCUE_RANKER_MAX_TERMS = 6
+
+_PER_ITEM_MAX_ITEMS = 5
+_PER_ITEM_MIN_TERM_LEN = 4
+_PER_ITEM_MAX_TERMS = 4
+_PER_ITEM_MAX_FILES = 5
+_PER_ITEM_GREP_TIMEOUT = 2
+
+
+def _per_item_rescue_files(
+    repo: Path,
+    issue_text: str,
+    tracked: set,
+    existing_files: List[str],
+) -> List[str]:
+    """Per-acceptance-item context selection. For each acceptance item, run a
+    focused fixed-string grep across the tracked set and return at most one
+    likely file per item that is not already in the preload list. Catches the
+    under-coverage case where the model misses a sub-requirement because no
+    file matching that item was surfaced by the global ranker."""
+    items = _extract_acceptance_criteria(issue_text)
+    if not items or not tracked:
+        return []
+    existing = set(existing_files)
+    added: List[str] = []
+    seen: set = set()
+    for item in items[:_PER_ITEM_MAX_ITEMS]:
+        terms = [t for t in _issue_terms(item) if len(t) >= _PER_ITEM_MIN_TERM_LEN][:_PER_ITEM_MAX_TERMS]
+        if not terms:
+            continue
+        hits: Dict[str, int] = {}
+        for term in terms:
+            try:
+                proc = subprocess.run(
+                    ["git", "grep", "-l", "-i", "-F", "--", term],
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=_PER_ITEM_GREP_TIMEOUT,
+                )
+            except Exception:
+                continue
+            if proc.returncode not in (0, 1):
+                continue
+            for line in proc.stdout.splitlines():
+                relative_path = line.strip()
+                if relative_path and relative_path in tracked:
+                    hits[relative_path] = hits.get(relative_path, 0) + 1
+        candidates = [
+            (count, path) for path, count in hits.items()
+            if count >= 1 and path not in existing and path not in seen
+        ]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: (-c[0], len(c[1]), c[1]))
+        best = candidates[0][1]
+        added.append(best)
+        seen.add(best)
+        if len(added) >= _PER_ITEM_MAX_FILES:
+            break
+    return added
 
 
 def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]:
@@ -2101,6 +2168,76 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+def _structured_acceptance_items(issue_text: str) -> List[Dict[str, Any]]:
+    items = _extract_acceptance_criteria(issue_text)
+    structured: List[Dict[str, Any]] = []
+    for item in items:
+        paths = _extract_issue_path_mentions(item)
+        backticked = re.findall(r"`([A-Za-z_$][\w.$]*)`", item)
+        camel = re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){1,})\b", item)
+        snake = re.findall(r"\b([a-z][a-z0-9]*_[a-z][a-z0-9_]+)\b", item)
+        identifiers: List[str] = []
+        for src in (backticked, camel, snake):
+            for tok in src:
+                if tok and tok not in identifiers:
+                    identifiers.append(tok)
+        structured.append({
+            "text": item,
+            "paths": paths[:3],
+            "identifiers": identifiers[:5],
+        })
+    return structured
+
+
+def _strict_unaddressed_items(patch: str, issue_text: str) -> List[str]:
+    items = _structured_acceptance_items(issue_text)
+    if not items:
+        return []
+    changed = set(_patch_changed_files(patch))
+    added_lower = _patch_added_text(patch)
+    missing: List[str] = []
+    for entry in items:
+        text = entry["text"]
+        paths = entry["paths"]
+        identifiers = entry["identifiers"]
+        addressed = False
+        if paths and any(
+            (p in changed) or any(cf == p or cf.endswith("/" + p) for cf in changed)
+            for p in paths
+        ):
+            addressed = True
+        if not addressed and identifiers:
+            for idn in identifiers:
+                if idn.lower() in added_lower:
+                    addressed = True
+                    break
+        if not addressed:
+            keywords = _criterion_keywords(text)
+            if keywords:
+                hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
+                if hits * 10 >= len(keywords) * 7:
+                    addressed = True
+        if not addressed:
+            missing.append(text[:200])
+        if len(missing) >= 5:
+            break
+    return missing
+
+
+def build_strict_criteria_prompt(missing: List[str]) -> str:
+    body = "\n  ".join(f"- {m}" for m in missing[:5])
+    return (
+        "Final coverage check — these items from the task are still NOT "
+        "reflected in any file you touched or any specific identifier you "
+        "added:\n  "
+        f"{body}\n\n"
+        "For each item, either add the minimal change to address it (cite "
+        "the file and the concrete edit) or explicitly justify why it is "
+        "intentionally out of scope. End with <final>done</final>. Do not "
+        "leave any item unaddressed without explanation."
+    )
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2827,6 +2964,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
+    strict_criteria_turns_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2868,7 +3006,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, strict_criteria_turns_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -2982,6 +3120,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        if (
+            strict_criteria_turns_used < MAX_STRICT_CRITERIA_TURNS
+            and criteria_nudges_used > 0
+        ):
+            strict_missing = _strict_unaddressed_items(patch, issue)
+            if len(strict_missing) >= 2:
+                strict_criteria_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_strict_criteria_prompt(strict_missing),
+                    "STRICT_CRITERIA_QUEUED:\n  " + " | ".join(c[:60] for c in strict_missing[:3]),
                 )
                 return True
 
