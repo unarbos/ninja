@@ -123,6 +123,7 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
 MAX_STUB_FIX_TURNS = 1     # demand completion when patch added a function but left it as TODO/pass/similar-logic stub
 MAX_LITERAL_TOKEN_NUDGES = 1  # surface issue-quoted/backticked tokens (UI element names, identifiers) absent from added lines
+MAX_SCOPE_CREEP_DELETION_NUDGES = 1  # patch removed unasked-for code; fire one revert/justify turn
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2235,6 +2236,76 @@ def _issue_requires_deletion(issue_text: str) -> bool:
     return bool(_DELETION_VERB_RE.search(issue_text))
 
 
+# Scope-creep deletion: patches that remove code the issue never asked to
+# remove. Symmetric twin of the deletion-nudge: fires when issue does NOT
+# contain removal verbs but the patch nonetheless drops substantive lines.
+# Loss pattern seen in duel #004605 round 064774: king dropped an existing
+# DB index that nobody asked about.
+_SCOPE_CREEP_DELETION_THRESHOLD = 6
+
+
+def _is_diff_old_file_header(line: str) -> bool:
+    """True only for real unified-diff old-file headers (`--- a/...`,
+    `--- /dev/null`, `--- "a/...`). Excludes content lines like `--- foo`
+    which are SQL/Lua/Markdown `-- foo` source lines that happen to be
+    removed."""
+    return line.startswith(("--- a/", "--- b/", "--- /dev/null", '--- "a/', '--- "b/'))
+
+
+def _is_diff_new_file_header(line: str) -> bool:
+    """Mirror of _is_diff_old_file_header for `+++` lines."""
+    return line.startswith(("+++ a/", "+++ b/", "+++ /dev/null", '+++ "a/', '+++ "b/'))
+
+
+def _patch_substantive_deletion_count(patch: str) -> int:
+    """Non-blank `-` (removed) lines, excluding real `---` file headers.
+    Counts SQL/Lua/Markdown content lines whose source starts with `--`."""
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("-"):
+            continue
+        if _is_diff_old_file_header(line):
+            continue
+        if line[1:].strip():
+            count += 1
+    return count
+
+
+def _patch_substantive_addition_count(patch: str) -> int:
+    """Non-blank `+` (added) lines, excluding real `+++` file headers."""
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("+"):
+            continue
+        if _is_diff_new_file_header(line):
+            continue
+        if line[1:].strip():
+            count += 1
+    return count
+
+
+def _patch_has_unrequested_scope_creep_deletions(patch: str, issue_text: str) -> bool:
+    """Heuristic: True if patch has many deletions but issue didn't ask for them.
+
+    Skips when the issue explicitly requests removal (_issue_requires_deletion
+    already fires the deletion-nudge in that case). Also skips when deletions
+    are a small fraction of additions — replacement edits commonly remove a
+    few lines and add the new version. Fires when deletions exceed an absolute
+    threshold AND form a sizeable fraction of total changes — that's the
+    'I dropped something while doing the requested edit' shape.
+    """
+    if _issue_requires_deletion(issue_text):
+        return False
+    deletions = _patch_substantive_deletion_count(patch)
+    if deletions < _SCOPE_CREEP_DELETION_THRESHOLD:
+        return False
+    additions = _patch_substantive_addition_count(patch)
+    # Replacement-style edits: ratio of deletions to total < 1/3 → routine.
+    # Pure-deletion-leaning patches without a removal mandate → suspicious.
+    total = deletions + additions
+    return total > 0 and (deletions / total) >= 0.33
+
+
 # Stub bodies (TODO/pass/similar-logic comments) added under time pressure
 # despite the system prompt forbidding them. Detect to fire a completion turn.
 
@@ -2828,6 +2899,28 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "RUNTIME-CORRECTNESS CHECKLIST (high-frequency loss patterns the judge "
+        "catches but static checks do not):\n"
+        "  - ASYNC/PROMISES: every `await`-able call is actually awaited; no "
+        "    `Promise` pushed into a typed array (`Uint8Array[]`, etc.) without "
+        "    `await`; no `.map(async ...)` without `Promise.all`.\n"
+        "  - REACT EFFECTS: a `useEffect`'s deps array does NOT include state "
+        "    that the effect itself sets (otherwise infinite re-render); "
+        "    cleanup functions return correctly; refs vs state used "
+        "    appropriately.\n"
+        "  - EVENT/ROUTE WIRING: if you added a new subcommand/handler/route/"
+        "    controller, it is REGISTERED with its parent (CLI group attached "
+        "    to `main`, route mounted on the app, component imported where "
+        "    used). A new file with no importer is dead code.\n"
+        "  - UI ↔ BACKEND: any new UI action invokes the actual backend "
+        "    function/RPC (not just local state mutation). New buttons must "
+        "    call something that exists.\n"
+        "  - EDGE-CASE NUMERICS: zero, negative, NaN, infinity, empty array, "
+        "    single-element array, log of non-positive — each handled if the "
+        "    function takes numeric input.\n"
+        "  - FORMAT/CONVENTION: if the codebase has an established i18n / "
+        "    locale / config / migration / route-naming convention, your "
+        "    additions follow it. Don't invent a new namespace or shape.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
@@ -2836,7 +2929,10 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "  - No new helper functions or defensive checks not required by the task\n"
+        "  - NO removal of code the task did not explicitly ask to remove "
+        "(dropped indexes, deleted siblings, regressed adjacent endpoints are "
+        "all immediate loss conditions).\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -2918,6 +3014,31 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
         "files, revert old code), then run a quick verification and emit "
         "<final>summary</final>.\n\n"
         "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_scope_creep_deletion_prompt(deletion_count: int, issue_text: str) -> str:
+    """Surface unrequested deletions and demand revert-or-justify per chunk.
+    Duel #004605 round 064774: king dropped an existing DB index nobody asked
+    about, losing the round on regression."""
+    short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
+    return (
+        "Scope-creep deletion — your patch removes "
+        f"{deletion_count} substantive line(s), but the task does NOT ask "
+        "you to remove existing code. Removing unrelated code is a regression "
+        "the judge weighs heavily (dropping an existing index, deleting an "
+        "unrelated function, regressing a sibling endpoint).\n\n"
+        "Review every `-` (removed) line in your patch:\n"
+        "  (a) if it is strictly required to deliver the requested change "
+        "(replacing a literal value, refactoring the exact function the task "
+        "names), keep it;\n"
+        "  (b) otherwise, restore the original line. Use `git checkout HEAD -- "
+        "<file>` only if needed; prefer surgical `sed`/python edits to add back "
+        "specific lines so you keep your additions.\n\n"
+        "Do NOT add new scope. Do NOT 'clean up while you're there'. The "
+        "smallest correct patch wins.\n\n"
+        "Task (for reference):\n"
         f"{short}\n"
     )
 
@@ -3270,6 +3391,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     deletion_nudges_used = 0
     stub_fix_turns_used = 0
     literal_token_nudges_used = 0
+    scope_creep_deletion_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3305,7 +3427,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, stub_fix_turns_used, literal_token_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, stub_fix_turns_used, literal_token_nudges_used, scope_creep_deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3393,6 +3515,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_stub_fix_prompt(stub_labels, issue),
                     "STUB_FIX_QUEUED:\n  " + ", ".join(stub_labels[:4]),
+                )
+                return True
+
+        # Scope-creep deletion: inverse of deletion gap. Fires when patch removes
+        # substantive code but the issue never asked to remove anything. Catches
+        # regressions like dropping an existing DB index while doing a schema add.
+        if scope_creep_deletion_nudges_used < MAX_SCOPE_CREEP_DELETION_NUDGES:
+            if _patch_has_unrequested_scope_creep_deletions(patch, issue):
+                scope_creep_deletion_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                deletion_count = _patch_substantive_deletion_count(patch)
+                queue_refinement_turn(
+                    assistant_text,
+                    build_scope_creep_deletion_prompt(deletion_count, issue),
+                    f"SCOPE_CREEP_DELETION_NUDGE_QUEUED: {deletion_count} unrequested deletions",
                 )
                 return True
 
