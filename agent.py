@@ -941,6 +941,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         return "", []
 
     files = _augment_with_test_partners(files, tracked_set)
+    # 16-fix: owner-surface augmentation (from 16.py v34) — add sibling-owner
+    # files when issue mentions trigger concepts (page/route, cache/sync,
+    # schema/migration, etc.).  Wraps in try/except so any error falls back
+    # silently to the existing ranking.
+    try:
+        files = _augment_with_owner_surfaces(files, tracked_set, issue)
+    except Exception:
+        pass
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
     parts: List[str] = []
@@ -987,6 +995,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
+    # 16-fix: prepend acceptance-criteria checklist (from 16.py v40).
+    try:
+        _v40_crit = _v40_extract_acceptance_criteria(issue)
+        _v40_block = _v40_format_criteria_checklist(_v40_crit)
+    except Exception:
+        _v40_block = ""
+    if _v40_block:
+        return _v40_block + "\n\n" + "\n\n".join(parts), included
     return "\n\n".join(parts), included
 
 
@@ -2801,6 +2817,176 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
+# -----------------------------
+# 16-fix: owner-surface ranking + v40 acceptance-criteria checklist
+# (ported from 16.py — these were the two net-new mechanisms; the rest of
+# 16.py removed king90 fixes and was rejected by judge).
+# -----------------------------
+
+_OWNER_SURFACE_RULES: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+    (
+        ("page", "route", "navigation", "screen", "view", "dashboard", "admin", "form"),
+        ("page", "route", "router", "nav", "layout", "dashboard", "admin", "form", "component"),
+    ),
+    (
+        ("cache", "offline", "persist", "localstorage", "refresh", "stale", "sync", "reload"),
+        ("cache", "storage", "store", "state", "hook", "sync", "provider", "context"),
+    ),
+    (
+        ("schema", "migration", "policy", "rpc", "database", "sql", "record", "field"),
+        ("schema", "migration", "model", "entity", "repository", "serializer", "sql", "fixture"),
+    ),
+    (
+        ("prompt", "classifier", "agent", "ai", "email", "intent", "example"),
+        ("prompt", "example", "classifier", "orchestrator", "service", "schema", "fixture"),
+    ),
+    (
+        ("notification", "reminder", "schedule", "background", "token", "quiet", "push"),
+        ("notification", "reminder", "schedule", "background", "token", "preference", "setting"),
+    ),
+    (
+        ("auth", "profile", "social", "post", "comment", "follow", "feed"),
+        ("auth", "profile", "social", "post", "comment", "follow", "feed", "api", "route"),
+    ),
+    (
+        ("editor", "clipboard", "selection", "paste", "copy", "shortcut", "keyboard"),
+        ("editor", "clipboard", "selection", "input", "textarea", "shortcut", "keymap"),
+    ),
+    (
+        ("simulation", "animation", "canvas", "three", "progress", "scrub", "play", "pause"),
+        ("simulation", "animation", "canvas", "three", "progress", "state", "control"),
+    ),
+    (
+        ("extract", "package", "library", "shared", "plugin", "workspace", "exports", "entrypoint"),
+        ("package", "library", "shared", "plugin", "workspace", "exports", "entry", "index", "config"),
+    ),
+    (
+        ("docs", "documentation", "readme", "smoke", "unit", "test", "coverage"),
+        ("readme", "docs", "test", "spec", "smoke", "unit", "fixture"),
+    ),
+    (
+        ("parser", "parse", "yaml", "openapi", "schema", "generated", "regenerate", "handler"),
+        ("parser", "schema", "generated", "handler", "spec", "openapi", "fixture", "test"),
+    ),
+    (
+        ("ffi", "bridge", "ios", "android", "mobile", "client", "core", "binding"),
+        ("ffi", "bridge", "ios", "android", "client", "core", "binding", "wrapper"),
+    ),
+    (
+        ("batch", "upload", "file", "photo", "compress", "storage", "multipart"),
+        ("batch", "upload", "file", "photo", "storage", "route", "endpoint", "service"),
+    ),
+    (
+        ("theme", "light mode", "dark mode", "palette", "color", "css", "style", "tailwind", "responsive"),
+        ("theme", "provider", "layout", "css", "style", "tailwind", "component", "navbar"),
+    ),
+)
+
+
+def _augment_with_owner_surfaces(files: List[str], tracked: set, issue: str) -> List[str]:
+    """Append likely sibling owner files using `_OWNER_SURFACE_RULES`."""
+    if not files or not tracked:
+        return files
+    issue_lower = issue.lower()
+    active_needles: List[str] = []
+    for triggers, needles in _OWNER_SURFACE_RULES:
+        if any(trigger in issue_lower for trigger in triggers):
+            active_needles.extend(needles)
+    if not active_needles:
+        return files
+
+    ranked_roots = {Path(p).parts[0].lower() for p in files if Path(p).parts}
+    issue_terms = set(_issue_terms(issue))
+    seen = set(files)
+    candidates: List[Tuple[int, str]] = []
+
+    for relative_path in tracked:
+        if relative_path in seen or not _context_file_allowed(relative_path):
+            continue
+        path = Path(relative_path)
+        path_lower = relative_path.lower()
+        score = 0
+        score += sum(5 for needle in active_needles if needle in path_lower)
+        score += sum(2 for term in issue_terms if term in path_lower)
+        if path.parts and path.parts[0].lower() in ranked_roots:
+            score += 4
+        if "test" in path.name.lower() or "spec" in path.name.lower():
+            score += 2
+        if score:
+            candidates.append((score, relative_path))
+
+    if not candidates:
+        return files
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    augmented = list(files)
+    for _score, relative_path in candidates[:8]:
+        if relative_path not in seen:
+            augmented.append(relative_path)
+            seen.add(relative_path)
+    return augmented
+
+
+_V40_CRITERION_LEAD_RE = re.compile(
+    r"(?:^|\n)\s*(?:[-*•]|\d+\.|\d+\))\s+([^\n]{8,200})"
+)
+_V40_CONJUNCTION_RE = re.compile(
+    r"\b(?:and|also|must|should|when|unless|only|both|ensure|preserve)\b",
+    re.IGNORECASE,
+)
+_V40_MAX_CRITERIA = 8
+_V40_MIN_CRITERION_LEN = 10
+_V40_MAX_CRITERION_LEN = 200
+
+
+def _v40_extract_acceptance_criteria(issue: str) -> List[str]:
+    """Extract criterion-like clauses from issue text (bullets, then conjunction sentences)."""
+    if not issue or not issue.strip():
+        return []
+    found: List[str] = []
+    seen: set = set()
+    for m in _V40_CRITERION_LEAD_RE.finditer(issue):
+        text = m.group(1).strip()
+        text = re.sub(r"\s+", " ", text)
+        if len(text) < _V40_MIN_CRITERION_LEN or len(text) > _V40_MAX_CRITERION_LEN:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(text)
+        if len(found) >= _V40_MAX_CRITERIA:
+            return found
+    if len(found) < 3:
+        for sentence in re.split(r"(?<=[.!?])\s+", issue):
+            sentence = sentence.strip()
+            if (len(sentence) < _V40_MIN_CRITERION_LEN
+                or len(sentence) > _V40_MAX_CRITERION_LEN):
+                continue
+            if not _V40_CONJUNCTION_RE.search(sentence):
+                continue
+            key = sentence.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(sentence)
+            if len(found) >= _V40_MAX_CRITERIA:
+                return found
+    return found
+
+
+def _v40_format_criteria_checklist(criteria: List[str]) -> str:
+    """Render extracted criteria as a structured checklist block."""
+    if not criteria:
+        return ""
+    lines = ["ACCEPTANCE CRITERIA CHECKLIST (extracted from issue):"]
+    for i, c in enumerate(criteria, 1):
+        lines.append(f"  [{i}] {c}")
+    lines.append("")
+    lines.append("Address EVERY checklist item. Missing any one is the most-dinged judge pattern.")
+    return "\n".join(lines)
+
+
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
