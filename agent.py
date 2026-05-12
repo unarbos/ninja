@@ -120,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_ERROR_HANDLING_NUDGES = 1  # surface missing defensive constructs when issue asks for error handling
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2142,6 +2143,72 @@ def _issue_requires_deletion(issue_text: str) -> bool:
 
 
 # -----------------------------
+# Error-handling gap detection
+# -----------------------------
+#
+# Duel rationales repeatedly cite missing error handling on the king side —
+# "JSON parsing errors would escape", "no try/catch", "weakens auth",
+# "errors are not caught". The reference patch often wraps a flow in
+# try/catch or returns an error path that the king skipped. This gate is
+# parallel to the deletion-gap detector above: it fires when the issue
+# explicitly asks for error handling / validation / fallback / retry but
+# the patch contains zero defensive constructs.
+
+_ERROR_HANDLING_ASK_RE = re.compile(
+    r"\b(error[\s-]*handling|exception[\s-]*handling|fall[\s-]*back|"
+    r"retry(?:ing|\s+logic)?|graceful(?:ly)?|"
+    r"handle\s+(?:\w+\s+){0,3}?(?:errors?|exceptions?|failures?|edge\s+case)|"
+    r"catch\s+(?:\w+\s+){0,3}?(?:errors?|exceptions?)|"
+    r"on\s+(?:failure|error)|in\s+case\s+of|"
+    r"validate\s+(?:input|the\s+input|the\s+request)|input\s+validation)\b",
+    re.IGNORECASE,
+)
+
+# Defensive-construct tokens covering Python, JS/TS, Go, Rust, Java, C#,
+# Promise chains, and option/optional chaining. Substring match on the
+# `+` side of the patch is intentionally permissive — we only care that
+# *some* defensive structure exists, not that it's perfectly placed.
+_ERROR_HANDLING_PATCH_TOKENS: Tuple[str, ...] = (
+    "try:",
+    "except ",
+    "except:",
+    "raise ",
+    "try {",
+    "} catch",
+    "catch (",
+    "catch(",
+    ".catch(",
+    "if err != nil",
+    "Result<",
+    "Option<",
+    "Err(",
+    "Ok(",
+    "?.",
+    "?? ",
+    "if (!",
+    "throw ",
+    "throws ",
+)
+
+
+def _issue_requires_error_handling(issue_text: str) -> bool:
+    """True if the issue explicitly asks for error/exception/fallback work."""
+    return bool(_ERROR_HANDLING_ASK_RE.search(issue_text))
+
+
+def _patch_has_error_handling(patch: str) -> bool:
+    """True if any added line contains a defensive-construct token."""
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        for token in _ERROR_HANDLING_PATCH_TOKENS:
+            if token in added:
+                return True
+    return False
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2647,6 +2714,40 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_error_handling_nudge_prompt(issue_text: str) -> str:
+    """Tell the model the task wants defensive code but the patch is happy-path only.
+
+    Diff-judge rationales repeatedly flag the king for "errors would escape",
+    "no try/catch", "no fallback", "weakens auth" — patterns where the
+    reference patch wraps an external call, parser, or auth check in a
+    defensive construct that the king's patch skipped. Mirrors the
+    deletion-gap design: only fires when the issue text explicitly asks
+    for error handling and the patch shows zero defensive tokens.
+    """
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Error-handling gap — the task explicitly mentions error handling, "
+        "validation, fallback, retry, or graceful failure, but your current "
+        "patch contains NO defensive constructs (no try/except, no try/catch, "
+        "no .catch(), no err != nil branch, no Result/Option/Err arm, no "
+        "input-validation guard).\n\n"
+        "Add the minimum defensive structure the task actually requires:\n"
+        "  - Wrap risky calls (network, parsing, file I/O) in try/except or "
+        "try/catch and surface a meaningful error path\n"
+        "  - For Go/Rust, return the error or propagate via `?` instead of "
+        "silently dropping it\n"
+        "  - For JS/TS, attach .catch() to Promises and handle non-2xx "
+        "responses on fetch results\n"
+        "  - For input validation, reject the bad input with the same "
+        "error type/shape the surrounding code already uses\n\n"
+        "Do NOT add defensive code outside the area the task targets — "
+        "scope discipline still applies. Emit <final>summary</final> once "
+        "the missing branch is in place.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -2944,6 +3045,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    error_handling_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -2979,7 +3081,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, error_handling_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3071,6 +3173,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # Error-handling gap: issue asks for error handling / validation /
+        # fallback / retry, but the patch has no defensive constructs. Same
+        # structural-omission family as the deletion gate — fires before
+        # coverage/criteria so the model spends a refinement turn closing a
+        # behavioural gap rather than re-listing acceptance bullets.
+        if error_handling_nudges_used < MAX_ERROR_HANDLING_NUDGES:
+            if _issue_requires_error_handling(issue) and not _patch_has_error_handling(patch):
+                error_handling_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_error_handling_nudge_prompt(issue),
+                    "ERROR_HANDLING_NUDGE_QUEUED: issue asks for error handling but patch has no defensive constructs",
+                )
+                return True
+
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
         # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
@@ -3142,8 +3262,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
