@@ -117,6 +117,8 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_SURFACE_NUDGES = 1     # v32: nudge once when patch skips an integration surface the issue implies
+MAX_STATIC_FOOTGUN_NUDGES = 1  # cheap static/runtime footgun guard
+MAX_SCOPE_RISK_NUDGES = 1      # warn on behavior-breaking or over-broad rewrites
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -539,15 +541,20 @@ def ensure_git_repo(repo: Path) -> None:
 def get_patch(repo: Path) -> str:
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
+        ":(exclude,glob)**/*.pyo",
         ":(exclude,glob)**/__pycache__/**",
         ":(exclude,glob)**/.pytest_cache/**",
         ":(exclude,glob)**/.mypy_cache/**",
         ":(exclude,glob)**/.ruff_cache/**",
         ":(exclude,glob)**/node_modules/**",
+        ":(exclude,glob)**/.cache/**",
+        ":(exclude,glob)**/.nuxt/**",
         ":(exclude,glob)**/coverage/**",
         ":(exclude,glob)**/dist/**",
         ":(exclude,glob)**/build/**",
         ":(exclude,glob)**/target/**",
+        ":(exclude,glob)**/.next/**",
+        ":(exclude,glob)**/.turbo/**",
         ":(exclude).git",
     ]
     proc = subprocess.run(
@@ -629,7 +636,7 @@ _DB_LIKE_SUFFIXES: set = {
     ".sqlite", ".sqlite3", ".db",
 }
 _TRANSIENT_SUFFIXES: set = {
-    ".log", ".tmp", ".cache",
+    ".log", ".tmp", ".cache", ".sqlite", ".db",
 }
 _LOCKFILE_NAMES: set = {
     "package-lock.json",
@@ -679,7 +686,10 @@ def _sanitize_patch_against_issue(patch: str, issue: str) -> str:
         suffix = Path(path).suffix.lower()
         name = Path(path).name.lower()
         if suffix in _ASSET_SUFFIXES and not asset_ok:
-            continue
+            # Keep tracked asset edits; only trim brand-new asset churn unless
+            # the task explicitly asks for assets/logo/icon/image work.
+            if ("\nnew file mode " in block) or ("Binary files /dev/null and " in block):
+                continue
         if suffix in _ARCHIVE_SUFFIXES:
             continue
         if suffix in _DB_LIKE_SUFFIXES:
@@ -716,7 +726,27 @@ def _finalize_patch_hygiene(patch: str, issue: str, logs: List[str]) -> str:
             "PATCH_HYGIENE_TRIMMED:\nsource_chars=" + str(len(patch))
             + " final_chars=" + str(len(cleaned))
         )
+    lock_warn = _lockfile_noise_warning(cleaned, issue)
+    if lock_warn:
+        logs.append(lock_warn)
     return cleaned
+
+
+def _lockfile_noise_warning(patch: str, issue: str) -> str:
+    """Warn when lockfiles changed without dependency intent in the issue."""
+    if not patch.strip():
+        return ""
+    changed = set(_patch_changed_files(patch))
+    lock_changed = sorted(path for path in changed if Path(path).name.lower() in _LOCKFILE_NAMES)
+    if not lock_changed:
+        return ""
+    package_json_changed = "package.json" in changed
+    if package_json_changed:
+        return ""
+    issue_lower = issue.lower()
+    if any(term in issue_lower for term in _DEPS_KEYWORDS):
+        return ""
+    return "PATCH_HYGIENE_WARN:\nlockfile_without_dependency_intent=" + ",".join(lock_changed[:4])
 
 
 def _strip_eval_term_additions_in_fixtures(diff_output: str) -> str:
@@ -820,7 +850,10 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     suffix_lower = path.suffix.lower()
     name_lower = path.name.lower()
-    if suffix_lower in {".pyc", ".pyo"}:
+    if suffix_lower in {
+        ".pyc", ".pyo", ".class", ".o", ".obj", ".so", ".dll", ".dylib",
+        ".exe", ".bin", ".wasm", ".log", ".tmp", ".sqlite", ".db",
+    }:
         return True
     if name_lower == ".ds_store":
         return True
@@ -834,29 +867,17 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "dist",
         "build",
         "target",
+        ".cache",
         ".git",
         ".idea",
         ".vscode",
         ".gradle",
         ".terraform",
         ".next",
+        ".nuxt",
         ".turbo",
     }
-    generated_suffixes = {
-        ".class",
-        ".o",
-        ".obj",
-        ".so",
-        ".dll",
-        ".dylib",
-        ".exe",
-        ".bin",
-        ".wasm",
-    }
-    return (
-        any(part in generated_parts for part in path.parts)
-        or suffix_lower in generated_suffixes
-    )
+    return any(part in generated_parts for part in path.parts)
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1163,6 +1184,8 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
                     seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
+    surfaces = _classify_issue_surfaces(issue)
+    core_terms = _extract_core_action_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -1186,6 +1209,16 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        if ("extraction_refactor" in core_terms or "wiring" in surfaces) and Path(relative_path).name.lower() in {"app.js", "app.ts", "main.js", "main.ts", "index.js", "index.ts"}:
+            score += 32
+        if ("api" in surfaces) and any(seg in path_lower for seg in ("/route", "/routes/", "/router", "/controllers/", "/server", "/api/")):
+            score += 14
+        if ("ui" in surfaces) and any(seg in path_lower for seg in ("/components/", "/pages/", "/views/", "/screens/", ".css", ".scss")):
+            score += 10
+        if ("build" in surfaces) and Path(relative_path).name.lower() in {"package.json", "vercel.json", "vite.config.ts", "vite.config.js"}:
+            score += 20
+        if ("tests" in surfaces) and ("/test" in path_lower or ".test." in path_lower or ".spec." in path_lower):
+            score += 12
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1246,14 +1279,13 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
         anchor_tokens.update(_split_path_tokens(path))
 
     issue_tokens = set(_issue_terms(issue))
+    issue_surfaces = _classify_issue_surfaces(issue)
+    core_terms = _extract_core_action_terms(issue)
     issue_symbols = {s.lower() for s in _extract_issue_symbols(issue, max_symbols=16)}
     signal_tokens = {t for t in (anchor_tokens | issue_tokens | issue_symbols) if len(t) >= 4}
     root_file_wanted = bool(
-        issue_tokens
-        & {
-            "build", "cli", "config", "dependency", "dependencies", "docker",
-            "package", "script", "setup", "workflow",
-        }
+        (issue_tokens & {"build", "config", "dependency", "dependencies", "docker", "package", "script", "setup", "workflow"})
+        or ("build" in issue_surfaces)
     )
 
     candidates: List[Tuple[int, str]] = []
@@ -1277,6 +1309,12 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
         score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
         score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
+            score += 5
+        if ("extraction_refactor" in core_terms or "wiring" in issue_surfaces) and path.name.lower() in {"app.js", "app.ts", "main.js", "main.ts", "index.js", "index.ts"}:
+            score += 8
+        if ("api" in issue_surfaces) and any(tok in path_lower for tok in ("/route", "/routes/", "/router", "/server", "/api/")):
+            score += 6
+        if ("ui" in issue_surfaces) and any(tok in path_lower for tok in ("/components/", "/pages/", "/views/", "/screens/", ".css", ".scss")):
             score += 5
         if "test" in path_lower or "spec" in path_lower:
             score -= 2  # companion-test loading already handles tests.
@@ -2299,76 +2337,22 @@ def _symbol_grep_hits(
 # obvious missing pieces before <final>.
 
 _SURFACE_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    (
-        "ui",
-        (
-            "component", "components", "page", "pages", "view", "screen",
-            "layout", "navbar", "sidebar", "header", "footer", "modal",
-            "dialog", "form", "button", "input", "dropdown", "menu",
-            "dashboard", "panel", "card", "tab", "tabs", "style", "styles",
-            "css", "scss", "tailwind", "ui", "ux", "responsive", "render",
-            "click", "hover", "icon", "theme", "dark mode", "light mode",
-            "placeholder", "tooltip", "alert", "notification", "toast",
-        ),
-    ),
-    (
-        "api",
-        (
-            "endpoint", "endpoints", "route", "routes", "controller",
-            "controllers", "handler", "handlers", "service", "services",
-            "http", "https", "request", "response", "rest", "graphql",
-            "api", "post", "patch", "put", "delete", "fetch", "axios",
-            "client", "webhook",
-        ),
-    ),
-    (
-        "schema",
-        (
-            "model", "models", "schema", "schemas", "migration", "migrations",
-            "field", "fields", "column", "columns", "table", "tables",
-            "database", "db", "sql", "orm", "serializer", "serializers",
-            "type", "types", "interface", "dto",
-        ),
-    ),
-    (
-        "test",
-        (
-            "test", "tests", "spec", "specs", "regression", "fixture",
-            "fixtures", "unittest", "pytest", "jest", "vitest",
-        ),
-    ),
-    (
-        "platform",
-        (
-            "native", "web", "mobile", "desktop", "android", "ios",
-            "flutter", "dart", "electron", "react native", "expo",
-            "swiftui", "kotlin", "swift", "platform", "windows", "macos",
-            "linux",
-        ),
-    ),
-    (
-        "cli",
-        (
-            "command", "commands", "flag", "flags", "argument", "argv",
-            "script", "scripts", "makefile", "shell", "bash", "cli",
-            "subcommand", "argparse", "click",
-        ),
-    ),
-    (
-        "docs",
-        (
-            "readme", "documentation", "docs", "doc", "changelog", "guide",
-            "tutorial", "comment", "docstring",
-        ),
-    ),
+    ("ui", ("component", "page", "view", "modal", "button", "navbar", "layout", "mobile", "desktop", "responsive", "css", "classname", "loading", "empty state")),
+    ("api", ("endpoint", "route", "controller", "request", "response", "http", "backend", "server")),
+    ("data", ("schema", "model", "migration", "db", "field", "serializer", "type", "interface")),
+    ("wiring", ("import", "export", "register", "mount", "route", "app.js", "provider", "hook", "store", "service", "client")),
+    ("tests", ("test", "spec", "regression", "smoke", "e2e")),
+    ("docs", ("readme", "docs", "changelog", "version")),
+    ("build", ("package.json", "vite", "vercel", "script", "config")),
+    ("platform", ("native", "web", "mobile", "android", "ios", "flutter", "dart", "browser")),
 )
 
 
 def _classify_issue_surfaces(issue: str) -> set:
     """Tag the issue with high-level surface labels using keyword heuristics.
 
-    Returns a set drawn from {"ui","api","schema","test","platform","cli",
-    "docs"}. Empty set for short or signal-free issues. The classifier is
+    Returns a set drawn from {"ui","api","data","wiring","tests","docs",
+    "build","platform"}. Empty set for short or signal-free issues. The classifier is
     intentionally generous on the recall side: it is read by the initial
     prompt + a refinement nudge, both of which already let the model dismiss
     a false positive.
@@ -2393,11 +2377,9 @@ def _classify_issue_surfaces(issue: str) -> set:
 def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[str]:
     """Build a compact deduped requirement checklist from the issue text.
 
-    Stronger than `_extract_acceptance_criteria`: also catches imperative
-    sentences (must/should/ensure/add/update/remove/support/implement/fix/
-    when/unless/also/both/all/require/enable/disable/return/raise/expect),
-    quoted UI text, and HTTP-method endpoint mentions. Capped + deduped so
-    the prompt stays short.
+    Captures list items, imperative sentences, explicit paths, quoted UI/API
+    literals, endpoint strings, and clause-level requirements split by
+    "also/and/both/all/unless/only" hints.
     """
     if not issue:
         return []
@@ -2423,8 +2405,9 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
                 return items
 
     imperative_re = re.compile(
-        r"\b(must|should|ensure|add|update|remove|support|implement|fix|"
-        r"when|unless|also|both|all|require[sd]?|enable|disable|return|raise|expect)\b",
+        r"\b(must|should|ensure|add|update|remove|delete|replace|implement|support|"
+        r"preserve|keep|use|move|wire|integrate|hide|show|route|endpoint|api|frontend|"
+        r"backend|mobile|desktop|loading|empty|error|fallback)\b",
         re.IGNORECASE,
     )
     for raw in re.split(r"(?<=[.!?])\s+", issue):
@@ -2433,6 +2416,11 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
             continue
         if imperative_re.search(text):
             add(text)
+            clauses = re.split(r"\b(?:also|and|both|all|unless|only)\b", text, flags=re.IGNORECASE)
+            for clause in clauses:
+                clause_text = clause.strip(" ,;:-")
+                if imperative_re.search(clause_text):
+                    add(clause_text)
             if len(items) >= max_items:
                 return items
 
@@ -2448,13 +2436,38 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
         if len(items) >= max_items:
             return items
 
-    path_re = re.compile(r"(?<![A-Za-z0-9_])(/(?:api|routes|admin|users|auth|posts|products|panel)/[A-Za-z0-9_/{}-]+)")
+    path_re = re.compile(
+        r"(?<![A-Za-z0-9_])([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|json|md|yml|yaml|css|scss)|/[A-Za-z0-9_./{}-]+)"
+    )
     for m in path_re.finditer(issue):
-        add("path " + m.group(1))
+        add("path " + m.group(1).strip())
         if len(items) >= max_items:
             return items
 
     return items[:max_items]
+
+
+def _extract_core_action_terms(issue: str) -> set:
+    """Extract high-leverage action phrases for completion/risk heuristics."""
+    if not issue:
+        return set()
+    lowered = issue.lower()
+    terms: set = set()
+    patterns = {
+        "delete_remove": r"\b(delete|remove)\b",
+        "wire_import_use": r"\b(wire|import|use|register|mount|integrate)\b",
+        "preserve_flow": r"\b(preserve|keep existing|do not break|existing flow|current flow)\b",
+        "dedicated_ref": r"\bdedicated ref\b",
+        "route_placement": r"\b(route order|route placement|shadow|static route|dynamic route)\b",
+        "frontend_flow": r"\b(frontend flow|selection|resubmission|resubmit)\b",
+        "extraction_refactor": r"\b(extract|refactor|split module|move to module)\b",
+        "loading_empty_error": r"\b(loading|empty|error|fallback)\b",
+        "responsive": r"\b(mobile|desktop|responsive|breakpoint)\b",
+    }
+    for name, pattern in patterns.items():
+        if re.search(pattern, lowered):
+            terms.add(name)
+    return terms
 
 
 def _detect_platform_import_violations(patch: str) -> List[str]:
@@ -2488,7 +2501,7 @@ def _detect_platform_import_violations(patch: str) -> List[str]:
     return violations
 
 
-def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
+def _surface_completeness_gaps(repo: Path, patch: str, issue: str) -> List[str]:
     """Heuristic: list integration surfaces the issue implies but the patch skips.
 
     Returns a list of human-readable gap descriptions. Empty list means the
@@ -2499,6 +2512,7 @@ def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
     if not patch.strip() or not issue.strip():
         return []
     surfaces = _classify_issue_surfaces(issue)
+    core_terms = _extract_core_action_terms(issue)
     if not surfaces:
         return []
     changed = _patch_changed_files(patch)
@@ -2507,7 +2521,7 @@ def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
 
     touched_ui = False
     touched_api = False
-    touched_schema = False
+    touched_data = False
     touched_test = False
     touched_docs = False
     touched_frontend = False
@@ -2546,7 +2560,7 @@ def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
             "models", "schemas", "schema", "migrations", "migration",
             "serializers", "serializer", "types", "entities",
         )) or "schema" in lower or "model" in lower:
-            touched_schema = True
+            touched_data = True
         if (
             any(("test" in part) or ("spec" in part) for part in parts)
             or "_test" in lower
@@ -2575,12 +2589,12 @@ def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
                 "feature spans UI and API but only one side is wired; add the "
                 "missing frontend client call OR backend endpoint"
             )
-    if "schema" in surfaces and not touched_schema:
+    if "data" in surfaces and not touched_data:
         gaps.append(
             "issue references model/schema/field changes but patch touches no "
             "model/schema/type/serializer files"
         )
-    if "test" in surfaces and not touched_test:
+    if "tests" in surfaces and not touched_test:
         gaps.append(
             "issue references tests/regression but patch touches no test/spec file"
         )
@@ -2593,7 +2607,102 @@ def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
         if bad_imports:
             gaps.append("platform-specific import in shared/non-web file: " + "; ".join(bad_imports[:3]))
 
+    issue_paths = _extract_issue_path_mentions(issue)
+    if ("delete_remove" in core_terms) and issue_paths:
+        changed_set = set(changed)
+        for req in issue_paths:
+            req_clean = req.strip("./")
+            if any(req_clean == c or c.endswith("/" + req_clean) for c in changed_set):
+                continue
+            gaps.append(f"issue requests remove/delete but named path is untouched: {req_clean}")
+            break
+
+    lowered_issue = issue.lower()
+    if ("extraction_refactor" in core_terms) or any(k in lowered_issue for k in ("extract", "refactor", "module")):
+        added_modules = [p for p in changed if p.endswith((".ts", ".tsx", ".js", ".jsx", ".py")) and _patch_is_new_file(patch, p)]
+        entrypoint_touched = any(
+            Path(p).name.lower() in {"app.js", "app.ts", "main.ts", "main.js", "index.ts", "index.js"}
+            for p in changed
+        )
+        if added_modules and not entrypoint_touched:
+            gaps.append("extraction/refactor adds module files but does not update original entrypoint/import site")
+
+    if any(k in lowered_issue for k in ("selection", "resubmission", "resubmit", "frontend flow")) and touched_backend and not touched_frontend:
+        gaps.append("issue references frontend flow/selection/resubmission but patch only changes backend")
+
+    if any(k in lowered_issue for k in ("loading", "empty", "error", "fallback")):
+        added_lower = _patch_added_text(patch)
+        if not any(token in added_lower for token in ("loading", "empty", "error", "fallback", "isloading", "isempty")):
+            gaps.append("issue mentions loading/empty/error/fallback but changed UI code lacks these states")
+
+    if any(k in lowered_issue for k in ("changelog", "readme", "docs", "version")) and not touched_docs:
+        gaps.append("issue mentions docs/changelog/version but no docs/version file changed")
+
+    if any(k in lowered_issue for k in ("test", "regression", "smoke")) and not touched_test:
+        gaps.append("issue mentions tests/regression/smoke but no test/spec file changed")
+
+    if any(k in lowered_issue for k in ("mobile", "responsive", "desktop")):
+        if _patch_has_breakpoint_risk(patch):
+            gaps.append("responsive/mobile task may alter breakpoint semantics; verify small-screen layout behavior")
+
+    if any(k in lowered_issue for k in ("route", "endpoint")):
+        if _patch_has_route_shadowing_pattern(patch):
+            gaps.append("static route may be registered after dynamic parameter route and get shadowed")
+        else:
+            for rel in changed:
+                if not any(tok in rel.lower() for tok in ("route", "router", "server", "api")):
+                    continue
+                full = (repo / rel).resolve()
+                try:
+                    full.relative_to(repo.resolve())
+                    source = full.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                if _file_has_route_shadowing(source):
+                    gaps.append("router file order suggests static route may be shadowed by dynamic route")
+                    break
+
     return gaps
+
+
+def _patch_is_new_file(patch: str, relative_path: str) -> bool:
+    block_re = re.compile(
+        r"^diff --git a/" + re.escape(relative_path) + r" b/" + re.escape(relative_path) + r"$.*?(?=^diff --git |\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    m = block_re.search(patch)
+    if not m:
+        return False
+    return "\nnew file mode " in m.group(0)
+
+
+def _patch_has_route_shadowing_pattern(patch: str) -> bool:
+    dynamic_seen: Dict[str, bool] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+            current_file = m.group(2) if m else ""
+            dynamic_seen[current_file] = False
+            continue
+        if not current_file or (not line.startswith("+")) or line.startswith("+++"):
+            continue
+        body = line[1:]
+        if re.search(r'["\']/:[A-Za-z_][\w-]*["\']', body):
+            dynamic_seen[current_file] = True
+        if dynamic_seen.get(current_file, False) and re.search(r'["\']/[A-Za-z0-9_-]+["\']', body) and not re.search(r'["\']/:[A-Za-z_][\w-]*["\']', body):
+            return True
+    return False
+
+
+def _patch_has_breakpoint_risk(patch: str) -> bool:
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].lower()
+        if ("flex-row" in body or "grid-cols-" in body) and not any(tok in body for tok in ("sm:", "md:", "lg:", "@media", "max-width", "min-width")):
+            return True
+    return False
 
 
 # -----------------------------
@@ -2713,6 +2822,166 @@ def _check_dart_platform_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 # -----------------------------
+# v33: static footgun checks
+# -----------------------------
+
+_JSX_IDENTIFIER_IMPORT_GUARD: Tuple[str, ...] = (
+    "Icon", "TrashIcon", "BreadcrumbItem", "Link", "Button",
+)
+
+
+def _patch_added_lines_by_file(patch: str) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    current = ""
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+            current = m.group(2) if m else ""
+            if current:
+                out.setdefault(current, [])
+            continue
+        if not current:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            out[current].append(line[1:])
+    return out
+
+
+def _check_static_footguns(repo: Path, patch: str, issue: str) -> List[str]:
+    if not patch.strip():
+        return []
+    errors: List[str] = []
+    changed = _patch_changed_files(patch)
+    added = _patch_added_lines_by_file(patch)
+    issue_lower = issue.lower()
+
+    if any(k in issue_lower for k in ("route", "endpoint")) and _patch_has_route_shadowing_pattern(patch):
+        errors.append("route shadowing risk: static route appears after dynamic parameter route")
+
+    for relative_path in changed:
+        suffix = Path(relative_path).suffix.lower()
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except Exception:
+            continue
+        if not full.exists():
+            continue
+        try:
+            src = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if suffix in {".tsx", ".jsx", ".ts", ".js", ".mjs", ".cjs"}:
+            add_lines = "\n".join(added.get(relative_path, []))
+            for ident in _JSX_IDENTIFIER_IMPORT_GUARD:
+                if re.search(r"\b" + re.escape(ident) + r"\b", add_lines):
+                    imported = re.search(r"import\s+.*\b" + re.escape(ident) + r"\b.*from", src)
+                    declared = re.search(r"\b(?:const|let|var|function|class)\s+" + re.escape(ident) + r"\b", src)
+                    if not imported and not declared:
+                        errors.append(f"{relative_path}: `{ident}` appears in added code without import/local declaration")
+                        break
+
+            dup_state = re.findall(r"const\s*\[\s*([A-Za-z_]\w*)\s*,\s*set[A-Za-z_]\w*\s*\]\s*=\s*useState\s*\(", src)
+            if dup_state and len(dup_state) != len(set(dup_state)):
+                errors.append(f"{relative_path}: duplicate useState declaration for same state variable")
+
+            if re.search(r"\bemail\.toLowerCase\s*\(", add_lines) and not re.search(r"(email\s*[!?]\.|email\s*&&|email\s*\?)", add_lines):
+                errors.append(f"{relative_path}: possible optional email `.toLowerCase()` without guard")
+
+            defined_tokens = set(re.findall(r"\b(?:const|let|var|function|class)\s+([A-Za-z_]\w*)", src))
+            imported_tokens = set(re.findall(r"import\s*\{([^}]+)\}\s*from", src))
+            flat_imported: set = set()
+            for grp in imported_tokens:
+                for token in grp.split(","):
+                    flat_imported.add(token.strip().split(" as ")[0].strip())
+            params = set(re.findall(r"\(([A-Za-z_]\w*)[,)]", src))
+            known = defined_tokens | flat_imported | params | {"React"}
+            for token in re.findall(r"\b([A-Za-z_]\w*)\b", add_lines):
+                if token in known:
+                    continue
+                if token[0].isupper():
+                    continue
+                if token in {"if", "for", "while", "return", "const", "let", "var", "true", "false", "null", "undefined"}:
+                    continue
+                if re.search(r"\." + re.escape(token) + r"\b", add_lines):
+                    continue
+                if token in {"email", "asset", "kmReadings"}:
+                    errors.append(f"{relative_path}: added code may reference undefined variable `{token}`")
+                    break
+
+            if any(k in issue_lower for k in ("route", "endpoint")) and any(tok in relative_path.lower() for tok in ("route", "router", "server", "api")):
+                if _file_has_route_shadowing(src):
+                    errors.append(f"{relative_path}: static route is declared after dynamic parameter route")
+
+        if suffix == ".py":
+            if re.search(r"^\s*\w+\s*=\s*\{[^}]*\b\w+\(", src, re.MULTILINE):
+                errors.append(f"{relative_path}: top-level registry/dict may call function before definition")
+            add_lines = "\n".join(added.get(relative_path, []))
+            if re.search(r"\[[^\]]*(bbox|box|bounds)[^\]]+\]", add_lines) and re.search(r"\b(np\.\w+|numpy)\b", src, re.IGNORECASE):
+                if not re.search(r"\b(int|round|floor|ceil)\s*\(", add_lines):
+                    errors.append(f"{relative_path}: numpy slice with bbox-like values may require int conversion")
+
+    py_changed = [p for p in changed if p.endswith(".py")]
+    if py_changed and _has_executable("python3"):
+        for relative_path in py_changed[:8]:
+            proc = run_command(f"python3 -m py_compile {_shell_quote(relative_path)}", repo, timeout=4)
+            if proc.exit_code != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                errors.append(f"{relative_path}: py_compile failed: {(tail[-1] if tail else 'unknown error')}")
+                break
+
+    return errors[:10]
+
+
+def _file_has_route_shadowing(source: str) -> bool:
+    route_re = re.compile(r'["\'](/[^"\']+)["\']')
+    dynamic_index: Optional[int] = None
+    static_after_dynamic = False
+    lines = source.splitlines()
+    for idx, line in enumerate(lines):
+        if not any(tok in line for tok in (".get(", ".post(", ".put(", ".patch(", ".delete(", "add_api_route(", "@router.", "router.")):
+            continue
+        m = route_re.search(line)
+        if not m:
+            continue
+        route = m.group(1)
+        if "/:" in route or re.search(r"/\{[^}]+\}", route):
+            if dynamic_index is None:
+                dynamic_index = idx
+        elif dynamic_index is not None and idx > dynamic_index:
+            static_after_dynamic = True
+            break
+    return static_after_dynamic
+
+
+def _scope_risk_gaps(patch: str, issue: str) -> List[str]:
+    if not patch.strip():
+        return []
+    issue_lower = issue.lower()
+    added = 0
+    removed = 0
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    gaps: List[str] = []
+    if removed > (added * 2 + 40) and not any(k in issue_lower for k in ("cleanup", "remove", "delete", "deprecate")):
+        gaps.append("patch removes substantially more code than it adds for a non-cleanup issue")
+
+    if any(k in issue_lower for k in ("route", "navbar", "navigation", "link")):
+        mentioned = {t for t in re.findall(r"/[A-Za-z0-9_/-]+", issue)}
+        for line in patch.splitlines():
+            if (line.startswith("+") or line.startswith("-")) and not line.startswith(("+++", "---")):
+                routes = set(re.findall(r"/[A-Za-z0-9_/-]+", line))
+                if any(r not in mentioned for r in routes):
+                    gaps.append("patch changes route/navigation targets not mentioned in issue")
+                    break
+    return gaps[:4]
+
+
+# -----------------------------
 # v32: forbidden evaluator/grader term guard
 # -----------------------------
 
@@ -2785,6 +3054,7 @@ First response format:
 - Acceptance checklist: a numbered list of every concrete acceptance item the issue implies (UI text shown, endpoint exposed, field added, nav link added, test added, etc.). Each item is something a reviewer can verify in the diff.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
 - Requirement -> file map: for each acceptance item, list the file(s) you intend to edit. Use "?" while still searching.
+- Deletion requirements: explicitly call out every remove/delete/obsolete requirement. If a file/UI is requested to be removed, your final diff must actually remove it or state why it already does not exist.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2802,6 +3072,7 @@ ISSUE CONTRACT
 ====================================================================
 
 Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
+Before replacing existing flows, list what behavior must remain (auth/cart/nav/overlay/reveal/telemetry/message flows, existing actions, existing data sources) and preserve it unless the issue explicitly asks to remove/replace it.
 
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
@@ -2924,6 +3195,7 @@ Then your patch must cover every implied surface in the SAME submission. Example
 Inspect adjacent existing files BEFORE introducing new abstractions, routes, or components. Match the existing folder layout, naming, CSS class style, and platform-separation pattern. Do not invent a parallel structure.
 
 For UI changes: the target page/route name in the issue is authoritative -- if it says `/panel`, edit `/panel`, not `/admin`. Preserve layout invariants the issue mentions or that adjacent code already enforces (min-height, centering, container sizing, anchor IDs, sort/order of displayed metrics).
+For row-level click handlers with nested action buttons, prevent accidental bubbling (e.g., stopPropagation) when the row click opens details.
 
 For platform-aware code: do not import platform-only modules (e.g., `dart:html`) from shared/mobile files; use the existing platform-separation helper or conditional import already present in the repo.
 
@@ -2943,7 +3215,7 @@ If a sanity check fails, fix it before finalizing. The smallest failing import o
 SAFETY
 ====================================================================
 
-No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
+No sudo. No chmod. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata. File deletion is allowed only when explicitly required by the issue.
 '''
 
 
@@ -2976,14 +3248,16 @@ Preloaded likely relevant tracked-file snippets (already read for you - do not r
             guidance.append("UI surface: identify the EXACT target page/component (route name in the issue is authoritative); preserve adjacent layout/CSS-class style; do NOT invent a parallel page when one is named.")
         if "api" in surfaces:
             guidance.append("API surface: add the route + controller/handler + service; mirror the existing route style (verb, path shape, response wrapper).")
-        if "schema" in surfaces:
+        if "data" in surfaces:
             guidance.append("Schema surface: update the model/schema/types/serializer/migration in lockstep so the field reaches the wire.")
-        if "test" in surfaces:
+        if "wiring" in surfaces:
+            guidance.append("Wiring surface: if you add or extract modules, update entrypoint imports/registration and remove obsolete inline code.")
+        if "tests" in surfaces:
             guidance.append("Test surface: add or update the companion test next to the closest existing test, matching its naming and fixture style.")
         if "platform" in surfaces:
             guidance.append("Platform surface: keep platform-only modules out of shared files; reuse the repo's existing platform separation pattern instead of inventing one.")
-        if "cli" in surfaces:
-            guidance.append("CLI surface: register the new flag/subcommand in the same parser the existing flags use; update help text.")
+        if "build" in surfaces:
+            guidance.append("Build surface: update package/vite/vercel/config only when the issue explicitly requires build/deploy/script changes.")
         if "docs" in surfaces:
             guidance.append("Docs surface: update the README/docs section that documents the changed behavior.")
         bullet_lines = "\n".join(f"- {g}" for g in guidance)
@@ -3012,8 +3286,12 @@ Repository summary:
 {repo_summary}
 {context_section}{surface_section}{checklist_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them - the LLM judge penalizes incomplete solutions.
+Build an acceptance checklist and map each item to likely owner files/surfaces before editing.
+If issue text asks to delete/remove a file or obsolete flow, your final diff must actually remove it (or explicitly explain why no removal was needed).
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. For multi-surface feature tasks, identify ALL implied surfaces and edit each one in the same submission.
+For feature tasks inspect owners plus wiring points. UI+API tasks need both frontend client/service/UI and backend route/controller when implied. Extraction/refactor tasks need new modules AND original entrypoint imports/usage AND old inline code removed. Route tasks must verify static route ordering vs dynamic params. UI interaction tasks must preserve event propagation, loading/empty/error/fallback behavior.
+Prefer preserving existing flows over replacement: extend current scripts/handlers/components unless the issue explicitly says replace.
 
 If the preloaded snippets show the target code, edit them directly - do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -3163,12 +3441,17 @@ def build_self_check_prompt(
                 "response shape matches what the UI/client expects; "
                 "service/client wiring updated; error/loading paths handled."
             )
-        if "schema" in surfaces:
+        if "data" in surfaces:
             surface_extras.append(
                 "Data: model/schema/migration/serializer/types updated in "
                 "lockstep so the new field reaches the wire."
             )
-        if "test" in surfaces:
+        if "wiring" in surfaces:
+            surface_extras.append(
+                "Wiring: extraction/refactor edits include new module plus "
+                "entrypoint import/usage updates, and obsolete inline code was removed."
+            )
+        if "tests" in surfaces:
             surface_extras.append(
                 "Tests: companion test added or updated next to the closest "
                 "existing test, matching its style; no test was weakened."
@@ -3205,8 +3488,9 @@ def build_self_check_prompt(
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference - review your patch against all three:\n\n"
         "REQUIREMENT -> DIFF MAPPING (do this first, in your head):\n"
-        "  - For EACH acceptance item from your <plan>, name the file + hunk that satisfies it.\n"
-        "  - If an item has no corresponding hunk, either add the missing edit now or note the omission.\n\n"
+        "  - For EACH acceptance item from your <plan>, name the changed file(s) + hunk.\n"
+        "  - If an item has no corresponding hunk, it is missing; add it now.\n"
+        "  - Explicitly verify remove/delete requirements are actually satisfied by a deletion/edit hunk.\n\n"
         "CORRECTNESS (LLM judge weight - high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
@@ -3214,8 +3498,11 @@ def build_self_check_prompt(
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight - high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated.\n"
-        "  - No syntax errors, missing imports, or unbalanced directives introduced.\n\n"
+        "  - Extraction tasks: new module is imported/used and old inline code removed.\n"
+        "  - UI tasks: loading/empty/error/fallback, responsive/mobile behavior, event propagation, and existing flow preservation are checked.\n"
+        "  - API/data tasks: route order, request/response shape, frontend client wiring, and schema/type updates are checked.\n"
+        "  - Static sanity: imports, undefined names, duplicate state, route shadowing checked.\n"
+        "  - Patch hygiene: no chmod/mode churn, no pyc/cache/generated noise, no unrelated lockfile churn.\n\n"
         "SCOPE (similarity score weight - medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks.\n"
         "  - No type annotation changes not required by the task.\n"
@@ -3273,7 +3560,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
-def build_surface_nudge_prompt(gaps: List[str], issue_text: str) -> str:
+def build_surface_nudge_prompt(gaps: List[str], issue: str) -> str:
     """Tell the model which integration surfaces the patch still skips.
 
     v32: feature-task losses commonly come from skipping one side of an
@@ -3282,7 +3569,7 @@ def build_surface_nudge_prompt(gaps: List[str], issue_text: str) -> str:
     add the missing edit or justify the omission in the final summary.
     """
     bullets = "\n  ".join(f"- {g}" for g in gaps[:6]) or "(none)"
-    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    short = issue[:1500] if len(issue) > 1500 else issue
     return (
         "Surface-completeness gap - your patch covers some but not all "
         "integration surfaces this task implies:\n"
@@ -3364,7 +3651,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # v28 multi-shot helpers
 # -----------------------------
 
-_MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
+_MULTISHOT_LOW_SIGNAL_THRESHOLD = 0  # retained for compatibility; logic uses plausibility helper
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
 
@@ -3419,34 +3706,45 @@ def _multishot_should_skip_retry(
     success_flag: bool,
     repo: Optional[Path],
 ) -> bool:
-    """Return True if attempt #1 is good enough that retry would waste budget.
+    """Retry only when attempt #1 is empty or obviously low-signal noise."""
+    if not patch.strip() or substantive < 1:
+        return False
+    if _diff_low_signal_summary(patch):
+        return False
+    return _patch_is_plausible_small_fix(repo, patch, issue, success_flag)
 
-    The original threshold (>=3 substantive lines) tossed plenty of valid
-    one-line fixes. We accept attempt #1 when ANY of these is true:
-      - already meets the substantive threshold, OR
-      - patch touches a path the issue explicitly mentions, OR
-      - the inner agent reported success AND our static check is clean.
-    The retry path still runs for empty / clearly broken first attempts.
-    """
-    if substantive >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-        return True
-    if substantive < 1 or not patch.strip():
+
+def _patch_is_plausible_small_fix(
+    repo: Optional[Path],
+    patch: str,
+    issue: str,
+    success_flag: bool,
+) -> bool:
+    """Accept small but plausible fixes instead of wasting retry budget."""
+    if not patch.strip():
         return False
     changed = _patch_changed_files(patch)
     if not changed:
         return False
+    issue_lower = issue.lower()
     issue_paths = _extract_issue_path_mentions(issue)
-    for path in changed:
-        for mention in issue_paths:
-            if path == mention or path.endswith("/" + mention):
-                return True
+    changed_stems = {Path(p).stem.lower() for p in changed}
+
+    if any(any(path == m or path.endswith("/" + m.strip("./")) for m in issue_paths) for path in changed):
+        return True
+    if any(kw in issue_lower for kw in ("delete", "remove")) and any("\ndeleted file mode " in block for block in re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE) if block):
+        return True
+    if any(stem and stem in issue_lower for stem in changed_stems):
+        return True
+    if any(kw in issue_lower for kw in ("route", "endpoint", "script", "package")) and any(kw in _patch_added_text(patch) for kw in ("router", "app.use", "scripts", "typecheck", "build")):
+        return True
     if success_flag and repo is not None:
         try:
-            if not _check_syntax(repo, patch):
+            if not _check_syntax(repo, patch) and not _check_static_footguns(repo, patch, issue):
                 return True
         except Exception:
-            return False
-    return False
+            pass
+    return _multishot_count_substantive(patch) >= 1
 
 
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
@@ -3530,6 +3828,9 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ):
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "first_attempt_strong_enough"
+            if _n1 <= 3:
+                prior_logs = _result1.get("logs", "") or ""
+                _result1["logs"] = prior_logs + ("\n" if prior_logs else "") + "SMALL_PATCH_ACCEPTED_NO_MULTISHOT"
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
@@ -3601,6 +3902,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     surface_nudges_used = 0  # v32: integration-cascade gap nudge counter
+    static_footgun_nudges_used = 0
+    scope_risk_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3610,6 +3913,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     # v32: classify the issue once so prompt builders + refinement gates share state.
     issue_surfaces: set = _classify_issue_surfaces(issue)
     issue_checklist: List[str] = _extract_requirement_checklist(issue)
+    issue_core_terms: set = _extract_core_action_terms(issue)
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -3645,7 +3949,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, surface_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, surface_nudges_used, static_footgun_nudges_used, scope_risk_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3703,6 +4007,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if static_footgun_nudges_used < MAX_STATIC_FOOTGUN_NUDGES:
+            footguns = _check_static_footguns(repo, patch, issue)
+            if footguns:
+                static_footgun_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(footguns),
+                    "STATIC_FOOTGUN_QUEUED:\n  " + "\n  ".join(footguns[:4]),
                 )
                 return True
 
@@ -3769,7 +4087,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # the schema/API endpoint). Heuristic only; the prompt explicitly
         # gives the model the option to dismiss false positives.
         if surface_nudges_used < MAX_SURFACE_NUDGES:
-            surface_gaps = _surface_completeness_gaps(patch, issue)
+            surface_gaps = _surface_completeness_gaps(repo, patch, issue)
             if surface_gaps:
                 surface_nudges_used += 1
                 total_refinement_turns_used += 1
@@ -3779,6 +4097,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_surface_nudge_prompt(surface_gaps, issue),
                     "SURFACE_NUDGE_QUEUED:\n  " + " | ".join(g[:80] for g in surface_gaps[:4]),
+                )
+                return True
+
+        if scope_risk_nudges_used < MAX_SCOPE_RISK_NUDGES:
+            scope_gaps = _scope_risk_gaps(patch, issue)
+            if scope_gaps:
+                scope_risk_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_surface_nudge_prompt(scope_gaps, issue),
+                    "SCOPE_RISK_QUEUED:\n  " + " | ".join(scope_gaps[:3]),
                 )
                 return True
 
@@ -3822,6 +4154,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append(
                 "ISSUE_TAGS:\nsurfaces=" + ",".join(sorted(issue_surfaces) or ["(none)"])
                 + " checklist_items=" + str(len(issue_checklist))
+                + " core_terms=" + ",".join(sorted(issue_core_terms) or ["(none)"])
             )
 
         for step in range(1, max_steps + 1):
