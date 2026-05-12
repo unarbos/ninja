@@ -946,7 +946,18 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # v46: TSX app-router preload tightening (port from UID 58).
+    # Halve caps when the repo is a Next.js app router, freeing
+    # wall-clock budget for editing instead of discovery.
+    _v46_preload_files_cap = MAX_PRELOADED_FILES
+    _v46_preload_chars_cap = MAX_PRELOADED_CONTEXT_CHARS
+    try:
+        if _repo_is_tsx_app_router(list(_tracked_files(repo))):
+            _v46_preload_files_cap = max(6, MAX_PRELOADED_FILES // 2)
+            _v46_preload_chars_cap = max(20000, MAX_PRELOADED_CONTEXT_CHARS // 2)
+    except Exception:
+        pass
+    per_file_budget = max(1500, _v46_preload_chars_cap // max(1, min(len(files), _v46_preload_files_cap)))
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -964,19 +975,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
+    for relative_path in files[:_v46_preload_files_cap]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
-        if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+        if parts and used + len(block) > _v46_preload_chars_cap:
             break
         parts.append(block)
         included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo)
-    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+    if project_hints and used + len(project_hints) <= _v46_preload_chars_cap + 1200:
         parts.append(project_hints)
         used += len(project_hints)
 
@@ -984,8 +995,45 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
-    if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
+    if recent_examples and used + len(recent_examples) <= _v46_preload_chars_cap + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+
+    # Preflight failing-test execution. Surfaces the actual AssertionError /
+    # stack trace from issue-named pytest targets so the model diagnoses from
+    # ground truth instead of inferring from test source alone. No-op when
+    # pytest isn't available, when the issue doesn't name a target, or when
+    # the named test is already green.
+    preflight = _preflight_failing_tests(repo, issue)
+    if preflight:
+        parts.append(preflight)
+
+    # v42: prepend acceptance-criteria checklist (port from v40)
+
+
+    try:
+
+
+        _v42_crit = _extract_acceptance_criteria(issue)
+
+
+        _v42_block = (
+            'ACCEPTANCE CRITERIA CHECKLIST (extracted from issue):\n' +
+            ''.join(f'  [{i+1}] {c}\n' for i, c in enumerate(_v42_crit)) +
+            '\nAddress each checklist item.'
+        ) if _v42_crit else ''
+
+
+    except Exception:
+
+
+        _v42_block = ""
+
+
+    if _v42_block:
+
+
+        return _v42_block + "\n\n" + "\n\n".join(parts), included
+
 
     return "\n\n".join(parts), included
 
@@ -1034,6 +1082,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # v44: quoted-evidence path boost (port from UID 46)
+    try:
+        _v44_quoted = _quoted_evidence_paths(repo, tracked_set, issue)
+    except Exception:
+        _v44_quoted = {}
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1056,6 +1109,8 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # v44: boost files containing verbatim issue-quoted phrases
+        score += _v44_quoted.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1670,6 +1725,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     silently passed through.
     """
     errors: List[str] = []
+    # v44: compute added-names set once for test quality gate
+    try:
+        _v44_added_names = _patch_added_names_set(patch)
+    except Exception:
+        _v44_added_names = set()
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
         result: Optional[str] = None
@@ -1687,6 +1747,14 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+        # v44: test-quality gate on touched test files when patch added names
+        if result is None and _is_test_path(relative_path) and _v44_added_names:
+            try:
+                tq = _check_test_quality_one(repo, relative_path, _v44_added_names)
+            except Exception:
+                tq = None
+            if tq:
+                errors.append(tq)
     return errors
 
 
@@ -1915,6 +1983,108 @@ def _select_companion_test_failure(
         if output:
             return (partner, output)
     return None
+
+
+# Preflight failing-test runner. The companion-test gate runs AFTER the model
+# patches; this runs BEFORE. When the issue explicitly names a pytest target
+# (file path or file::test_name), running the test up-front captures the actual
+# AssertionError / stack trace as ground truth — much more diagnostic than the
+# test source alone. Strict 18s total cap so a misfire can't eat the inner
+# wall budget.
+_PREFLIGHT_TEST_TOTAL_BUDGET_SECONDS = 18
+_PREFLIGHT_TEST_PER_TARGET_TIMEOUT = 9
+_PREFLIGHT_TEST_MAX_TARGETS = 2
+_PREFLIGHT_TEST_TAIL_CHARS = 1500
+_PYTEST_TARGET_RE = re.compile(
+    r"(?<![\w])("
+    r"(?:[\w./-]+/)?test_[\w-]+\.py(?:::[\w]+)?"
+    r"|"
+    r"(?:[\w./-]+/)?[\w-]+_test\.py(?:::[\w]+)?"
+    r")(?![\w/-])"
+)
+
+
+def _extract_pytest_targets(issue_text: str) -> List[str]:
+    """Pull pytest target strings (file or file::testname) from issue text.
+
+    Conservative — only matches canonical test_*.py / *_test.py naming.
+    Ordering preserved so the issue's first reference wins when capped.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for m in _PYTEST_TARGET_RE.finditer(issue_text):
+        target = m.group(1).strip("`'\"()[]{}:,;").rstrip(".")
+        if target and target not in seen:
+            seen.add(target)
+            out.append(target)
+    return out
+
+
+def _preflight_failing_tests(repo: Path, issue_text: str) -> str:
+    """Run pytest targets named in the issue and return a preload block with
+    the actual failure output, or empty string when no useful signal is
+    available. Skipped when pytest is unavailable, no target is named, or
+    pytest itself is unrunnable in this repo.
+    """
+    if not _has_executable("pytest"):
+        return ""
+    targets = _extract_pytest_targets(issue_text)[:_PREFLIGHT_TEST_MAX_TARGETS]
+    if not targets:
+        return ""
+
+    failures: List[str] = []
+    started = time.monotonic()
+    for target in targets:
+        if time.monotonic() - started > _PREFLIGHT_TEST_TOTAL_BUDGET_SECONDS:
+            break
+        path_part = target.split("::", 1)[0]
+        full = (repo / path_part).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists() or not full.is_file():
+            continue
+
+        try:
+            proc = subprocess.run(
+                ["pytest", target, "-x", "--tb=short", "-q", "--no-header"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_PREFLIGHT_TEST_PER_TARGET_TIMEOUT,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            continue
+
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        unrunnable_markers = (
+            "No module named pytest",
+            "No module named 'pytest'",
+            "command not found",
+        )
+        if any(marker in output for marker in unrunnable_markers):
+            return ""
+        if proc.returncode == 0:
+            continue
+        tail = output[-_PREFLIGHT_TEST_TAIL_CHARS:] if len(output) > _PREFLIGHT_TEST_TAIL_CHARS else output
+        failures.append(f"```\n$ pytest {target}\n{tail}\n```")
+
+    if not failures:
+        return ""
+    return (
+        "PREFLIGHT TEST RESULTS — running the test target(s) named in the "
+        "issue confirms the current failure(s). Use these exact error "
+        "messages and stack traces to diagnose the root cause; do not "
+        "guess from the test source alone:\n\n"
+        + "\n\n".join(failures)
+    )
 
 
 def _recent_commit_examples(repo: Path) -> str:
@@ -2799,6 +2969,30 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+# Quality vector for the FINAL multi-shot picker — compared lexicographically,
+# higher wins: (syntax_clean, covers_paths, -files, -lines). Among
+# correctness-equivalent patches the smaller one wins, since Cursor-baseline
+# similarity rewards surgical patches and the LLM judge explicitly penalises
+# scope creep. Replaces the previous raw substantive-line compare that
+# preferred LARGER patches when both were valid.
+def _multishot_quality(
+    repo: Optional[Path], patch: str, issue_text: str
+) -> Tuple[int, int, int, int]:
+    if not patch.strip():
+        return (0, 0, 0, 0)
+    syntax_clean = 1
+    if repo is not None:
+        try:
+            if _check_syntax(repo, patch):
+                syntax_clean = 0
+        except Exception:
+            pass
+    covers = 1 if _patch_covers_required_paths(patch, issue_text) else 0
+    files = len(_patch_changed_files(patch))
+    lines = _multishot_count_substantive(patch)
+    return (syntax_clean, covers, -files, -lines)
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2808,6 +3002,203 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
+# ============================================================
+# v42 PORT — acceptance-criteria checklist (from v40)
+# ============================================================
+# Parse issue text into discrete acceptance criteria, inject as a
+# CHECKLIST into preloaded context. Targets the LLM judge's biggest
+# penalty: "missed acceptance criteria" on multi-bullet issues.
+
+
+
+
+
+
+# ============================================================
+
+
+# ============================================================
+# v45 FIX — constants required by v44's ported functions (from UID 46)
+# Missing in v44 → caused NameError on every solve() call.
+# ============================================================
+_QUOTED_EVIDENCE_TRIPLE_RE = re.compile(r"```.*?```", re.DOTALL)
+_QUOTED_EVIDENCE_SINGLE_RE = re.compile(r"`([^`]{8,80})`")
+_QUOTED_EVIDENCE_DOUBLE_RE = re.compile(r'"([^"]{8,80})"')
+_QUOTED_EVIDENCE_SQUOTE_RE = re.compile(r"'([^']{8,80})'")
+_QUOTED_EVIDENCE_ERROR_RE = re.compile(r"(?m)^(\w+(?:Error|Exception|Warning):\s+.+)$")
+_QUOTED_EVIDENCE_MAX_PHRASES = 16
+_QUOTED_EVIDENCE_MAX_FILE_HITS = 12
+
+_TEST_PATH_PATTERNS = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"_test\.(py|go)$"),
+    re.compile(r"\.test\.(ts|tsx|js|jsx)$"),
+    re.compile(r"\.spec\.(ts|tsx|js|jsx)$"),
+)
+# ============================================================
+
+# ============================================================
+# v44 PORT — UID 46 content-quality mechanisms (PR#1264 oleksandrhordiienko63-byte)
+# 1. _quoted_evidence_paths: rank boost for files with issue-quoted phrases
+# 2. _is_test_path + _check_test_quality_one + _patch_added_names_set: test quality gate
+# 3. build_budget_pressure_escalation_prompt: escalating budget warning
+# ============================================================
+def _quoted_evidence_paths(repo: Path, tracked_set: set, issue_text: str) -> Dict[str, int]:
+    """Boost files whose contents contain verbatim quotes/fences from the issue.
+
+    Issue text often contains the exact string that caused the bug (exception
+    messages, config keys, UI strings, code snippets in backtick fences).
+    Those literal phrases are the strongest evidence pointer to the file that
+    prints or uses them — path-token ranking misses them entirely.
+
+    Returns {relative_path: weight} for files that matched at least one phrase.
+    Weight = min(8, 4 + word_count_of_phrase // 3).
+    """
+    if not issue_text or not tracked_set:
+        return {}
+
+    phrases: list = []
+    seen_phrases: set = set()
+
+    def _add(phrase: str) -> None:
+        phrase = phrase.strip()
+        if len(phrase) < 8 or phrase in seen_phrases or len(phrases) >= _QUOTED_EVIDENCE_MAX_PHRASES:
+            return
+        seen_phrases.add(phrase)
+        phrases.append(phrase)
+
+    for block_match in _QUOTED_EVIDENCE_TRIPLE_RE.finditer(issue_text):
+        block_body = block_match.group(0)[3:-3].strip("`").strip()
+        for line in block_body.splitlines():
+            line = line.strip()
+            if len(line) >= 12:
+                _add(line)
+
+    for m in _QUOTED_EVIDENCE_SINGLE_RE.finditer(issue_text):
+        val = m.group(1)
+        if any(ch in val for ch in (" ", ".", "/", ":", "=")):
+            _add(val)
+
+    for m in _QUOTED_EVIDENCE_DOUBLE_RE.finditer(issue_text):
+        _add(m.group(1))
+
+    for m in _QUOTED_EVIDENCE_SQUOTE_RE.finditer(issue_text):
+        _add(m.group(1))
+
+    for m in _QUOTED_EVIDENCE_ERROR_RE.finditer(issue_text):
+        _add(m.group(1))
+
+    result: Dict[str, int] = {}
+    for phrase in phrases:
+        if len(phrases) >= _QUOTED_EVIDENCE_MAX_PHRASES:
+            break
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", phrase],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        matched: list = []
+        for line in proc.stdout.splitlines():
+            p = line.strip()
+            if p and p in tracked_set:
+                matched.append(p)
+        if not matched or len(matched) > _QUOTED_EVIDENCE_MAX_FILE_HITS:
+            continue
+        word_count = len(phrase.split())
+        weight = min(8, 4 + word_count // 3)
+        for p in matched:
+            result[p] = result.get(p, 0) + weight
+
+    return result
+
+
+def _is_test_path(relative_path: str) -> bool:
+    return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
+
+def _check_test_quality_one(repo: Path, relative_path: str,
+                            patch_added_names: set) -> Optional[str]:
+    """Return advisory if a test file contains no invocation of patch-added names."""
+    import ast as _ast_tq
+    full = repo / relative_path
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not relative_path.endswith(".py"):
+        if re.search(r"\.toBe\(|\.toEqual\(|expect\(", source):
+            return None
+        return f"{relative_path}: test file has no invocation assertions"
+    try:
+        tree = _ast_tq.parse(source)
+    except SyntaxError:
+        return None
+    calls_referencing_patch: list = []
+    for node in _ast_tq.walk(tree):
+        if isinstance(node, _ast_tq.Call):
+            target = node.func
+            while isinstance(target, _ast_tq.Attribute):
+                target = target.value
+            if isinstance(target, _ast_tq.Name) and target.id in patch_added_names:
+                calls_referencing_patch.append(target.id)
+    if calls_referencing_patch:
+        return None
+    return (
+        f"{relative_path}: test file does not invoke any of the patch's "
+        f"added/modified names — likely a stub-level test"
+    )
+
+def _patch_added_names_set(patch: str) -> set:
+    """Extract top-level def/class names introduced by the patch."""
+    names: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:]
+        m = re.match(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", body)
+        if m:
+            names.add(m.group(1))
+    return names
+
+def build_budget_pressure_escalation_prompt(step: int, elapsed: float, budget: float) -> str:
+    return (
+        f"BUDGET CRITICAL — step {step}, ~{elapsed:.0f}s of {budget:.0f}s used.\n"
+        "Emit your edits now using cat <<'EOF' > path or sed -i blocks for "
+        "every file you intend to change. A partial fix beats no patch.\n"
+        "If a single file is enough, ship that one file this turn."
+    )
+
+# ============================================================
+
+# ============================================================
+# v46 PORT — UID 58 (PR#1259) Next.js TSX app-router detector
+# Halves preload caps on detected app-router repos where wall-clock
+# SIGKILL has prevented any patch landing. Frees budget for editing.
+# ============================================================
+_TSX_APP_ROUTER_MIN_TSX_FILES = 5
+
+def _repo_is_tsx_app_router(tracked: List[str]) -> bool:
+    tsx_count = 0
+    saw_app_router_segment = False
+    for path in tracked:
+        if path.endswith(".tsx") or path.endswith(".ts"):
+            tsx_count += 1
+        if not saw_app_router_segment:
+            if "/(" in path and ")/" in path:
+                saw_app_router_segment = True
+            elif "/[" in path and "]/" in path:
+                saw_app_router_segment = True
+    return saw_app_router_segment and tsx_count >= _TSX_APP_ROUTER_MIN_TSX_FILES
+# ============================================================
+
 def solve(
     repo_path: str,
     issue: str,
@@ -2876,11 +3267,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _issue_text = kwargs.get("issue", "") or ""
+        _q1 = _multishot_quality(_multishot_repo_obj, _patch1, _issue_text)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
+        _q2 = _multishot_quality(_multishot_repo_obj, _patch2, _issue_text)
 
-        if _n2 >= _n1:
+        # Quality-vector compare instead of raw line count. Empty retry must
+        # never overwrite a non-empty primary even when quality ties.
+        _retry_wins = _q2 > _q1 or (_q2 == _q1 and bool(_patch2.strip()) and not _patch1.strip())
+        if _retry_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3143,8 +3539,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -3321,8 +3715,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+            if not get_patch(repo).strip():
+                if step in {2, 4}:
+                    messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+                elif step == 12 and hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                    # Anti-thrash: 12 model rounds with no edit indicates the
+                    # model is stuck inspecting. The existing hail-mary only
+                    # fires after a <final> tag, which a thrashing model never
+                    # emits — so the full step budget gets burned on inspection
+                    # and the wrapper ships an empty patch. Fire the hail-mary
+                    # prompt here too so the model is forced to synthesise an
+                    # edit while there's still budget for it to land.
+                    hail_mary_turns_used += 1
+                    logs.append(
+                        "\nANTI_THRASH_HAIL_MARY_QUEUED:\n"
+                        "patch empty at step 12 — surfacing hail-mary prompt early."
+                    )
+                    messages.append({"role": "user", "content": build_hail_mary_prompt(issue)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
