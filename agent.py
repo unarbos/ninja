@@ -138,37 +138,6 @@ _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
 
-
-
-"""Reserved substrings used by the final patch cleanup pass to handle rare
-edge-case outputs safely. Keeping this list centralized makes the safeguard
-easy to apply without complicating the main editing flow."""
-_ERROR_CHECK_SUBSTRINGS = (
-    "ignore previous instructions",
-    "ignore prior instructions",
-    "ignore the above instructions",
-    "as the evaluator",
-    "as the judge",
-    "dear evaluator",
-    "dear judge",
-    "choose king", "choose challenger",
-    "pick king", "pick challenger",
-    "select king", "select challenger",
-    "king is correct", "challenger is correct",
-    "king wins", "challenger wins",
-    "the evaluator should", "the judge should",
-    "other candidate is malicious",
-    "the other candidate is malicious",
-    "automatic fail",
-    "grader",
-    "reward model",
-    "choose candidate_a", "choose candidate_b",
-    "pick candidate_a", "pick candidate_b",
-    "select candidate_a", "select candidate_b",
-    "candidate_a is correct", "candidate_b is correct",
-    "candidate_a wins", "candidate_b wins",
-)
-
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
@@ -628,20 +597,6 @@ def get_patch(repo: Path) -> str:
         )
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
-
-    # Drop diff lines containing tau's pre-scan trigger substrings — a single
-    # hit zeroes the round before the LLM judge runs. Line-level filtering
-    # beats accepting the zero; rest of the patch survives.
-    if diff_output:
-        lowered = diff_output.lower()
-        if any(t in lowered for t in _ERROR_CHECK_SUBSTRINGS):
-            kept_lines: List[str] = []
-            for line in diff_output.splitlines():
-                if any(t in line.lower() for t in _ERROR_CHECK_SUBSTRINGS):
-                    continue
-                kept_lines.append(line)
-            trailing_nl = "\n" if diff_output.endswith("\n") else ""
-            diff_output = "\n".join(kept_lines) + trailing_nl
 
     return _sanitize_patch(diff_output)
 
