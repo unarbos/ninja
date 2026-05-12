@@ -120,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_MISSING_IMPORT_NUDGES = 1  # surface NameError-shaped references the patch added without importing
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2250,6 +2251,150 @@ def _patch_creates_any_new_file(patch: str) -> bool:
 
 
 # -----------------------------
+# Missing-import detection (Python)
+# -----------------------------
+#
+# Loss-rationale analysis shows ~20% of king-lost rounds cite "broken
+# at runtime" patterns where the dominant sub-pattern is missing
+# imports — e.g. "app.py uses `timezone` without importing it",
+# "introduces NameError on first call". The existing `_check_syntax`
+# step runs `python -m py_compile` which catches *parse* errors but
+# NOT undefined names (those fail at runtime). This gate parses
+# Python files the patch touches, collects the names defined or
+# imported at module scope, and flags `+` lines that reference an
+# unresolved `name.attr` shape. False positives are conservatively
+# minimized: the prompt tells the model to ignore the nudge if the
+# flagged name is a local variable or genuinely doesn't need importing.
+
+# Captures the leading identifier in a `name.attr` reference. Won't
+# match `obj.attr` chains where `obj` is itself an attribute (negative
+# lookbehind on word char or dot).
+_PY_MODULE_REF_RE = re.compile(
+    r"(?<![\w.])([a-zA-Z_][a-zA-Z0-9_]{1,30})\.[a-zA-Z_]"
+)
+
+# Names that look module-like but resolve from self/cls or built-ins;
+# skip these to keep false positives low. Curated from frequent
+# Python idioms.
+_IMPORT_SKIP_NAMES = frozenset({
+    "self", "cls", "this", "super",
+    "True", "False", "None",
+    "int", "str", "float", "bool", "bytes", "bytearray", "list", "tuple",
+    "dict", "set", "frozenset", "object", "type", "complex",
+    "len", "range", "enumerate", "zip", "map", "filter",
+    "print", "input", "open", "iter", "next",
+    "isinstance", "issubclass", "hasattr", "getattr", "setattr", "delattr",
+    "min", "max", "sum", "abs", "round", "any", "all", "sorted", "reversed",
+    "callable", "id", "vars", "dir", "locals", "globals", "repr",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "RuntimeError", "AttributeError", "NameError", "ImportError",
+    "FileNotFoundError", "NotImplementedError", "StopIteration",
+    "OSError", "IOError", "ZeroDivisionError", "ArithmeticError",
+    "__name__", "__file__", "__doc__", "__init__", "__class__",
+    "__main__", "__all__", "__version__", "__future__",
+})
+
+
+def _file_top_level_names(text: str) -> set:
+    """Return identifiers visible at module scope in a Python file:
+    imports, top-level function/class defs, top-level assignments."""
+    out: set = set()
+    try:
+        import ast
+        tree = ast.parse(text)
+    except Exception:
+        # Fallback regex-only parse if AST fails (file might be syntactically broken,
+        # which is exactly the case this gate is trying to help catch).
+        for m in re.finditer(r"^\s*import\s+([\w.,\s]+)$", text, re.MULTILINE):
+            for item in m.group(1).split(","):
+                item = item.strip()
+                if item:
+                    out.add(item.split(".")[0].split(" as ")[-1].strip())
+        for m in re.finditer(r"^\s*from\s+[\w.]+\s+import\s+([\w.,\s*()]+)$", text, re.MULTILINE):
+            body = m.group(1).strip().strip("()")
+            for item in body.split(","):
+                item = item.strip()
+                if item and item != "*":
+                    out.add(item.split(" as ")[-1].strip())
+        for m in re.finditer(r"^(?:def|class)\s+([\w]+)", text, re.MULTILINE):
+            out.add(m.group(1))
+        for m in re.finditer(r"^([A-Za-z_]\w*)\s*=", text, re.MULTILINE):
+            out.add(m.group(1))
+        return out
+    # Walk module-level nodes only — function-local imports count too via
+    # ast.walk, so collect from the whole tree but treat all as "available".
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    # Wildcard import — can't statically resolve; conservatively
+                    # skip the whole file by returning a sentinel.
+                    return {"*WILDCARD*"}
+                out.add(alias.asname or alias.name)
+        elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+            out.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    out.add(target.id)
+    return out
+
+
+def _patch_missing_imports(patch: str, repo: Path) -> List[Tuple[str, str]]:
+    """Return list of (file_path, missing_name) where a `+` line in a
+    Python file references `name.attr` but `name` is not visible at the
+    file's module scope. Caps at 8 to keep the nudge prompt compact."""
+    if "+" not in patch:
+        return []
+    out: List[Tuple[str, str]] = []
+    current_file: Optional[str] = None
+    added_by_file: Dict[str, List[str]] = {}
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+?)$", line)
+            current_file = m.group(2) if m else None
+            continue
+        if not current_file or not current_file.endswith(".py"):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added_by_file.setdefault(current_file, []).append(line[1:])
+    if not added_by_file:
+        return []
+    for file_path, added in added_by_file.items():
+        try:
+            text = (repo / file_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        names = _file_top_level_names(text)
+        if "*WILDCARD*" in names:
+            continue  # Can't reason about wildcard-imported names; skip.
+        seen_missing: set = set()
+        for raw in added:
+            # Ignore comment-only lines and string literals coarsely.
+            stripped = raw.lstrip()
+            if stripped.startswith("#"):
+                continue
+            for ref in _PY_MODULE_REF_RE.findall(raw):
+                if (ref in _IMPORT_SKIP_NAMES
+                        or ref in names
+                        or ref.isupper()       # constants usually module-level
+                        or len(ref) <= 1):
+                    continue
+                if ref in seen_missing:
+                    continue
+                seen_missing.add(ref)
+                out.append((file_path, ref))
+                if len(out) >= 8:
+                    return out
+    return out
+
+
+# -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
 #
@@ -2779,6 +2924,39 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_missing_import_nudge_prompt(missing: List[Tuple[str, str]]) -> str:
+    """Tell the model the patch references names that aren't imported.
+
+    Loss-rationale analysis repeatedly cites NameError-shaped failures:
+    `app.py uses timezone without importing it`, `module not declared`,
+    `unresolved reference`. py_compile catches parse errors but NOT
+    undefined names. Surface the specific (file, name) pairs so the
+    model can add the missing import or, if the name is a local
+    variable in scope, ignore the nudge.
+    """
+    grouped: Dict[str, List[str]] = {}
+    for file_path, name in missing[:8]:
+        grouped.setdefault(file_path, []).append(name)
+    bullets_lines: List[str] = []
+    for file_path, names in grouped.items():
+        bullets_lines.append(f"  - {file_path}: {', '.join(sorted(set(names)))}")
+    bullets = "\n".join(bullets_lines) or "  (none)"
+    return (
+        "Missing-import gap — your patch references these `name.attr` "
+        "or `name(...)` shapes in Python files, but `name` is not "
+        "imported and not defined at module scope:\n"
+        f"{bullets}\n\n"
+        "Each will raise NameError at runtime even though the file "
+        "parses cleanly. For each one: either add the correct import "
+        "(`import name` / `from package import name` / `import package "
+        "as name`), or — if the reference is genuinely a local variable "
+        "you assign inside the function — ignore that specific entry "
+        "and continue. Do NOT add speculative imports for names you do "
+        "not actually use. After fixing the imports, emit "
+        "<final>summary</final>.\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -3076,6 +3254,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    missing_import_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3290,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, missing_import_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3162,6 +3341,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Missing-import gate. Sits adjacent to syntax-fix: py_compile
+        # validates parse-time correctness, this validates name-resolution
+        # at module scope. Catches the `app.py uses timezone without
+        # importing it` failure pattern that runtime-NameError on first
+        # call but slips past the parse-time check.
+        if missing_import_nudges_used < MAX_MISSING_IMPORT_NUDGES:
+            missing_imports = _patch_missing_imports(patch, repo)
+            if missing_imports:
+                missing_import_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_import_nudge_prompt(missing_imports),
+                    "MISSING_IMPORT_NUDGE_QUEUED:\n  "
+                    + ", ".join(f"{f}:{n}" for f, n in missing_imports[:6]),
                 )
                 return True
 
@@ -3291,8 +3488,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
