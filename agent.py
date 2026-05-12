@@ -103,7 +103,9 @@ MAX_COMMANDS_PER_RESPONSE = 15
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
+WALL_CLOCK_BUDGET_SECONDS = 248.0  # keep below docker_solver's max(per-task-timeout, 300s)
+                                   # hard wall so a second multishot attempt has comparable
+                                   # time and is never killed mid-attempt
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -796,11 +798,26 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     needles so we keep only the regions relevant to the task instead of the
     head N chars of the file.
     """
-    files = _rank_context_files(repo, issue)
+    files, top_score = _rank_context_files(repo, issue)
+    tracked_set = set(_tracked_files(repo))
+
+    # Rescue-ranker: weak top_score means no path mention and no
+    # symbol-grep hit landed, so the top-ranked file is essentially random
+    # — the dominant catastrophic-floor failure mode. Run a cheap
+    # broad-grep over the full tracked set and surface the 1-3 files that
+    # match the most issue terms. Surface a small banner before the
+    # snippet blocks so the model treats those files as the most likely
+    # targets rather than guessing from path-mention-style cues.
+    rescue_files: List[str] = []
+    if top_score < _RESCUE_RANKER_TOP_SCORE_THRESHOLD:
+        rescue_files = _broad_grep_fallback(repo, issue, tracked_set)
+        if rescue_files:
+            existing = set(files)
+            files = [f for f in rescue_files if f not in existing] + files
+
     if not files:
         return "", []
 
-    tracked_set = set(_tracked_files(repo))
     issue_tests = _find_issue_tests(repo, issue, tracked_set)
     files = _merge_priority_files(files, issue_tests)
     files = _augment_with_test_partners(files, tracked_set)
@@ -811,6 +828,22 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+
+    if rescue_files:
+        # Banner is small and high-leverage; surface BEFORE the snippet
+        # blocks so the model reads it before any file content. Marker
+        # comments are stable so _strip_preloaded_section keeps treating
+        # this block correctly.
+        rescue_banner = (
+            "### rescue-ranker hint\n"
+            "The issue does not directly name a file or identifier present in "
+            "this repository. The following file(s) matched the most issue "
+            "terms via a broad text search and are the most likely targets — "
+            "inspect them first before running broader searches:\n"
+            + "".join(f"  - {p}\n" for p in rescue_files)
+        )
+        parts.append(rescue_banner)
+        used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
         snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
@@ -936,10 +969,15 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
-def _rank_context_files(repo: Path, issue: str) -> List[str]:
+def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
+    """Returns (ranked_paths, top_score). top_score is the highest computed
+    score in the scoring pass; callers use it to detect "weak ranking"
+    rounds where no path/identifier signal hit, so the top file is
+    functionally random and the rescue-ranker fallback should fire.
+    """
     tracked = _tracked_files(repo)
     if not tracked:
-        return []
+        return [], 0
 
     issue_lower = issue.lower()
     path_mentions = _extract_issue_path_mentions(issue)
@@ -1001,7 +1039,64 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
             continue
         seen.add(relative_path)
         ranked.append(relative_path)
-    return ranked
+    top_score = scored[0][0] if scored else 0
+    if mentioned:
+        # Explicit path or backtick-ident match: ranking is strong even if
+        # the scored list is empty (mentioned files bypass the score loop).
+        top_score = max(top_score, 100)
+    return ranked, top_score
+
+
+# Rescue-ranker: threshold below which _rank_context_files is treated as
+# "weak signal" and the broad-grep fallback fires. 60 = the floor of the
+# symbol-grep boost (60 + 8*hits); below it means no path mention and no
+# symbol-grep hit landed, so the top file is essentially random and the
+# rescue ranker should run instead.
+_RESCUE_RANKER_TOP_SCORE_THRESHOLD = 60
+_RESCUE_RANKER_MAX_FALLBACK_FILES = 3
+_RESCUE_RANKER_MIN_TERM_LEN = 5
+_RESCUE_RANKER_MAX_TERMS = 6
+
+
+def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]:
+    """Rescue-ranker: when _rank_context_files produces no strong signal,
+    scan tracked files by raw issue-term match count. Catches tasks where
+    the issue references concepts that don't appear as identifiers (e.g.
+    natural-language bug description with no class/function names).
+
+    Distinct from _symbol_grep_hits which only searches for code-shaped
+    tokens; this one treats the issue as plain English, lower-cased,
+    fixed-string, and counts the number of distinct issue terms each
+    file matches. Returns up to _RESCUE_RANKER_MAX_FALLBACK_FILES paths
+    that matched at least 2 distinct issue terms.
+    """
+    if not tracked:
+        return []
+    terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
+    if not terms:
+        return []
+    hits: Dict[str, int] = {}
+    for term in terms:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-i", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if relative_path and relative_path in tracked and _context_file_allowed(relative_path):
+                hits[relative_path] = hits.get(relative_path, 0) + 1
+    candidates = [(count, path) for path, count in hits.items() if count >= 2]
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
 
 
 def _tracked_files(repo: Path) -> List[str]:
@@ -3476,6 +3571,32 @@ def build_corruption_fix_prompt(findings: List[str]) -> str:
     )
 
 
+def build_gap_edit_prompt(issue_text: str) -> str:
+    """Follow-up after a heuristic gap nudge (coverage/criteria/literal/contract/
+    deliverable) when the model returned an acknowledgement but the on-disk
+    patch is unchanged. The gap nudges have higher value when the model
+    follows them with a real edit rather than a justification; this prompt
+    converts the model's next turn into a forced single-edit step.
+    """
+    short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
+    return (
+        "The previous gap-nudge prompt did not produce a real code change "
+        "(diff is identical). Either the gap is genuinely satisfied — in "
+        "which case finish with <final>summary</final> and explain where "
+        "the requirement is satisfied in existing code — or one specific "
+        "edit is still missing.\n\n"
+        "If an edit is still missing, do it now:\n\n"
+        "RE-READ THE ISSUE:\n\n"
+        f"{short}\n\n"
+        "Make ONE task-supported code edit consistent with the gap. Pick "
+        "the most likely target file from the preloaded snippets, or use "
+        "one focused grep if the target is still unclear. Use sed -i, a "
+        "python -c one-liner, or a heredoc to make a SINGLE TARGETED "
+        "CODE CHANGE in that file. Do NOT change file modes or permissions. "
+        "Then end with <final>summary</final>."
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -3528,8 +3649,16 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-_MULTISHOT_TOTAL_BUDGET = 580.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0
+# Tau docker_solver hard wall is max(per-task-timeout, 300s) from exec start.
+# A 580s outer budget invited "retry" starts with only seconds left, then the
+# process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
+# failure mode observed in duel #4544). Keep outer budget under ~300s.
+_MULTISHOT_TOTAL_BUDGET = 278.0
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
+# If attempt 1 already consumed this much wall clock, skip attempt 2 even when
+# attempt 1 was low-signal — otherwise the process often dies before the retry
+# finishes, which is worse than shipping the first (possibly thin) patch.
+_MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -3639,10 +3768,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     inherited):
 
     1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
+       Two attempts at WALL_CLOCK_BUDGET_SECONDS=248s already saturate the
+       _MULTISHOT_TOTAL_BUDGET=278s envelope. A third attempt would have to
        be either (a) so short it cannot produce a patch, or (b) push past
-       the validator's per-round soft cap and forfeit the round entirely.
+       the docker_solver hard wall and get killed mid-attempt.
        The empty-patch case is already handled inside `_solve_attempt` by
        the hail-mary refinement turn (see `maybe_queue_refinement`), and
        any uncaught exception is caught by the `except Exception` arm
@@ -3681,6 +3810,14 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
+            return _result1
+
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
+            # Attempt 1 already burned the outer budget — starting attempt 2
+            # invites a docker_solver kill (hard wall ~300s from exec start),
+            # which is strictly worse than shipping attempt 1's thin patch.
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
         if _multishot_repo_obj is not None:
@@ -3756,11 +3893,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     deliverable_nudges_used = 0
     ui_binding_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    must_edit_after_gap = False
+    must_edit_patch = ""
+    gap_edit_nudges_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
     # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
-    # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 580s`), but
+    # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 278s`), but
     # that wrapper only checks elapsed time *between* attempts. Without an
     # inner guard, a single attempt can blow the whole budget on a stuck
     # model loop and starve the retry of any time. We stop the inner loop
@@ -3787,6 +3927,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
+            -1. gap-edit — when a prior coverage/criteria/literal/contract/
+                deliverable nudge fired and the patch is unchanged, force
+                one targeted edit instead of letting the model acknowledge.
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
@@ -3808,8 +3951,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, contract_nudges_used, deliverable_nudges_used, ui_binding_nudges_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, integration_nudges_used, artifact_nudges_used, dependency_nudges_used, hazard_review_turns_used, literal_nudges_used, corruption_turns_used, contract_nudges_used, deliverable_nudges_used, ui_binding_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
+
+        # must_edit_after_gap: when a high-ROI heuristic gate fires
+        # (coverage/criteria/literal/contract/deliverable) the model often
+        # responds with an acknowledgement instead of a real edit. If the
+        # patch is unchanged on the next turn, force one targeted edit
+        # via build_gap_edit_prompt before continuing the cap'd cascade.
+        # Cleared as soon as the model produces any patch change.
+        if must_edit_after_gap:
+            if patch != must_edit_patch:
+                must_edit_after_gap = False
+                must_edit_patch = ""
+                gap_edit_nudges_used = 0
+            elif gap_edit_nudges_used < 1:
+                gap_edit_nudges_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_gap_edit_prompt(issue),
+                    "REQUIRED_EDIT_AFTER_GAP_QUEUED",
+                )
+                return True
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
@@ -3894,6 +4057,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if missing:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(missing, issue),
@@ -3912,6 +4077,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if unaddressed:
                 criteria_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
@@ -3924,6 +4091,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if literal_summary:
                 literal_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
                     build_literal_acceptance_nudge_prompt(literal_summary, issue),
@@ -3936,6 +4105,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if contract_summary:
                 contract_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
                     build_contract_propagation_prompt(contract_summary, issue),
@@ -3948,6 +4119,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if deliverable_summary:
                 deliverable_nudges_used += 1
                 total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
                     build_deliverable_gap_prompt(deliverable_summary, issue),
