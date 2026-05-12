@@ -120,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_COMPLETENESS_NUDGES = 1  # one wiring/artifact turn when code is unreachable or requested collateral is missing
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -746,6 +747,99 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".bin",
     }
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
+
+
+def _safe_repo_child(repo: Path, relative_path: str) -> Optional[Path]:
+    """Resolve a repo-relative path without letting cleanup escape the repo."""
+    try:
+        root = repo.resolve()
+        full = (repo / relative_path).resolve()
+        full.relative_to(root)
+        return full
+    except Exception:
+        return None
+
+
+def _run_git_quiet(repo: Path, args: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _is_mode_only_diff(repo: Path, relative_path: str) -> bool:
+    try:
+        numstat = _run_git_quiet(repo, ["diff", "--numstat", "--", relative_path], timeout=8)
+        summary = _run_git_quiet(repo, ["diff", "--summary", "--", relative_path], timeout=8)
+    except Exception:
+        return False
+    return (
+        numstat.returncode == 0
+        and not (numstat.stdout or "").strip()
+        and "mode change" in (summary.stdout or "")
+    )
+
+
+def _prune_empty_generated_parents(repo: Path, relative_path: str) -> None:
+    generated_parts = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    path = Path(relative_path)
+    for idx in range(len(path.parts), 0, -1):
+        parent = Path(*path.parts[:idx])
+        if not any(part in generated_parts for part in parent.parts):
+            continue
+        full = _safe_repo_child(repo, str(parent))
+        if full is None or not full.exists() or not full.is_dir():
+            continue
+        try:
+            full.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_noise_worktree_paths(repo: Path) -> List[str]:
+    """Physically remove generated/mode-only diff noise before patch collection."""
+    cleaned: List[str] = []
+
+    try:
+        untracked = _run_git_quiet(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    except Exception:
+        untracked = None
+    if untracked is not None and untracked.returncode == 0:
+        for relative_path in [item for item in untracked.stdout.split("\0") if item]:
+            if not _should_skip_patch_path(relative_path):
+                continue
+            full = _safe_repo_child(repo, relative_path)
+            if full is None or not full.exists():
+                continue
+            try:
+                if full.is_dir():
+                    shutil.rmtree(full)
+                else:
+                    full.unlink()
+                cleaned.append(f"removed-untracked:{relative_path}")
+                _prune_empty_generated_parents(repo, relative_path)
+            except Exception:
+                continue
+
+    try:
+        changed = _run_git_quiet(repo, ["diff", "--name-only", "-z"])
+    except Exception:
+        changed = None
+    if changed is not None and changed.returncode == 0:
+        for relative_path in [item for item in changed.stdout.split("\0") if item]:
+            if _should_skip_patch_path(relative_path) or _is_mode_only_diff(repo, relative_path):
+                try:
+                    restored = _run_git_quiet(repo, ["checkout", "--", relative_path], timeout=10)
+                    if restored.returncode == 0:
+                        cleaned.append(f"restored-noise:{relative_path}")
+                except Exception:
+                    continue
+
+    return cleaned[:30]
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1552,6 +1646,83 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+_INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
+    "route", "routing", "router", "page", "screen", "view", "sidebar",
+    "navigation", "nav", "menu", "endpoint", "api", "controller", "service",
+    "handler", "wire", "integrate", "dashboard",
+)
+
+_INTEGRATION_ENTRYPOINT_RE = re.compile(
+    r"(^|/)(app|main|index|router|routes|urls|sidebar|navigation|nav|menu|"
+    r"controller|controllers|service|services|api|server|layout|dashboard)"
+    r"([./_-]|$)|"
+    r"(App|Main|Router|Routes|Sidebar|Navigation|Nav|Menu|Controller|Service|Layout|Dashboard)\."
+)
+
+_IMPLEMENTATION_FILE_RE = re.compile(
+    r"(^|/)(components?|pages?|views?|screens?|features?|modules?|services?|controllers?|api)/"
+    r"|[A-Z][A-Za-z0-9_]*(Page|View|Screen|Component|Panel|Card|Form|Modal|Controller|Service)\."
+)
+
+
+def _integration_gap_summary(patch: str, issue_text: str) -> str:
+    """Heuristic for patches that add code but may not wire it into entrypoints."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    if not any(hint in issue_lower for hint in _INTEGRATION_ISSUE_HINTS):
+        return ""
+    changed = _patch_changed_files(patch)
+    if not changed or any(_INTEGRATION_ENTRYPOINT_RE.search(path) for path in changed):
+        return ""
+    implementation_paths = [path for path in changed if _IMPLEMENTATION_FILE_RE.search(path)]
+    added = _patch_added_text(patch)
+    added_mentions_integration = bool(
+        re.search(
+            r"\b(route|routes|router|navigate|navigation|sidebar|menu|endpoint|"
+            r"controller|service|handler|app\.|urlpatterns|path\(|Route\b|"
+            r"useNavigate|Link\b|NavLink|RouterProvider)\b",
+            added,
+        )
+    )
+    if not implementation_paths and not added_mentions_integration:
+        return ""
+    examples = ", ".join((implementation_paths or changed)[:6])
+    return (
+        "patch adds implementation-like files or code but no obvious route/nav/API "
+        f"entrypoint was touched. Changed implementation paths: {examples}"
+    )
+
+
+_ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], "re.Pattern[str]"], ...] = (
+    ("tests", ("test", "tests", "testing", "regression", "spec"), re.compile(r"(^|/)(tests?|__tests__|specs?)/|(_test|test_|\.test\.|\.spec\.)", re.IGNORECASE)),
+    ("docs", ("doc", "docs", "documentation", "readme", "guide", "adr"), re.compile(r"(^|/)(docs?|adr|guides?)/|(^|/)(readme|changelog|adr)[^/]*\.(md|rst|txt)$", re.IGNORECASE)),
+    ("version/package metadata", ("version", "bump", "package.json", "pyproject", "pom.xml", "gradle", "cargo.toml"), re.compile(r"(^|/)(package\.json|pyproject\.toml|pom\.xml|build\.gradle|build\.gradle\.kts|cargo\.toml|setup\.py|setup\.cfg|pubspec\.yaml|composer\.json)$", re.IGNORECASE)),
+    ("schema/migration", ("schema", "migration", "migrations", "sql", "prisma", "ddl"), re.compile(r"(^|/)(migrations?|schema|prisma)/|schema\.(sql|prisma)$|\.(sql)$", re.IGNORECASE)),
+    ("i18n/locale", ("i18n", "locale", "locales", "translation", "translations", "lang"), re.compile(r"(^|/)(i18n|locales?|lang|translations?)/|\.(po|pot|strings)$", re.IGNORECASE)),
+    ("fixture/sample", ("fixture", "fixtures", "sample", "example"), re.compile(r"(^|/)(fixtures?|samples?|examples?)/", re.IGNORECASE)),
+)
+
+
+def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
+    return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
+
+
+def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
+    """Find explicitly requested artifact classes missing from the patch."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    changed = _patch_changed_files(patch)
+    missing: List[str] = []
+    for label, hints, path_re in _ARTIFACT_REQUESTS:
+        if _issue_has_artifact_hint(issue_lower, hints) and not any(path_re.search(path) for path in changed):
+            missing.append(label)
+    if not missing:
+        return ""
+    return "task text appears to request these artifact(s), but no matching files were touched: " + ", ".join(missing[:6])
 
 
 # -----------------------------
@@ -2779,6 +2950,24 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_completeness_nudge_prompt(summary: str, issue_text: str) -> str:
+    return (
+        "Completeness check: your patch may solve a local piece of the task "
+        "without making it reachable, or it may omit an explicitly requested "
+        "supporting artifact.\n\n"
+        f"{summary}\n\n"
+        "Before finalizing, inspect the relevant convention and make only the "
+        "minimal missing edit: route/router/sidebar/menu wiring, API/controller/"
+        "service registration, main/index entrypoint, tests/specs, docs/README, "
+        "version/package metadata, migration/schema, locale file, or fixture. "
+        "If the patch is already complete through an existing convention, finish "
+        "with <final>summary</final> and name that convention. Do not broaden the "
+        "feature beyond the task.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -3070,6 +3259,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    completeness_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3094,6 +3284,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
+    def clean_worktree_noise() -> None:
+        cleaned_noise = _cleanup_noise_worktree_paths(repo)
+        if cleaned_noise:
+            logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
+
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
@@ -3106,12 +3301,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. completeness-nudge — make implementation reachable / add requested artifacts
+            7. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, completeness_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        clean_worktree_noise()
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3251,6 +3448,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if completeness_nudges_used < MAX_COMPLETENESS_NUDGES:
+            completeness_summary = _integration_gap_summary(patch, issue) or _requested_artifact_gap_summary(patch, issue)
+            if completeness_summary:
+                completeness_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_completeness_nudge_prompt(completeness_summary, issue),
+                    "COMPLETENESS_NUDGE_QUEUED:\n  " + completeness_summary[:120],
+                )
+                return True
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -3299,6 +3510,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
+                clean_worktree_noise()
                 modified_files = _patch_changed_files(get_patch(repo))
                 stripped = _strip_preloaded_section(
                     original_initial,
@@ -3352,6 +3564,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 # and return that patch rather than wiping everything because
                 # the proxy hiccuped. Empty patches score 0; partial patches
                 # can still earn cursor-similarity credit.
+                clean_worktree_noise()
                 if get_patch(repo).strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
@@ -3382,6 +3595,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 consecutive_no_command += 1
+                clean_worktree_noise()
                 patch = get_patch(repo)
                 if patch.strip():
                     if maybe_queue_refinement(response_text):
@@ -3408,6 +3622,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
                 if step >= 4 or command_index > 1:
+                    clean_worktree_noise()
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
@@ -3437,6 +3652,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "Continue with one command at a time if more work remains."
                 )
 
+            if final is not None:
+                clean_worktree_noise()
             if final is not None and get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
@@ -3450,6 +3667,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
+                clean_worktree_noise()
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -3470,9 +3688,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
+            clean_worktree_noise()
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        clean_worktree_noise()
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
@@ -3491,6 +3711,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
+                cleaned_noise = _cleanup_noise_worktree_paths(repo)
+                if cleaned_noise:
+                    logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
                 patch = get_patch(repo)
             except Exception:
                 pass
