@@ -116,6 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_SURFACE_NUDGES = 1     # v32: nudge once when patch skips an integration surface the issue implies
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -594,8 +595,173 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_lines_from_headers(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
     return cleaned
+
+
+def _strip_mode_lines_from_headers(diff_output: str) -> str:
+    """Drop `old mode/new mode` lines from per-file headers that have content.
+
+    Mode-only file diffs are already pruned by `_strip_mode_only_file_diffs`.
+    Files with both a mode change AND real hunks are kept, but the
+    permission/mode header lines (which the LLM judge reliably treats as
+    unrelated churn) are scrubbed from the diff.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        if line.startswith("old mode ") or line.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+_ASSET_SUFFIXES: set = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".pdf",
+    ".bmp", ".tiff",
+}
+_ARCHIVE_SUFFIXES: set = {
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+}
+_DB_LIKE_SUFFIXES: set = {
+    ".sqlite", ".sqlite3", ".db",
+}
+_TRANSIENT_SUFFIXES: set = {
+    ".log", ".tmp", ".cache",
+}
+_LOCKFILE_NAMES: set = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "cargo.lock",
+    "go.sum",
+    "gemfile.lock",
+    "composer.lock",
+}
+_ASSET_KEYWORDS: Tuple[str, ...] = (
+    "image", "asset", "icon", "logo", "screenshot", "figure", "diagram",
+    "thumbnail", "favicon", "picture", "media", "graphic", "svg", "png",
+)
+_DEPS_KEYWORDS: Tuple[str, ...] = (
+    "dependency", "dependencies", "lockfile", "lock file", "package json",
+    "package.json", "yarn.lock", "package-lock", "pyproject", "requirements",
+    "cargo.toml", "go.sum", "go.mod", "version bump", "bump version",
+)
+
+
+def _sanitize_patch_against_issue(patch: str, issue: str) -> str:
+    """Drop binary/asset/lockfile/permission-only blocks the issue did NOT request.
+
+    Conservative second sanitizer: a file is only stripped when its kind
+    (asset, archive, sqlite, log, lockfile) does not appear in the issue
+    text. A real "add logo.png" task still emits an asset diff because the
+    keyword `logo`/`png` is in the issue.
+    """
+    if not patch.strip():
+        return patch
+    issue_lower = issue.lower()
+    asset_ok = any(kw in issue_lower for kw in _ASSET_KEYWORDS)
+    deps_ok = any(kw in issue_lower for kw in _DEPS_KEYWORDS)
+
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        path = _diff_block_path(block)
+        if not path:
+            kept.append(block)
+            continue
+        suffix = Path(path).suffix.lower()
+        name = Path(path).name.lower()
+        if suffix in _ASSET_SUFFIXES and not asset_ok:
+            continue
+        if suffix in _ARCHIVE_SUFFIXES:
+            continue
+        if suffix in _DB_LIKE_SUFFIXES:
+            continue
+        if suffix in _TRANSIENT_SUFFIXES:
+            continue
+        if name in _LOCKFILE_NAMES and not deps_ok:
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if patch.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return _strip_mode_lines_from_headers(result)
+
+
+def _finalize_patch_hygiene(patch: str, issue: str, logs: List[str]) -> str:
+    """Apply the issue-aware sanitizers + log what fired, before final return.
+
+    Order: drop binary/asset/lockfile blocks the issue did not request, then
+    sweep any evaluator/grader phrases out of fixture/data files, then warn
+    (without stripping) when the same phrases linger in real source code.
+    """
+    if not patch.strip():
+        return patch
+    cleaned = _sanitize_patch_against_issue(patch, issue)
+    cleaned = _strip_eval_term_additions_in_fixtures(cleaned)
+    leftover = _patch_contains_forbidden_eval_terms(cleaned)
+    if leftover:
+        logs.append(
+            "PATCH_HYGIENE_WARN:\nforbidden_terms_remaining=" + ",".join(sorted(leftover))
+        )
+    if cleaned != patch:
+        logs.append(
+            "PATCH_HYGIENE_TRIMMED:\nsource_chars=" + str(len(patch))
+            + " final_chars=" + str(len(cleaned))
+        )
+    return cleaned
+
+
+def _strip_eval_term_additions_in_fixtures(diff_output: str) -> str:
+    """Drop `+` lines that introduce evaluator/grader phrases in fixture/data files.
+
+    Conservative: the strip only fires for paths that look like fixtures or
+    data (json/yaml/csv/txt under fixture-ish folders). Real source-code
+    edits with the same words are kept and surfaced through logging instead
+    of silent removal.
+    """
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        path = _diff_block_path(block)
+        lowered_path = path.lower()
+        is_fixture = (
+            "fixture" in lowered_path
+            or "/data/" in "/" + lowered_path
+            or "/mocks/" in "/" + lowered_path
+            or "/snapshots/" in "/" + lowered_path
+            or lowered_path.endswith(".json")
+            or lowered_path.endswith(".yaml")
+            or lowered_path.endswith(".yml")
+            or lowered_path.endswith(".csv")
+            or lowered_path.endswith(".txt")
+        )
+        if not is_fixture:
+            out.append(block)
+            continue
+        kept_lines: List[str] = []
+        for line in block.splitlines(keepends=True):
+            if line.startswith("+") and not line.startswith("+++"):
+                lowered = line.lower()
+                if any(term in lowered for term in _FORBIDDEN_EVAL_TERMS):
+                    continue
+            kept_lines.append(line)
+        out.append("".join(kept_lines))
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _diff_block_path(block: str) -> str:
@@ -652,7 +818,11 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    suffix_lower = path.suffix.lower()
+    name_lower = path.name.lower()
+    if suffix_lower in {".pyc", ".pyo"}:
+        return True
+    if name_lower == ".ds_store":
         return True
     generated_parts = {
         "__pycache__",
@@ -665,6 +835,12 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".idea",
+        ".vscode",
+        ".gradle",
+        ".terraform",
+        ".next",
+        ".turbo",
     }
     generated_suffixes = {
         ".class",
@@ -675,8 +851,12 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".dylib",
         ".exe",
         ".bin",
+        ".wasm",
     }
-    return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
+    return (
+        any(part in generated_parts for part in path.parts)
+        or suffix_lower in generated_suffixes
+    )
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1580,6 +1760,19 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+
+        # v32: layered text checks for surfaces the parser-based checks miss.
+        # These run AFTER the primary parse so we don't double-report a file
+        # whose syntax is clearly broken; they only contribute when the parse
+        # check returned clean.
+        if result is None:
+            extra: Optional[str] = None
+            if suffix in {".tsx", ".jsx"}:
+                extra = _check_tsx_react_imports_one(repo, relative_path)
+            elif suffix == ".dart":
+                extra = _check_dart_platform_one(repo, relative_path)
+            if extra:
+                errors.append(extra)
     return errors
 
 
@@ -2094,6 +2287,467 @@ def _symbol_grep_hits(
 
 
 # -----------------------------
+# v32: issue surface classifier + requirement checklist + completeness gate
+# -----------------------------
+#
+# Duel review notes consistently show that multi-surface feature tasks are
+# lost because the agent fixes the local bug but skips the integration
+# cascade (route + service + frontend wiring + schema + tests). These helpers
+# tag the issue with high-level surfaces and verify the patch covers each
+# surface the task implies. They are intentionally heuristic and cheap; they
+# never claim to know the real test set, only to nudge the model toward the
+# obvious missing pieces before <final>.
+
+_SURFACE_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "ui",
+        (
+            "component", "components", "page", "pages", "view", "screen",
+            "layout", "navbar", "sidebar", "header", "footer", "modal",
+            "dialog", "form", "button", "input", "dropdown", "menu",
+            "dashboard", "panel", "card", "tab", "tabs", "style", "styles",
+            "css", "scss", "tailwind", "ui", "ux", "responsive", "render",
+            "click", "hover", "icon", "theme", "dark mode", "light mode",
+            "placeholder", "tooltip", "alert", "notification", "toast",
+        ),
+    ),
+    (
+        "api",
+        (
+            "endpoint", "endpoints", "route", "routes", "controller",
+            "controllers", "handler", "handlers", "service", "services",
+            "http", "https", "request", "response", "rest", "graphql",
+            "api", "post", "patch", "put", "delete", "fetch", "axios",
+            "client", "webhook",
+        ),
+    ),
+    (
+        "schema",
+        (
+            "model", "models", "schema", "schemas", "migration", "migrations",
+            "field", "fields", "column", "columns", "table", "tables",
+            "database", "db", "sql", "orm", "serializer", "serializers",
+            "type", "types", "interface", "dto",
+        ),
+    ),
+    (
+        "test",
+        (
+            "test", "tests", "spec", "specs", "regression", "fixture",
+            "fixtures", "unittest", "pytest", "jest", "vitest",
+        ),
+    ),
+    (
+        "platform",
+        (
+            "native", "web", "mobile", "desktop", "android", "ios",
+            "flutter", "dart", "electron", "react native", "expo",
+            "swiftui", "kotlin", "swift", "platform", "windows", "macos",
+            "linux",
+        ),
+    ),
+    (
+        "cli",
+        (
+            "command", "commands", "flag", "flags", "argument", "argv",
+            "script", "scripts", "makefile", "shell", "bash", "cli",
+            "subcommand", "argparse", "click",
+        ),
+    ),
+    (
+        "docs",
+        (
+            "readme", "documentation", "docs", "doc", "changelog", "guide",
+            "tutorial", "comment", "docstring",
+        ),
+    ),
+)
+
+
+def _classify_issue_surfaces(issue: str) -> set:
+    """Tag the issue with high-level surface labels using keyword heuristics.
+
+    Returns a set drawn from {"ui","api","schema","test","platform","cli",
+    "docs"}. Empty set for short or signal-free issues. The classifier is
+    intentionally generous on the recall side: it is read by the initial
+    prompt + a refinement nudge, both of which already let the model dismiss
+    a false positive.
+    """
+    if not issue:
+        return set()
+    lowered = issue.lower()
+    tags: set = set()
+    for tag, keywords in _SURFACE_KEYWORDS:
+        for kw in keywords:
+            if " " in kw:
+                if kw in lowered:
+                    tags.add(tag)
+                    break
+            else:
+                if re.search(r"\b" + re.escape(kw) + r"\b", lowered):
+                    tags.add(tag)
+                    break
+    return tags
+
+
+def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[str]:
+    """Build a compact deduped requirement checklist from the issue text.
+
+    Stronger than `_extract_acceptance_criteria`: also catches imperative
+    sentences (must/should/ensure/add/update/remove/support/implement/fix/
+    when/unless/also/both/all/require/enable/disable/return/raise/expect),
+    quoted UI text, and HTTP-method endpoint mentions. Capped + deduped so
+    the prompt stays short.
+    """
+    if not issue:
+        return []
+    items: List[str] = []
+    seen: set = set()
+
+    def add(text: str) -> None:
+        normalized = re.sub(r"\s+", " ", text).strip(" -*\t")
+        if not normalized or len(normalized) < 6 or len(normalized) > 240:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(normalized)
+
+    bullet_re = re.compile(r"^\s*(?:[-*\u2022]|\[[ xX]\]|\d+[.)])\s+(.+?)\s*$")
+    for line in issue.splitlines():
+        m = bullet_re.match(line)
+        if m:
+            add(m.group(1))
+            if len(items) >= max_items:
+                return items
+
+    imperative_re = re.compile(
+        r"\b(must|should|ensure|add|update|remove|support|implement|fix|"
+        r"when|unless|also|both|all|require[sd]?|enable|disable|return|raise|expect)\b",
+        re.IGNORECASE,
+    )
+    for raw in re.split(r"(?<=[.!?])\s+", issue):
+        text = raw.strip()
+        if not text or len(text) < 12:
+            continue
+        if imperative_re.search(text):
+            add(text)
+            if len(items) >= max_items:
+                return items
+
+    quote_re = re.compile(r"[\"'\u201c\u2018]([^\"'\u201d\u2019]{3,80})[\"'\u201d\u2019]")
+    for m in quote_re.finditer(issue):
+        add('show or use literal text "' + m.group(1).strip() + '"')
+        if len(items) >= max_items:
+            return items
+
+    endpoint_re = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}-]+)")
+    for m in endpoint_re.finditer(issue):
+        add("endpoint " + m.group(1).upper() + " " + m.group(2))
+        if len(items) >= max_items:
+            return items
+
+    path_re = re.compile(r"(?<![A-Za-z0-9_])(/(?:api|routes|admin|users|auth|posts|products|panel)/[A-Za-z0-9_/{}-]+)")
+    for m in path_re.finditer(issue):
+        add("path " + m.group(1))
+        if len(items) >= max_items:
+            return items
+
+    return items[:max_items]
+
+
+def _detect_platform_import_violations(patch: str) -> List[str]:
+    """Flag dart:html (web-only) imports added in non-web Dart files."""
+    violations: List[str] = []
+    current_file = ""
+    is_web_path = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_file = tokens[3][2:]
+            else:
+                current_file = ""
+            lowered_path = current_file.lower()
+            is_web_path = (
+                "/web/" in "/" + lowered_path
+                or lowered_path.startswith("web/")
+                or "platform_web" in lowered_path
+                or "web_only" in lowered_path
+            )
+            continue
+        if not current_file.endswith(".dart"):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if "import 'dart:html'" in body or 'import "dart:html"' in body:
+            if not is_web_path:
+                violations.append(current_file + ": dart:html imported outside web folder")
+    return violations
+
+
+def _surface_completeness_gaps(patch: str, issue: str) -> List[str]:
+    """Heuristic: list integration surfaces the issue implies but the patch skips.
+
+    Returns a list of human-readable gap descriptions. Empty list means the
+    patch already touches every surface the issue suggests (or the issue has
+    no clear surface tags). The model decides per gap whether to add an edit
+    or document the omission in <final>.
+    """
+    if not patch.strip() or not issue.strip():
+        return []
+    surfaces = _classify_issue_surfaces(issue)
+    if not surfaces:
+        return []
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+
+    touched_ui = False
+    touched_api = False
+    touched_schema = False
+    touched_test = False
+    touched_docs = False
+    touched_frontend = False
+    touched_backend = False
+    for path in changed:
+        lower = path.lower()
+        suffix = Path(path).suffix.lower()
+        parts = {p.lower() for p in Path(path).parts}
+        name_lower = Path(path).name.lower()
+        if (
+            suffix in {".tsx", ".jsx", ".vue", ".svelte"}
+            or "components" in parts
+            or "pages" in parts
+            or "views" in parts
+            or "screens" in parts
+            or "layouts" in parts
+            or "ui" in parts
+            or suffix in {".css", ".scss", ".sass", ".less"}
+        ):
+            touched_ui = True
+            touched_frontend = True
+        if (
+            "frontend" in parts
+            or "client" in parts
+            or "web" in parts
+            or suffix in {".ts", ".tsx", ".jsx", ".js", ".mjs", ".cjs"}
+        ):
+            touched_frontend = True
+        if any(part in parts for part in (
+            "backend", "server", "api", "controllers", "controller",
+            "routes", "handlers", "handler", "services", "service",
+        )):
+            touched_api = True
+            touched_backend = True
+        if any(part in parts for part in (
+            "models", "schemas", "schema", "migrations", "migration",
+            "serializers", "serializer", "types", "entities",
+        )) or "schema" in lower or "model" in lower:
+            touched_schema = True
+        if (
+            any(("test" in part) or ("spec" in part) for part in parts)
+            or "_test" in lower
+            or ".test." in lower
+            or ".spec." in lower
+            or name_lower.startswith("test_")
+        ):
+            touched_test = True
+        if (suffix in {".md", ".rst", ".txt"}) or "readme" in name_lower:
+            touched_docs = True
+
+    gaps: List[str] = []
+    if "ui" in surfaces and not touched_ui:
+        gaps.append(
+            "issue references UI/component/page work but patch touches no "
+            "frontend/component/style files"
+        )
+    if "api" in surfaces and not touched_api:
+        gaps.append(
+            "issue references API/route/endpoint work but patch touches no "
+            "backend route/controller/service files"
+        )
+    if ("ui" in surfaces) and ("api" in surfaces):
+        if not (touched_frontend and touched_backend):
+            gaps.append(
+                "feature spans UI and API but only one side is wired; add the "
+                "missing frontend client call OR backend endpoint"
+            )
+    if "schema" in surfaces and not touched_schema:
+        gaps.append(
+            "issue references model/schema/field changes but patch touches no "
+            "model/schema/type/serializer files"
+        )
+    if "test" in surfaces and not touched_test:
+        gaps.append(
+            "issue references tests/regression but patch touches no test/spec file"
+        )
+    if "docs" in surfaces and not touched_docs:
+        gaps.append(
+            "issue references README/docs but patch touches no markdown/doc file"
+        )
+    if "platform" in surfaces:
+        bad_imports = _detect_platform_import_violations(patch)
+        if bad_imports:
+            gaps.append("platform-specific import in shared/non-web file: " + "; ".join(bad_imports[:3]))
+
+    return gaps
+
+
+# -----------------------------
+# v32: TSX React + Dart platform static checks
+# -----------------------------
+
+_TSX_HOOK_NAMES: Tuple[str, ...] = (
+    "useState", "useEffect", "useReducer", "useMemo",
+    "useCallback", "useRef", "useContext", "useLayoutEffect",
+    "useImperativeHandle", "useTransition", "useDeferredValue",
+)
+
+_LEADING_DIRECTIVE_RE = re.compile(
+    r'^["\'](?:use client|use server|use strict)["\']\s*;?\s*$'
+)
+
+
+def _check_tsx_react_imports_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Cheap text scan for the React-import / directive bugs we lose duels on.
+
+    Targets observed failure patterns:
+      - Malformed leading `"use client"`/`"use server"` directive (the
+        unbalanced-quote bug seen in real submissions).
+      - `React.<Member>` usage with no `import React` in scope.
+      - Hook usage (useState/useEffect/...) without it being imported.
+    Returns a single error string or None.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    issues: List[str] = []
+
+    first_nonblank = ""
+    for line in source.splitlines():
+        if line.strip():
+            first_nonblank = line.strip()
+            break
+    if first_nonblank.startswith(("'use", '"use')):
+        if not _LEADING_DIRECTIVE_RE.match(first_nonblank):
+            issues.append(
+                f"{relative_path}:1: malformed leading directive `{first_nonblank[:60]}`"
+            )
+
+    react_namespace_used = bool(re.search(r"\bReact\.\w+", source))
+    has_default_react_import = bool(re.search(r"^\s*import\s+React\b", source, re.MULTILINE))
+    has_namespace_react_import = bool(
+        re.search(r"^\s*import\s+\*\s+as\s+React\s+from\s+['\"]react['\"]", source, re.MULTILINE)
+    )
+    has_react_anywhere = bool(re.search(r"from\s+['\"]react['\"]", source))
+
+    if react_namespace_used and not (has_default_react_import or has_namespace_react_import):
+        issues.append(f"{relative_path}: uses `React.<member>` without `import React`")
+
+    hooks_used = [name for name in _TSX_HOOK_NAMES if re.search(r"\b" + name + r"\b", source)]
+    if hooks_used and (has_react_anywhere or has_default_react_import or has_namespace_react_import):
+        # Only flag inside files that actually consume react: a destructured
+        # `import { useState } from 'react'` is the standard contract. We
+        # skip the check entirely in non-react files to avoid false-positive
+        # hook-name collisions with non-react libraries (e.g., zustand's
+        # `useStore`, tanstack's `useQuery`).
+        imported_hooks: set = set()
+        for m in re.finditer(r"import\s*\{([^}]+)\}\s*from\s*['\"]react['\"]", source):
+            for token in m.group(1).split(","):
+                imported_hooks.add(token.strip().split(" as ")[0].strip())
+        if has_namespace_react_import:
+            missing: List[str] = []
+        else:
+            missing = [h for h in hooks_used if h not in imported_hooks]
+        if missing:
+            issues.append(
+                f"{relative_path}: uses hook(s) {', '.join(missing[:4])} without importing from 'react'"
+            )
+
+    if issues:
+        return "; ".join(issues[:3])
+    return None
+
+
+def _check_dart_platform_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag dart:html in shared/non-web Dart files (a real duel-loss pattern).
+
+    `dart:html` only resolves on the web target; importing it from shared or
+    mobile/desktop code makes the build fail on those targets.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or full.suffix.lower() != ".dart":
+        return None
+    lowered_path = relative_path.lower()
+    is_web_only = (
+        "/web/" in "/" + lowered_path
+        or lowered_path.startswith("web/")
+        or "platform_web" in lowered_path
+        or "web_only" in lowered_path
+    )
+    if is_web_only:
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if re.search(r"^\s*import\s+['\"]dart:html['\"]", source, re.MULTILINE):
+        return f"{relative_path}: imports `dart:html` in shared/non-web Dart file"
+    return None
+
+
+# -----------------------------
+# v32: forbidden evaluator/grader term guard
+# -----------------------------
+
+_FORBIDDEN_EVAL_TERMS: Tuple[str, ...] = (
+    "hidden test",
+    "hidden tests",
+    "evaluator",
+    "grader",
+    "scoring metadata",
+    "validator secret",
+)
+
+
+def _patch_contains_forbidden_eval_terms(patch: str) -> List[str]:
+    """Return forbidden evaluator/grader terms newly introduced by the patch.
+
+    Only `+` lines are inspected. Existing-source mentions of the same words
+    are intentionally ignored so legitimate prior usage is not flagged.
+    """
+    if not patch.strip():
+        return []
+    hits: List[str] = []
+    seen: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].lower()
+        for term in _FORBIDDEN_EVAL_TERMS:
+            if term in body and term not in seen:
+                hits.append(term)
+                seen.add(term)
+    return hits
+
+
+# -----------------------------
 # Prompting
 # -----------------------------
 
@@ -2128,7 +2782,9 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Acceptance checklist: a numbered list of every concrete acceptance item the issue implies (UI text shown, endpoint exposed, field added, nav link added, test added, etc.). Each item is something a reviewer can verify in the diff.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- Requirement -> file map: for each acceptance item, list the file(s) you intend to edit. Use "?" while still searching.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2250,6 +2906,40 @@ Do NOT change:
 - File permissions or mode bits (chmod is forbidden)
 
 ====================================================================
+MULTI-SURFACE COMPLETION
+====================================================================
+
+Feature tasks usually span more than one surface. When the issue mentions or implies several of:
+- UI: page, component, layout, navbar, form, modal, style, css
+- API: endpoint, route, controller, handler, http verb, request/response
+- DATA: model, schema, field, migration, serializer, type/interface
+- TESTS: tests/spec/regression
+- DOCS: README/docs/guide
+
+Then your patch must cover every implied surface in the SAME submission. Examples:
+- "Add a Dashboard page" with backend data implies a route, a component/page file, and the API client call to fetch the data.
+- "Add slug-based detail view" implies a backend endpoint, a frontend route, the service mapping, and the link from the listing page.
+- "Add a settings toggle" implies the storage/schema field, the read/write API, and the UI control.
+
+Inspect adjacent existing files BEFORE introducing new abstractions, routes, or components. Match the existing folder layout, naming, CSS class style, and platform-separation pattern. Do not invent a parallel structure.
+
+For UI changes: the target page/route name in the issue is authoritative -- if it says `/panel`, edit `/panel`, not `/admin`. Preserve layout invariants the issue mentions or that adjacent code already enforces (min-height, centering, container sizing, anchor IDs, sort/order of displayed metrics).
+
+For platform-aware code: do not import platform-only modules (e.g., `dart:html`) from shared/mobile files; use the existing platform-separation helper or conditional import already present in the repo.
+
+====================================================================
+PRE-FINAL SANITY
+====================================================================
+
+Before <final>, you must have at least mentally confirmed:
+- every acceptance checklist item has a corresponding hunk in the diff (or a noted reason it requires no edit)
+- every file you added an import or new reference in still parses (no missing `import React`, no missing `from foo import bar`, no unmatched `"use client"` directive)
+- you ran the most targeted test/check available, or recorded that none was applicable
+- you did not introduce generated, cache, binary, or permission-only changes (no `__pycache__`, no `.png` churn, no `chmod`)
+
+If a sanity check fails, fix it before finalizing. The smallest failing import or stale checklist item costs the round.
+
+====================================================================
 SAFETY
 ====================================================================
 
@@ -2261,16 +2951,57 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(
+    issue: str,
+    repo_summary: str,
+    preloaded_context: str = "",
+    surfaces: Optional[set] = None,
+    checklist: Optional[List[str]] = None,
+) -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
 {_PRELOAD_BEGIN_MARKER}
-Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
+Preloaded likely relevant tracked-file snippets (already read for you - do not re-read):
 
 {preloaded_context}
 {_PRELOAD_END_MARKER}
 """
+
+    surface_section = ""
+    if surfaces:
+        ordered = sorted(surfaces)
+        guidance: List[str] = []
+        if "ui" in surfaces:
+            guidance.append("UI surface: identify the EXACT target page/component (route name in the issue is authoritative); preserve adjacent layout/CSS-class style; do NOT invent a parallel page when one is named.")
+        if "api" in surfaces:
+            guidance.append("API surface: add the route + controller/handler + service; mirror the existing route style (verb, path shape, response wrapper).")
+        if "schema" in surfaces:
+            guidance.append("Schema surface: update the model/schema/types/serializer/migration in lockstep so the field reaches the wire.")
+        if "test" in surfaces:
+            guidance.append("Test surface: add or update the companion test next to the closest existing test, matching its naming and fixture style.")
+        if "platform" in surfaces:
+            guidance.append("Platform surface: keep platform-only modules out of shared files; reuse the repo's existing platform separation pattern instead of inventing one.")
+        if "cli" in surfaces:
+            guidance.append("CLI surface: register the new flag/subcommand in the same parser the existing flags use; update help text.")
+        if "docs" in surfaces:
+            guidance.append("Docs surface: update the README/docs section that documents the changed behavior.")
+        bullet_lines = "\n".join(f"- {g}" for g in guidance)
+        surface_section = (
+            "\nDETECTED SURFACES (heuristic; verify against the issue and codebase): "
+            + ", ".join(ordered) + "\n"
+            + bullet_lines + "\n"
+            + "Cover EVERY detected surface in the same submission unless inspection proves the surface is already correct.\n"
+        )
+
+    checklist_section = ""
+    if checklist:
+        joined = "\n".join(f"  {idx + 1}. {item}" for idx, item in enumerate(checklist[:12]))
+        checklist_section = (
+            "\nHEURISTIC ACCEPTANCE CHECKLIST (extracted from the issue text; refine in your <plan>):\n"
+            + joined + "\n"
+            + "Treat these as a minimum bar. Your <plan> must include a final acceptance checklist (yours, not this) and a requirement -> file map.\n"
+        )
 
     return f"""Fix this issue:
 
@@ -2279,12 +3010,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 Repository summary:
 
 {repo_summary}
-{context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{context_section}{surface_section}{checklist_section}
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them - the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. For multi-surface feature tasks, identify ALL implied surfaces and edit each one in the same submission.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If the preloaded snippets show the target code, edit them directly - do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
@@ -2398,38 +3129,112 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
     )
 
 
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+def build_self_check_prompt(
+    patch: str,
+    issue_text: str,
+    surfaces: Optional[set] = None,
+    checklist: Optional[List[str]] = None,
+) -> str:
+    """Show the model its own draft and ask for a focused self-review.
+
+    v32: includes a requirement -> file mapping requirement and a surface-aware
+    checklist (UI invariants, API+UI cascade, platform separation) so the
+    self-review covers the duel-loss patterns named in submission analysis.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+
+    surface_extras: List[str] = []
+    if surfaces:
+        if "ui" in surfaces:
+            surface_extras.append(
+                "UI: target page/route matches the one named in the issue; "
+                "layout invariants (min-height, centering, container sizing, "
+                "anchor IDs, sort/order of displayed metrics) are preserved; "
+                "obsolete UI removed if the issue requested replacement; "
+                "no fake/placeholder data substituted for the real flow."
+            )
+        if "api" in surfaces:
+            surface_extras.append(
+                "API: endpoint exists with the requested verb + path; "
+                "response shape matches what the UI/client expects; "
+                "service/client wiring updated; error/loading paths handled."
+            )
+        if "schema" in surfaces:
+            surface_extras.append(
+                "Data: model/schema/migration/serializer/types updated in "
+                "lockstep so the new field reaches the wire."
+            )
+        if "test" in surfaces:
+            surface_extras.append(
+                "Tests: companion test added or updated next to the closest "
+                "existing test, matching its style; no test was weakened."
+            )
+        if "platform" in surfaces:
+            surface_extras.append(
+                "Platform: shared/mobile files contain no platform-only "
+                "imports (e.g., dart:html); existing platform-separation "
+                "pattern is reused, not replaced."
+            )
+        if "docs" in surfaces:
+            surface_extras.append(
+                "Docs: README/docs section reflects the new behavior."
+            )
+
+    surface_block = ""
+    if surface_extras:
+        surface_block = (
+            "\nSURFACE CHECKLIST (the issue tagged: "
+            + ", ".join(sorted(surfaces or [])) + "):\n  - "
+            + "\n  - ".join(surface_extras) + "\n"
+        )
+
+    checklist_block = ""
+    if checklist:
+        items = "\n  ".join(f"- {c}" for c in checklist[:10])
+        checklist_block = (
+            "\nORIGINAL HEURISTIC CHECKLIST (issue-derived; the diff must "
+            "address each, or you must explain why it does not apply):\n  "
+            + items + "\n"
+        )
+
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "with the reference - review your patch against all three:\n\n"
+        "REQUIREMENT -> DIFF MAPPING (do this first, in your head):\n"
+        "  - For EACH acceptance item from your <plan>, name the file + hunk that satisfies it.\n"
+        "  - If an item has no corresponding hunk, either add the missing edit now or note the omission.\n\n"
+        "CORRECTNESS (LLM judge weight - high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS (LLM judge weight - high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
-        "Your patch:\n```diff\n"
-        f"{truncated}\n```\n\n"
+        "  - Companion tests broken by the source change are updated.\n"
+        "  - No syntax errors, missing imports, or unbalanced directives introduced.\n\n"
+        "SCOPE (similarity score weight - medium impact):\n"
+        "  - No whitespace-only, comment-only, or blank-line-only hunks.\n"
+        "  - No type annotation changes not required by the task.\n"
+        "  - No refactoring, renaming, or reordering not required by the task.\n"
+        "  - No new helper functions or defensive checks not required by the task.\n"
+        "  - No generated/cache/binary churn, no permission/mode-only edits.\n"
+        + surface_block
+        + checklist_block
+        + "\nYour patch:\n```diff\n"
+        + truncated
+        + "\n```\n\n"
         "Task:\n"
-        f"{issue_text[:2000]}\n\n"
+        + issue_text[:2000]
+        + "\n\n"
         "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+        "(run missing tests, fix root causes, revert scope-creep hunks, "
+        "add missing imports), then end with <final>summary</final>. Do NOT "
+        "add new features, destructive operations, or unrelated scope."
     )
 
 
@@ -2465,6 +3270,37 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "code. Add only what is required to cover the listed criteria.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
+    )
+
+
+def build_surface_nudge_prompt(gaps: List[str], issue_text: str) -> str:
+    """Tell the model which integration surfaces the patch still skips.
+
+    v32: feature-task losses commonly come from skipping one side of an
+    obvious cascade (added the route but not the UI link, added the UI but
+    not the schema field). Surface the gap explicitly so the model can either
+    add the missing edit or justify the omission in the final summary.
+    """
+    bullets = "\n  ".join(f"- {g}" for g in gaps[:6]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Surface-completeness gap - your patch covers some but not all "
+        "integration surfaces this task implies:\n"
+        f"  {bullets}\n\n"
+        "For each gap, decide:\n"
+        "  (a) it really needs an additional edit -> issue the missing "
+        "<command> blocks now (route, controller, service, schema, frontend "
+        "client, UI link, test, doc) so all surfaces line up; OR\n"
+        "  (b) the gap is a false positive (existing surface is already "
+        "correct, or the keyword in the issue was generic) -> proceed to "
+        "<final>summary</final> and explain in the summary which surface "
+        "you intentionally did not touch and why.\n\n"
+        "Inspect adjacent files first so any new edit IMITATES the existing "
+        "architecture (route style, naming, CSS classes, component shape, "
+        "platform-separation pattern). Do NOT introduce new abstractions or "
+        "rename existing ones. Do NOT broaden scope past the listed gaps.\n\n"
+        "Task (for reference):\n"
+        f"{short}\n"
     )
 
 
@@ -2576,6 +3412,43 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
         pass
 
 
+def _multishot_should_skip_retry(
+    patch: str,
+    substantive: int,
+    issue: str,
+    success_flag: bool,
+    repo: Optional[Path],
+) -> bool:
+    """Return True if attempt #1 is good enough that retry would waste budget.
+
+    The original threshold (>=3 substantive lines) tossed plenty of valid
+    one-line fixes. We accept attempt #1 when ANY of these is true:
+      - already meets the substantive threshold, OR
+      - patch touches a path the issue explicitly mentions, OR
+      - the inner agent reported success AND our static check is clean.
+    The retry path still runs for empty / clearly broken first attempts.
+    """
+    if substantive >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        return True
+    if substantive < 1 or not patch.strip():
+        return False
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return False
+    issue_paths = _extract_issue_path_mentions(issue)
+    for path in changed:
+        for mention in issue_paths:
+            if path == mention or path.endswith("/" + mention):
+                return True
+    if success_flag and repo is not None:
+        try:
+            if not _check_syntax(repo, patch):
+                return True
+        except Exception:
+            return False
+    return False
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
@@ -2644,8 +3517,19 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # v32: keep one-line fixes whose target file matches the issue path
+        # mentions, or that pass our syntax check after a reported success.
+        # The original threshold-only check threw away plenty of correct
+        # small patches and used the retry budget on a coin-flip.
+        if _multishot_should_skip_retry(
+            _patch1,
+            _n1,
+            kwargs.get("issue", ""),
+            bool(_result1.get("success")),
+            _multishot_repo_obj,
+        ):
             _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "first_attempt_strong_enough"
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
@@ -2716,12 +3600,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    surface_nudges_used = 0  # v32: integration-cascade gap nudge counter
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     solve_started_at = time.monotonic()
+    # v32: classify the issue once so prompt builders + refinement gates share state.
+    issue_surfaces: set = _classify_issue_surfaces(issue)
+    issue_checklist: List[str] = _extract_requirement_checklist(issue)
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2751,12 +3639,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. surface-nudge — v32: name integration surfaces the patch skips
+            7. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, surface_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -2873,12 +3762,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v32: surface-completeness gate fires after criteria-nudge but
+        # before self-check. Catches multi-surface feature tasks where the
+        # patch fixes the local bug but skips the integration cascade
+        # (e.g., added the route but not the UI link, added the UI but not
+        # the schema/API endpoint). Heuristic only; the prompt explicitly
+        # gives the model the option to dismiss false positives.
+        if surface_nudges_used < MAX_SURFACE_NUDGES:
+            surface_gaps = _surface_completeness_gaps(patch, issue)
+            if surface_gaps:
+                surface_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_surface_nudge_prompt(surface_gaps, issue),
+                    "SURFACE_NUDGE_QUEUED:\n  " + " | ".join(g[:80] for g in surface_gaps[:4]),
+                )
+                return True
+
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
+                build_self_check_prompt(
+                    patch,
+                    issue,
+                    surfaces=issue_surfaces,
+                    checklist=issue_checklist,
+                ),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -2894,11 +3808,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(issue, repo_summary, preloaded_context)},
+            {"role": "user", "content": build_initial_user_prompt(
+                issue,
+                repo_summary,
+                preloaded_context,
+                surfaces=issue_surfaces,
+                checklist=issue_checklist,
+            )},
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        if issue_surfaces or issue_checklist:
+            logs.append(
+                "ISSUE_TAGS:\nsurfaces=" + ",".join(sorted(issue_surfaces) or ["(none)"])
+                + " checklist_items=" + str(len(issue_checklist))
+            )
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3080,6 +4004,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        patch = _finalize_patch_hygiene(patch, issue, logs)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3100,6 +4025,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 patch = get_patch(repo)
             except Exception:
                 pass
+        patch = _finalize_patch_hygiene(patch, issue, logs)
 
         return AgentResult(
             patch=patch,
