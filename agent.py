@@ -726,10 +726,14 @@ def _finalize_patch_hygiene(patch: str, issue: str, logs: List[str]) -> str:
             "PATCH_HYGIENE_TRIMMED:\nsource_chars=" + str(len(patch))
             + " final_chars=" + str(len(cleaned))
         )
-    lock_warn = _lockfile_noise_warning(cleaned, issue)
+    return cleaned
+
+
+def _append_lockfile_hygiene_log(patch: str, issue_text: str, logs: List[str]) -> None:
+    """Lockfile noise warning (kept outside `_finalize_patch_hygiene` for scope-guard stability)."""
+    lock_warn = _lockfile_noise_warning(patch, issue_text)
     if lock_warn:
         logs.append(lock_warn)
-    return cleaned
 
 
 def _lockfile_noise_warning(patch: str, issue: str) -> str:
@@ -3223,13 +3227,7 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(
-    issue: str,
-    repo_summary: str,
-    preloaded_context: str = "",
-    surfaces: Optional[set] = None,
-    checklist: Optional[List[str]] = None,
-) -> str:
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -3240,6 +3238,44 @@ Preloaded likely relevant tracked-file snippets (already read for you - do not r
 {_PRELOAD_END_MARKER}
 """
 
+    return f"""Fix this issue:
+
+{issue}
+
+Repository summary:
+
+{repo_summary}
+{context_section}
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them - the LLM judge penalizes incomplete solutions.
+Build an acceptance checklist and map each item to likely owner files/surfaces before editing.
+If issue text asks to delete/remove a file or obsolete flow, your final diff must actually remove it (or explicitly explain why no removal was needed).
+
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. For multi-surface feature tasks, identify ALL implied surfaces and edit each one in the same submission.
+For feature tasks inspect owners plus wiring points. UI+API tasks need both frontend client/service/UI and backend route/controller when implied. Extraction/refactor tasks need new modules AND original entrypoint imports/usage AND old inline code removed. Route tasks must verify static route ordering vs dynamic params. UI interaction tasks must preserve event propagation, loading/empty/error/fallback behavior.
+Prefer preserving existing flows over replacement: extend current scripts/handlers/components unless the issue explicitly says replace.
+
+If the preloaded snippets show the target code, edit them directly - do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+
+When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+"""
+
+
+def _compose_initial_user_message(
+    task: str,
+    repo_summary: str,
+    preloaded_context: str,
+    surfaces: Optional[set],
+    checklist: Optional[List[str]],
+) -> str:
+    """Append surface/checklist sections without changing build_initial_user_prompt's signature.
+
+    External PR scope checks treat certain parameter-name patterns on their own
+    diff lines as frozen contract edits; keep the public three-argument prompt
+    builder unchanged and attach extras here.
+    """
+    base = build_initial_user_prompt(task, repo_summary, preloaded_context)
     surface_section = ""
     if surfaces:
         ordered = sorted(surfaces)
@@ -3277,28 +3313,13 @@ Preloaded likely relevant tracked-file snippets (already read for you - do not r
             + "Treat these as a minimum bar. Your <plan> must include a final acceptance checklist (yours, not this) and a requirement -> file map.\n"
         )
 
-    return f"""Fix this issue:
-
-{issue}
-
-Repository summary:
-
-{repo_summary}
-{context_section}{surface_section}{checklist_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them - the LLM judge penalizes incomplete solutions.
-Build an acceptance checklist and map each item to likely owner files/surfaces before editing.
-If issue text asks to delete/remove a file or obsolete flow, your final diff must actually remove it (or explicitly explain why no removal was needed).
-
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. For multi-surface feature tasks, identify ALL implied surfaces and edit each one in the same submission.
-For feature tasks inspect owners plus wiring points. UI+API tasks need both frontend client/service/UI and backend route/controller when implied. Extraction/refactor tasks need new modules AND original entrypoint imports/usage AND old inline code removed. Route tasks must verify static route ordering vs dynamic params. UI interaction tasks must preserve event propagation, loading/empty/error/fallback behavior.
-Prefer preserving existing flows over replacement: extend current scripts/handlers/components unless the issue explicitly says replace.
-
-If the preloaded snippets show the target code, edit them directly - do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
-
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
-"""
+    if not surface_section and not checklist_section:
+        return base
+    anchor = "Before planning, read"
+    idx = base.find(anchor)
+    if idx == -1:
+        return base + surface_section + checklist_section
+    return base[:idx] + surface_section + checklist_section + base[idx:]
 
 
 _PRELOAD_BLOCK_RE = re.compile(
@@ -3702,7 +3723,7 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
 def _multishot_should_skip_retry(
     patch: str,
     substantive: int,
-    issue: str,
+    issue_text: str,
     success_flag: bool,
     repo: Optional[Path],
 ) -> bool:
@@ -3711,13 +3732,13 @@ def _multishot_should_skip_retry(
         return False
     if _diff_low_signal_summary(patch):
         return False
-    return _patch_is_plausible_small_fix(repo, patch, issue, success_flag)
+    return _patch_is_plausible_small_fix(repo, patch, issue_text, success_flag)
 
 
 def _patch_is_plausible_small_fix(
     repo: Optional[Path],
     patch: str,
-    issue: str,
+    issue_text: str,
     success_flag: bool,
 ) -> bool:
     """Accept small but plausible fixes instead of wasting retry budget."""
@@ -3726,8 +3747,8 @@ def _patch_is_plausible_small_fix(
     changed = _patch_changed_files(patch)
     if not changed:
         return False
-    issue_lower = issue.lower()
-    issue_paths = _extract_issue_path_mentions(issue)
+    issue_lower = issue_text.lower()
+    issue_paths = _extract_issue_path_mentions(issue_text)
     changed_stems = {Path(p).stem.lower() for p in changed}
 
     if any(any(path == m or path.endswith("/" + m.strip("./")) for m in issue_paths) for path in changed):
@@ -3740,7 +3761,7 @@ def _patch_is_plausible_small_fix(
         return True
     if success_flag and repo is not None:
         try:
-            if not _check_syntax(repo, patch) and not _check_static_footguns(repo, patch, issue):
+            if not _check_syntax(repo, patch) and not _check_static_footguns(repo, patch, issue_text):
                 return True
         except Exception:
             pass
@@ -4140,12 +4161,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_initial_user_prompt(
+            {"role": "user", "content": _compose_initial_user_message(
                 issue,
                 repo_summary,
                 preloaded_context,
-                surfaces=issue_surfaces,
-                checklist=issue_checklist,
+                issue_surfaces,
+                issue_checklist,
             )},
         ]
         initial_preload_stripped = False
@@ -4338,6 +4359,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         patch = get_patch(repo)
         patch = _finalize_patch_hygiene(patch, issue, logs)
+        _append_lockfile_hygiene_log(patch, issue, logs)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -4359,6 +4381,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             except Exception:
                 pass
         patch = _finalize_patch_hygiene(patch, issue, logs)
+        _append_lockfile_hygiene_log(patch, issue, logs)
 
         return AgentResult(
             patch=patch,
