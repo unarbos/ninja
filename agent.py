@@ -122,7 +122,7 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
-                                # Raised 2?3 after fixing multishot timing bug (attempt 2 now has a
+                                # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
                                 # hard wall).
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
@@ -2222,7 +2222,7 @@ def _criterion_keywords(criterion: str) -> List[str]:
 # substring check on the natural-language form misses these matches and
 # inflates the criteria-nudge false-positive rate. Stripping the suffix
 # (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ? identifier gap.
+# matching `react`) bridges the natural-language → identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
@@ -2552,7 +2552,7 @@ Avoid: re-reading preloaded files, broad recursive searches, generated/vendor ou
 ROOT CAUSE RULE
 ====================================================================
 
-Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input ? fix parser. Serializer omits field ? fix serializer. Cache returns stale value ? fix invalidation. CLI option ignored ? fix option parsing. Validation rejects valid case ? fix validation rule, not caller workaround.
+Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input → fix parser. Serializer omits field → fix serializer. Cache returns stale value → fix invalidation. CLI option ignored → fix option parsing. Validation rejects valid case → fix validation rule, not caller workaround.
 
 Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
 
@@ -2938,7 +2938,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
 
     return (
-        f"? RETRY ATTEMPT: A prior attempt at this task {reason_str} "
+        f"⚠ RETRY ATTEMPT: A prior attempt at this task {reason_str} "
         f"({steps} steps). Do NOT repeat the same approach.\n"
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
@@ -3139,7 +3139,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # Pass remaining multishot budget so attempt 2 can't overrun the docker
         # hard wall.  Without this, attempt 2 inherits the full 248 s inner
         # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall ? process killed,
+        # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
@@ -3247,7 +3247,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, initial_preload_stripped
         patch = get_patch(repo)
 
         if must_edit_after_gap:
