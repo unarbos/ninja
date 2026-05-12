@@ -87,8 +87,8 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))  # v20: bigger window -> fewer follow-up reads -> fewer turns -> no timeout
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))  # v20: match expanded observation budget
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
 MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modules
@@ -2600,6 +2600,52 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def _validate_patch_imports(patch: str) -> list:
+    """v20: detect likely missing imports in added Python/TS/JS lines.
+    Returns list of warning strings; empty = no issue detected.
+    """
+    import re as _re_vi
+    added = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("++")]
+    added_text = "\n".join(added)
+
+    issues = []
+
+    # Python: new function/class names that appear to be used but not imported
+    py_import_pattern = _re_vi.compile(r"^import\s+(\S+)|^from\s+(\S+)\s+import", _re_vi.M)
+    py_call_pattern = _re_vi.compile(r"\b([A-Z][A-Za-z0-9]+)\s*\(")  # CapCase = likely class
+    defined_names = {m.group(1) or m.group(2) for m in py_import_pattern.finditer(added_text) if m.group(1) or m.group(2)}
+    called_classes = {m.group(1) for m in py_call_pattern.finditer(added_text)}
+    for cls in called_classes - defined_names:
+        if len(cls) > 4 and cls not in {"True", "False", "None", "Exception", "ValueError"}:
+            issues.append(f"Possible missing import or undefined class: `{cls}`")
+
+    # JS/TS: new identifiers used in JSX/TSX that may need imports
+    ts_usage_pattern = _re_vi.compile(r"<([A-Z][A-Za-z0-9]+)")  # JSX component usage
+    imported_ts = set(_re_vi.findall(r"import\s+\{?([A-Z][A-Za-z0-9, ]+)\}?", added_text))
+    jsx_used = {m.group(1) for m in ts_usage_pattern.finditer(added_text)}
+    flat_imported = {s.strip() for chunk in imported_ts for s in chunk.split(",")}
+    for comp in jsx_used - flat_imported:
+        if len(comp) > 3:
+            issues.append(f"Possible missing JSX import: `<{comp}>`")
+
+    return issues[:4]  # cap at 4 to avoid noisy prompts
+
+
+def build_import_fix_prompt(issues: list) -> str:
+    """v20: prompt to fix detected missing imports."""
+    issue_text = "\n".join(f"  - {i}" for i in issues)
+    return (
+        "Import/symbol check detected potential missing imports or undefined references:\n"
+        f"{issue_text}\n\n"
+        "For each flagged item:\n"
+        "  1. Check whether it is already imported in the file (if so, ignore the flag).\n"
+        "  2. If genuinely missing: add the import at the top of the correct file.\n"
+        "  3. If the identifier is from a library not yet in package.json / requirements.txt, "
+        "add the dependency too.\n"
+        "Use sed -i or a heredoc to make the fix. Then end with <final>imports verified</final>."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -2841,6 +2887,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     def out_of_time() -> bool:
         return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
 
+    def _elapsed_guard() -> str:
+        """Proactive wall-clock guard -- fires before out_of_time() to allow graceful recovery.
+        Returns 'OK' | 'COMPRESS' | 'EMERGENCY' | 'FINALIZE'.
+        """
+        elapsed = time.monotonic() - solve_started_at
+        if elapsed >= 243.0:
+            return "FINALIZE"
+        if elapsed >= 225.0:
+            return "EMERGENCY"
+        if elapsed >= 200.0:
+            return "COMPRESS"
+        return "OK"
+
     def queue_refinement_turn(
         assistant_text: str,
         prompt_text: str,
@@ -2929,6 +2988,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # v20: import/symbol validation gate (fires after syntax is clean)
+        if (
+            syntax_fix_turns_used >= MAX_SYNTAX_FIX_TURNS
+            and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS
+        ):
+            import_issues = _validate_patch_imports(patch)
+            if import_issues:
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_import_fix_prompt(import_issues),
+                    "IMPORT_FIX_QUEUED:\n  " + "; ".join(import_issues[:3]),
+                )
+                return True
+
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
         # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
         # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
@@ -3011,6 +3085,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         initial_preload_stripped = False
 
         _wall_start = time.monotonic()
+        response_text: Optional[str] = None  # v20: init before loop for elapsed_guard EMERGENCY branch
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3033,6 +3108,31 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                 initial_preload_stripped = True
 
+            _guard = _elapsed_guard()
+            if _guard == "FINALIZE":
+                logs.append(
+                    "ELAPSED_GUARD_FINALIZE: elapsed>=243s -- returning best patch immediately."
+                )
+                break
+            if _guard == "EMERGENCY":
+                patch = get_patch(repo)
+                if not patch.strip() and hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                    hail_mary_turns_used += 1
+                    queue_refinement_turn(
+                        response_text or "",
+                        build_hail_mary_prompt(issue),
+                        "ELAPSED_GUARD_EMERGENCY: forcing hail-mary at >=225s elapsed",
+                    )
+                    continue
+                logs.append(
+                    "ELAPSED_GUARD_EMERGENCY: elapsed>=225s -- finalizing current patch."
+                )
+                break
+            if _guard == "COMPRESS":
+                logs.append(
+                    "ELAPSED_GUARD_COMPRESS: elapsed>=200s -- skipping optional refinement turns."
+                )
+                # Fall through; optional refinement turns are disabled by the flag below
             if out_of_time():
                 logs.append(
                     f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
