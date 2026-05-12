@@ -1480,15 +1480,98 @@ def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     return not _uncovered_required_paths(patch, issue_text)
 
 
-def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
+_IDENT_BACKTICK_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,80})`")
+_IDENT_BARE_CAMEL_RE = re.compile(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){1,6})\b")
+_IDENT_FILE_EXTENSIONS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".rb", ".go", ".rs",
+    ".java", ".kt", ".php", ".cs", ".swift", ".m", ".mm",
+)
+_IDENT_MAX_RESULTS = 5
+
+
+def _camel_to_snake(name: str) -> str:
+    """Convert CamelCase / camelCase to snake_case (FooBar -> foo_bar)."""
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+def _extract_identifier_as_paths(issue_text: str, tracked: List[str]) -> List[str]:
+    """Map CamelCase / snake_case identifiers in the issue to plausible
+    tracked file paths.
+
+    Issue authors often reference code by class or function name
+    (`FooController`, `email_handler`) without writing the file path. The
+    coverage-nudge previously missed these because `_extract_issue_path_mentions`
+    only matched literal `path/to/file.ext` strings. This helper produces
+    candidate filenames from identifiers and keeps only those that are
+    actually tracked, so we never surface a fabricated path to the model.
+    """
+    if not issue_text or not tracked:
+        return []
+
+    candidates: List[str] = []
+    seen: set = set()
+    for match in _IDENT_BACKTICK_RE.finditer(issue_text):
+        ident = match.group(1)
+        if "/" in ident or "." in ident:
+            continue  # path-like; already covered by _extract_issue_path_mentions
+        key = ident.lower()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(ident)
+    for match in _IDENT_BARE_CAMEL_RE.finditer(issue_text):
+        ident = match.group(1)
+        key = ident.lower()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(ident)
+    if not candidates:
+        return []
+
+    by_basename: Dict[str, List[str]] = {}
+    for path in tracked:
+        name = Path(path).name.lower()
+        by_basename.setdefault(name, []).append(path)
+
+    results: List[str] = []
+    for ident in candidates:
+        snake = _camel_to_snake(ident)
+        names: List[str] = []
+        for ext in _IDENT_FILE_EXTENSIONS:
+            names.append((ident + ext).lower())
+            if snake != ident.lower():
+                names.append((snake + ext).lower())
+        for name in names:
+            for tracked_path in by_basename.get(name, []):
+                if tracked_path not in results:
+                    results.append(tracked_path)
+                    if len(results) >= _IDENT_MAX_RESULTS:
+                        return results
+    return results
+
+
+def _uncovered_required_paths(
+    patch: str,
+    issue_text: str,
+    repo: Optional[Path] = None,
+) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
     which files the task says to edit but that haven't been touched. The
     LLM judge frequently dings king for "missing/lacks/omits" — surfacing
     the gap to the model directly is the cheapest way to close it.
+
+    When `repo` is supplied, identifier-only references (e.g. `FooController`
+    mentioned in the issue but never written as a path) are resolved to
+    tracked files and added to the required set.
     """
-    required = _extract_issue_path_mentions(issue_text)
+    required = list(_extract_issue_path_mentions(issue_text))
+    if repo is not None:
+        ident_paths = _extract_identifier_as_paths(issue_text, _tracked_files(repo))
+        for path in ident_paths:
+            if path not in required:
+                required.append(path)
     if not required:
         return []
     changed = set(_patch_changed_files(patch))
@@ -1788,6 +1871,63 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _project_test_command(
+    repo: Path,
+    test_path: str,
+) -> Optional[List[str]]:
+    """Project-declared JS/TS companion-test command, if `package.json` names
+    a recognised runner via deps or `scripts.test`.
+
+    The base companion-test gate only runs `node --check` (syntax-only) for
+    JS/TS files, so a real test failure on a vitest/jest/mocha repo never
+    flows into the test-fix refinement turn. Reading the project's own
+    declared command restores that ground-truth signal at the cost of one
+    extra subprocess. Returns None when the project doesn't declare a
+    recognised runner, when `npx` is unavailable, or when parsing fails.
+    Falls back gracefully to `node --check` so a misdetection never makes
+    the gate worse.
+    """
+    package_json = repo / "package.json"
+    if not package_json.is_file():
+        return None
+    try:
+        raw = package_json.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    deps: set = set()
+    for key in ("dependencies", "devDependencies", "peerDependencies"):
+        section = data.get(key)
+        if isinstance(section, dict):
+            for name in section.keys():
+                if isinstance(name, str):
+                    deps.add(name)
+    test_script_lc = ""
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        raw_test = scripts.get("test")
+        if isinstance(raw_test, str):
+            test_script_lc = raw_test.lower()
+
+    if not _has_executable("npx"):
+        return None
+
+    # vitest first: faster cold start and accepts a positional file arg.
+    if "vitest" in deps or "vitest" in test_script_lc:
+        return ["npx", "--no-install", "vitest", "run", test_path]
+    if "jest" in deps or "jest" in test_script_lc:
+        return ["npx", "--no-install", "jest", test_path, "--silent", "--bail"]
+    if "mocha" in deps or "mocha" in test_script_lc:
+        return ["npx", "--no-install", "mocha", test_path, "--bail"]
+    return None
+
+
 def _run_companion_test(
     repo: Path,
     test_path: str,
@@ -1801,9 +1941,11 @@ def _run_companion_test(
       - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
         the failure when output indicates pytest itself isn't importable
         (ModuleNotFoundError) — that's not a real test failure.
-      - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
-        they require project-level config we can't synthesize in 8s on an
-        unknown repo.
+      - JS/TS: project-declared runner via `package.json` (vitest, jest, or
+        mocha through `npx --no-install`) when one is detected; otherwise
+        `node --check <test_path>` as the syntax-only fallback. Reading the
+        project's own declared command turns the gate from "did this parse?"
+        into "did this test pass?" on the long tail of validator tasks.
       - Other languages: skipped (returns None).
 
     Errors (timeout, runner missing, exception) intentionally degrade to None
@@ -1866,6 +2008,45 @@ def _run_companion_test(
 
     # ---- JS / TS ----
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        # Try the project's own declared test runner first (vitest / jest /
+        # mocha via package.json). On unrunnable (no binary, npx error)
+        # we fall through to `node --check` rather than worsen the gate.
+        project_cmd = _project_test_command(repo, test_path)
+        if project_cmd:
+            try:
+                project_proc = subprocess.run(
+                    project_cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                project_proc = None  # fall back to syntax check
+            except Exception:
+                project_proc = None
+            if project_proc is not None:
+                project_output = (
+                    (project_proc.stdout or "") + "\n" + (project_proc.stderr or "")
+                ).strip()
+                # Only treat the run as authoritative when it actually ran
+                # the test binary. `npx --no-install` emits a specific error
+                # when the runner package is absent from node_modules.
+                project_unrunnable = (
+                    "could not determine executable to run" in project_output
+                    or "npm ERR! could not determine executable" in project_output
+                )
+                if not project_unrunnable:
+                    if project_proc.returncode == 0:
+                        return None  # project runner passed — done
+                    return (
+                        project_output[-2400:]
+                        if len(project_output) > 2400
+                        else project_output
+                    )
+
         if not _has_executable("node"):
             return None
         try:
@@ -2122,7 +2303,17 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # mismatch cheaply and surfaces a targeted nudge before <final>.
 
 _DELETION_VERB_RE = re.compile(
-    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b",
+    # Imperative single-word verbs.
+    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b"
+    # Prose phrases that imply removal without an imperative verb. Issue
+    # authors often write "X is no longer needed" or "consolidate A and B
+    # into one page" rather than "delete A and B".
+    r"|\bno\s+longer\b"
+    r"|\bphased?\s+out\b"
+    r"|\bconsolidate(?:d)?\s+into\b"
+    r"|\bmerge[d]?\s+into\b"
+    r"|\bin\s+favor\s+of\b"
+    r"|\bshould\s+not\s+(?:support|exist|be|include)\b",
     re.IGNORECASE,
 )
 
@@ -3089,7 +3280,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
-            missing = _uncovered_required_paths(patch, issue)
+            missing = _uncovered_required_paths(patch, issue, repo=repo)
             if missing:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
@@ -3142,8 +3333,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
