@@ -222,6 +222,94 @@ def _truncate(text: str, max_chars: int) -> str:
     )
 
 
+# Markers that flag the actionable failure body of long observations.
+# Plain head/tail truncation drops them in the middle while preserving
+# the boilerplate header + summary at the ends.  (Port of ProjectNobi PR#1265.)
+_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "RuntimeError",
+    "FAIL ",
+    "FAILED ",
+    "panic:",
+)
+
+
+def _truncate_around_error(text: str, max_chars: int) -> str:
+    """Like _truncate() but centers the window on the first error marker when
+    one would otherwise be lost in the middle of the text. Falls through to
+    plain head/tail when no marker is found or when the marker already falls
+    inside the head half.
+    """
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker < half or first_marker > len(text) - half:
+        return _truncate(text, max_chars)
+    start = max(0, first_marker - max_chars // 3)
+    end = min(len(text), start + max_chars)
+    prefix = "" if start == 0 else f"...[head {start} chars]...\n"
+    suffix = "" if end == len(text) else f"\n...[tail {len(text) - end} chars]..."
+    return prefix + text[start:end] + suffix
+
+
+# Sandbox-policy denylist (port of ProjectNobi PR#1265).  Commands that depend
+# on network access are blocked with a category-specific hint message instead
+# of being run (and failing slowly + costing wall-clock).
+SANDBOX_FORBIDDEN_RULES: Tuple[Tuple[str, str], ...] = (
+    (r"\bpip3?\s+install\b", "install"),
+    (r"\bpython3?\s+-m\s+pip\s+install\b", "install"),
+    (r"\beasy_install\b", "install"),
+    (r"\bpoetry\s+(install|add|update|lock)\b", "install"),
+    (r"\buv\s+pip\s+install\b", "install"),
+    (r"\bconda\s+install\b", "install"),
+    (r"\bnpm\s+(install|i|ci|update|add)\b", "install"),
+    (r"\bpnpm\s+(install|i|add|update)\b", "install"),
+    (r"\byarn\s+(add|install|upgrade|remove)\b", "install"),
+    (r"^\s*yarn\s*$", "install"),
+    (r"\bbun\s+(install|i|add)\b", "install"),
+    (r"\bcargo\s+(add|install|update)\b", "install"),
+    (r"\bgo\s+(get|install)\b", "install"),
+    (r"\bgo\s+mod\s+(download|tidy)\b", "install"),
+    (r"\bbundle\s+(install|update)\b", "install"),
+    (r"\bgem\s+install\b", "install"),
+    (r"\bmvn\s+(install|dependency:resolve|dependency:tree)\b", "install"),
+    (r"\b(apt|apt-get|yum|dnf|brew|pacman|zypper)\s+install\b", "install"),
+    (r"\bpacman\s+-S\b", "install"),
+    (r"\bcomposer\s+(install|require|update)\b", "install"),
+    (r"\bgit\s+clone\b", "remote_git"),
+    (r"\bgit\s+fetch\b", "remote_git"),
+    (r"\bgit\s+pull\b", "remote_git"),
+    (r"\bgit\s+push\b", "remote_git"),
+    (r"\bgit\s+remote\s+(update|add|set-url)\b", "remote_git"),
+)
+
+
+_SANDBOX_HINTS: Dict[str, str] = {
+    "install": (
+        "Sandbox has no network and no on-demand installs. If a dependency is "
+        "missing, do NOT try to install it. Skip that verification path and edit "
+        "source files based on what is already available."
+    ),
+    "remote_git": (
+        "Sandbox has no network. Use local-only git: `git status`, `git diff`, "
+        "`git log`, `git show`. The repo is already cloned for you."
+    ),
+}
+
+
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
@@ -421,6 +509,18 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             blocked=True,
         )
 
+    # Sandbox-policy block (PR#1265): network-dependent commands are useless in sandbox.
+    for _sb_pattern, _sb_category in SANDBOX_FORBIDDEN_RULES:
+        if re.search(_sb_pattern, command):
+            return CommandResult(
+                command=command,
+                exit_code=1,
+                stdout="",
+                stderr=_SANDBOX_HINTS.get(_sb_category, "Command blocked by sandbox policy."),
+                duration_sec=0.0,
+                blocked=True,
+            )
+
     start = time.time()
 
     try:
@@ -439,8 +539,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -455,8 +555,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
