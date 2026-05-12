@@ -120,6 +120,8 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_DUPLICATE_SYMBOL_NUDGES = 1  # catch added function/class whose name already exists in the same file
+MAX_STRUCTURAL_INTEGRITY_NUDGES = 1  # catch missing Python imports / broken HTML structure post-edit
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -630,6 +632,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_change_lines_in_mixed_blocks(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -665,6 +668,40 @@ def _sanitize_patch(diff_output: str) -> str:
         cleaned = rebuilt
 
     return cleaned
+
+
+def _strip_mode_change_lines_in_mixed_blocks(diff_output: str) -> str:
+    """Drop `old mode`/`new mode` lines from blocks that also contain real hunks.
+
+    When the model touches a file's content AND its mode, the previous mode-only
+    stripper leaves the mode lines in place because there are @@ hunks present.
+    The judge still sees the mode churn and penalises it. Strip the mode lines
+    while preserving the content edit.
+    """
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if "\n@@ " not in block:
+            out.append(block)
+            continue
+        if "\nold mode " not in block and "\nnew mode " not in block:
+            out.append(block)
+            continue
+        kept_lines = [
+            line for line in block.splitlines(keepends=True)
+            if not (line.startswith("old mode ") or line.startswith("new mode "))
+        ]
+        out.append("".join(kept_lines))
+
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _diff_block_path(block: str) -> str:
@@ -2177,7 +2214,18 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # mismatch cheaply and surfaces a targeted nudge before <final>.
 
 _DELETION_VERB_RE = re.compile(
-    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b",
+    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|"
+    r"disable|deactivate|rename|migrate|consolidate|unify|swap|retire|sunset)\b",
+    re.IGNORECASE,
+)
+
+# Phrases that imply the new code REPLACES existing code, even without a verb
+# like "remove" being present. Round 064628 lost because the issue said
+# "support multi-file upload" — no removal verb — but the model kept the old
+# single-file handler alongside the new one, producing a duplicate function.
+_REPLACES_OLD_RE = re.compile(
+    r"\b(instead of|rather than|replacing the|in place of|supersed[a-z]+|"
+    r"superceded|formerly|previously used|legacy|old (?:way|method|function|handler|component|page))\b",
     re.IGNORECASE,
 )
 
@@ -2218,8 +2266,218 @@ def _patch_has_deletions(patch: str) -> bool:
 
 
 def _issue_requires_deletion(issue_text: str) -> bool:
-    """True if the issue contains explicit removal/replacement verbs."""
-    return bool(_DELETION_VERB_RE.search(issue_text))
+    """True if the issue contains removal verbs OR replacement-implying phrases."""
+    if _DELETION_VERB_RE.search(issue_text):
+        return True
+    return bool(_REPLACES_OLD_RE.search(issue_text))
+
+
+# -----------------------------
+# Duplicate-symbol detection
+# -----------------------------
+#
+# Round 064628 lost because the patch ADDED a new `handleFotoUpload` without
+# removing the existing one — two functions with the same name in the same
+# Vue/TS file cause a compile error. Same family of bug: 064805 (Kotlin
+# rename left stale references), 064644 (writing harness duplicate exports).
+# This gate runs after syntax fixes (because if the file doesn't parse, the
+# regex won't match the right lines) and before test (a duplicate-symbol
+# compile error makes the test gate useless).
+
+_SYMBOL_DEF_PATTERNS = [
+    # Python
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*[:(]"),
+    # JavaScript / TypeScript function declarations
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("),
+    # JS/TS const/let assignments of arrow functions or function expressions
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s*)?(?:\(|function\b)"),
+    # Go
+    re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\("),
+    # Rust
+    re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*[<(]"),
+    # Kotlin / Swift
+    re.compile(r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+|fileprivate\s+|open\s+)?fun\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+|fileprivate\s+)?func\s+([A-Za-z_]\w*)\s*\("),
+]
+
+
+def _line_defines_symbol(line: str) -> Optional[str]:
+    """Return the symbol name this line defines, or None."""
+    for pat in _SYMBOL_DEF_PATTERNS:
+        m = pat.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _patch_added_symbol_definitions(patch: str) -> Dict[str, set]:
+    """Map each modified file to the set of symbol names added by `+` lines."""
+    result: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        name = _line_defines_symbol(line[1:])
+        if name and current_file:
+            result.setdefault(current_file, set()).add(name)
+    return result
+
+
+def _file_duplicate_symbols(repo: Path, file_path: str, candidate_names: set) -> List[str]:
+    """Return names that have 2+ matching definitions in the post-patch file."""
+    abs_path = repo / file_path
+    if not abs_path.is_file():
+        return []
+    try:
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    counts: Dict[str, int] = {name: 0 for name in candidate_names}
+    for line in text.splitlines():
+        name = _line_defines_symbol(line)
+        if name in counts:
+            counts[name] += 1
+    return sorted(n for n, c in counts.items() if c >= 2)
+
+
+def _find_duplicate_symbols(repo: Path, patch: str) -> Dict[str, List[str]]:
+    """Top-level: returns {file: [dup_names]} for symbols defined more than once."""
+    out: Dict[str, List[str]] = {}
+    added = _patch_added_symbol_definitions(patch)
+    for path, names in added.items():
+        dups = _file_duplicate_symbols(repo, path, names)
+        if dups:
+            out[path] = dups
+    return out
+
+
+# -----------------------------
+# Structural integrity checks
+# -----------------------------
+#
+# Duel data: round 065055 lost because the patch used `timezone.utc` without
+# importing it (NameError at runtime). Round 064624 lost because the patch
+# left stray `<tr>` rows after `</html>` (malformed DOM). These are cheap
+# post-edit checks that catch a class of common runtime/structural bugs the
+# syntax gate misses (Python parses fine without imports; HTML parsers are
+# lenient about stray content).
+
+_PYTHON_NEEDS_IMPORT = {
+    "timezone", "datetime", "timedelta", "date",
+    "Path", "PurePath",
+    "Optional", "Dict", "List", "Tuple", "Set", "Union", "Callable", "Any",
+    "Iterable", "Iterator", "Sequence", "Mapping", "TypedDict", "Literal",
+    "Counter", "defaultdict", "OrderedDict", "deque", "namedtuple",
+}
+
+
+def _extract_python_imports(source: str) -> set:
+    """Return the set of names this Python file makes available via imports."""
+    names: set = set()
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^from\s+[\w.]+\s+import\s+(.+?)(\s*#.*)?$", line)
+        if m:
+            tokens = m.group(1).replace("(", " ").replace(")", " ").strip().rstrip(",")
+            for tok in tokens.split(","):
+                tok = tok.strip().rstrip(",")
+                if not tok or tok == "*":
+                    continue
+                if " as " in tok:
+                    _, alias = tok.split(" as ", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok)
+            continue
+        m = re.match(r"^import\s+(.+?)(\s*#.*)?$", line)
+        if m:
+            for tok in m.group(1).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if " as " in tok:
+                    _, alias = tok.split(" as ", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok.split(".")[0])
+    return names
+
+
+def _check_missing_imports(repo: Path, patch: str) -> Dict[str, List[str]]:
+    """Return {file: [symbols used in added lines but not imported]} for .py files."""
+    file_usages: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not current_file.endswith(".py"):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        content = line[1:]
+        stripped = content.strip()
+        if stripped.startswith(("import ", "from ", "#")):
+            continue
+        for sym in _PYTHON_NEEDS_IMPORT:
+            # Match symbol not preceded by . or word char, followed by ( [ or .
+            if re.search(rf"(?<![.\w]){re.escape(sym)}(?=[\(\[\.\s,:])", content):
+                file_usages.setdefault(current_file, set()).add(sym)
+
+    out: Dict[str, List[str]] = {}
+    for path, syms in file_usages.items():
+        abs_path = repo / path
+        if not abs_path.is_file():
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        imported = _extract_python_imports(text)
+        missing = sorted(s for s in syms if s not in imported)
+        if missing:
+            out[path] = missing
+    return out
+
+
+def _check_html_structure(repo: Path, patch: str) -> Dict[str, str]:
+    """Return {file: stray_content_preview} for HTML files with content after </html>."""
+    files_touched: set = set()
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            if current_file.lower().endswith((".html", ".htm")):
+                files_touched.add(current_file)
+
+    out: Dict[str, str] = {}
+    for path in files_touched:
+        abs_path = repo / path
+        if not abs_path.is_file():
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        m = re.search(r"</\s*html\s*>", text, re.IGNORECASE)
+        if not m:
+            continue
+        after = text[m.end():]
+        # Strip HTML comments and pure whitespace
+        after_clean = re.sub(r"<!--.*?-->", "", after, flags=re.DOTALL).strip()
+        if after_clean:
+            preview = after_clean[:120].replace("\n", " ⏎ ")
+            out[path] = preview
+    return out
 
 
 def _issue_implies_relocation(issue_text: str) -> bool:
@@ -2482,6 +2740,12 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
+**React / JSX / Vue:** Hooks (useState, useEffect, useMemo, useCallback, useRef) MUST be called at the component top level only — never inside useMemo bodies, conditionals, loops, nested helper functions, or callbacks. Always audit useEffect dependency arrays: if state `X` appears in the deps AND you call `setX(...)` inside the effect with no guard, you have an infinite render loop. For typewriter/animation effects, drive the index with a ref or raw counter, never with the displayed-state value as both the dep and the setter target.
+
+**Async / await:** When you call an async function, explicitly `await` it unless it is intentionally fire-and-forget with error handling. `Promise<T>[]` is NOT `T[]` — if you build an array from `.save()`, `.toJSON()`, `fetch()`, or any other async-returning call, you must `await Promise.all(arr)` before treating the elements as bytes, strings, or objects. Missing awaits in Blob/Uint8Array/file-download paths silently break the feature at runtime.
+
+**Math / edge cases:** Before calling `Math.log(x)`, `Math.sqrt(x)`, `/x`, or `Math.pow(x, y)` with non-integer y, guard against the input being ≤0, NaN, or undefined. Statistical and financial code (Calmar ratio, profit factor, Sharpe ratio) almost always has an edge case for empty inputs, all-zero inputs, and all-losers/all-winners — handle them explicitly with the value the reference patch uses (often 0, NaN, or a sentinel), never let the formula divide by zero silently.
+
 ====================================================================
 SCOPE DISCIPLINE
 ====================================================================
@@ -2496,6 +2760,12 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
+- Existing database indexes, schema columns, or migrations that the issue did not mention
+- Lockfiles, package manifests, generated files (bun.lock, pnpm-lock.yaml, package-lock.json) unless the dependency change is the task itself
+- Existing CSS/SCSS rules adjacent to your fix when only logic changes are required
+- AppShell, layout, navbar, or sidebar files when the task is scoped to a feature page
+
+If the issue scopes the change to a single file, page, route, or feature, your patch MUST stay scoped there. Resist the urge to clean up adjacent code, remove "unused" exports, or improve nearby styling. Every line you touch outside the requested scope is a penalty during reference comparison. When in doubt, ask: "Did the issue mention this file?" — if no, do not edit it.
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
@@ -2776,6 +3046,78 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
         "<final>summary</final>.\n\n"
         "Task:\n"
         f"{short}\n"
+    )
+
+
+def build_duplicate_symbol_nudge_prompt(dups_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it added a function/class whose name already exists in the file.
+
+    Duel data (round 064628): the patch added a new `handleFotoUpload` while
+    leaving the existing one in place — two definitions with the same name in
+    one Vue/TS file is a compile error. Same failure mode is common in Python,
+    Go, Rust, Kotlin: the model writes new code without removing the old code
+    it was meant to replace.
+    """
+    bullet_lines: List[str] = []
+    for path, names in dups_by_file.items():
+        for name in names:
+            bullet_lines.append(f"  - {path}: `{name}` is defined 2+ times in the file now")
+    return (
+        "Duplicate symbol — your patch added a function/class whose name already "
+        "exists in the same file. Two definitions with the same name will break "
+        "compilation (Python/Go/Rust/Kotlin) or cause runtime shadowing (JS/TS).\n\n"
+        "Affected definitions:\n"
+        + "\n".join(bullet_lines)
+        + "\n\nVerify with `grep -n 'def NAME\\|function NAME\\|class NAME\\|fn NAME' "
+        "path/to/file`, then delete the OBSOLETE definition (the one your new code "
+        "is meant to replace) and emit <final>summary</final>.\n"
+    )
+
+
+def build_missing_imports_nudge_prompt(missing_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it used Python symbols without importing them.
+
+    Duel data (round 065055): patch used `timezone.utc` but never imported
+    `timezone` (or `datetime`) — runtime NameError. Python parses fine without
+    imports, so syntax_fix won't catch this; only an explicit symbol/import
+    audit will.
+    """
+    bullets: List[str] = []
+    for path, syms in missing_by_file.items():
+        bullets.append(f"  - {path}: missing import for {', '.join('`' + s + '`' for s in syms)}")
+    return (
+        "Missing import — your patch uses Python symbols that are not imported "
+        "in the file. The code will fail at runtime with NameError, even though "
+        "the syntax parses cleanly.\n\n"
+        "Affected files:\n"
+        + "\n".join(bullets)
+        + "\n\nAdd the necessary imports at the top of each file. Common patterns:\n"
+        "  - `from datetime import datetime, timezone, timedelta`\n"
+        "  - `from pathlib import Path`\n"
+        "  - `from typing import Optional, Dict, List, Tuple, Any, Callable`\n"
+        "  - `from collections import Counter, defaultdict, deque`\n\n"
+        "Then emit <final>summary</final>.\n"
+    )
+
+
+def build_html_structure_nudge_prompt(stray_by_file: Dict[str, str]) -> str:
+    """Tell the model its HTML file has content after the closing </html> tag.
+
+    Duel data (round 064624): wishlist.html had stray `<tr>` rows after `</html>`,
+    breaking DOM structure. Most browsers tolerate it visually, but the judge
+    penalises the structural break.
+    """
+    bullets: List[str] = []
+    for path, preview in stray_by_file.items():
+        bullets.append(f"  - {path}: stray content after </html>: {preview}")
+    return (
+        "Broken HTML structure — one or more files have content sitting AFTER the "
+        "closing `</html>` tag. This is malformed DOM and will be flagged.\n\n"
+        "Affected files:\n"
+        + "\n".join(bullets)
+        + "\n\nEither delete the stray content (if it was leftover from a previous edit) "
+        "or move it inside the `<body>` block where it belongs. Verify the file ends "
+        "cleanly with `</html>` followed only by whitespace, then emit <final>summary</final>.\n"
     )
 
 
@@ -3076,6 +3418,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    duplicate_symbol_nudges_used = 0
+    structural_integrity_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3455,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, duplicate_symbol_nudges_used, structural_integrity_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3162,6 +3506,60 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Duplicate-symbol gate: a function/class with the same name defined twice
+        # in one file = compile error (round 064628). Runs after syntax (so the
+        # regex matches valid code) and before test (a duplicate-symbol compile
+        # error makes the test gate's slow runner useless).
+        if duplicate_symbol_nudges_used < MAX_DUPLICATE_SYMBOL_NUDGES:
+            dups = _find_duplicate_symbols(repo, patch)
+            if dups:
+                duplicate_symbol_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duplicate_symbol_nudge_prompt(dups),
+                    "DUPLICATE_SYMBOL_QUEUED:\n  " + "; ".join(
+                        f"{path}: {', '.join(names)}" for path, names in dups.items()
+                    ),
+                )
+                return True
+
+        # Structural integrity gate: missing Python imports (round 065055) and
+        # broken HTML structure (round 064624). Two cheap post-edit checks
+        # sharing one refinement-budget slot — only the first detected issue
+        # fires, the other waits for the next cycle.
+        if structural_integrity_nudges_used < MAX_STRUCTURAL_INTEGRITY_NUDGES:
+            missing_imports = _check_missing_imports(repo, patch)
+            if missing_imports:
+                structural_integrity_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_imports_nudge_prompt(missing_imports),
+                    "MISSING_IMPORTS_QUEUED:\n  " + "; ".join(
+                        f"{path}: {', '.join(syms)}" for path, syms in missing_imports.items()
+                    ),
+                )
+                return True
+            html_breaks = _check_html_structure(repo, patch)
+            if html_breaks:
+                structural_integrity_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_html_structure_nudge_prompt(html_breaks),
+                    "HTML_STRUCTURE_QUEUED:\n  " + "; ".join(
+                        f"{path}: {preview[:60]}" for path, preview in html_breaks.items()
+                    ),
                 )
                 return True
 
