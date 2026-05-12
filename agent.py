@@ -705,7 +705,7 @@ def _sanitize_patch_against_issue(patch: str, issue: str) -> str:
     return _strip_mode_lines_from_headers(result)
 
 
-def _finalize_patch_hygiene(patch: str, issue: str, logs: List[str]) -> str:
+def _finalize_patch_hygiene(patch: str, issue_text: str, logs: List[str]) -> str:
     """Apply the issue-aware sanitizers + log what fired, before final return.
 
     Order: drop binary/asset/lockfile blocks the issue did not request, then
@@ -714,7 +714,7 @@ def _finalize_patch_hygiene(patch: str, issue: str, logs: List[str]) -> str:
     """
     if not patch.strip():
         return patch
-    cleaned = _sanitize_patch_against_issue(patch, issue)
+    cleaned = _sanitize_patch_against_issue(patch, issue_text)
     cleaned = _strip_eval_term_additions_in_fixtures(cleaned)
     leftover = _patch_contains_forbidden_eval_terms(cleaned)
     if leftover:
@@ -2378,14 +2378,14 @@ def _classify_issue_surfaces(issue: str) -> set:
     return tags
 
 
-def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[str]:
+def _extract_requirement_checklist(issue_text: str, *, max_items: int = 12) -> List[str]:
     """Build a compact deduped requirement checklist from the issue text.
 
     Captures list items, imperative sentences, explicit paths, quoted UI/API
     literals, endpoint strings, and clause-level requirements split by
     "also/and/both/all/unless/only" hints.
     """
-    if not issue:
+    if not issue_text:
         return []
     items: List[str] = []
     seen: set = set()
@@ -2401,7 +2401,7 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
         items.append(normalized)
 
     bullet_re = re.compile(r"^\s*(?:[-*\u2022]|\[[ xX]\]|\d+[.)])\s+(.+?)\s*$")
-    for line in issue.splitlines():
+    for line in issue_text.splitlines():
         m = bullet_re.match(line)
         if m:
             add(m.group(1))
@@ -2414,7 +2414,7 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
         r"backend|mobile|desktop|loading|empty|error|fallback)\b",
         re.IGNORECASE,
     )
-    for raw in re.split(r"(?<=[.!?])\s+", issue):
+    for raw in re.split(r"(?<=[.!?])\s+", issue_text):
         text = raw.strip()
         if not text or len(text) < 12:
             continue
@@ -2429,13 +2429,13 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
                 return items
 
     quote_re = re.compile(r"[\"'\u201c\u2018]([^\"'\u201d\u2019]{3,80})[\"'\u201d\u2019]")
-    for m in quote_re.finditer(issue):
+    for m in quote_re.finditer(issue_text):
         add('show or use literal text "' + m.group(1).strip() + '"')
         if len(items) >= max_items:
             return items
 
     endpoint_re = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}-]+)")
-    for m in endpoint_re.finditer(issue):
+    for m in endpoint_re.finditer(issue_text):
         add("endpoint " + m.group(1).upper() + " " + m.group(2))
         if len(items) >= max_items:
             return items
@@ -2443,7 +2443,7 @@ def _extract_requirement_checklist(issue: str, *, max_items: int = 12) -> List[s
     path_re = re.compile(
         r"(?<![A-Za-z0-9_])([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|json|md|yml|yaml|css|scss)|/[A-Za-z0-9_./{}-]+)"
     )
-    for m in path_re.finditer(issue):
+    for m in path_re.finditer(issue_text):
         add("path " + m.group(1).strip())
         if len(items) >= max_items:
             return items
@@ -3227,7 +3227,7 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
+def build_initial_user_prompt(issue_text: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -3240,7 +3240,7 @@ Preloaded likely relevant tracked-file snippets (already read for you - do not r
 
     return f"""Fix this issue:
 
-{issue}
+{issue_text}
 
 Repository summary:
 
