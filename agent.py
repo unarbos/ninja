@@ -116,8 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
-MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
+MAX_TOTAL_REFINEMENT_TURNS = 3  # substantive gates need room; polish/syntax get the last slot
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -384,8 +383,28 @@ def chat_completion(
 # repo. You may improve command validation, environment handling, timeouts, and
 # output shaping. Keep commands scoped to the repo and avoid secrets or network
 # access outside the validator inference proxy.
+def _compute_command_timeout(cmd: str) -> int:
+    """Return an appropriate timeout for cmd based on command class.
+
+    Clamps to WALL_CLOCK_BUDGET_SECONDS / 3 to prevent a single command from
+    consuming the whole budget.
+    """
+    lowered = cmd.lower()
+    if re.search(r"\b(pytest|jest|vitest|go\s+test|cargo\s+test|mocha|playwright)\b", lowered):
+        result = 90
+    elif re.search(r"\b(make|npm\s+(run\s+)?build|tsc|cargo\s+build|mvn|gradle)\b", lowered):
+        result = 60
+    elif re.search(r"\b(grep|find|rg|ag)\b", lowered):
+        result = 30
+    else:
+        result = DEFAULT_COMMAND_TIMEOUT
+    return min(result, int(WALL_CLOCK_BUDGET_SECONDS / 3))
+
+
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
+    if timeout == DEFAULT_COMMAND_TIMEOUT:
+        timeout = _compute_command_timeout(command)
 
     if not command:
         return CommandResult(
@@ -584,7 +603,24 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return _sanitize_patch(diff_output)
+    sanitized = _sanitize_patch(diff_output)
+    if _validate_patch_applies(repo, sanitized):
+        return sanitized
+    # Fallback: plain working-tree diff without untracked synthesis
+    fallback_proc = subprocess.run(
+        ["git", "diff", "--no-color", "--no-renames", "--", "."],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    fallback = fallback_proc.stdout or ""
+    if fallback.strip() and _validate_patch_applies(repo, fallback):
+        return fallback
+    # Both attempts failed validation — return sanitized anyway; a malformed
+    # diff still earns cursor-similarity credit over an empty result.
+    return sanitized
 
 
 def _sanitize_patch(diff_output: str) -> str:
@@ -652,7 +688,9 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
@@ -665,6 +703,11 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".tox",
+        ".idea",
+        ".vscode",
+        ".next",
+        ".turbo",
     }
     generated_suffixes = {
         ".class",
@@ -677,6 +720,29 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".bin",
     }
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
+
+
+def _validate_patch_applies(repo: Path, patch: str) -> bool:
+    """Check whether a unified diff applies cleanly to the current working tree.
+
+    Uses git apply --check so no files are modified. Returns True for empty
+    patches (nothing to validate) and when the check passes; False on any
+    apply failure that would silently drop hunks at scoring time.
+    """
+    if not patch.strip():
+        return True
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn", "-"],
+            cwd=str(repo),
+            input=patch,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return True
 
 
 def get_repo_summary(repo: Path) -> str:
@@ -1476,6 +1542,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".php",
 }
 
 
@@ -1555,12 +1624,41 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_go_syntax(repo: Path, files: List[str]) -> List[str]:
+    """Run gofmt -e -l per .go file; return stderr lines as syntax-error messages.
+
+    Silently passes when gofmt is missing (exit 127 / unavailable) so the gate
+    degrades to brace-balance rather than blocking the refinement chain.
+    """
+    if not _has_executable("gofmt"):
+        return []
+    errors: List[str] = []
+    for relative_path in files:
+        if Path(relative_path).suffix.lower() != ".go":
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        proc = run_command(
+            f"gofmt -e -l {_shell_quote(relative_path)}", repo, timeout=_SYNTAX_TIMEOUT,
+        )
+        if proc.exit_code not in (0, 127) and (proc.stderr or "").strip():
+            for line in proc.stderr.strip().splitlines():
+                if line.strip():
+                    errors.append(f"{relative_path}: {line.strip()}")
+    return errors
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed
+    through.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -1575,6 +1673,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        elif suffix == ".go":
+            go_errs = _check_go_syntax(repo, [relative_path])
+            result = go_errs[0] if go_errs else None
+            if result is None and not _has_executable("gofmt"):
+                result = _check_brace_balance_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
@@ -2482,17 +2585,30 @@ def build_gap_edit_prompt(issue_text: str) -> str:
     )
 
 
-def build_hail_mary_prompt(issue_text: str) -> str:
+def build_hail_mary_prompt(
+    issue_text: str,
+    last_assistant_tail: str = "",
+    last_command: str = "",
+) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
-    refinement turn. Closes the architectural hole at maybe_queue_refinement's
-    early-exit ('if not patch.strip(): return False'), which silently accepted
-    empty patches. The emergency turn still requires a task-supported code edit;
-    it must not guess blindly or touch unrelated files."""
+    refinement turn. Embeds a PRIOR ATTEMPT TRACE so the model knows what it
+    already tried and can pick a genuinely different approach."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    trace_parts: List[str] = []
+    if last_command or last_assistant_tail:
+        trace_parts.append("PRIOR ATTEMPT TRACE:")
+        if last_command:
+            trace_parts.append(f"  Last command: {last_command[:200]}")
+        if last_assistant_tail:
+            trimmed = last_assistant_tail[-800:].strip()
+            trace_parts.append(f"  Last assistant output tail:\n{trimmed}")
+        trace_parts.append("")
+    trace_block = "\n".join(trace_parts)
     return (
         "EMERGENCY: after all refinement attempts your patch is still empty, "
         "so the task is not solved yet.\n\n"
-        "RE-READ THE ISSUE:\n\n"
+        + trace_block
+        + "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE task-supported code edit consistent with the issue. Pick the most "
         "likely target file from the preloaded snippets, or use one focused grep if the target is still unclear. "
@@ -2531,6 +2647,48 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 580.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 90.0  # don't start retry if <90s remain
+
+
+def _build_retry_context(result1: dict) -> str:
+    """Build a preamble injected into the issue text for the second attempt.
+
+    Surfaces what the first attempt tried and failed so the model can choose a
+    genuinely different approach rather than repeating the same dead end.
+    """
+    patch1 = result1.get("patch", "") or ""
+    n1 = _multishot_count_substantive(patch1)
+    logs_text = result1.get("logs", "") or ""
+
+    last_cmd = ""
+    # Walk log lines in reverse to find the last executed command block.
+    in_obs = False
+    for line in reversed(logs_text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("COMMAND:"):
+            in_obs = True
+            continue
+        if in_obs and stripped:
+            last_cmd = stripped[:120]
+            break
+
+    error_tail = ""
+    stderr_idx = logs_text.rfind("STDERR:")
+    if stderr_idx >= 0:
+        raw = logs_text[stderr_idx + 7 : stderr_idx + 250].strip()
+        error_tail = raw.replace("\n", " ")[:120]
+
+    parts = [
+        f"PRIOR ATTEMPT LOW SIGNAL: previous run produced {n1} substantive added line(s).",
+    ]
+    if last_cmd:
+        parts.append(f"Last command attempted: {last_cmd}.")
+    if error_tail:
+        parts.append(f"Last error tail: {error_tail}.")
+    parts.append(
+        "Pick a DIFFERENT target file from the preload list, or inspect a region you "
+        "did not read in attempt 1. Do not re-issue the same commands."
+    )
+    return "\n".join(parts)
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2656,7 +2814,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        _retry_kwargs = dict(kwargs)
+        _retry_context = _build_retry_context(_result1)
+        _retry_kwargs["issue"] = _retry_context + "\n\n" + (kwargs.get("issue") or "")
+        _result2 = _solve_attempt(**_retry_kwargs)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -2780,52 +2941,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
+                _hm_cmds = extract_commands(assistant_text)
+                _hm_last_cmd = _hm_cmds[-1] if _hm_cmds else ""
                 queue_refinement_turn(
                     assistant_text,
-                    build_hail_mary_prompt(issue),
+                    build_hail_mary_prompt(issue, assistant_text[-800:], _hm_last_cmd),
                     "HAIL_MARY_QUEUED: patch empty at refinement gate",
                 )
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        # Hard-stop if we've already used the total cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
+        # Substantive gates run first so they get budget before polish/syntax.
+        # Order: companion-test (ground truth) → criteria-nudge → coverage-nudge
+        #        → syntax → polish → self-check.
 
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
-            syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -2836,6 +2969,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_test_fix_prompt(test_path, output),
                     f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+            unaddressed = _unaddressed_criteria(patch, issue)
+            if unaddressed:
+                criteria_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_criteria_nudge_prompt(unaddressed, issue),
+                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
                 )
                 return True
 
@@ -2853,23 +3000,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
+        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_fix_turns_used += 1
                 total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                    build_syntax_fix_prompt(syntax_errors),
+                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if polish_turns_used < MAX_POLISH_TURNS:
+            junk = _diff_low_signal_summary(patch)
+            if junk:
+                polish_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_polish_prompt(junk),
+                    f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
 
