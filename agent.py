@@ -1,51 +1,4 @@
 #!/usr/bin/env python3
-"""
-Portable single-file SWE-style coding agent harness.
-
-Contract:
-    The validator imports this file and calls:
-
-        solve(
-            repo_path="/tmp/task_repo",
-            issue="Fix the bug...",
-            model="validator-managed-model",
-            api_base="http://validator-proxy/v1",
-            api_key="per-run-proxy-token"
-        )
-
-    It returns:
-        {
-            "patch": "... unified git diff ...",
-            "logs": "...",
-            "steps": int,
-            "cost": float | None,
-            "success": bool,
-        }
-
-Design goals:
-    - Single file.
-    - No external Python dependencies.
-    - Validator-provided OpenAI-compatible /v1/chat/completions endpoint.
-    - No direct OpenRouter/OpenAI credentials in miner code.
-    - Bash-only action interface.
-    - Validator owns repo, tests, sandbox, scoring, hidden tasks.
-    - Miners only patch this file.
-
-Miner editing guide:
-    You are expected to improve this file. Good areas to edit include prompting,
-    context gathering, command selection, tool/result parsing, stopping logic,
-    patch generation, safety checks, and how the agent uses its step budget.
-
-    Keep these validator-owned boundaries intact:
-    - Preserve solve(repo_path, issue, model, api_base, api_key, ...) as the
-      public entry point.
-    - Return a dict with patch, logs, steps, cost, and success.
-    - Use only the validator-provided api_base/api_key for LLM calls.
-    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
-      path, or validator secret.
-    - Do not add third-party package requirements; this file must stay portable.
-    - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
-"""
 
 from __future__ import annotations
 
@@ -64,16 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# -----------------------------
-# Config
-# -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
-# VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
-# validator wiring. During real validation the validator passes model, api_base,
-# and api_key into solve(). Keep this code compatible with that path.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("NINJA_MODEL", "")
 DEFAULT_API_BASE = (
     os.environ.get("AGENT_API_BASE")
@@ -95,20 +42,12 @@ MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
-# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
-# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 255.0  # slightly smaller limit for better safety
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
@@ -117,22 +56,12 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted)
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
-# Recent-commit injection: small in-context style anchors from the staged repo's
-# real history. The validator clones the real repo with full git history; the
-# pilot stages snapshots with one synthetic commit so this is a no-op locally
-# but high-leverage live. Cursor's reference patches ARE recent commits in this
-# codebase's style — showing the model 1-2 actual examples teaches the codebase's
-# idioms (variable conventions, hunk shape, test-touch patterns) far better than
-# any abstract prompt rule.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
 
-# MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
-# weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
     r"\brm\s+-rf\s+/",
     r"\bsudo\b",
@@ -158,9 +87,6 @@ DANGEROUS_PATTERNS = [
 ]
 
 
-# -----------------------------
-# Data structures
-# -----------------------------
 
 @dataclass
 class CommandResult:
@@ -191,9 +117,6 @@ class AgentResult:
         }
 
 
-# -----------------------------
-# Utility
-# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -292,14 +215,7 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
-# -----------------------------
-# OpenAI-compatible client
-# -----------------------------
 
-# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
-# behavior, response parsing, or model-message strategy here. Keep all requests
-# pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -309,12 +225,6 @@ def chat_completion(
     timeout: int = 120,
     max_retries: int = HTTP_MAX_RETRIES,
 ) -> Tuple[str, Optional[float], Dict[str, Any]]:
-    """OpenAI-compatible /v1/chat/completions client.
-
-    Retries with exponential backoff on transient transport failures (timeout,
-    connection reset, HTTP 5xx, HTTP 429). Client-side 4xx (other than 429) bail
-    out immediately because retrying won't change the outcome.
-    """
 
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
@@ -376,14 +286,7 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
-# Shell execution
-# -----------------------------
 
-# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
-# repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -490,9 +393,6 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
 
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
@@ -514,9 +414,6 @@ def extract_final(model_text: str) -> Optional[str]:
     return match.group(1).strip()
 
 
-# -----------------------------
-# Git helpers
-# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -709,13 +606,6 @@ _PROJECT_HINT_FILES = (
 
 
 def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
-    """Compact top-level verification hints: test scripts and build config.
-
-    This is intentionally separate from ranked source context. The model often
-    knows what to edit but wastes a turn guessing the right verification
-    command. A small manifest summary helps it pick targeted tests without
-    broad config-file exploration.
-    """
     tracked = set(_tracked_files(repo))
     blocks: List[str] = []
 
@@ -766,28 +656,6 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Preload the highest-ranked tracked files plus their companion tests.
-
-    Returns `(context_text, included_files)` so the caller can later strip the
-    bulky snippet block but still keep the file-name breadcrumb.
-
-    Two improvements over a vanilla rank-and-read loop:
-
-      1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
-         X_test.go for X.go, etc.) are slotted in right after their source
-         partner. Real GitHub-derived tasks almost always need source+test
-         changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
-
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
-
-    Each file snippet is fetched via `_read_context_file` with issue-derived
-    needles so we keep only the regions relevant to the task instead of the
-    head N chars of the file.
-    """
     files = _rank_context_files(repo, issue)
     if not files:
         return "", []
@@ -796,6 +664,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
 
     needles = _preload_needles(issue)
+    path_mentioned = {
+        p.strip("./") for p in _extract_issue_path_mentions(issue)
+    }
 
     parts: List[str] = []
     included: List[str] = []
@@ -803,7 +674,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+        file_budget = per_file_budget * 2 if relative_path in path_mentioned else per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -818,9 +690,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -829,12 +698,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
 
 def _preload_needles(issue: str) -> List[str]:
-    """Build a deduped needle list for issue-aware partial file loading.
-
-    Order: explicit identifiers (`_extract_issue_symbols`) first since they
-    are the strongest signal, then file-stem mentions (so `foo.py` in the
-    issue picks out lines referencing `foo`), then general issue terms.
-    """
     out: List[str] = []
     seen: set = set()
 
@@ -853,17 +716,34 @@ def _preload_needles(issue: str) -> List[str]:
         stem = Path(mention).stem
         if stem and len(stem) >= 3:
             add(stem)
+    for quoted in _QUOTED_NEEDLE_RE.findall(issue):
+        if not any(c.isalpha() for c in quoted):
+            continue
+        if len(quoted.split()) > 8:
+            continue
+        add(quoted.strip())
+    for block in _FENCED_CODE_RE.findall(issue):
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if len(line) < 8 or len(line) > 120:
+                continue
+            if not any(c.isalnum() for c in line):
+                continue
+            if line.startswith(("#", "//", "/*", "*")):
+                continue
+            add(line)
     for term in _issue_terms(issue):
         if len(term) >= 4:
             add(term)
     return out
 
 
+_QUOTED_NEEDLE_RE = re.compile(r'["\']([^"\']{4,80})["\']')
+_FENCED_CODE_RE = re.compile(r"```[A-Za-z]*\n(.*?)```", re.DOTALL)
+
+
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files — only treat as
-                              # "mentioned" when an identifier picks out a
-                              # specific small handful in the tracked set.
 
 
 def _rank_context_files(repo: Path, issue: str) -> List[str]:
@@ -880,13 +760,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if normalized in tracked_set and _context_file_allowed(normalized):
             mentioned.append(normalized)
 
-    # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
-    # `email_notificacoes`) are deliberate signals from the task author about
-    # the code surface that matters. When they pick out a small specific set
-    # of tracked files by path-substring, treat those files as explicit
-    # mentions so they get the same +100 ranking boost as path-mentioned
-    # files. Skipped when the identifier matches too many files (filters out
-    # generic identifiers like `basic.py` or `any2txt`).
     seen_mentioned = set(mentioned)
     for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
@@ -917,7 +790,6 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
-        # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
         if score > 0:
@@ -1015,13 +887,6 @@ def _read_context_file(
     max_chars: int,
     needles: Optional[List[str]] = None,
 ) -> str:
-    """Read a tracked file, optionally returning only issue-relevant windows.
-
-    When `needles` is provided and the file is larger than `max_chars`, we
-    extract regions around lines that match any needle (case-insensitive
-    substring) plus a few lines of context, instead of head/tail truncation.
-    Falls back to `_truncate` when no needles match or the file already fits.
-    """
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1047,14 +912,6 @@ def _extract_relevant_regions(
     ctx_before: int = 8,
     ctx_after: int = 12,
 ) -> str:
-    """Return windows around lines matching any needle, capped at `max_chars`.
-
-    When the file already fits within `max_chars`, the whole file is returned
-    verbatim. When no needles match, fall back to `_truncate` (head/tail
-    summary). Otherwise produce a concatenation of merged windows around each
-    matching line, prefixed with line-range headers so the model can reason
-    about location.
-    """
     if not text:
         return text
     if len(text) <= max_chars:
@@ -1114,20 +971,6 @@ def _extract_relevant_regions(
     return "\n\n".join(parts)
 
 
-# -----------------------------
-# Hunk classifiers + diff hygiene
-# -----------------------------
-#
-# Two failure modes produce low-quality patches: drive-by whitespace /
-# comment / blank-line edits, and patches that cover the wrong files. The
-# helpers below detect both. They're applied at two stages:
-#
-#   1. At patch-return time: low-signal hunks are silently dropped from the
-#      final diff (so the validator never sees them).
-#   2. Inside the loop: when the model's draft contains junk, we queue a
-#      "polish" turn that asks the model to revert those hunks itself, since
-#      doing so cleanly is safer than mechanical filtering for borderline cases
-#      (e.g., a comment edit that genuinely matters).
 
 _COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
 _BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
@@ -1147,13 +990,11 @@ def _line_is_comment(line: str) -> bool:
 
 
 def _hunk_is_blank_only(added: List[str], removed: List[str]) -> bool:
-    """Hunk that only changes blank-line layout."""
     body = [line for line in added + removed if line.strip()]
     return not body and bool(added or removed)
 
 
 def _hunk_is_whitespace_only(added: List[str], removed: List[str]) -> bool:
-    """Added and removed lines are identical after stripping whitespace."""
     if not added and not removed:
         return False
     a = sorted(line.strip() for line in added if line.strip())
@@ -1171,12 +1012,6 @@ def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
 
 
 def _strip_low_signal_hunks(diff_output: str) -> str:
-    """Drop blank-only / whitespace-only / comment-only hunks from each file.
-
-    Whole-file blocks with no @@ markers are kept verbatim because they are
-    file-create / file-delete / binary patches that the hunk classifier
-    can't reason about.
-    """
     if not diff_output.strip():
         return diff_output
 
@@ -1209,7 +1044,6 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
             substantive.append(hunk_text)
         if substantive:
             out.append(header + "".join(substantive))
-        # If every hunk was junk, drop the whole file block entirely.
     result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
@@ -1217,7 +1051,6 @@ def _strip_low_signal_hunks(diff_output: str) -> str:
 
 
 def _diff_low_signal_summary(patch: str) -> str:
-    """Human-readable summary of low-signal hunks for the polish prompt."""
     if not patch.strip():
         return ""
 
@@ -1264,7 +1097,6 @@ def _diff_low_signal_summary(patch: str) -> str:
 
 
 def _patch_changed_files(patch: str) -> List[str]:
-    """Return the list of `b/` paths touched by a unified diff, in order."""
     seen: List[str] = []
     for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
         path = match.group(2)
@@ -1274,18 +1106,10 @@ def _patch_changed_files(patch: str) -> List[str]:
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
-    """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
 
 
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
-    """Required paths from the issue that the patch doesn't touch yet.
-
-    Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
-    """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
         return []
@@ -1297,15 +1121,6 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# -----------------------------
-# Multi-language syntax gate
-# -----------------------------
-#
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
@@ -1334,11 +1149,6 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
-    """`node --check file.js` — bytecode parse only, no execution.
-
-    Skips the check entirely when `node` is unavailable; we'd rather miss a
-    syntax issue than waste 10 seconds on a NotFound retry.
-    """
     if not _has_executable("node"):
         return None
     proc_result = run_command(
@@ -1369,29 +1179,12 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
-# Languages where ' is unambiguously a string delimiter. The brace-balance
-# parser below treats ' as a string-mode toggle, which produces false
-# positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
-#     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust — `'a` is a lifetime annotation
-#   - Go — `'X'` is a rune literal
-# Net effect of including those: a single `'X'` in any function would yield
-# a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
-# to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
 }
 
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
-    """Cheap brace/paren/bracket balance check for languages without a parser.
-
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
-    """
     full = (repo / relative_path).resolve()
     try:
         full.relative_to(repo.resolve())
@@ -1433,7 +1226,6 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
                 in_str = None
             i += 1
             continue
-        # Not in string/comment.
         if ch == "/" and nxt == "/":
             in_line_comment = True
             i += 2
@@ -1461,12 +1253,6 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
-    """Best-effort multi-language syntax check on touched files.
-
-    Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
-    """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
@@ -1476,28 +1262,17 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
             if result is None and suffix == ".js":
-                # node was unavailable; fall back to brace balance check.
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
     return errors
 
 
 def _has_executable(name: str) -> bool:
-    """True if `name` is on PATH. Uses shutil.which (stdlib).
-
-    The earlier impl invoked `command -v` via subprocess with shell=False,
-    but `command` is a bash builtin and not a standalone binary on
-    python:3.11-slim, so the subprocess call always raised FileNotFoundError
-    and returned False. Net effect: every gate that depends on this check
-    (e.g. JS/TS `node --check`, pytest discovery) silently no-op'd in
-    production. shutil.which is the portable equivalent.
-    """
     try:
         return shutil.which(name) is not None
     except Exception:
@@ -1505,28 +1280,16 @@ def _has_executable(name: str) -> bool:
 
 
 def _shell_quote(value: str) -> str:
-    """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-# -----------------------------
-# Companion-test discovery + execution
-# -----------------------------
-#
-# When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
-# repo, running that test before <final> catches a class of regressions the
-# scope/judge gates can't see. Cursor's baseline diffs almost always update
-# tests in lockstep with source edits, and a fast pytest -k catches "I broke
-# the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python — the most common shapes.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
     ("{stem}.py", "{dir}/tests/test_{stem}.py"),
     ("{stem}.py", "tests/{stem}_test.py"),
-    # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
@@ -1535,7 +1298,6 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "{dir}/{stem}.test.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
@@ -1543,7 +1305,6 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
 
 
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
@@ -1564,7 +1325,6 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
 
 
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
-    """Slot each ranked source file's companion test in immediately after it."""
     if not tracked:
         return files
     augmented: List[str] = []
@@ -1585,44 +1345,16 @@ def _run_companion_test(
     test_path: str,
     timeout_seconds: int = 8,
 ) -> Optional[str]:
-    """Best-effort companion-test execution. Returns failure-output tail on FAIL,
-    or None when the test passed, the runner is unavailable, or the language
-    isn't supported.
-
-    Languages handled:
-      - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
-        the failure when output indicates pytest itself isn't importable
-        (ModuleNotFoundError) — that's not a real test failure.
-      - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
-        they require project-level config we can't synthesize in 8s on an
-        unknown repo.
-      - Other languages: skipped (returns None).
-
-    Errors (timeout, runner missing, exception) intentionally degrade to None
-    so the refinement chain doesn't queue a fix for something the agent can't
-    actually act on. The whole gate is best-effort.
-
-    Pairs with build_test_fix_prompt — when this returns a non-None failure
-    tail, that tail is fed back to the model as one extra refinement turn.
-    Companion-test execution was scaffolded by previous king alexlange1 (the
-    constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
-    co-loading templates _TEST_PARTNER_TEMPLATES) but never wired up; the
-    massive PR #185 rewrite preserved the dead scaffolding without using it.
-    This re-introduces the runtime-correctness signal as a refinement gate.
-    """
     full = repo / test_path
     if not full.exists() or not full.is_file():
         return None
 
     suffix = Path(test_path).suffix.lower()
 
-    # ---- Python ----
     if suffix == ".py":
         runner_cmds: List[List[str]] = []
         if _has_executable("pytest"):
             runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
-        # Always also try `python3 -m pytest`: works when pytest is importable
-        # but no `pytest` binary is on PATH (pip-installed without entry script).
         runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
 
         for cmd in runner_cmds:
@@ -1656,7 +1388,6 @@ def _run_companion_test(
 
         return None  # no runner produced a usable signal
 
-    # ---- JS / TS ----
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
         if not _has_executable("node"):
             return None
@@ -1687,12 +1418,6 @@ def _select_companion_test_failure(
     patch: str,
     test_timeout_seconds: int = 8,
 ) -> Optional[Tuple[str, str]]:
-    """For files touched by the patch, find the first companion test that fails.
-
-    Returns (test_path, output_tail) on the first non-None failure, else None.
-    Stops at the first failure to keep the refinement budget tight (one fix
-    turn maximum per cycle).
-    """
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -1710,15 +1435,6 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
-
-    The model imitates concrete examples better than abstract rules. Cursor's
-    reference patch IS a one-off commit in this codebase's style; showing the
-    model 1-2 real recent commits gives it the same anchor."""
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -1756,13 +1472,6 @@ def _recent_commit_examples(repo: Path) -> str:
                     break
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
-            # NOTE: previous version passed --pretty=format:%s which caused
-            # `git show` to emit the commit subject in place of the standard
-            # header but git still appended the diff. After the >=100 char
-            # filter the only commits that survived were those with very long
-            # subjects (e.g. squash messages); their wrapped output was a mix
-            # of subject + diff, which is noise. --pretty=format: empties the
-            # header entirely so we keep just the diff body.
             diff_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -1793,7 +1502,6 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# v21 edge: criteria-nudge support
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
@@ -1808,12 +1516,6 @@ _CRITERIA_STOP = frozenset({
 
 
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
-    """Pull acceptance-criterion checkpoints from the issue text.
-
-    Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `•`) first; fallback to imperative sentences (must/should/implement/add/
-    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
-    so the nudge prompt stays compact."""
     if not issue_text:
         return []
     bullets: List[str] = []
@@ -1847,19 +1549,10 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
 
 
 def _criterion_keywords(criterion: str) -> List[str]:
-    """Significant tokens from a criterion (drop stopwords + short words)."""
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", criterion.lower())
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# Verb/noun suffixes commonly used in acceptance-criterion English that don't
-# appear in source-code identifiers. The criteria say "clicking", "loads",
-# "selection", "displayed", "correctly"; the corresponding code uses
-# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
-# substring check on the natural-language form misses these matches and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix
-# (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ↔ identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
@@ -1875,7 +1568,6 @@ def _keyword_in_added(keyword: str, added_lower: str) -> bool:
 
 
 def _patch_added_text(patch: str) -> str:
-    """Concat all + lines of the patch (lower-cased) for keyword search."""
     out: List[str] = []
     for line in patch.splitlines():
         if line.startswith("+") and not line.startswith("+++"):
@@ -1884,9 +1576,6 @@ def _patch_added_text(patch: str) -> str:
 
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
-    """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
@@ -1898,22 +1587,12 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         keywords = _criterion_keywords(crit)
         if not keywords:
             continue
-        # criterion is "addressed" if at least HALF its keywords appear
         hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
 
 
-# -----------------------------
-# Issue-symbol grep ranking
-# -----------------------------
-#
-# `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough — a one-line bug fix often
-# names a function or class without mentioning the file. We extract identifier-
-# shaped tokens from the issue and grep the repo for them; files that contain
-# those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
 _SYMBOL_STOP = {
@@ -1930,12 +1609,6 @@ _SYMBOL_STOP = {
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
-    """Pull identifier-shaped tokens from the issue text.
-
-    Heuristic: any CamelCase or snake_case identifier, plus any all-lowercase
-    identifier of length >=4 (so we catch `pairs`, `solve`, `parse`, etc.).
-    Stop-words and very short tokens are filtered out.
-    """
     seen: set = set()
     out: List[str] = []
     for match in _SYMBOL_RE.finditer(issue_text):
@@ -1960,11 +1633,6 @@ def _symbol_grep_hits(
     tracked_set: set,
     issue_text: str,
 ) -> Dict[str, int]:
-    """Count how many extracted symbols each tracked file references.
-
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
-    to ranking, never the only signal.
-    """
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
@@ -1993,22 +1661,7 @@ def _symbol_grep_hits(
     return hits
 
 
-# -----------------------------
-# Prompting
-# -----------------------------
 
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
-#
-# Trimmed from the prompt2.txt expansion (~760 lines) to a tight policy
-# block. The earlier draft repeated itself across PATCH SELECTION,
-# REFERENCE PATCH HEURISTICS, BENCHMARK MINDSET, DIFF QUALITY CHECK and
-# similar sections. Sending those duplicates on every step burned token
-# budget linearly without changing model behaviour. We keep:
-#   - the first-response `<plan>` + immediate command rule (load-bearing)
-#   - the command/final output protocol (validator parses these)
-#   - a single source of truth for scope, style, verification, safety
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
 You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
@@ -2215,14 +1868,6 @@ def _strip_preloaded_section(
     preloaded_files: List[str],
     modified_files: Optional[List[str]] = None,
 ) -> str:
-    """Replace the bulky preloaded snippet block with a short breadcrumb.
-
-    Triggered after step 4 to free token budget for later iterations: the
-    model has already seen the snippets in earlier turns and only needs to
-    know which files were preloaded (and which it has already touched) so it
-    can re-open them on demand instead of re-reading the whole block on
-    every request.
-    """
     if not _PRELOAD_BLOCK_RE.search(initial_user_text):
         return initial_user_text
 
@@ -2271,13 +1916,6 @@ def build_budget_pressure_prompt(step: int) -> str:
 
 
 def build_polish_prompt(junk_summary: str) -> str:
-    """Ask the model to revert specific low-signal hunks before final.
-
-    The LLM judge frequently penalises patches for "unrelated changes",
-    "unnecessary churn", and "cosmetic edits". Be explicit about which
-    classes of changes count as scope creep so the model knows what to
-    revert and what to keep.
-    """
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
         f"  {junk_summary}\n\n"
@@ -2301,12 +1939,6 @@ def build_polish_prompt(junk_summary: str) -> str:
 
 
 def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
-    """Tell the model which issue-mentioned paths are still untouched.
-
-    The LLM diff judge most often docks king for incomplete coverage. When the
-    issue names specific files and the draft skips them, surface that gap
-    directly — much cheaper than hoping the self-check catches it.
-    """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     return (
         "Coverage gap — the task explicitly mentions these path(s) but your "
@@ -2323,7 +1955,6 @@ def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> st
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 4000
@@ -2358,7 +1989,6 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
 
 
 def build_syntax_fix_prompt(errors: List[str]) -> str:
-    """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
     return (
         f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
@@ -2369,12 +1999,6 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
 
 
 def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
-    """Tell the model which acceptance-criteria checkpoints look unaddressed.
-
-    The LLM judge frequently dings the king for "missing N of M criteria" on
-    multi-bullet issues. The path-coverage gate sees files; this gate sees the
-    criterion checkpoints themselves and surfaces them with the original text.
-    """
     bullets = "\n  ".join(f"- {c}" for c in unaddressed[:8]) or "(none)"
     return (
         "Criterion-coverage gap — these acceptance-criterion checkpoints from "
@@ -2393,13 +2017,6 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
 
 
 def build_hail_mary_prompt(issue_text: str) -> str:
-    """Last-resort refinement when the patch is STILL empty after every other
-    refinement turn. Closes the architectural hole at maybe_queue_refinement's
-    early-exit ('if not patch.strip(): return False'), which silently accepted
-    empty patches and cost ~10% of rounds in the live duel that promoted this
-    king. An empty patch has Jaccard = 0 against any non-empty reference; a
-    plausible-but-wrong edit has Jaccard > 0 with non-zero probability.
-    Convert the worst case from a guaranteed forfeit into a guess."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
         "EMERGENCY: after all refinement attempts your patch is still empty. "
@@ -2420,7 +2037,6 @@ def build_hail_mary_prompt(issue_text: str) -> str:
 
 
 def build_test_fix_prompt(test_path: str, output: str) -> str:
-    """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
     return (
         f"Companion test is failing after your patch: `{test_path}`.\n\n"
@@ -2435,13 +2051,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
-# -----------------------------
-# Main agent
-# -----------------------------
 
-# -----------------------------
-# v28 multi-shot helpers
-# -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 580.0
@@ -2510,15 +2120,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
-# -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
-# -----------------------------
 
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
 def solve(
     repo_path: str,
     issue: str,
@@ -2529,16 +2131,6 @@ def solve(
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
-    """
-    Main portable interface for validators.
-
-    v43: wrapped in patch-preserve safety net. If anything in the multi-shot
-    body raises (timeout, network, OOM, anything), we capture whatever's on
-    disk at the time and return it as the patch. The validator scores empty
-    patches at zero — any non-empty diff beats empty. Production data shows
-    50%+ of our challenger rounds end in `time_limit_exceeded` with no patch;
-    the safety net converts those to "whatever partial work survived".
-    """
     return _solve_with_safety_net(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
@@ -2547,32 +2139,6 @@ def solve(
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """The actual multi-shot driver, wrapped so any exception still returns
-    the on-disk patch state instead of propagating.
-
-    Design notes for the next forker (these were called out in earlier
-    review rounds, recording them here so the choices are not silently
-    inherited):
-
-    1. There is intentionally no third "emergency" single-shot fallback.
-       Two attempts at WALL_CLOCK_BUDGET_SECONDS=270s already saturate the
-       _MULTISHOT_TOTAL_BUDGET=580s envelope. A third attempt would have to
-       be either (a) so short it cannot produce a patch, or (b) push past
-       the validator's per-round soft cap and forfeit the round entirely.
-       The empty-patch case is already handled inside `_solve_attempt` by
-       the hail-mary refinement turn (see `maybe_queue_refinement`), and
-       any uncaught exception is caught by the `except Exception` arm
-       below which returns the on-disk patch verbatim.
-
-    2. The lint/syntax gate has not been removed; it lives inside
-       `maybe_queue_refinement` as the `syntax_fix` step (calling
-       `_check_syntax` -> `build_syntax_fix_prompt`). It runs after polish
-       and before the companion-test gate, capped by MAX_SYNTAX_FIX_TURNS
-       and MAX_TOTAL_REFINEMENT_TURNS so it cannot blow the budget. It is
-       deliberately scoped to the syntax-check refinement turn rather than
-       a hard pre-final block because real patches that touch unsupported
-       languages (Rust/Swift/etc.) would otherwise be gated incorrectly.
-    """
     repo_path = kwargs["repo_path"]
     _multishot_repo_obj = None
     try:
@@ -2619,10 +2185,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         return _result1
 
     except Exception as exc:
-        # v43 safety net: ANY uncaught exception from the multi-shot body
-        # should not propagate. Instead, return whatever patch is on disk
-        # right now. (Don't catch BaseException — let SystemExit/KeyboardInterrupt
-        # do their thing so the validator can clean-kill the process.)
         salvaged = ""
         try:
             if _multishot_repo_obj is not None:
@@ -2639,8 +2201,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Original solve loop, callable through kwargs to avoid re-stating the
-    validator-protected parameter signature outside of solve()."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -2666,13 +2226,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
-    # Wall-clock guard for the inner attempt. The outer multi-shot wrapper
-    # holds a separate total budget (`_MULTISHOT_TOTAL_BUDGET = 580s`), but
-    # that wrapper only checks elapsed time *between* attempts. Without an
-    # inner guard, a single attempt can blow the whole budget on a stuck
-    # model loop and starve the retry of any time. We stop the inner loop
-    # once `WALL_CLOCK_RESERVE_SECONDS` of headroom remain so we always
-    # return whatever patch is already on disk.
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
 
@@ -2684,35 +2237,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         prompt_text: str,
         marker: str,
     ) -> None:
-        """Append assistant + corrective user message and journal it."""
         logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
-        """If the current patch warrants a refinement turn, queue it.
-
-        Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
-        """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -2724,8 +2256,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -2753,15 +2283,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -2787,12 +2308,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v21 edge: criteria-nudge fires after coverage-nudge. Coverage gates on
-        # FILES the issue mentions; criteria gates on the acceptance-criterion
-        # CHECKPOINTS (numbered list / bullets / imperative sentences). The
-        # judge's "missing N of M criteria" complaint is the most common reason
-        # the king loses on multi-bullet issues — surfacing the unaddressed
-        # bullets directly is much cheaper than hoping self-check catches them.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
@@ -2830,15 +2345,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            # Past step 4 the preloaded snippets are no longer load-bearing —
-            # the model has either used them or moved on. Replace the bulky
-            # block in the initial user message with a short breadcrumb so
-            # the next request fits more recent context within the token cap.
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
                 modified_files = _patch_changed_files(get_patch(repo))
@@ -2890,10 +2399,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if response_text is None:
                 consecutive_model_errors += 1
-                # If we already have any patch staged in the repo, stop early
-                # and return that patch rather than wiping everything because
-                # the proxy hiccuped. Empty patches score 0; partial patches
-                # can still earn cursor-similarity credit.
                 if get_patch(repo).strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
@@ -2907,7 +2412,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "errors -- ending loop."
                     )
                     break
-                # No patch yet but still time/budget; ride out and try again.
                 continue
 
             consecutive_model_errors = 0
@@ -2965,7 +2469,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
                             break
@@ -2981,9 +2484,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if final is not None and get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
-                    # Refinement turn queued; do not declare success yet. Skip
-                    # the observation append below since queue_refinement_turn
-                    # already wrote the assistant + corrective user message.
                     if success:
                         break
                     continue
@@ -3133,13 +2633,7 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-# -----------------------------
-# CLI for local testing
-# -----------------------------
 
-# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
-# CLI to make local experiments easier, but do not rely on CLI-only behavior for
-# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
