@@ -109,14 +109,14 @@ MAX_COMMANDS_PER_RESPONSE = 15
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
-# Hardcoded - not user-tunable. The PR Scope Guard's env-var allowlist
+# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 # Inner solve wall: keep below the multishot outer budget so a second
 # attempt has comparable time. Tau docker_solver enforces a hard wall of
-# max(per-task-timeout, 300s) from exec start - see multishot constants below.
+# max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
@@ -139,7 +139,7 @@ _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in 
 # real history. The validator clones the real repo with full git history; the
 # pilot stages snapshots with one synthetic commit so this is a no-op locally
 # but high-leverage live. Recent commits are concrete examples of this
-# codebase's style - showing the model 1-2 actual examples teaches the codebase's
+# codebase's style — showing the model 1-2 actual examples teaches the codebase's
 # idioms (variable conventions, hunk shape, test-touch patterns) far better than
 # any abstract prompt rule.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
@@ -1039,7 +1039,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     tracked_set = set(_tracked_files(repo))
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
-    # hit landed, so the top-ranked file is essentially random - this is
+    # hit landed, so the top-ranked file is essentially random — this is
     # the dominant catastrophic-floor failure mode. Run a cheap broad-grep
     # over the full tracked set (no context-file filter) and surface the
     # 1-3 files that match the most issue terms. Also surface a banner
@@ -1097,7 +1097,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) - the helper returns "" and we add nothing.
+    # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1107,7 +1107,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
 _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
-                              # dozens of unrelated files - only treat as
+                              # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
@@ -1772,10 +1772,10 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # Languages where ' is unambiguously a string delimiter. The brace-balance
 # parser below treats ' as a string-mode toggle, which produces false
 # positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala - `'X'` is a character literal
+#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
 #     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust - `'a` is a lifetime annotation
-#   - Go - `'X'` is a rune literal
+#   - Rust — `'a` is a lifetime annotation
+#   - Go — `'X'` is a rune literal
 # Net effect of including those: a single `'X'` in any function would yield
 # a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
 # to JS-family + Swift, where ' is a real string delimiter.
@@ -1920,7 +1920,7 @@ def _shell_quote(value: str) -> str:
 # the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
-    # Python - the most common shapes.
+    # Python — the most common shapes.
     ("{stem}.py", "tests/test_{stem}.py"),
     ("{stem}.py", "test_{stem}.py"),
     ("{stem}.py", "{dir}/test_{stem}.py"),
@@ -1929,7 +1929,7 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "test/{stem}_test.py"),
     ("{stem}.py", "test/test_{stem}.py"),
     ("{stem}.py", "{dir}/{stem}_test.py"),
-    # TypeScript / JavaScript - Jest / Vitest conventions.
+    # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
@@ -1941,7 +1941,7 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "tests/{stem}.test.js"),
     ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages - single canonical convention each.
+    # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
@@ -2315,7 +2315,7 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # -----------------------------
 #
 # `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough - a one-line bug fix often
+# overlap. For multi-file repos that's not enough — a one-line bug fix often
 # names a function or class without mentioning the file. We extract identifier-
 # shaped tokens from the issue and grep the repo for them; files that contain
 # those identifiers get a context-rank boost.
@@ -2886,7 +2886,7 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 _MULTISHOT_TOTAL_BUDGET = 278.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # If attempt 1 already consumed this much wall clock, skip attempt 2 even when
-# attempt 1 was low-signal - otherwise the process often dies before the retry
+# attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0   # v23: restored to king's value; import_nudge removed so first attempts are faster again
 
@@ -2985,7 +2985,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
-# Main agent (v28 - multi-shot wrapper around _solve_inner)
+# Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -3044,7 +3044,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
-            # Attempt 1 already burned the outer budget - starting attempt 2
+            # Attempt 1 already burned the outer budget — starting attempt 2
             # invites a docker_solver kill (hard wall ~300s from exec start),
             # which is strictly worse than shipping attempt 1's thin patch.
             _result1["multishot_attempts"] = 1
@@ -3181,7 +3181,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v20 edge - close the architectural hole at the empty-patch early
+        # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
@@ -3255,7 +3255,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         # v22: criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge - addressing them is higher-value
+        # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
@@ -3461,7 +3461,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched - keep working instead of accepting.
+                            # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
                             break
