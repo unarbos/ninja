@@ -59,6 +59,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -763,6 +764,114 @@ def get_repo_summary(repo: Path) -> str:
     return "\n\n".join(parts)
 
 
+# -----------------------------
+# Unified-diff salvage from model output
+# -----------------------------
+#
+# The model occasionally describes its fix as a `diff --git ...` block (often
+# inside markdown fences) without ever issuing a sed/python edit command —
+# then declares <final> assuming the diff was applied. In that path the
+# working tree is unchanged, `get_patch` returns empty, and the round
+# collapses to a zero-similarity loss. This salvage step lets us recover by
+# parsing diff blocks out of the assistant's prior messages and applying
+# them ourselves as a strict last-resort, only when the working tree is
+# otherwise empty. It is the strongest available defense against the
+# catastrophic empty-patch failure mode: a partially-correct diff still
+# beats a guaranteed zero.
+
+_EMITTED_DIFF_BLOCK_RE = re.compile(
+    r"(?m)^(?:```(?:diff|patch)?\s*\n)?"
+    r"(diff --git a/[^\n]+ b/[^\n]+\n[\s\S]+?)"
+    r"(?=^diff --git |^```|\Z)"
+)
+
+
+def _extract_emitted_diff_blocks(text: str) -> List[str]:
+    """Find `diff --git ...` blocks the model emitted in prose / code fences.
+
+    Returns each block stripped of trailing markdown fence syntax, with at
+    least one hunk marker (`@@`) or file-create/delete header present so we
+    don't try to apply purely cosmetic descriptions.
+    """
+    candidates: List[str] = []
+    if not text or "diff --git " not in text:
+        return candidates
+
+    for match in _EMITTED_DIFF_BLOCK_RE.finditer(text):
+        block = match.group(1).strip()
+        if not block.startswith("diff --git "):
+            continue
+        if not (
+            "\n@@ " in block
+            or "\nnew file mode " in block
+            or "\ndeleted file mode " in block
+        ):
+            continue
+        if not block.endswith("\n"):
+            block = block + "\n"
+        candidates.append(block)
+    return candidates
+
+
+def _try_apply_emitted_diff(repo: Path, diff_text: str) -> bool:
+    """Best-effort `git apply` of a model-emitted diff block.
+
+    Tries plain apply first, falls back to `--3way`, and finally to
+    `--reject` so a partial application still lands the parts that match.
+    Returns True if any application changed the working tree.
+    """
+    if not diff_text.strip():
+        return False
+    for git_args in (
+        ["git", "apply", "--whitespace=nowarn", "-p1"],
+        ["git", "apply", "--3way", "--whitespace=nowarn", "-p1"],
+        ["git", "apply", "--reject", "--whitespace=nowarn", "-p1"],
+    ):
+        try:
+            proc = subprocess.run(
+                git_args,
+                cwd=str(repo),
+                input=diff_text,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            return True
+        # `git apply --reject` returns non-zero even on partial success when
+        # any hunk could not be applied. Check the working tree directly.
+        if "--reject" in git_args:
+            staged_patch = get_patch(repo)
+            if staged_patch.strip():
+                return True
+    return False
+
+
+def _salvage_patch_from_messages(
+    repo: Path,
+    messages: List[Dict[str, str]],
+) -> Optional[str]:
+    """When the working tree is empty, walk recent assistant turns and try
+    to apply any unified diff the model emitted in conversation.
+
+    Returns the diff text that successfully applied (so the caller can log
+    it), or None if nothing was salvageable. Operates on the most recent
+    assistant messages first because the model's later attempts usually
+    supersede earlier drafts.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content") or ""
+        for block in _extract_emitted_diff_blocks(content):
+            if _try_apply_emitted_diff(repo, block):
+                return block
+    return None
+
+
 TEXT_FILE_EXTENSIONS = {
     ".c",
     ".cc",
@@ -957,7 +1066,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     Returns `(context_text, included_files)` so late solve steps can drop the
     bulky snippets while keeping a file-name breadcrumb.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Four improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -974,9 +1083,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          migrations, UI entry points, package/build files) are appended after
          the direct hits. This improves file targeting on feature tasks without
          displacing the primary target files.
+
+      4. Path-level issue-term matches use document-frequency downweighting
+         (SweRank-style) so tokens that appear in many paths do not dominate.
+         For top-ranked files with symbol hits, preloaded snippets can be
+         excerpt-centered on the first in-file symbol match (SWE-Edit-style
+         focused view) instead of only the file head.
     """
-    files, top_score = _rank_context_files(repo, issue)
+    files, top_score, symbol_hits = _rank_context_files(repo, issue)
     tracked_set = set(_tracked_files(repo))
+    preload_symbols = _extract_issue_symbols(issue)
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
@@ -1001,7 +1117,20 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
+
+    # Test-target hint: when the issue text directly names pytest-style trace
+    # paths or `file:line` references, surface them at the very top of the
+    # preload so the model uses them as its primary verification command.
+    # This frequently saves 1-2 inspection turns on stack-trace-bearing
+    # issues where the failing test is named in plain sight.
+    test_hint = _test_target_hint_block(issue, tracked_set)
+    if test_hint:
+        parts.append(test_hint)
+        used += len(test_hint)
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1019,8 +1148,18 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
+        use_center = (
+            file_idx < 3
+            and relative_path in symbol_hits
+            and symbol_hits[relative_path] > 0
+            and bool(preload_symbols)
+        )
+        if use_center:
+            snippet = _read_context_file_centered(repo, relative_path, budget_for_file, preload_symbols)
+        else:
+            snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1052,15 +1191,18 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
-def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
-    """Returns (ranked_paths, top_score). top_score is the highest computed
-    score in the scoring pass; callers use it to detect "weak ranking"
-    rounds where no path/identifier signal hit, so the top file is
-    functionally random and the rescue-ranker fallback should fire.
+def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[str, int]]:
+    """Returns (ranked_paths, top_score, symbol_hit_counts).
+
+    top_score is the highest computed score in the scoring pass; callers use
+    it to detect "weak ranking" rounds where no path/identifier signal hit, so
+    the top file is functionally random and the rescue-ranker fallback should
+    fire. symbol_hit_counts maps path -> distinct symbol grep hit count for
+    preload excerpt centering.
     """
     tracked = _tracked_files(repo)
     if not tracked:
-        return [], 0
+        return [], 0, {}
 
     issue_lower = issue.lower()
     path_mentions = _extract_issue_path_mentions(issue)
@@ -1088,6 +1230,10 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                     seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
+    allowed_paths = [p for p in tracked if _context_file_allowed(p)]
+    n_allowed = len(allowed_paths)
+    term_df = _path_term_df(allowed_paths, terms) if terms and allowed_paths else {}
+
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -1103,11 +1249,19 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 35
         if name_lower and name_lower in issue_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        for term in terms:
+            if term not in path_lower:
+                continue
+            df = term_df.get(term, 0)
+            score += _idf_path_term_points(df, n_allowed, 3, 1)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
-            score += sum(2 for term in terms if term in path_lower)
+            for term in terms:
+                if term not in path_lower:
+                    continue
+                df = term_df.get(term, 0)
+                score += _idf_path_term_points(df, n_allowed, 2, 1)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
@@ -1127,7 +1281,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Explicit path or backtick-ident match: ranking is strong even if
         # the scored list is empty (mentioned files bypass the score loop).
         top_score = max(top_score, 100)
-    return ranked, top_score
+    return ranked, top_score, symbol_hits
 
 
 # Threshold below which _rank_context_files is treated as "weak signal" and
@@ -1158,8 +1312,8 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-    hits: Dict[str, int] = {}
-    for term in terms:
+
+    def _grep_term(term: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
@@ -1170,13 +1324,21 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
                 timeout=3,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if relative_path and relative_path in tracked:
-                hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
+        futures = {pool.submit(_grep_term, t): t for t in terms}
+        for future in as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
+
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1255,9 +1417,12 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        path_words = _split_path_tokens(relative_path)
+        def _token_in_path(tok: str) -> bool:
+            return tok in path_words if len(tok) < 5 else tok in path_lower
+        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
+        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
+        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -1275,7 +1440,44 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
     return augmented
 
 
+_TRACKED_FILES_CACHE: Dict[Tuple[str, float], List[str]] = {}
+_TRACKED_FILES_CACHE_MAX = 8
+
+
 def _tracked_files(repo: Path) -> List[str]:
+    """Cached wrapper around `git ls-files`.
+
+    On a single solve, hot helpers (`_rank_context_files`, `_broad_grep_fallback`,
+    `_augment_with_test_partners`, `_augment_with_integration_partners`,
+    `_project_hint_block`) each call this. Without caching that's 5-8
+    subprocess spawns for an unchanged file list per solve — 80-180 ms of
+    pure wall-clock that the inspection loop loses. Caching by `(path,
+    .git/index mtime)` invalidates naturally when the working tree changes
+    (which a solve typically does, but only well into the loop).
+    """
+    try:
+        resolved = repo.resolve()
+        index = resolved / ".git" / "index"
+        mtime = index.stat().st_mtime if index.exists() else 0.0
+    except Exception:
+        resolved = repo
+        mtime = 0.0
+    key = (str(resolved), mtime)
+    cached = _TRACKED_FILES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    files = _tracked_files_uncached(repo)
+    _TRACKED_FILES_CACHE[key] = files
+    if len(_TRACKED_FILES_CACHE) > _TRACKED_FILES_CACHE_MAX:
+        # Bounded LRU-ish eviction: drop the oldest insertion to keep RSS
+        # predictable across many solves in the same process.
+        for stale_key in list(_TRACKED_FILES_CACHE.keys())[:-_TRACKED_FILES_CACHE_MAX]:
+            _TRACKED_FILES_CACHE.pop(stale_key, None)
+    return files
+
+
+def _tracked_files_uncached(repo: Path) -> List[str]:
     try:
         proc = subprocess.run(
             ["git", "ls-files"],
@@ -1369,6 +1571,99 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+_GREP_FIRST_LINE_RE = re.compile(r"^[^:]+:(\d+):")
+
+
+def _git_first_line_hitting_symbol(repo: Path, relative_path: str, symbols: List[str]) -> Optional[int]:
+    """Return 1-based line number of first symbol hit in file, or None.
+
+    SWE-Edit / context-learning work: centering excerpts on identifier matches
+    surfaces the buggy region inside large files instead of only the file head.
+    """
+    for sym in symbols[:8]:
+        if not sym or not sym.strip():
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-m", "1", "-F", "--", sym, "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0 or not proc.stdout:
+            continue
+        first = proc.stdout.splitlines()[0]
+        m = _GREP_FIRST_LINE_RE.match(first)
+        if not m:
+            continue
+        try:
+            return int(m.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _read_context_file_centered(repo: Path, relative_path: str, max_chars: int, symbols: List[str]) -> str:
+    """Like `_read_context_file` but windows around the first issue-symbol hit."""
+    line_1 = _git_first_line_hitting_symbol(repo, relative_path, symbols)
+    if line_1 is None:
+        return _read_context_file(repo, relative_path, max_chars)
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return _read_context_file(repo, relative_path, max_chars)
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return _read_context_file(repo, relative_path, max_chars)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    idx = max(0, min(len(lines) - 1, line_1 - 1))
+    line_budget = max(24, max_chars // 90)
+    half = line_budget // 2
+    start = max(0, idx - half)
+    end = min(len(lines), start + line_budget)
+    if end - start < line_budget:
+        start = max(0, end - line_budget)
+    header = f"(excerpt lines {start + 1}-{end} of {len(lines)}, near issue symbol match)\n"
+    excerpt = "\n".join(lines[start:end])
+    return _truncate(header + excerpt, max_chars)
+
+
+def _path_term_df(allowed_paths: List[str], terms: List[str]) -> Dict[str, int]:
+    """Document frequency: how many paths contain each issue term (substring).
+
+    SweRank-style signal: downweight terms that hit most of the tree so
+    `utils`/`index` do not drown out discriminative tokens.
+    """
+    out: Dict[str, int] = {}
+    for term in terms:
+        tl = term.lower()
+        out[term] = sum(1 for p in allowed_paths if tl in p.lower())
+    return out
+
+
+def _idf_path_term_points(df: int, n_paths: int, strong: int, weak: int) -> int:
+    """Map (df, corpus size) to 0 / weak / strong path-match points."""
+    if n_paths <= 0 or strong <= 0:
+        return strong
+    # Ultra-common in paths — treat as noise.
+    if df > max(12, (n_paths * 35) // 100):
+        return 0
+    if df > max(4, (n_paths * 12) // 100):
+        return weak
+    return strong
 
 
 # -----------------------------
@@ -2299,6 +2594,119 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
+# -----------------------------
+# Test-target extraction from issue text
+# -----------------------------
+#
+# Real GitHub issues frequently include pytest tracebacks or explicit test
+# trace lines like `tests/test_user.py::test_register_with_email`. Those are
+# extremely high-signal: the issue author has already told us exactly which
+# test the fix must satisfy. Surfacing them as a preload hint cuts the
+# inspection phase short — the model can `pytest <target>` directly instead
+# of running a broad search to find the failing case.
+
+_PYTEST_TRACE_RE = re.compile(
+    r"(?<![\w./-])((?:tests?|spec|test)/[\w./-]+\.(?:py|js|ts|jsx|tsx|rb|go|rs))"
+    r"(?:::([A-Za-z_][\w.\[\]_-]*))?",
+    re.IGNORECASE,
+)
+# `path/to/file.py:LINE` patterns from tracebacks. Less specific than the
+# pytest node syntax but still names a concrete file the fix touches.
+_FILELINE_TRACE_RE = re.compile(
+    r"(?<![\w./-])(?:File\s+\")?"
+    r"([\w./-]+\.(?:py|js|ts|jsx|tsx|rb|go|rs))"
+    r"(?:\"|,\s+line\s+|:\s*(?=\d))(\d+)",
+    re.IGNORECASE,
+)
+_TEST_TARGET_MAX = 6
+
+
+def _extract_test_targets_from_issue(issue_text: str) -> List[str]:
+    """Pull explicit test traces / file:line references out of an issue.
+
+    Returns up to `_TEST_TARGET_MAX` strings, preferring pytest-style
+    `path::node` references first, then plain `path:line` traceback hits.
+    The strings are formatted as the model would type them into a command
+    (so it can copy-paste a `pytest` invocation without re-decoding).
+    """
+    out: List[str] = []
+    if not issue_text:
+        return out
+
+    for match in _PYTEST_TRACE_RE.finditer(issue_text):
+        path = match.group(1)
+        node = match.group(2)
+        # Reject obvious non-test paths that share the regex shape: the path
+        # must contain `/test` (any depth) or its basename must start with
+        # `test_` / end with `_test.py`-style suffix.
+        lower = path.lower()
+        basename = Path(path).name.lower()
+        looks_test = (
+            "/test" in lower
+            or lower.startswith("test/")
+            or basename.startswith("test_")
+            or basename.startswith("test-")
+            or "_test." in basename
+            or ".test." in basename
+            or basename.startswith("spec_")
+            or "/spec" in lower
+            or "_spec." in basename
+        )
+        if not looks_test:
+            continue
+        full = f"{path}::{node}" if node else path
+        if full not in out:
+            out.append(full)
+        if len(out) >= _TEST_TARGET_MAX:
+            return out
+
+    for match in _FILELINE_TRACE_RE.finditer(issue_text):
+        path = match.group(1)
+        line = match.group(2)
+        full = f"{path}:{line}"
+        # Don't double-up if we already have the bare test path
+        if any(existing.startswith(path) for existing in out):
+            continue
+        if full not in out:
+            out.append(full)
+        if len(out) >= _TEST_TARGET_MAX:
+            break
+
+    return out
+
+
+def _test_target_hint_block(issue_text: str, tracked_set: set) -> str:
+    """Render the extracted test targets as a compact preload hint.
+
+    Only emits targets whose underlying file path exists in the tracked
+    set so the model isn't pointed at a stale or external file mentioned
+    in the issue (a recurring failure mode pre-cache: the trace named a
+    test that lived in the user's local clone but not in the staged repo).
+    """
+    targets = _extract_test_targets_from_issue(issue_text)
+    if not targets:
+        return ""
+    kept: List[str] = []
+    for target in targets:
+        # Strip ::node or :line to get the underlying path.
+        bare = target.split("::", 1)[0].split(":", 1)[0]
+        if bare in tracked_set:
+            kept.append(target)
+    if not kept:
+        return ""
+    lines = ["### test targets from issue"]
+    lines.append(
+        "The issue text names these test path(s) directly — run them as your "
+        "primary verification command after editing the source:"
+    )
+    lines.extend(f"  - {t}" for t in kept[:_TEST_TARGET_MAX])
+    return "\n".join(lines)
+
+
+_SYMBOL_GREP_NOISE_DF_FLOOR = 8
+_SYMBOL_GREP_NOISE_DF_PCT = 40
+
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
@@ -2306,14 +2714,20 @@ def _symbol_grep_hits(
 ) -> Dict[str, int]:
     """Count how many extracted symbols each tracked file references.
 
-    Skips on git-grep failure to keep the cycle cheap; symbol-grep is a *boost*
-    to ranking, never the only signal.
+    Symbols whose document frequency exceeds ~40% of the corpus (or 8 files,
+    whichever is larger) are treated as noise and do not contribute hits.
+    Without this, ubiquitous identifiers like `init`, `data`, `error`, or
+    `value` flood every file with hit credit and the top-ranked output
+    becomes effectively the largest file in the repo instead of the
+    behaviorally relevant one. The IDF cap mirrors the path-term IDF gate
+    already used in `_rank_context_files`, so both signals share the same
+    "ignore terms that point everywhere" policy.
     """
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_symbol(symbol: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -2324,16 +2738,32 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked_set
+            and _context_file_allowed(line.strip())
+        ]
+
+    noise_threshold = max(
+        _SYMBOL_GREP_NOISE_DF_FLOOR,
+        (len(tracked_set) * _SYMBOL_GREP_NOISE_DF_PCT) // 100,
+    ) if tracked_set else _SYMBOL_GREP_NOISE_DF_FLOOR
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        futures = {pool.submit(_grep_symbol, s): s for s in symbols}
+        for future in as_completed(futures):
+            paths = future.result()
+            # IDF cap: a symbol that appears in too many files carries no
+            # discriminative signal — skip it entirely so it can't inflate
+            # the score of every candidate.
+            if len(paths) > noise_threshold:
                 continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            for path in paths:
+                hits[path] = hits.get(path, 0) + 1
     return hits
 
 
@@ -2401,6 +2831,12 @@ INSPECTION STRATEGY
 
 Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
+If the preload contains a `### test targets from issue` block, treat those paths as confirmed verification anchors — run them directly as your primary check once a fix is in place, instead of grepping the test suite for failing tests.
+
+If the preload contains a `### rescue-ranker hint` block, treat the listed file(s) as the most likely targets the broad text scan surfaced. Inspect them FIRST before doing any other search.
+
+Never re-issue an identical inspection command. The harness silently short-circuits repeated inspection commands (`cat foo.py`, `git diff`, `ls`, `grep ...`) when they exactly match a recent turn — re-running them wastes the wall-clock budget and forces the harness to nudge you. If the prior observation did not give you what you needed, change the command: narrower line range, different file, or `sed -n '<start>,<end>p>'` instead of full-file `cat`.
+
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
 
 ====================================================================
@@ -2450,7 +2886,7 @@ Add or update a test only when the issue requests it, a companion test already c
 
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
-If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests.
+If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests. Never claim tests passed if they did not run or failed. If dependencies/environment block verification, say so briefly in `<final>`.
 
 ====================================================================
 STYLE, COMMENTS, AND PUBLIC API
@@ -2460,11 +2896,11 @@ Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, b
 
 Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
-Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
+Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response.
 
-Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
+Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one. Patch the general root behavior, not only the visible case.
 
 ====================================================================
 LANGUAGE-SPECIFIC COMPLETENESS RULES
@@ -2477,6 +2913,12 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 **TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
+
+**Python:** Preserve existing typing style; do not add annotations to untyped code unless required; avoid broad `except Exception`; reuse existing exceptions and fixtures.
+
+**JS/TS:** Preserve CJS vs ESM and async style; avoid `any` unless nearby code uses it; do not change package-manager files unless required.
+
+**Shell/SQL:** Preserve POSIX/bash compatibility, quoting style, naming conventions; minimal reversible migrations only.
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
@@ -2506,6 +2948,54 @@ SAFETY
 No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
 
 Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
+
+====================================================================
+FAILURE RECOVERY AND COMMAND ECONOMY
+====================================================================
+
+If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
+
+A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
+
+====================================================================
+REFERENCE PATCH SHAPE
+====================================================================
+
+Each duel round scores you 50% on patch similarity to a hidden Cursor reference patch and 50% on an independent LLM judge that compares your diff against the issue/reference. Both reward the same shape:
+
+- Same files touched as the reference (focused, not broader).
+- Same kind of edit (one-line substitution mirrors one-line substitution; small guarded block replacement mirrors small guarded block replacement; do not turn a 3-line fix into a 30-line refactor).
+- Comparable insertion / removal balance — if the task obviously requires removals (issue says "remove X" or "replace Y with Z"), your patch MUST contain real deletion lines, not just additions on top of the old code.
+- Zero unrelated churn — every formatter / whitespace / comment-reordering / import-shuffle / drive-by rename costs you on BOTH halves of the score, never gains anything.
+
+Hunks that contain only blank-line, whitespace, or comment-only changes are silently dropped by the harness before submission, so spending tokens on them is pure waste. Do not emit them.
+
+====================================================================
+EDIT-FIRST DISCIPLINE (PATCH FALLBACK)
+====================================================================
+
+The validator scores `patch = git diff` of the working tree. Two failure modes return an empty patch and lose the round outright:
+
+- You write `<final>` while the working tree is unchanged (you described a fix but never ran a `sed -i` / `python -c` / heredoc that wrote it to disk).
+- You emit a unified-diff block in your message body and assume the harness applied it.
+
+To avoid both: every fix MUST be made by an actual edit command that mutates a tracked file before `<final>`. Use `sed -i`, `python - <<'PY' ... PY`, or `cat > path <<'EOF' ... EOF`. After the edit, run `git diff --stat` to confirm the working tree shows the expected changes; do not trust your edit blindly.
+
+The harness has a last-resort recovery that scans your conversation for any `diff --git ...` block you emitted and tries `git apply` on it when the working tree is otherwise empty. This is purely a safety net — it only fires when you would have lost the round, and partial application is the best it can do. Always prefer making the edit directly; rely on the salvage only if the interactive edit path is genuinely blocked.
+
+====================================================================
+FINAL ANSWER
+====================================================================
+
+When done, emit only:
+
+<final>
+Changed [file/function] to [brief root-cause fix]. Added/updated [test] if applicable. Verified with [command], or explain why verification could not be run.
+</final>
+
+Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
+
+You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 '''
 
 
@@ -2818,8 +3308,9 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     it must not guess blindly or touch unrelated files."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "EMERGENCY: after all refinement attempts your patch is still empty, "
-        "so the task is not solved yet.\n\n"
+        "EMERGENCY: after all refinement attempts your patch is still empty. "
+        "An empty patch is strictly worse than any plausible code edit — "
+        "even a partially-wrong fix is better than no fix at all.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE task-supported code edit consistent with the issue. Pick the most "
@@ -3076,6 +3567,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    # Recent-command memo: skip identical commands across the last N turns.
+    # When the model loops on the same inspection (`cat foo.py`, `cat foo.py`,
+    # `cat foo.py`), each repetition burns wall-clock without changing
+    # state. Skipping with a synthetic observation forces the model to pick
+    # something else instead of replaying a no-op.
+    recent_command_memo: List[str] = []
+    recent_command_memo_max = 4
+    skipped_duplicates_in_run = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3402,10 +3901,56 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                # Duplicate-command skip: if this exact command was already
+                # run in one of the last `recent_command_memo_max` slots,
+                # short-circuit with a synthetic observation so the model
+                # is pushed to try something different. Edit/verification
+                # commands (`sed -i`, `pytest`, etc.) are intentionally
+                # exempt — reruns of those are usually legitimate (apply
+                # then verify; verify after fix). The skip only fires on
+                # idempotent inspection commands.
+                normalized = re.sub(r"\s+", " ", command.strip())[:240]
+                is_idempotent_inspection = bool(
+                    re.match(
+                        r"^(cat|head|tail|ls|tree|file|wc|stat|grep|rg|find|"
+                        r"git\s+(diff|status|log|show|ls-files|grep)|sed\s+-n)\b",
+                        normalized,
+                        re.IGNORECASE,
+                    )
+                )
+                if (
+                    is_idempotent_inspection
+                    and normalized in recent_command_memo
+                ):
+                    skipped_duplicates_in_run += 1
+                    skip_msg = (
+                        f"OBSERVATION {command_index}/{len(command_batch)}:\n"
+                        "COMMAND:\n"
+                        f"{command}\n\n"
+                        "EXIT_CODE:\n0\n\n"
+                        "DURATION_SECONDS:\n0.000\n\n"
+                        "STDOUT:\n"
+                        "[skipped: identical inspection command was already "
+                        "run in a recent turn — switch to a different file, "
+                        "a narrower region, or make the edit now]\n"
+                    )
+                    observations.append(skip_msg)
+                    logs.append(
+                        f"\nDUPLICATE_COMMAND_SKIPPED ({skipped_duplicates_in_run}):\n  {command[:160]}"
+                    )
+                    continue
+                recent_command_memo.append(normalized)
+                if len(recent_command_memo) > recent_command_memo_max:
+                    recent_command_memo = recent_command_memo[-recent_command_memo_max:]
+
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                if out_of_time():
+                    logs.append("WALL_CLOCK_STOP_MID_BATCH: time exhausted between commands")
+                    break
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -3474,6 +4019,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        # Empty-patch salvage: when the loop exits with no working-tree
+        # changes, try to recover by applying any unified diff the model
+        # emitted in its conversation. Most rounds hit zero similarity on
+        # empty patches; a partially-correct salvaged diff is strictly
+        # better than nothing. This fires AFTER all refinement gates have
+        # already had a chance to push the model into making the edit
+        # itself.
+        if not patch.strip():
+            salvaged = _salvage_patch_from_messages(repo, messages)
+            if salvaged:
+                logs.append(
+                    "EMITTED_DIFF_SALVAGE:\n"
+                    "Applied a unified diff block extracted from the model's "
+                    "conversation because the working tree was empty."
+                )
+                patch = get_patch(repo)
+
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3494,6 +4056,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 patch = get_patch(repo)
             except Exception:
                 pass
+            # Salvage path also fires on fatal errors: if `messages` exists
+            # in scope and the working tree is still empty, try the diff
+            # extraction one more time before giving up. `messages` is
+            # local to the try block so guard with locals() lookup.
+            if not patch.strip() and "messages" in locals():
+                try:
+                    if _salvage_patch_from_messages(repo, locals()["messages"]):
+                        patch = get_patch(repo)
+                        logs.append("EMITTED_DIFF_SALVAGE_AFTER_FATAL: recovered patch from conversation.")
+                except Exception:
+                    pass
 
         return AgentResult(
             patch=patch,
@@ -3512,30 +4085,38 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-    ]
+    _NONZERO_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
 
     good_markers = [
         " passed",
         " all passed",
         " tests passed",
         "success",
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+    ]
+
+    static_bad_markers = [
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+        "exception",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(_NONZERO_FAIL_RE.search(lower))
+        or any(marker in lower for marker in static_bad_markers)
+    )
+    if stderr_body and (
+        bool(_NONZERO_FAIL_RE.search(stderr_body))
+        or any(marker in stderr_body for marker in static_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
