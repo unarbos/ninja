@@ -109,10 +109,6 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
-_STEP_MIDPOINT_TRIGGER = 12
-_PLANNING_PHASE_STEPS = 4   # steps 1-4 = exploration only; <final> blocked
-_STEP_MIDPOINT_LINE_FLOOR = 5
-
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -634,6 +630,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -721,6 +718,18 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual old/new-mode metadata lines that survived _strip_mode_only_file_diffs."""
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1005,7 +1014,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1023,7 +1035,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        per_file_budget = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
@@ -2557,7 +2570,6 @@ Repository summary:
 {repo_summary}
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
-Steps 1-{_PLANNING_PHASE_STEPS} are exploration: read files and build your complete plan before writing any code. Do not emit <final> before step {_PLANNING_PHASE_STEPS + 1}.
 {update_hint}If the issue has N numbered bullets, your `<plan>` must have at least N requirement rows.
 Number each planned change as a separate step.
 
@@ -2884,33 +2896,6 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 
 
 
-def _step_midpoint_advisory(step_num: int, patch: str) -> Optional[str]:
-    if step_num != _STEP_MIDPOINT_TRIGGER:
-        return None
-    n = sum(1 for ln in patch.splitlines() if ln.startswith(('+', '-')) and len(ln.strip()) > 1)
-    if n >= _STEP_MIDPOINT_LINE_FLOOR:
-        return None
-    return (
-        f"Step {step_num}: patch has only {n} substantive edit(s). "
-        "Ensure ALL issue requirements are addressed before finalizing. "
-        "Add any missing integration points now."
-    )
-
-
-def _planning_phase_guard(step_num: int, response_text: str) -> Optional[str]:
-    """Returns a nudge if the model tries to finalize during the planning phase."""
-    if step_num > _PLANNING_PHASE_STEPS:
-        return None
-    if "<final>" not in response_text:
-        return None
-    return (
-        f"Planning phase (step {step_num}/{_PLANNING_PHASE_STEPS}): exploration is not complete yet. "
-        "Do not emit <final> until you have: (1) traced the root cause in the actual files, "
-        "(2) listed every file that needs changing, (3) confirmed all acceptance criteria are covered. "
-        "Continue reading files and building your plan."
-    )
-
-
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -3139,7 +3124,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
-    _step_advisory_sent = False
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3353,6 +3337,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable executable-bit tracking: prevents spurious old/new-mode lines in diffs.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
@@ -3394,16 +3390,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
-
-            if not _step_advisory_sent:
-                _step_adv = _step_midpoint_advisory(step, get_patch(repo))
-                if _step_adv:
-                    _step_advisory_sent = True
-                    logs.append(f"\nSTEP_MIDPOINT_ADVISORY_FIRED: step={step}\n")
-                    messages.append({
-                        "role": "user",
-                        "content": f"[Step advisory]: {_step_adv}",
-                    })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
@@ -3452,13 +3438,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             consecutive_model_errors = 0
             logs.append("MODEL_RESPONSE:\n" + response_text)
-
-            _planning_guard_msg = _planning_phase_guard(step, response_text)
-            if _planning_guard_msg:
-                logs.append(f"\nPLANNING_GUARD_FIRED: step={step}\n")
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": _planning_guard_msg})
-                continue
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
