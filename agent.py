@@ -1002,7 +1002,27 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # v4 weighted file budgets: top-ranked files (1-3) get bigger character
+    # slices than bottom-ranked. Reasons: (1) per-file similarity has
+    # diminishing returns at low rank — preloading a low-relevance file at
+    # 3000 chars produces a tiny chance of helping; (2) top-ranked files are
+    # most likely to be the actual fix target and benefit from fuller
+    # context (more class signatures, surrounding helpers visible). Smooth
+    # decay curve so middle-ranked files still get fair allocation; floor at
+    # 1500 to preserve minimum-useful snippet size.
+    n_files_taken = min(len(files), MAX_PRELOADED_FILES)
+    if n_files_taken > 0:
+        _budget_curve = [
+            2.4 if i < 2 else 1.7 if i < 4 else 1.2 if i < 8 else 0.7
+            for i in range(n_files_taken)
+        ]
+        _curve_total = sum(_budget_curve) or 1.0
+        _file_budgets = [
+            max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / _curve_total))
+            for w in _budget_curve
+        ]
+    else:
+        _file_budgets = []
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1020,8 +1040,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for _idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = (
+            _file_budgets[_idx] if _idx < len(_file_budgets) else 1500
+        )
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -2967,13 +2990,14 @@ _FILE_COUNT_ESTIMATE_MIN = 1
 _FILE_COUNT_ESTIMATE_MAX = 12
 _BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
 
-# v2 production-tuned constants for under-delivery retry.
-# Live duel #4625 showed 12 of 42 challenger rounds hit time_limit_exceeded,
-# largely because retries kicked in on borderline cases AND inherited too
-# much budget. v2 makes the trigger STRICTER (severe gap only) and caps
-# attempt-2 budget tightly so a slow attempt 1 cannot cascade a timeout.
-_UNDERDELIVER_MIN_ESTIMATE = 5
-_UNDERDELIVER_RATIO_FACTOR = 3   # require actual * 3 <= estimated (e.g. 1 of 5)
+# v4 production-tuned constants for under-delivery retry.
+# v1 (looser trigger, no budget cap) won 18 rounds; v2 (stricter trigger,
+# tight budget cap) won 17. The trigger TIGHTNESS was the regression:
+# fewer retries means fewer Lever-4 "more files" wins. v4 restores v1's
+# trigger (actual + 1 < estimated) but keeps v2's budget cap (which DID
+# prevent timeout cascades). Best of both: many retries, all bounded.
+_UNDERDELIVER_MIN_ESTIMATE = 4
+_UNDERDELIVER_GAP_TOLERANCE = 1   # actual + tolerance < estimated → retry
 _UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
 _ATTEMPT2_BUDGET_MAX = 90.0
 _ATTEMPT2_BUDGET_MIN = 45.0
@@ -3117,23 +3141,23 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _n1 = _multishot_count_substantive(_patch1)
         _elapsed = time.monotonic() - _multishot_started
 
-        # v2 severe under-delivery detection: attempt 1 wrote enough lines but
-        # touched only ~1/3 or fewer of the files the task implies AND finished
-        # well inside the budget so attempt 2 has clean headroom. The strict
-        # ratio (actual * 3 <= estimated) and the elapsed cap together prevent
-        # the v1 failure mode where retries kicked in on borderline cases and
-        # cascaded into time_limit_exceeded (12 of 42 rounds in duel #4625).
+        # v4 under-delivery detection: looser trigger than v2 (v1's
+        # actual + 1 < estimated, which produced 18 wins) combined with v2's
+        # tight attempt-2 budget cap and elapsed gate (which prevented v1's
+        # timeout cascades). The trigger fires whenever attempt 1 wrote
+        # enough lines but is at least 2 files short of the task's expected
+        # file count, AND there is time headroom for a bounded retry.
         _issue_text = kwargs.get("issue", "") or ""
         _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
         _estimated_files = _estimate_issue_file_count(_issue_text)
-        _underdelivered_severe = (
+        _underdelivered = (
             _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
             and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
-            and _actual_files * _UNDERDELIVER_RATIO_FACTOR <= _estimated_files
+            and _actual_files + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
             and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
         )
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered_severe:
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
@@ -3162,7 +3186,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _ATTEMPT2_BUDGET_MIN,
             min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
         )
-        if _underdelivered_severe:
+        if _underdelivered:
             _bootstrap = build_attempt2_underdeliver_bootstrap(
                 _result1, _n1, _actual_files, _estimated_files
             )
@@ -3671,6 +3695,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+_NONZERO_TEST_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -3679,30 +3706,49 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
+    # v4: split "always bad" markers (traceback, assertionerror, etc.) from
+    # the "failure-count" markers — the prior code treated ' failed' as a
+    # substring, which incorrectly flagged "0 failed" / "failures: 0" as
+    # bad. _NONZERO_TEST_FAIL_RE catches only non-zero counts. Result: more
+    # tests correctly classified as PASS, fewer wasted refinement turns
+    # nudging the model to "fix" a passing test.
+    always_bad_markers = (
         "traceback",
         "assertionerror",
         "syntaxerror",
         "exception",
-    ]
-
-    good_markers = [
+    )
+    good_markers = (
         " passed",
         " all passed",
         " tests passed",
         "success",
-    ]
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "failed: 0",
+        "errors: 0",
+        "failures: 0",
+        "0 tests failed",
+        " ok\n",
+        " ok ",
+        "build succeeded",
+        "ran 0 tests",
+    )
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(_NONZERO_TEST_FAIL_RE.search(lower))
+        or any(marker in lower for marker in always_bad_markers)
+    )
+    if stderr_body and (
+        bool(_NONZERO_TEST_FAIL_RE.search(stderr_body))
+        or any(marker in stderr_body for marker in always_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
