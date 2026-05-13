@@ -239,21 +239,24 @@ Validation tasks are generated from real GitHub commits. Each task starts from
 the repository before the mined commit, and the reference patch is used to
 construct and filter the task.
 
-Live duel scoring is now 100% dual LLM diff judgment. For each round, the
-validator runs the current king and the challenger on the same task, randomly
-maps their patches to anonymous candidates, and asks the configured judges to
-choose the better patch for correctness, completeness, and alignment with the
-task.
+For duels, the scoring target is the Cursor baseline solution. The validator
+pre-solves each task with Cursor and the current king, then compares both king
+and challenger patches to that same baseline during the duel.
 
-The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-4.6`
-through OpenRouter. If they disagree, they exchange public candidate-labeled
-deliberation notes and retry before the round is finalized.
+Round score is blended: 1/2 Cursor-baseline similarity plus 1/2 LLM diff
+judgment. The live diff judge uses `openai/gpt-5.4` through OpenRouter at
+temperature 0 with medium reasoning effort and a 16000-token output cap, then
+scores the king and challenger patches against the task/reference context.
 
 The challenger needs more decisive round wins than the current king. The
 validator may require an extra win margin in production.
 
+Cursor is only the measuring stick. The challenger does not need to beat Cursor
+directly; it only needs more decisive round wins than the current king plus the
+configured margin.
+
 The validator still compares king and challenger patches for copy detection, but
-that similarity check is separate from the round score.
+that pairwise similarity does not replace the Cursor baseline scoring target.
 
 When a PR challenger becomes king, the validator merges that PR into
 `unarbos/ninja:main`; future miners branch from that new base harness. Validator
