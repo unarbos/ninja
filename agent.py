@@ -108,6 +108,14 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Floor on wall-clock budget before `maybe_queue_refinement` is allowed to
+# queue another model turn. A queued refinement turn takes ~30-40s of inner
+# loop time (a full request/response cycle plus tool execution); below this
+# floor, queueing a turn we cannot finish is strictly worse than returning
+# the on-disk patch verbatim — the agent ends mid-refinement and ships an
+# intermediate state instead of the polished result. Picked above the
+# typical turn length so we exit before queueing rather than after.
+REFINEMENT_MIN_BUDGET_SECONDS = 50.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -3112,6 +3120,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (those are heuristic; test is ground truth from a real runner).
         """
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+
+        # Wall-clock guard: queueing another model turn costs ~30-40s of
+        # inner loop time. Below REFINEMENT_MIN_BUDGET_SECONDS we cannot
+        # safely complete one — starting it produces an intermediate-state
+        # patch on docker-kill rather than the clean refined patch. Exit
+        # the gate entirely so the caller emits <final> with the on-disk
+        # state. Loss-rationale analysis tied ~27% of recent challenger
+        # losses to timeout_or_empty patterns; this gate cuts that mode
+        # without affecting tasks that finish under budget.
+        if time_remaining() < REFINEMENT_MIN_BUDGET_SECONDS:
+            logs.append(
+                f"REFINEMENT_SKIPPED_LOW_BUDGET: remaining={time_remaining():.1f}s "
+                f"floor={REFINEMENT_MIN_BUDGET_SECONDS:.1f}s -- shipping on-disk patch"
+            )
+            return False
+
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3291,8 +3315,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
