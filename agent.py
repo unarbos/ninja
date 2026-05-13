@@ -49,19 +49,21 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 # -----------------------------
@@ -108,6 +110,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_REFINEMENT_MIN_BUDGET = 30.0  # skip refinement gates when budget this low
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -625,6 +628,7 @@ _EDGECASE_GUARDRAIL = (
 
 
 def _sanitize_patch(diff_output: str) -> str:
+    """Remove patch blocks that consistently score as noise, never fixes."""
     if not diff_output.strip():
         return diff_output
 
@@ -721,7 +725,9 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
@@ -734,6 +740,9 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".idea", ".vscode",
+        ".next", ".turbo",
+        ".tox",
     }
     generated_suffixes = {
         ".class",
@@ -1089,6 +1098,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    name_hits = _name_fragment_hits(issue, tracked_set)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1111,6 +1121,10 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Boost files whose paths contain noun fragments from the issue title.
+        # Weaker than symbol-grep (18-42 vs 60-100) — tiebreaks weak-signal rounds.
+        if relative_path in name_hits:
+            score += 18 + min(24, 6 * name_hits[relative_path])
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1638,6 +1652,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".php",
 }
 
 
@@ -2182,32 +2199,6 @@ _DELETION_VERB_RE = re.compile(
 )
 
 
-# Phrases that imply the patch should CREATE a file at a NEW path rather than
-# (or in addition to) editing the old-path file. Covers king_analysis P1:
-# "import path … to the new location", "rebuild as separate components",
-# "move X to Y", "create … under …". Pairs the verb/instruction with a
-# nearby noun ("page"/"file"/"component"/"location"/"path"/"module"/"screen"
-# /"directory") within ~6 intervening words so colloquial uses of "move" or
-# "rebuild" don't fire on unrelated tasks.
-_RELOCATION_PHRASE_RE = re.compile(
-    r"(?:"
-    r"(?:move|relocate|rebuild|extract|split|migrate|reorganize)\s+(?:\S+\s+){0,6}?"
-    r"(?:page|pages|file|files|component|components|module|modules|screen|screens|view|views|directory|folder|location|path)"
-    r"|"
-    r"(?:correct|fix|update|change)\s+(?:the\s+)?import\s+path"
-    r"|"
-    r"(?:create|add)\s+(?:\S+\s+){0,4}?(?:new|separate|standalone)\s+"
-    r"(?:file|page|component|module|screen|view)"
-    r"|"
-    r"to\s+(?:its|a|the)\s+(?:new|own|proper|correct)\s+"
-    r"(?:location|path|directory|folder|module|file)"
-    r"|"
-    r"(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _patch_has_deletions(patch: str) -> bool:
     """True if the patch contains at least one substantive deletion line."""
     for line in patch.splitlines():
@@ -2220,33 +2211,6 @@ def _patch_has_deletions(patch: str) -> bool:
 def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
-
-
-def _issue_implies_relocation(issue_text: str) -> bool:
-    """True if the issue text implies a file should be CREATED at a new path.
-
-    Triggers on phrasing like "correct the import path … to the new location",
-    "rebuild as separate components", "move X to its own file", "create a
-    new screen file". Used by the coverage-nudge gate to detect when the
-    patch only edits the OLD-path file instead of creating a new one.
-    """
-    return bool(_RELOCATION_PHRASE_RE.search(issue_text))
-
-
-def _patch_creates_any_new_file(patch: str) -> bool:
-    """True if the patch contains at least one `new file mode` header.
-
-    Used together with `_issue_implies_relocation` to detect the king's P1
-    half-relocation pattern: issue says "move/relocate/rebuild as new file"
-    but the patch only edits an existing file.
-    """
-    for line in patch.splitlines():
-        if line.startswith("new file mode "):
-            return True
-        # `git mv`-equivalent renames also count as creating-at-new-path.
-        if line.startswith("rename to "):
-            return True
-    return False
 
 
 # -----------------------------
@@ -2334,6 +2298,45 @@ def _symbol_grep_hits(
             if not _context_file_allowed(relative_path):
                 continue
             hits[relative_path] = hits.get(relative_path, 0) + 1
+    return hits
+
+
+_NAME_FRAGMENT_MIN_LEN = 4
+_NAME_FRAGMENT_MAX_LEN = 24
+_NAME_FRAGMENT_STOPWORDS = frozenset({
+    "this", "that", "with", "from", "into", "over", "when", "where", "what", "which",
+    "have", "need", "want", "make", "fix", "bug", "issue", "task", "please", "should",
+    "could", "would", "there", "here", "they", "them", "then", "than", "also", "just",
+    "test", "tests", "file", "files", "line", "lines", "code", "function", "method",
+    "class", "module", "return", "value", "name", "none", "true", "false",
+})
+
+
+def _name_fragment_hits(
+    issue_text: str, tracked: Iterable[str],
+) -> Dict[str, int]:
+    """Score tracked file paths by how many issue-derived noun fragments appear
+    inside the lowercased path. Distinct from _symbol_grep_hits (which scans
+    file contents) — this is a path-level signal so it finds e.g.
+    `services/auth_flow.py` from an issue saying 'authentication flow' even
+    when the file body never uses that word.
+    """
+    fragments: set = set()
+    for match in re.finditer(r"[A-Za-z][A-Za-z_-]{2,}", issue_text):
+        token = match.group(0).lower().strip("_-")
+        if not (_NAME_FRAGMENT_MIN_LEN <= len(token) <= _NAME_FRAGMENT_MAX_LEN):
+            continue
+        if token in _NAME_FRAGMENT_STOPWORDS:
+            continue
+        fragments.add(token)
+    if not fragments:
+        return {}
+    hits: Dict[str, int] = {}
+    for path in tracked:
+        lowered = path.lower()
+        count = sum(1 for frag in fragments if frag in lowered)
+        if count >= 1:
+            hits[path] = count
     return hits
 
 
@@ -2478,8 +2481,6 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
-**Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
-
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
 ====================================================================
@@ -2496,8 +2497,6 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
-
-**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
 ====================================================================
 SAFETY
@@ -2628,35 +2627,15 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
-def build_coverage_nudge_prompt(
-    missing_paths: List[str],
-    issue_text: str,
-    relocation_gap: bool = False,
-) -> str:
+def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
     Incomplete coverage is common on multi-file tasks. When the issue names
     specific files and the draft skips them, surface that gap directly — much
-    cheaper than hoping the self-check catches it. When `relocation_gap` is
-    set, also instruct the model to CREATE a new file at the implied path
-    (king_analysis P1 fix: don't just edit the old-path file).
+    cheaper than hoping the self-check catches it.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
-    relocation_hint = ""
-    if relocation_gap:
-        relocation_hint = (
-            "RELOCATION GAP — the task implies a file should exist at a NEW path "
-            "(phrases like 'move X to Y', 'rebuild as separate components', "
-            "'correct the import path to the new location', 'create a new "
-            "screen/page file'), but your current patch contains NO `new file "
-            "mode` header. The model frequently mis-reads relocation as "
-            "'edit-in-place'. Create the new file at the implied path with "
-            "`cat > path/to/new_file.ext <<'EOF' ... EOF`, then update every "
-            "importer/caller to reference the NEW path. Do not leave the old "
-            "file unchanged unless the task explicitly says to keep both.\n\n"
-        )
     return (
-        f"{relocation_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2867,6 +2846,9 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
+# Grace window added on top of the cooperative budget so a blocking I/O stall
+# that slips past the budget check still gets cut before the docker hard wall.
+_DEADLINE_GRACE_SECONDS = 8.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2963,6 +2945,46 @@ def solve(
     )
 
 
+def _run_with_deadline(
+    fn: Callable[[], Dict[str, Any]],
+    deadline: float,
+    repo: Optional[Path],
+) -> Dict[str, Any]:
+    """Run fn() in a worker thread; if it doesn't return within `deadline`
+    seconds, salvage get_patch(repo) and return immediately. The worker thread
+    is left alive (Python cannot cancel a thread blocked in requests/subprocess);
+    since solve() is about to return to the validator the container is
+    short-lived so this is acceptable.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="solve-deadline"
+    )
+    future = executor.submit(fn)
+    try:
+        result = future.result(timeout=deadline)
+        executor.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        salvage = ""
+        try:
+            if repo is not None:
+                salvage = get_patch(repo)
+        except Exception:
+            salvage = ""
+        cleaned = _sanitize_patch(salvage) if salvage else ""
+        executor.shutdown(wait=False)
+        return AgentResult(
+            patch=cleaned,
+            logs=(
+                f"DEADLINE_SALVAGE: hit hard deadline {deadline:.0f}s; "
+                f"returning on-disk patch ({len(cleaned.splitlines())} lines)."
+            ),
+            steps=0,
+            cost=0.0,
+            success=bool(cleaned.strip()),
+        ).to_dict()
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Run multi-shot solving, salvaging the current patch on unexpected errors."""
     repo_path = kwargs["repo_path"]
@@ -2976,7 +2998,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_started = time.monotonic()
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        _deadline1 = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS)) + _DEADLINE_GRACE_SECONDS
+        _result1 = _run_with_deadline(lambda: _solve_attempt(**kwargs), _deadline1, _multishot_repo_obj)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -3008,7 +3031,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
+        _kwargs2 = {**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap}
+        _result2 = _run_with_deadline(lambda: _solve_attempt(**_kwargs2), _attempt2_budget + _DEADLINE_GRACE_SECONDS, _multishot_repo_obj)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -3143,6 +3167,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
+        remaining = time_remaining()
+        if remaining < _REFINEMENT_MIN_BUDGET:
+            logs.append(
+                f"REFINEMENT_BUDGET_EXHAUSTED: {remaining:.1f}s remaining "
+                f"< _REFINEMENT_MIN_BUDGET={_REFINEMENT_MIN_BUDGET}s; "
+                f"skipping all refinement gates to preserve patch return."
+            )
+            return False
+
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
@@ -3222,32 +3255,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            # king_analysis P1: issue says "move/relocate/rebuild as separate"
-            # but the patch contains no `new file mode` header — the model
-            # only edited the old-path file. Fire the same single-shot
-            # coverage nudge with a relocation-specific hint at the top.
-            relocation_gap = (
-                _issue_implies_relocation(issue)
-                and not _patch_creates_any_new_file(patch)
-            )
-            if missing or relocation_gap:
+            if missing:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
-                if relocation_gap:
-                    logs.append("FIRE: relocation_gap_detected")
-                marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
-                marker = (
-                    "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
-                    + ("\n  [+relocation-gap]" if relocation_gap else "")
-                )
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
-                    ),
-                    marker,
+                    build_coverage_nudge_prompt(missing, issue),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
                 )
                 return True
 
