@@ -630,6 +630,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -717,6 +718,29 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode <N>` and `new mode <N>` lines from any file
+    block that survived `_strip_mode_only_file_diffs`.
+
+    Belt-and-suspenders with the `git config core.fileMode false` setting
+    applied at solve startup: that setting prevents the lines from being
+    generated in the first place, but if it fails to take effect (older
+    git version, sandbox config quirk, alternate diff backend) the lines
+    can still appear. This strip is purely text-level — it removes only
+    metadata lines, never content `+`/`-` lines or hunk headers, so the
+    patch remains structurally valid for the validator's diff applier.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -2168,6 +2192,58 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Reference-category estimation
+# -----------------------------
+#
+# Loss-rationale analysis shows ~37% of confirmation-duel losses cite
+# "missing reference items": files the reference patch touched that
+# our patch did not — tests, route registrations, migration files,
+# manifest entries, sibling components. Most are NOT named in the
+# issue text by path, so `_uncovered_required_paths` cannot catch
+# them. This helper does a cheap keyword scan to infer which file
+# categories the reference is likely to touch, then surfaces those
+# categories to the model via the pre-final enumeration prompt rule
+# in SYSTEM_PROMPT. The model still does the actual completeness
+# check (we can't list specific files without knowing the reference),
+# but having concrete category labels makes the check much more
+# actionable than the generic "enumerate every integration point".
+
+_REFERENCE_CATEGORY_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "test":      ("test ", " test", "tests", "spec ", "specs", "fixture", "fixtures",
+                  "regression"),
+    "deps":      ("dependency", "dependencies", "install", "package.json",
+                  "requirements", "cargo.toml", "pyproject", "poetry"),
+    "migration": ("migration", "migrations", "schema change", "migrate", "alembic"),
+    "route":     ("route", "routes", "endpoint", "endpoints", "/api/", "router",
+                  "url pattern", "url config"),
+    "schema":    ("schema", "interface", "type definition", "data model",
+                  "type signature"),
+    "component": ("component", "page", "screen", "view", "form", "modal", "dialog",
+                  "drawer", "panel"),
+    "docs":      ("readme", "docs", "documentation", "changelog"),
+}
+
+
+def _estimate_likely_categories(issue_text: str) -> List[str]:
+    """Return inferred reference-patch category labels for this issue.
+
+    Pure keyword scan over the issue text; intentionally generic so it
+    works across project types. Output is consumed as a diagnostic log
+    entry and is read by the model when reasoning about plan-row
+    completeness against the PRE-FINAL ENUMERATION CHECK in
+    SYSTEM_PROMPT.
+    """
+    if not issue_text:
+        return []
+    lower = issue_text.lower()
+    out: List[str] = []
+    for category, keywords in _REFERENCE_CATEGORY_KEYWORDS.items():
+        if any(kw in lower for kw in keywords):
+            out.append(category)
+    return out
+
+
+# -----------------------------
 # Deletion-gap detection
 # -----------------------------
 #
@@ -2384,6 +2460,26 @@ focused inspection command
 Never emit markdown fences around `<plan>`, `<command>`, or `<final>`.
 
 Never emit `<final>` before a required code change has been made and verification has been attempted, unless the issue clearly requires no code change.
+
+====================================================================
+PRE-FINAL ENUMERATION CHECK
+====================================================================
+
+Before emitting `<final>`, run `git diff --stat` and confirm:
+
+1. Every `<plan>` row maps to at least one changed file. If a row has no diff entry, either implement it NOW or remove that row from the plan.
+
+2. For feature additions, the reference patch typically touches sibling files even when the issue does not name them. Verify whichever apply:
+   - Test file (next to the existing tests; reuse fixtures, match names)
+   - Route / handler / registration file (if behavior is exposed via HTTP, CLI, or event entrypoint)
+   - Type / schema / interface file (if change extends a public contract)
+   - Migration file (if change extends a database schema)
+   - Component / page / view file (if UI behavior is added — even when the issue only names the feature, not the file)
+   - Dependency manifest (`package.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml`) — only if introducing a NEW external dep
+
+3. Compare your `git diff --stat` file count against your plan-row count. Fewer files than plan rows usually means missing implementation. Either add the files or revise the plan downward, then emit `<final>`.
+
+Skip a category ONLY when it does not apply to this task. NEVER skip "source file with the new behavior" — that is always required. Do NOT inflate the diff with files the task does not imply; over-broad scope is a separate failure mode also penalised.
 
 ====================================================================
 ISSUE CONTRACT
@@ -3279,8 +3375,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable git's executable-bit tracking for this attempt. In this
+        # sandbox the working-tree mode drifts from HEAD's recorded mode
+        # for incidental reasons (container umask, side effects of
+        # `sed -i`, stray chmod). Each drift causes `git diff` to emit
+        # `old mode <N>` / `new mode <N>` metadata lines on otherwise
+        # content-only edits. The reference patch never carries those
+        # lines, so they only widen cursor-similarity distance. Setting
+        # `core.fileMode=false` tells git to ignore mode bits when
+        # computing diffs, so the metadata disappears at the source.
+        # Repo-local config; does not affect any other repo or run.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+
+        # Log inferred reference categories so we can correlate
+        # completeness vs PRE-FINAL ENUMERATION CHECK firing pattern.
+        likely_categories = _estimate_likely_categories(issue)
+        if likely_categories:
+            logs.append(
+                "LIKELY_REFERENCE_CATEGORIES: " + ", ".join(likely_categories)
+            )
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3291,8 +3416,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
