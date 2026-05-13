@@ -958,7 +958,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     Returns `(context_text, included_files)` so late solve steps can drop the
     bulky snippets while keeping a file-name breadcrumb.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Four improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -975,9 +975,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          migrations, UI entry points, package/build files) are appended after
          the direct hits. This improves file targeting on feature tasks without
          displacing the primary target files.
+
+      4. Path-level issue-term matches use document-frequency downweighting
+         (SweRank-style) so tokens that appear in many paths do not dominate.
+         For top-ranked files with symbol hits, preloaded snippets can be
+         excerpt-centered on the first in-file symbol match (SWE-Edit-style
+         focused view) instead of only the file head.
     """
-    files, top_score = _rank_context_files(repo, issue)
+    files, top_score, symbol_hits = _rank_context_files(repo, issue)
     tracked_set = set(_tracked_files(repo))
+    preload_symbols = _extract_issue_symbols(issue)
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
@@ -1025,7 +1032,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
         budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
-        snippet = _read_context_file(repo, relative_path, budget_for_file)
+        use_center = (
+            file_idx < 3
+            and relative_path in symbol_hits
+            and symbol_hits[relative_path] > 0
+            and bool(preload_symbols)
+        )
+        if use_center:
+            snippet = _read_context_file_centered(repo, relative_path, budget_for_file, preload_symbols)
+        else:
+            snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1057,15 +1073,18 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
-def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
-    """Returns (ranked_paths, top_score). top_score is the highest computed
-    score in the scoring pass; callers use it to detect "weak ranking"
-    rounds where no path/identifier signal hit, so the top file is
-    functionally random and the rescue-ranker fallback should fire.
+def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[str, int]]:
+    """Returns (ranked_paths, top_score, symbol_hit_counts).
+
+    top_score is the highest computed score in the scoring pass; callers use
+    it to detect "weak ranking" rounds where no path/identifier signal hit, so
+    the top file is functionally random and the rescue-ranker fallback should
+    fire. symbol_hit_counts maps path -> distinct symbol grep hit count for
+    preload excerpt centering.
     """
     tracked = _tracked_files(repo)
     if not tracked:
-        return [], 0
+        return [], 0, {}
 
     issue_lower = issue.lower()
     path_mentions = _extract_issue_path_mentions(issue)
@@ -1093,6 +1112,10 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                     seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
+    allowed_paths = [p for p in tracked if _context_file_allowed(p)]
+    n_allowed = len(allowed_paths)
+    term_df = _path_term_df(allowed_paths, terms) if terms and allowed_paths else {}
+
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -1110,9 +1133,17 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        for term in terms:
+            if term not in path_lower:
+                continue
+            df = term_df.get(term, 0)
+            score += _idf_path_term_points(df, n_allowed, 3, 1)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
-            score += sum(2 for term in terms if term in path_lower)
+            for term in terms:
+                if term not in path_lower:
+                    continue
+                df = term_df.get(term, 0)
+                score += _idf_path_term_points(df, n_allowed, 2, 1)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
@@ -1132,7 +1163,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Explicit path or backtick-ident match: ranking is strong even if
         # the scored list is empty (mentioned files bypass the score loop).
         top_score = max(top_score, 100)
-    return ranked, top_score
+    return ranked, top_score, symbol_hits
 
 
 # Threshold below which _rank_context_files is treated as "weak signal" and
@@ -1385,6 +1416,99 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+_GREP_FIRST_LINE_RE = re.compile(r"^[^:]+:(\d+):")
+
+
+def _git_first_line_hitting_symbol(repo: Path, relative_path: str, symbols: List[str]) -> Optional[int]:
+    """Return 1-based line number of first symbol hit in file, or None.
+
+    SWE-Edit / context-learning work: centering excerpts on identifier matches
+    surfaces the buggy region inside large files instead of only the file head.
+    """
+    for sym in symbols[:8]:
+        if not sym or not sym.strip():
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-m", "1", "-F", "--", sym, "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0 or not proc.stdout:
+            continue
+        first = proc.stdout.splitlines()[0]
+        m = _GREP_FIRST_LINE_RE.match(first)
+        if not m:
+            continue
+        try:
+            return int(m.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _read_context_file_centered(repo: Path, relative_path: str, max_chars: int, symbols: List[str]) -> str:
+    """Like `_read_context_file` but windows around the first issue-symbol hit."""
+    line_1 = _git_first_line_hitting_symbol(repo, relative_path, symbols)
+    if line_1 is None:
+        return _read_context_file(repo, relative_path, max_chars)
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return _read_context_file(repo, relative_path, max_chars)
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return _read_context_file(repo, relative_path, max_chars)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    idx = max(0, min(len(lines) - 1, line_1 - 1))
+    line_budget = max(24, max_chars // 90)
+    half = line_budget // 2
+    start = max(0, idx - half)
+    end = min(len(lines), start + line_budget)
+    if end - start < line_budget:
+        start = max(0, end - line_budget)
+    header = f"(excerpt lines {start + 1}-{end} of {len(lines)}, near issue symbol match)\n"
+    excerpt = "\n".join(lines[start:end])
+    return _truncate(header + excerpt, max_chars)
+
+
+def _path_term_df(allowed_paths: List[str], terms: List[str]) -> Dict[str, int]:
+    """Document frequency: how many paths contain each issue term (substring).
+
+    SweRank-style signal: downweight terms that hit most of the tree so
+    `utils`/`index` do not drown out discriminative tokens.
+    """
+    out: Dict[str, int] = {}
+    for term in terms:
+        tl = term.lower()
+        out[term] = sum(1 for p in allowed_paths if tl in p.lower())
+    return out
+
+
+def _idf_path_term_points(df: int, n_paths: int, strong: int, weak: int) -> int:
+    """Map (df, corpus size) to 0 / weak / strong path-match points."""
+    if n_paths <= 0 or strong <= 0:
+        return strong
+    # Ultra-common in paths — treat as noise.
+    if df > max(12, (n_paths * 35) // 100):
+        return 0
+    if df > max(4, (n_paths * 12) // 100):
+        return weak
+    return strong
 
 
 # -----------------------------
