@@ -3229,9 +3229,6 @@ Do not write code comments, log messages, or strings containing evaluation-syste
 '''
 
 
-_PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
-_PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
-
 def _is_test_path(relative_path: str) -> bool:
     return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
 
@@ -3854,10 +3851,12 @@ _RELOCATION_PHRASE_RE = re.compile(r"(?:(?:move|relocate|rebuild|extract|split|m
 
 
 def _issue_implies_relocation(issue_text: str) -> bool:
+    """True if issue implies a file should be CREATED at a NEW path."""
     return bool(_RELOCATION_PHRASE_RE.search(issue_text))
 
 
 def _patch_creates_any_new_file(patch: str) -> bool:
+    """True if the patch contains `new file mode` or `rename to` header."""
     for line in patch.splitlines():
         if line.startswith("new file mode ") or line.startswith("rename to "):
             return True
