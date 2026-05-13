@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
@@ -1057,22 +1058,30 @@ _TERM_RARITY_CAP = 8
 _DOC_FREQUENCY_TERM_CAP = 12
 _DOC_FREQUENCY_GREP_TIMEOUT = 3.0
 _DOC_FREQUENCY_MIN_TERM_LEN = 3
+_DOC_FREQUENCY_MAX_WORKERS = 4
+_FAST_MODE_REMAINING_SECONDS = 50.0  # threshold below which cosmetic refinement
+                                      # gates are skipped to preserve budget for
+                                      # the actual edit + verification turn
 
 
 def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
     """Document frequency per term: how many tracked files contain it.
 
     Used to give a rarity bonus on top of the flat per-term ranking score,
-    never a penalty. One fixed-string case-insensitive git-grep per term,
-    capped at _DOC_FREQUENCY_TERM_CAP terms with a short per-call timeout
-    so a wide issue cannot stall the ranker. Returns {} on any failure;
-    callers fall back to _TERM_RARITY_BASE (the prior flat weight).
+    never a penalty. Each git-grep is wrapped in a thread-pool so a wide
+    issue with up to _DOC_FREQUENCY_TERM_CAP terms completes in roughly
+    one grep's worth of wall time instead of N. Each call has its own
+    timeout; one slow grep cannot block the others. Returns 0 for any
+    term that errored, was too short, or was beyond the cap; callers
+    fall back to _TERM_RARITY_BASE in that case.
     """
-    df: Dict[str, int] = {}
-    for term in terms[:_DOC_FREQUENCY_TERM_CAP]:
-        if not term or len(term) < _DOC_FREQUENCY_MIN_TERM_LEN:
-            df[term] = 0
-            continue
+    capped = list(terms[:_DOC_FREQUENCY_TERM_CAP])
+    eligible = [t for t in capped if t and len(t) >= _DOC_FREQUENCY_MIN_TERM_LEN]
+    df: Dict[str, int] = {t: 0 for t in capped}
+    if not eligible:
+        return df
+
+    def _grep_one(term: str) -> int:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
@@ -1082,9 +1091,22 @@ def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
                 timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
                 check=False,
             )
-            df[term] = proc.stdout.count("\n") if proc.returncode == 0 else 0
         except Exception:
-            df[term] = 0
+            return 0
+        if proc.returncode not in (0, 1):
+            return 0
+        return proc.stdout.count("\n")
+
+    workers = max(1, min(len(eligible), _DOC_FREQUENCY_MAX_WORKERS))
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for term, count in zip(eligible, pool.map(_grep_one, eligible)):
+                df[term] = count
+    except Exception:
+        # Threading failure should never poison the ranker; fall back to
+        # the prior sequential read so the caller still sees df=0 → base.
+        for term in eligible:
+            df[term] = _grep_one(term)
     return df
 
 
@@ -3418,7 +3440,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if polish_turns_used < MAX_POLISH_TURNS:
+        # When wall-clock budget is tight, skip cosmetic refinement gates
+        # (polish, self_check). These turns consume an LLM call each and on
+        # a slow model can themselves trigger the docker hard-wall kill.
+        # Live duel #4625 showed 12 of 42 challenger rounds hit
+        # time_limit_exceeded — fast-mode shedding of low-value gates is the
+        # direct mitigation. Correctness-class gates (syntax, test failure,
+        # deletion, coverage) ran above this point and are NOT skipped.
+        budget_tight = time_remaining() < _FAST_MODE_REMAINING_SECONDS
+
+        if not budget_tight and polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
@@ -3430,7 +3461,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+        if not budget_tight and self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
