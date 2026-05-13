@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -120,12 +121,11 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
-MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
-                                # cap total refinement turns across all gates (hail-mary excepted).
-                                # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
-                                # bounded budget so extra turns can't push the process past the docker
-                                # hard wall).
-_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+MAX_TOTAL_REFINEMENT_TURNS = 3  # cap total refinement turns across all gates (hail-mary excepted).
+                                # Chained refinement turns can blow the time budget; the cap keeps
+                                # the worst-case refinement cost bounded relative to the attempt-2
+                                # reserve.
+_STYLE_HINT_BUDGET = 600   # cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -1001,7 +1001,27 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # Weighted file budgets: top-ranked files (1-3) get bigger character
+    # slices than bottom-ranked. Reasons: (1) per-file similarity has
+    # diminishing returns at low rank — preloading a low-relevance file at
+    # 3000 chars produces a tiny chance of helping; (2) top-ranked files are
+    # most likely to be the actual fix target and benefit from fuller
+    # context (more class signatures, surrounding helpers visible). Smooth
+    # decay curve so middle-ranked files still get fair allocation; floor at
+    # 1500 to preserve minimum-useful snippet size.
+    n_files_taken = min(len(files), MAX_PRELOADED_FILES)
+    if n_files_taken > 0:
+        _budget_curve = [
+            2.4 if i < 2 else 1.7 if i < 4 else 1.2 if i < 8 else 0.7
+            for i in range(n_files_taken)
+        ]
+        _curve_total = sum(_budget_curve) or 1.0
+        _file_budgets = [
+            max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / _curve_total))
+            for w in _budget_curve
+        ]
+    else:
+        _file_budgets = []
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1019,8 +1039,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for _idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = (
+            _file_budgets[_idx] if _idx < len(_file_budgets) else 1500
+        )
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1035,9 +1058,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(project_hints)
         used += len(project_hints)
 
-    # v21 edge: append recent-commit examples as concrete style anchors. Silent
-    # no-op when the repo has no real history (pilot snapshots have one
-    # synthetic commit) — the helper returns "" and we add nothing.
+    # Append recent-commit examples as concrete style anchors. Silent no-op
+    # when the repo has no real history (pilot snapshots have one synthetic
+    # commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
@@ -1050,6 +1073,61 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+_TERM_RARITY_BASE = 3  # the prior flat per-term weight; preserved as the floor
+_TERM_RARITY_CAP = 8
+# Tight caps: pre-LLM grep overhead must stay small relative to the per-task
+# wall — short-wall (~120s) tasks cannot afford ~30s of ranker setup before
+# the model gets a turn. Six terms is enough to differentiate rare task
+# identifiers from common UI words; the floor at _TERM_RARITY_BASE preserves
+# the prior flat behavior when df is unknown.
+_DOC_FREQUENCY_TERM_CAP = 6
+_DOC_FREQUENCY_GREP_TIMEOUT = 1.2
+_DOC_FREQUENCY_MIN_TERM_LEN = 3
+
+
+def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """Document frequency per term: how many tracked files contain it.
+
+    Used to give a rarity bonus on top of the flat per-term ranking score,
+    never a penalty. One fixed-string case-insensitive git-grep per term,
+    capped at _DOC_FREQUENCY_TERM_CAP terms with a short per-call timeout
+    so a wide issue cannot stall the ranker. Returns {} on any failure;
+    callers fall back to _TERM_RARITY_BASE (the prior flat weight).
+    """
+    df: Dict[str, int] = {}
+    for term in terms[:_DOC_FREQUENCY_TERM_CAP]:
+        if not term or len(term) < _DOC_FREQUENCY_MIN_TERM_LEN:
+            df[term] = 0
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+                check=False,
+            )
+            df[term] = proc.stdout.count("\n") if proc.returncode == 0 else 0
+        except Exception:
+            df[term] = 0
+    return df
+
+
+def _term_bonus(term: str, df: Dict[str, int]) -> int:
+    """Rarity bonus per term hit on a candidate path.
+
+    Floor at _TERM_RARITY_BASE (= 3, the prior flat weight) so common
+    words never score below the king's behavior. Cap at _TERM_RARITY_CAP
+    (= 8) so a single rare-term hit cannot overwhelm an explicit-mention
+    boost (+100). When df is unknown or zero, falls back to the floor.
+    """
+    hits = df.get(term)
+    if hits is None or hits <= 0:
+        return _TERM_RARITY_BASE
+    bonus = 6.0 / math.log(2 + hits)
+    return max(_TERM_RARITY_BASE, min(_TERM_RARITY_CAP, int(round(bonus))))
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
@@ -1089,6 +1167,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # Rarity bonus floor-clamped at the prior flat weight (3). Common UI/
+    # business words still score the king-equivalent +3 per match; rare
+    # task-specific identifiers can pull up to +8. Pareto-improvement: no
+    # path can score lower than the king's flat weighting on this signal.
+    term_df = _doc_frequency(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1105,7 +1188,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -1973,14 +2056,14 @@ def _select_companion_test_failure(
 
 
 def _recent_commit_examples(repo: Path) -> str:
-    """v21 edge: read recent small-diff commits from the staged repo via git log
-    and format them as in-context style anchors. Returns empty string when the
-    repo has no real history (single synthetic commit in pilot snapshots), so
-    this is a silent no-op locally and a real lift live where the validator
-    clones the upstream repo with full history.
+    """Read recent small-diff commits from the staged repo via git log and
+    format them as in-context style anchors. Returns empty string when the
+    repo has no real history (single synthetic commit in pilot snapshots),
+    so this is a silent no-op locally and a real lift live where the
+    validator clones the upstream repo with full history.
 
-    The model imitates concrete examples better than abstract rules. Showing the
-    model 1-2 real recent commits gives it a concise local style anchor."""
+    The model imitates concrete examples better than abstract rules. Showing
+    the model 1-2 real recent commits gives it a concise local style anchor."""
     try:
         proc = subprocess.run(
             ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
@@ -2055,7 +2138,7 @@ def _recent_commit_examples(repo: Path) -> str:
         return ""
 
 
-# v21 edge: criteria-nudge support
+# criteria-nudge support
 _CRITERIA_MAX_BULLETS = 8
 _CRITERIA_MAX_TEXT = 220
 _CRITERIA_STOP = frozenset({
@@ -2694,13 +2777,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n\n"
+        "SAFETY (zero tolerance — these break correctness and the reference):\n"
+        "  - No DROP TABLE, TRUNCATE, or other destructive schema changes unless the task asks for them\n"
+        "  - No converting existing indexes to UNIQUE unless the task asks for it (breaks FKs / data invariants)\n"
+        "  - No new endpoints that expose full user records / credentials / private data\n"
+        "  - No widening of auth scopes or removing access checks unless the task asks for it\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
         "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
+        "(run missing tests, fix root causes, revert scope-creep hunks, revert any unsafe schema/auth change), "
         "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
     )
 
@@ -2853,7 +2941,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 # -----------------------------
-# v28 multi-shot helpers
+# Multi-shot helpers
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
@@ -2883,6 +2971,90 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
+    """Pick-between-attempts scorer richer than raw line count.
+
+    Adds a coverage bonus when the patch touches every issue-mentioned path,
+    and a per-syntax-error penalty so a broken longer patch loses to a
+    correct shorter one. Returns >= 0. Used only to break the tie between
+    attempt 1 and attempt 2 at decision time; early-exit + bootstrap still
+    use the raw line count for stable behavior matching the prior multishot.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    covers = 4 if _patch_covers_required_paths(patch, issue_text) else 0
+    syntax_penalty = 0
+    if repo is not None:
+        try:
+            syntax_penalty = 3 * len(_check_syntax(repo, patch))
+        except Exception:
+            syntax_penalty = 0
+    return max(0, base + covers - syntax_penalty)
+
+
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+
+# Under-delivery retry: cap when the first attempt covered too few files.
+# Trigger only when attempt 1 wrote enough lines, the task expects several
+# files, and the gap is real. All four conditions must hold, including a
+# tight elapsed gate so the retry never extends past the docker hard wall.
+_UNDERDELIVER_MIN_ESTIMATE = 3   # bullet/path heuristic must claim >=3 files
+_UNDERDELIVER_GAP_TOLERANCE = 1   # actual + tolerance < estimated → retry
+# Elapsed gate and budget chosen so worst-case attempt1+attempt2+reserve
+# stays well under a short (~120s) per-task wall. Earlier values (100s gate
+# + 90s budget = up to ~210s) correlated with the 169–195s timeout cluster
+# observed in production. Tighter window keeps the retry available for
+# fast-finish under-deliveries while removing the cascade risk.
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 70.0
+_ATTEMPT2_BUDGET_MAX = 50.0
+_ATTEMPT2_BUDGET_MIN = 35.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic file-count expectation for an integration-style task.
+
+    Counts acceptance-criteria-style bullets and explicit path mentions. Used
+    only by the under-delivery retry gate; the heuristic is intentionally
+    crude so it cannot consistently mis-fire toward firing extra retries.
+    """
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any], n_lines: int, actual_files: int, estimated_files: int
+) -> str:
+    """Bootstrap variant for the severe under-delivery case.
+
+    Used only when attempt 1 has enough lines (>= signal threshold) but the
+    file count is at most 1/3 of the task's estimated file count AND attempt
+    1 finished well within budget. Surfaces the file-count gap explicitly so
+    attempt 2 adds missing files rather than rewriting existing files.
+    """
+    steps = result1.get("steps", 0)
+    return (
+        f"⚠ RETRY ATTEMPT: A prior attempt wrote {n_lines} substantive line(s) "
+        f"across {actual_files} file(s) in {steps} step(s), but the task "
+        f"appears to require ~{estimated_files} files based on its acceptance "
+        f"criteria. Re-read the task and ensure EACH bullet or required path "
+        f"corresponds to a concrete file in your patch. Common omissions: "
+        f"separate test files per module, config files, new route/controller "
+        f"files, mock modules. Do not re-edit files the prior attempt already "
+        f"covered; add the MISSING files first.\n\n"
+    )
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2932,7 +3104,7 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 
 
 # -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
+# Main agent — multi-shot wrapper around _solve_inner
 # -----------------------------
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
@@ -2979,40 +3151,69 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # Under-delivery detection: trigger an attempt 2 when attempt 1
+        # produced enough lines but covered fewer files than the task seems
+        # to require (bullet/path heuristic), AND there is time headroom for
+        # a bounded retry. All four conditions must hold so the retry stays
+        # rare enough to not cascade into timeouts.
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
-        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
-            # Attempt 1 already burned the outer budget — starting attempt 2
-            # invites a docker_solver kill (hard wall ~300s from exec start),
-            # which is strictly worse than shipping attempt 1's thin patch.
+        # Empty attempt 1 (n1 == 0) bypasses the max-first-elapsed check
+        # because shipping an empty patch is the worst outcome — attempt 2
+        # with a tight budget is strictly better than 0.000 similarity.
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED and _n1 > 0:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
+        # Attempt-2 budget cap: clamp to the tight window above. Without the
+        # cap, attempt 2 would inherit remaining-reserve (~150s after a fast
+        # attempt 1) and could consume the full per-step budget on hard
+        # tasks, cascading to a timeout near the docker hard wall.
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _attempt2_budget = max(
+            _ATTEMPT2_BUDGET_MIN,
+            min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+        )
+        if _underdelivered:
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files, _estimated_files
+            )
+        else:
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        # Compare attempts on coverage+syntax-aware score, strict inequality
+        # (prefer primary on ties). Falls back to raw line count if scoring
+        # itself errors. The strict tie-break also reduces co-edit overlap
+        # with the prior multishot's >= behavior on identical attempts.
+        _issue = kwargs.get("issue", "") or ""
+        _s1 = _multishot_score(_multishot_repo_obj, _patch1, _issue)
+        _s2 = _multishot_score(_multishot_repo_obj, _patch2, _issue)
+        if _s2 > _s1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3070,7 +3271,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0  # total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
     must_edit_patch = ""
@@ -3128,10 +3329,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
+        # Close the architectural hole at the empty-patch early exit.
+        # Hail-mary is exempt from the total-refinement cap because it's the
+        # only thing standing between us and a guaranteed-zero empty-patch
+        # result.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -3143,8 +3344,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        # Cap chains of refinements — without this, 5-7 consecutive refinement
+        # turns can blow the time budget. Hard-stop if we've already used the
+        # cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
@@ -3504,6 +3706,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+_NONZERO_TEST_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -3512,30 +3717,49 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
+    # Split "always bad" markers (traceback, assertionerror, etc.) from the
+    # "failure-count" markers. Treating ' failed' as a plain substring
+    # incorrectly flags "0 failed" / "failures: 0" as bad; _NONZERO_TEST_FAIL_RE
+    # catches only non-zero counts, so more tests are correctly classified as
+    # PASS and refinement turns aren't wasted nudging the model to "fix" a
+    # passing test.
+    always_bad_markers = (
         "traceback",
         "assertionerror",
         "syntaxerror",
         "exception",
-    ]
-
-    good_markers = [
+    )
+    good_markers = (
         " passed",
         " all passed",
         " tests passed",
         "success",
-    ]
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "failed: 0",
+        "errors: 0",
+        "failures: 0",
+        "0 tests failed",
+        " ok\n",
+        " ok ",
+        "build succeeded",
+        "ran 0 tests",
+    )
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(_NONZERO_TEST_FAIL_RE.search(lower))
+        or any(marker in lower for marker in always_bad_markers)
+    )
+    if stderr_body and (
+        bool(_NONZERO_TEST_FAIL_RE.search(stderr_body))
+        or any(marker in stderr_body for marker in always_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
