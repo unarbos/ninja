@@ -120,11 +120,13 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_DUEL_HAZARD_NUDGES = 1 # narrow fixes for repeated king18 duel loss patterns
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
                                 # hard wall).
+PATCH_SOFT_STOP_STEP = 12   # 004641: useful patches lost after 20-30 model calls / timeouts
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -1554,6 +1556,56 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+def _iter_patch_file_blocks(patch: str) -> List[Tuple[str, str]]:
+    blocks: List[Tuple[str, str]] = []
+    for block in re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE):
+        if not block.startswith("diff --git "):
+            continue
+        path = _diff_block_path(block)
+        if path:
+            blocks.append((path, block))
+    return blocks
+
+
+def _duel_hazard_summary(patch: str, issue_text: str) -> str:
+    """Narrow static checks from repeated king18 duel-note losses."""
+    notes: List[str] = []
+    changed = _patch_changed_files(patch)
+    added_lower = _patch_added_text(patch)
+
+    if re.search(r"\[\s*\[[^\]\n]+\]\s+for\s+\w+", patch) or re.search(r"\bfor\s+\w+\s*,\s*\w+\s+of\s+Object\.entries", patch):
+        notes.append("JS/TS patch appears to contain Python-style comprehension syntax; rewrite as Object.entries(...).map(...) or a normal JS loop")
+
+    if (
+        re.search(r"\.(tsx|ts|jsx|js)$", " ".join(changed), re.IGNORECASE)
+        and re.search(r"\b(today|getDate\(\)|currentDay)\s*-\s*1\b|\?\?\s*31\b|\bdaysInMonth\b[^=\n]*=\s*31\b", patch)
+    ):
+        notes.append("calendar/budget logic appears to use fixed 31-day or today-1 math; compute real month length and inclusive current-day behavior")
+
+    if any(re.search(r"(^|/)(mock|mocks|demo|demos|example|examples|fixtures?)/", p, re.IGNORECASE) for p in changed):
+        if re.search(r"\b(page|screen|view|walkthrough|runtime|app|frontend|ui)\b", issue_text, re.IGNORECASE):
+            notes.append("patch edits mock/demo/fixture paths for a runtime UI task; verify the real page/screen/runtime file is also updated")
+
+    if re.search(r"\bsession_state\b|\buseState\b|\blocalStorage\b", patch):
+        if re.search(r"\b(hidden|switch|selected|dynamic|form|submit|pending|first message|contact|lead|chat)\b", issue_text, re.IGNORECASE):
+            notes.append("dynamic form/state flow may preserve stale hidden values; derive payload only from the current visible branch and resume queued actions explicitly")
+
+    if re.search(r"\b(public_key|publicKey|api key|token|new column|field)\b", added_lower):
+        if not re.search(r"\b(alter\s+table|migration|migrations/|ensure[_-]?column|schema)\b", patch, re.IGNORECASE):
+            notes.append("patch adds/passes a persisted field but no migration or ensure-column path is visible; keep existing databases compatible")
+
+    if re.search(r"\b(create\s+unique\s+index|unique\s+index|constraint\s+\S+\s+unique)\b", patch, re.IGNORECASE):
+        notes.append("patch adds UNIQUE/index SQL; ensure uniqueness is explicitly required and no existing cardinality is changed")
+
+    if "filename=\\\"" in patch or "filename=\\'" in patch:
+        notes.append("Content-Disposition filename appears to contain literal escaped quotes; emit normal quoted header parameters")
+
+    if re.search(r"\bverify_jwt\s*=\s*false\b|https?://(?:localhost|127\.0\.0\.1)", patch, re.IGNORECASE):
+        notes.append("Supabase/function config or frontend URL looks unsafe; preserve verify_jwt/env/relative-url conventions unless the issue requires public local access")
+
+    return "; ".join(notes[:3])
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -2442,6 +2494,8 @@ When a change necessarily spans multiple files (interface, signature, type, head
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
+Fresh duel lessons from king18 notes: once a useful patch exists, finish after targeted verification instead of continuing broad exploration; timeout and churn lose many close rounds. For dynamic forms or gated chat/lead flows, do not submit stale hidden state; preserve any pending message/action and resume it after required user data is collected. For calendar/budget math, compute real month length/current-day semantics rather than fixed 31-day or today-1 formulas. For JS/TS, never write Python-style comprehensions, server-component event handlers, or primitive server actions wired directly to forms. For runtime UI work, editing only mocks/demos/examples/fixtures is usually the wrong target unless the issue names them. For persisted fields and public APIs, update migration/ensure-column, read/write/upsert, service/API payloads, serializers/DTOs, and compatible callers. Avoid risky SQL uniqueness/index churn, hardcoded localhost URLs, disabled Supabase JWT, malformed Content-Disposition quotes, and ES module exports in non-module static scripts.
+
 ====================================================================
 TESTS AND VERIFICATION
 ====================================================================
@@ -2848,6 +2902,18 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+def build_duel_hazard_prompt(summary: str, issue_text: str) -> str:
+    return (
+        "Duel-pattern check: your patch matches a repeated king18 loss pattern.\n\n"
+        f"{summary}\n\n"
+        "Make the smallest correction that removes this risk, or if the visible "
+        "code proves the warning is a false positive, finish with <final> and "
+        "state the existing convention you verified. Do not broaden scope.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1400]}\n"
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
@@ -3076,6 +3142,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    duel_hazard_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3178,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, duel_hazard_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3251,6 +3318,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if duel_hazard_nudges_used < MAX_DUEL_HAZARD_NUDGES:
+            hazard = _duel_hazard_summary(patch, issue)
+            if hazard:
+                duel_hazard_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duel_hazard_prompt(hazard, issue),
+                    "DUEL_HAZARD_NUDGE_QUEUED:\n  " + hazard[:180],
+                )
+                return True
+
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
             if junk:
@@ -3296,10 +3377,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+            patch_at_step_start = get_patch(repo)
+            if step >= PATCH_SOFT_STOP_STEP and patch_at_step_start.strip():
+                if maybe_queue_refinement("Soft stop before another model turn."):
+                    continue
+                logs.append(
+                    "PATCH_SOFT_STOP:\n"
+                    "Returning current patch before another model turn to avoid timeout/churn."
+                )
+                success = True
+                break
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
+                modified_files = _patch_changed_files(patch_at_step_start)
                 stripped = _strip_preloaded_section(
                     original_initial,
                     preloaded_files,
