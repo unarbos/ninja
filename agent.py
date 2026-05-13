@@ -108,6 +108,9 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# If we already have a patch after the early solve window, prefer returning it
+# over risking the validator killing the process during another model/tool turn.
+PATCH_SOFT_RETURN_SECONDS = 92.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -2869,6 +2872,13 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
 
+def _patch_soft_return_due(patch: str, solve_started_at: float, *, now: Optional[float] = None) -> bool:
+    if not patch.strip():
+        return False
+    current = time.monotonic() if now is None else now
+    return (current - solve_started_at) >= PATCH_SOFT_RETURN_SECONDS
+
+
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
         return 0
@@ -3296,10 +3306,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+            patch_at_step_start = get_patch(repo)
+
+            if _patch_soft_return_due(patch_at_step_start, solve_started_at):
+                logs.append(
+                    "PATCH_SOFT_RETURN:\n"
+                    "Returning current patch before starting another model/tool turn."
+                )
+                success = True
+                break
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
+                modified_files = _patch_changed_files(patch_at_step_start)
                 stripped = _strip_preloaded_section(
                     original_initial,
                     preloaded_files,
@@ -3409,6 +3428,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
+                    if _patch_soft_return_due(patch, solve_started_at):
+                        logs.append(
+                            "\nPATCH_SOFT_RETURN:\n"
+                            "Returning current patch after command execution before external timeout."
+                        )
+                        success = True
+                        break
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
