@@ -49,7 +49,9 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import math
 import os
 import re
 import shutil
@@ -61,7 +63,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # -----------------------------
@@ -95,9 +97,9 @@ MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modul
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
-# Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
+# Anti-whiff knobs. Empty patches never solve the user's task, so any
+# transient model error or stuck loop directly costs useful repair attempts.
+# Be aggressive about retrying instead of returning early with no edits.
 # Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
 # (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
@@ -108,6 +110,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_REFINEMENT_MIN_BUDGET = 40.0  # skip refinement gates when budget this low
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -120,6 +123,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_COMPLETENESS_NUDGES = 1  # one wiring/artifact turn when code is unreachable or requested collateral is missing
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -748,6 +752,99 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
 
 
+def _safe_repo_child(repo: Path, relative_path: str) -> Optional[Path]:
+    """Resolve a repo-relative path without letting cleanup escape the repo."""
+    try:
+        root = repo.resolve()
+        full = (repo / relative_path).resolve()
+        full.relative_to(root)
+        return full
+    except Exception:
+        return None
+
+
+def _run_git_quiet(repo: Path, args: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _is_mode_only_diff(repo: Path, relative_path: str) -> bool:
+    try:
+        numstat = _run_git_quiet(repo, ["diff", "--numstat", "--", relative_path], timeout=8)
+        summary = _run_git_quiet(repo, ["diff", "--summary", "--", relative_path], timeout=8)
+    except Exception:
+        return False
+    return (
+        numstat.returncode == 0
+        and not (numstat.stdout or "").strip()
+        and "mode change" in (summary.stdout or "")
+    )
+
+
+def _prune_empty_generated_parents(repo: Path, relative_path: str) -> None:
+    generated_parts = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    path = Path(relative_path)
+    for idx in range(len(path.parts), 0, -1):
+        parent = Path(*path.parts[:idx])
+        if not any(part in generated_parts for part in parent.parts):
+            continue
+        full = _safe_repo_child(repo, str(parent))
+        if full is None or not full.exists() or not full.is_dir():
+            continue
+        try:
+            full.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_noise_worktree_paths(repo: Path) -> List[str]:
+    """Physically remove generated/mode-only diff noise before patch collection."""
+    cleaned: List[str] = []
+
+    try:
+        untracked = _run_git_quiet(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    except Exception:
+        untracked = None
+    if untracked is not None and untracked.returncode == 0:
+        for relative_path in [item for item in untracked.stdout.split("\0") if item]:
+            if not _should_skip_patch_path(relative_path):
+                continue
+            full = _safe_repo_child(repo, relative_path)
+            if full is None or not full.exists():
+                continue
+            try:
+                if full.is_dir():
+                    shutil.rmtree(full)
+                else:
+                    full.unlink()
+                cleaned.append(f"removed-untracked:{relative_path}")
+                _prune_empty_generated_parents(repo, relative_path)
+            except Exception:
+                continue
+
+    try:
+        changed = _run_git_quiet(repo, ["diff", "--name-only", "-z"])
+    except Exception:
+        changed = None
+    if changed is not None and changed.returncode == 0:
+        for relative_path in [item for item in changed.stdout.split("\0") if item]:
+            if _should_skip_patch_path(relative_path) or _is_mode_only_diff(repo, relative_path):
+                try:
+                    restored = _run_git_quiet(repo, ["checkout", "--", relative_path], timeout=10)
+                    if restored.returncode == 0:
+                        cleaned.append(f"restored-noise:{relative_path}")
+                except Exception:
+                    continue
+
+    return cleaned[:30]
+
+
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
@@ -1001,7 +1098,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1019,8 +1119,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1050,6 +1151,53 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+_TERM_RARITY_BASE = 3
+_TERM_RARITY_CAP = 8
+_DOC_FREQUENCY_TERM_CAP = 12
+_DOC_FREQUENCY_MIN_TERM_LEN = 3
+_DOC_FREQUENCY_GREP_TIMEOUT = 3.0
+
+
+def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """Count how many tracked files contain each issue term."""
+    df: Dict[str, int] = {}
+    capped_terms = [
+        term for term in terms[:_DOC_FREQUENCY_TERM_CAP]
+        if len(term) >= _DOC_FREQUENCY_MIN_TERM_LEN
+    ]
+    if not capped_terms:
+        return df
+
+    def _grep_count(term: str) -> Tuple[str, int]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+                check=False,
+            )
+        except Exception:
+            return term, 0
+        return term, proc.stdout.count("\n") if proc.returncode == 0 else 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(capped_terms), 6)) as pool:
+        futures = [pool.submit(_grep_count, term) for term in capped_terms]
+        for future in concurrent.futures.as_completed(futures):
+            term, count = future.result()
+            df[term] = count
+    return df
+
+
+def _term_bonus(term: str, df: Dict[str, int]) -> int:
+    """Give rarer issue terms a small ranking bonus, never below the old +3."""
+    hits = df.get(term)
+    if hits is None or hits <= 0:
+        return _TERM_RARITY_BASE
+    bonus = 6.0 / math.log(2 + hits)
+    return max(_TERM_RARITY_BASE, min(_TERM_RARITY_CAP, int(round(bonus))))
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
@@ -1089,6 +1237,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    term_df = _doc_frequency(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1103,9 +1252,9 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 35
         if name_lower and name_lower in issue_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -1158,8 +1307,8 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-    hits: Dict[str, int] = {}
-    for term in terms:
+
+    def _grep_term(term: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
@@ -1170,13 +1319,20 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
                 timeout=3,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if relative_path and relative_path in tracked:
-                hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+
+    hits: Dict[str, int] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
+        futures = {pool.submit(_grep_term, term): term for term in terms}
+        for future in concurrent.futures.as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1255,9 +1411,14 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        path_words = _split_path_tokens(relative_path)
+
+        def _token_in_path(token: str) -> bool:
+            return token in path_words if len(token) < 5 else token in path_lower
+
+        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
+        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
+        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -1530,6 +1691,515 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _iter_patch_file_blocks(patch: str) -> List[Tuple[str, str]]:
+    blocks: List[Tuple[str, str]] = []
+    current_path = ""
+    current_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            if current_path:
+                blocks.append((current_path, "\n".join(current_lines)))
+            current_path = ""
+            current_lines = [line]
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[3].startswith("b/"):
+                current_path = tokens[3][2:]
+        else:
+            current_lines.append(line)
+    if current_path:
+        blocks.append((current_path, "\n".join(current_lines)))
+    return blocks
+
+
+_JS_MANIFEST_RE = re.compile(
+    r"(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$",
+    re.IGNORECASE,
+)
+
+_JS_EXTERNAL_IMPORT_RE = re.compile(
+    r"""^\+\s*(?:import\s+(?:type\s+)?(?:[^'"]+\s+from\s+)?["']([^"'./][^"']*)["']|"""
+    r"""import\s*\(\s*["']([^"'./][^"']*)["']\s*\)|"""
+    r"""require\s*\(\s*["']([^"'./][^"']*)["']\s*\))""",
+    re.MULTILINE,
+)
+
+_NODE_BUILTINS: set = {
+    "assert", "buffer", "child_process", "cluster", "crypto", "dns", "events",
+    "fs", "http", "https", "net", "os", "path", "process", "querystring",
+    "readline", "stream", "string_decoder", "timers", "tls", "tty", "url",
+    "util", "vm", "zlib",
+}
+
+
+def _package_name_from_spec(spec: str) -> str:
+    spec = spec.strip()
+    if spec.startswith("node:"):
+        spec = spec[5:]
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else spec
+    return spec.split("/", 1)[0]
+
+
+def _package_json_declares(repo: Path, package_name: str) -> bool:
+    package_json = repo / "package.json"
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return True
+    for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        deps = data.get(section)
+        if isinstance(deps, dict) and package_name in deps:
+            return True
+    return False
+
+
+def _dependency_manifest_gap_summary(repo: Path, patch: str) -> str:
+    """Catch JS/TS patches that add a new external package import without manifest support."""
+    if not (repo / "package.json").exists():
+        return ""
+    changed = _patch_changed_files(patch)
+    if any(_JS_MANIFEST_RE.search(path) for path in changed):
+        return ""
+    missing: List[str] = []
+    for raw_spec in (m.group(1) or m.group(2) or m.group(3) or "" for m in _JS_EXTERNAL_IMPORT_RE.finditer(patch)):
+        package_name = _package_name_from_spec(raw_spec)
+        if (
+            not package_name
+            or package_name in _NODE_BUILTINS
+            or package_name.startswith(("@/", "~", "#"))
+            or _package_json_declares(repo, package_name)
+        ):
+            continue
+        if package_name not in missing:
+            missing.append(package_name)
+    if not missing:
+        return ""
+    return (
+        "patch adds external JS/TS package import(s) not declared in package.json "
+        f"and does not update a package manifest/lockfile: {', '.join(missing[:6])}"
+    )
+
+
+_SCRIPT_FILE_REF_RE = re.compile(
+    r"(?:^|\s)(?:node|tsx|ts-node|deno\s+run|python3?|bash|sh)\s+([A-Za-z0-9_./-]+\.(?:[cm]?[jt]s|py|sh|mjs|cjs))"
+)
+_DIRECT_SCRIPT_REF_RE = re.compile(r"\b((?:scripts?|bin|tools)/[A-Za-z0-9_./-]+\.(?:[cm]?[jt]s|py|sh|mjs|cjs))\b")
+
+
+def _package_script_reference_gap_summary(repo: Path, patch: str) -> str:
+    """Catch package scripts/config commands that point at files not present in the repo."""
+    touched = set(_patch_changed_files(patch))
+    if "package.json" not in touched and not any(path.endswith("/package.json") for path in touched):
+        return ""
+    existing_or_added = set(touched)
+    missing: List[str] = []
+    for _path, block in _iter_patch_file_blocks(patch):
+        if not _path.endswith("package.json"):
+            continue
+        added_lines = [
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        for line in added_lines:
+            if ":" not in line:
+                continue
+            for regex in (_SCRIPT_FILE_REF_RE, _DIRECT_SCRIPT_REF_RE):
+                for ref in regex.findall(line):
+                    ref = ref.strip().strip("\"'")
+                    if not ref or ref.startswith(("./node_modules/", "node_modules/")):
+                        continue
+                    candidate = ref[2:] if ref.startswith("./") else ref
+                    if candidate in existing_or_added:
+                        continue
+                    full = _safe_repo_child(repo, candidate)
+                    if full is not None and full.exists():
+                        continue
+                    if candidate not in missing:
+                        missing.append(candidate)
+    if not missing:
+        return ""
+    return (
+        "package.json script/config appears to reference file(s) that are not "
+        f"present or added in the patch: {', '.join(missing[:4])}"
+    )
+
+
+def _config_patch_hazard_summary(patch: str) -> str:
+    """Spot config/i18n hazards seen in duel artifacts."""
+    notes: List[str] = []
+    for path, block in _iter_patch_file_blocks(patch):
+        added = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        lower_path = path.lower()
+        if lower_path.endswith("supabase/config.toml"):
+            if re.search(r"\[functions\.[^\]]+\]\s*\n\s*\+\s*\[functions\.", block):
+                notes.append(f"{path}: Supabase function config block appears nested/adjacent without preserving the previous block")
+            if re.search(r"verify_jwt\s*=\s*false", added):
+                notes.append(f"{path}: Supabase function disables JWT verification; keep it enabled unless the task explicitly requires public unauthenticated access")
+            if "entrypoint" not in added and "import_map" not in added and re.search(r"\[functions\.[^\]]+\]", added):
+                notes.append(f"{path}: new Supabase function config lacks explicit entrypoint/import_map wiring")
+        if re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::\d+)?", added):
+            notes.append(f"{path}: patch hardcodes localhost URL; use existing env/config or relative API/function URL")
+        if lower_path.endswith(".php") and re.search(r"\],\s*\];", added):
+            notes.append(f"{path}: PHP array appears to end with `],];`; keep locale arrays syntactically clean")
+        if "/locale/" in lower_path and lower_path.endswith(".php") and re.search(r"'=>\s*'[A-Za-z][^']*(settings|failed|success|email|send)[^']*'", added, re.IGNORECASE):
+            if not re.search(r"(ja_JP|zh_CN|zh_TW|vn_VN|vi_VN|ko_KR|fr_FR|de_DE|es_ES)", path):
+                continue
+            notes.append(f"{path}: non-English locale entry appears to remain in English; translate per locale or reuse existing localized text")
+    return "; ".join(notes[:4])
+
+
+def _general_patch_hazard_summary(patch: str) -> str:
+    """Spot narrow cross-language hazards seen in duel artifacts."""
+    notes: List[str] = []
+    for path, block in _iter_patch_file_blocks(patch):
+        lower_path = path.lower()
+        added_lines = [
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        added = "\n".join(added_lines)
+        if lower_path.endswith((".sql", ".pgsql")):
+            if re.search(r"\bcreate\s+(?:unique\s+)?index\b[^\n]*\bunique\b|\bcreate\s+unique\s+index\b", added, re.IGNORECASE):
+                notes.append(f"{path}: patch adds a UNIQUE index/constraint; verify the task explicitly requires uniqueness and does not change existing cardinality")
+        if re.search(r"\.(ts|tsx|js|jsx|swift)$", lower_path):
+            if re.search(r"\bdaysInMonth\b[^;\n=]*=\s*31\b|\btotalDaysInMonth\b[^;\n=]*=\s*31\b|\?\?\s*31\b", added):
+                notes.append(f"{path}: date/month logic appears to default to 31 days; compute the real month length when possible")
+            if re.search(r"\b(currentDay|today|getDate\(\))\s*-\s*1\b", added):
+                notes.append(f"{path}: daily/month calculation subtracts one from the current day; check for off-by-one against inclusive current-day requirements")
+        if lower_path.endswith(".swift"):
+            if 'URL(fileURLWithPath: "/usr/local/bin/' in added or 'executableURL = URL(fileURLWithPath: "/usr/local/bin/' in added:
+                notes.append(f"{path}: Swift Process uses a hardcoded /usr/local/bin path; prefer /usr/bin/env or the app's existing command resolution")
+            if "waitUntilExit()" in added and "NSWorkspace.shared.open" in added:
+                notes.append(f"{path}: OAuth/browser handoff appears to wait for the CLI process to exit before opening the URL; stream output and open the URL as soon as it appears")
+    return "; ".join(notes[:4])
+
+
+# Heuristic markers for code that adds a persisted DB field/column.  When any of
+# these appear in the added lines for a model/schema file and no migration-like
+# file is touched in the same patch, surface a one-shot nudge so the model adds
+# the missing migration or ensure-column path.  Refined from the king loss in
+# duel 004636 / round 064754 (public_key propagation without ensure-column).
+_MODEL_FIELD_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][\w]*\s*=\s*(?:models?\.|db\.|sa\.|Column\()"  # Django/SQLAlchemy
+    r"|[A-Za-z_][\w]*\s*:\s*Mapped\["                                # SQLAlchemy 2.x
+    r"|@Column\b|@Field\b|@Property\b"                                # decorators
+    r"|t\.(?:string|integer|boolean|datetime|text|float|json|jsonb|uuid)\b"  # Rails/Sequel
+    r"|add_column\b|create_table\b"                                   # Active Record
+    r")",
+    re.MULTILINE,
+)
+_MIGRATION_PATH_RE = re.compile(
+    r"(^|/)(migrations?|db/migrate|alembic|schema\.rb|prisma/migrations|"
+    r"supabase/migrations)/|ensure[_-]?column|alter\s+table",
+    re.IGNORECASE,
+)
+_MODEL_FILE_RE = re.compile(
+    r"(^|/)(models?|schema|entities?)\b|\.(?:prisma|sql)$",
+    re.IGNORECASE,
+)
+
+
+def _migration_gap_summary(patch: str) -> str:
+    """If the patch adds a persisted field/column but no migration-like file is
+    touched, surface a one-shot nudge so existing databases keep working."""
+    if not patch.strip():
+        return ""
+    changed = _patch_changed_files(patch)
+    if any(_MIGRATION_PATH_RE.search(p) for p in changed):
+        return ""
+    candidate_models: List[str] = []
+    for path, block in _iter_patch_file_blocks(patch):
+        if not _MODEL_FILE_RE.search(path):
+            continue
+        added = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if _MODEL_FIELD_RE.search(added):
+            candidate_models.append(path)
+    if not candidate_models:
+        return ""
+    return (
+        f"patch adds field(s) to model/schema in {candidate_models[0]} but "
+        "no migration/ensure-column file is touched; add a migration, "
+        "alembic revision, or runtime ensure-column path so existing "
+        "databases gain the new column"
+    )
+
+
+# Common feature-noun keywords seen in duel issues that imply a dedicated file
+# even when the issue text does not literally name the path. We use this as a
+# narrow hint feeder for the coverage nudge — false positives are limited
+# because we only emit a hint when a tracked file basename actually matches.
+_FEATURE_NOUN_RE = re.compile(
+    r"\b([A-Z][a-z]{2,}(?:[A-Z][a-z0-9]+)?)\b"
+)
+_FEATURE_NOUN_STOPWORDS = frozenset({
+    "The", "This", "That", "These", "Those", "When", "Where", "What", "Which",
+    "While", "After", "Before", "Each", "Either", "Both", "Should", "Must",
+    "Make", "Add", "Update", "Use", "Issue", "Task", "Note", "Test", "Tests",
+    "User", "Users", "Page", "Pages", "View", "Views", "Screen", "Screens",
+    "Component", "Components", "Function", "Method", "Class", "Module",
+    "True", "False", "None", "Null", "Json", "JSON", "Html", "HTML", "CSS",
+})
+
+
+def _implied_target_paths(repo: Optional[Path], issue_text: str, patch: str) -> List[str]:
+    """Tracked files whose basename matches a capitalized feature-noun in the
+    issue but that aren't yet touched by the patch. Returns at most 3 paths."""
+    if repo is None or not issue_text.strip():
+        return []
+    nouns: List[str] = []
+    seen_lower: set = set()
+    for match in _FEATURE_NOUN_RE.findall(issue_text):
+        if match in _FEATURE_NOUN_STOPWORDS:
+            continue
+        lower = match.lower()
+        if lower in seen_lower:
+            continue
+        seen_lower.add(lower)
+        nouns.append(match)
+        if len(nouns) >= 8:
+            break
+    if not nouns:
+        return []
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return []
+    changed = {p.lower() for p in _patch_changed_files(patch)}
+    candidate_exts = (".tsx", ".jsx", ".ts", ".js", ".dart", ".py", ".vue", ".svelte")
+    suggestions: List[str] = []
+    for path in tracked:
+        if path.lower() in changed:
+            continue
+        if not path.lower().endswith(candidate_exts):
+            continue
+        stem = Path(path).stem
+        stem_lower = stem.lower()
+        for noun in nouns:
+            if stem_lower == noun.lower() or stem_lower == (noun.lower() + "s") or stem_lower == (noun.lower() + "_screen") or stem_lower == (noun.lower() + "_page") or stem_lower == (noun.lower() + "_view"):
+                suggestions.append(path)
+                break
+        if len(suggestions) >= 3:
+            break
+    return suggestions
+
+
+_LOCAL_IMPORT_RE = re.compile(
+    r"import\s+(?:type\s+)?\{\s*([^}]+)\s*\}\s+from\s+[\"']([^\"']+)[\"']"
+)
+_JS_TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+
+
+def _split_named_imports(names: str) -> List[str]:
+    out: List[str] = []
+    for part in names.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        name = name.split(" as ", 1)[0].strip()
+        if re.match(r"^[A-Za-z_$][\w$]*$", name):
+            out.append(name)
+    return out
+
+
+def _resolve_local_js_module(repo: Path, importer: str, spec: str) -> Optional[Path]:
+    if not spec.startswith((".", "@/")):
+        return None
+    bases: List[Path] = []
+    if spec.startswith("@/"):
+        tail = spec[2:]
+        bases.extend([repo / "src" / tail, repo / tail])
+    else:
+        bases.append((repo / importer).parent / spec)
+
+    for base in bases:
+        candidates = [base]
+        candidates.extend(Path(str(base) + ext) for ext in _JS_TS_EXTENSIONS)
+        candidates.extend(base / ("index" + ext) for ext in _JS_TS_EXTENSIONS)
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(repo.resolve())
+            except Exception:
+                continue
+            if resolved.exists() and resolved.is_file():
+                return resolved
+    return None
+
+
+def _module_exports_symbol(source: str, name: str) -> bool:
+    escaped = re.escape(name)
+    return bool(
+        re.search(rf"\bexport\s+(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+{escaped}\b", source)
+        or re.search(rf"\bexport\s*\{{[^}}]*\b{escaped}\b", source, re.DOTALL)
+    )
+
+
+def _js_ts_local_import_gap_summary(repo: Optional[Path], imports_by_path: List[Tuple[str, str]]) -> str:
+    if repo is None:
+        return ""
+    for importer, added_block in imports_by_path:
+        for names, spec in _LOCAL_IMPORT_RE.findall(added_block):
+            target = _resolve_local_js_module(repo, importer, spec)
+            if target is None:
+                continue
+            try:
+                source = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            missing = [name for name in _split_named_imports(names) if not _module_exports_symbol(source, name)]
+            if missing:
+                return (
+                    f"{importer}: imports {', '.join(missing[:3])} from `{spec}`, "
+                    "but the local module does not appear to export those symbol(s)"
+                )
+    return ""
+
+
+def _js_ts_patch_hazard_summary(patch: str, repo: Optional[Path] = None) -> str:
+    """Spot tiny JS/TS diff-shape hazards seen in duel artifacts."""
+    notes: List[str] = []
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    if ";rror\")" in added or ";rror')" in added:
+        notes.append("patch contains a malformed edit fragment like `;rror\")`, likely from a damaged catch block")
+    if (
+        "line.match(/^event:" in added
+        and "line.match(/^data:" in added
+        and "eventMatch && dataMatch" in added
+    ):
+        notes.append("SSE parser appears to require `event:` and `data:` on the same line; parse multi-line SSE events instead")
+    if "filename=\\\"" in added or "filename=\\'" in added:
+        notes.append("Content-Disposition filename appears to contain literal escaped quotes; emit normal quoted header parameters")
+    js_added_by_path: List[Tuple[str, str]] = []
+    python_route_seen: Dict[Tuple[str, str], str] = {}
+    for path, block in _iter_patch_file_blocks(patch):
+        if not path.lower().endswith(".py"):
+            continue
+        added_py = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        for owner, method, route in re.findall(
+            r"@([A-Za-z_][\w]*)\.(get|post|put|patch|delete)\s*\(\s*[\"']([^\"']+)[\"']",
+            added_py,
+            re.IGNORECASE,
+        ):
+            key = (method.lower(), route)
+            if key in python_route_seen:
+                notes.append(f"{path}: route `{owner}.{method} {route}` is added more than once; check for duplicate handlers")
+                break
+            python_route_seen[key] = path
+        for route, methods in re.findall(
+            r"@(?:[A-Za-z_][\w]*\.)?route\s*\(\s*[\"']([^\"']+)[\"'][^\n]*methods\s*=\s*\[([^\]]+)\]",
+            added_py,
+        ):
+            method_names = ",".join(sorted(re.findall(r"[\"']([A-Za-z]+)[\"']", methods))).lower()
+            key = (method_names or "any", route)
+            if key in python_route_seen:
+                notes.append(f"{path}: Flask route `{route}` is added more than once; check for duplicate handlers")
+                break
+            python_route_seen[key] = path
+        if re.search(r"@click\.group\([^\n]*\)\s*\ndef\s+[A-Za-z_][\w]*\(", added_py):
+            notes.append(f"{path}: standalone `@click.group` added; attach it to the root CLI with `@main.group` or `main.add_command(...)`")
+        if re.search(r"send_file\s*\([^)]*(?:filename|filepath|path)", added_py) and not re.search(r"safe_join|secure_filename|resolve\(\)|relative_to", added_py):
+            notes.append(f"{path}: file-serving route uses a request-controlled path; validate with safe path joining before send_file")
+    for path, block in _iter_patch_file_blocks(patch):
+        if not path.lower().endswith(".php"):
+            continue
+        added_php = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if "spl_autoload_register" in added_php and "substr($class" in added_php and "str_replace('\\\\', '/'" not in added_php:
+            notes.append(f"{path}: PHP autoloader builds class paths without converting namespace separators to `/`")
+    for path, block in _iter_patch_file_blocks(patch):
+        if not re.search(r"\.(js|jsx|ts|tsx)$", path, re.IGNORECASE):
+            continue
+        lines = block.splitlines()
+        added_lines = [
+            line[1:] for line in lines
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        added_block = "\n".join(added_lines)
+        js_added_by_path.append((path, added_block))
+        if re.search(r"\bf[\"'][^\"'\n]*\{[^\"'\n]*\}", added_block):
+            notes.append(
+                f"{path}: Python-style f-string syntax appears in JS/TS; use template literals/backticks or normal string concatenation"
+            )
+        for added_line in added_lines:
+            if re.search(r"^\s*(?:[A-Za-z_$][\w$]*\s*[:=]|return)\s*[\"'][^\"']*$", added_line):
+                notes.append(
+                    f"{path}: normal quoted JS/TS string appears to span lines; use backticks or escaped newline sequences"
+                )
+                break
+        if (
+            re.search(r"^\s*export\s+\{\s*default\s*\}\s+from\s+", added_block, re.MULTILINE)
+            and re.search(r"^\s*export\s+default\b", added_block, re.MULTILINE)
+        ):
+            notes.append(
+                f"{path}: file appears to add both a default re-export and another default export; keep exactly one default export"
+            )
+        for idx, line in enumerate(lines):
+            if line.startswith("+import ") and not line.startswith("+++"):
+                window = lines[idx + 1: idx + 8]
+                if any(re.match(r"^[ +][\"']use client[\"'];?\s*$", candidate) for candidate in window):
+                    notes.append(f"{path}: import added before `'use client'`; keep the directive first in client components")
+                    break
+        if re.search(r"/(?:public|static|assets|templates?)/", "/" + path) and re.search(
+            r"^\s*export\s+(?:async\s+)?(?:function|const|let|var)\b",
+            added_block,
+            re.MULTILINE,
+        ):
+            notes.append(
+                f"{path}: static/public script appears to add ES module `export`; verify the file is loaded as a module or attach APIs to the existing namespace"
+            )
+        if re.search(r"<button\b(?:(?!\btype=)[^>])*>(?:(?!</button>).)*(forgot|show|hide|toggle|close|cancel|eye|password)", added_block, re.IGNORECASE | re.DOTALL):
+            notes.append(f"{path}: non-submit UI button inside form-like code appears to omit `type=\"button\"`; avoid accidental form submission")
+        if re.search(r"\.(?:tsx|jsx)$", path) and re.search(r"\bd\.set\(\s*\{\s*[A-Za-z_$][\w$]*\s*:", added_block):
+            notes.append(f"{path}: settings/store keys are added via `set`; verify each key exists in the store/provider/schema before inventing names")
+    form_actions: set = set()
+    action_signatures: Dict[str, str] = {}
+    route_seen: Dict[Tuple[str, str], str] = {}
+    for path, added_block in js_added_by_path:
+        for name in re.findall(r"<form\b[^>]*\baction=\{\s*([A-Za-z_$][\w$]*)\s*\}", added_block):
+            form_actions.add(name)
+        for name, params in re.findall(
+            r"export\s+async\s+function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)",
+            added_block,
+        ):
+            action_signatures[name] = params
+        for method, route in re.findall(
+            r"\b(?:app|router)\.(get|post|put|patch|delete)\s*\(\s*[`\"']([^`\"']+)[`\"']",
+            added_block,
+            re.IGNORECASE,
+        ):
+            key = (method.lower(), route)
+            if key in route_seen:
+                notes.append(f"{path}: route `{method.upper()} {route}` is added more than once; check for duplicate handlers")
+                break
+            route_seen[key] = path
+    for name in sorted(form_actions):
+        params = action_signatures.get(name)
+        if params and "FormData" not in params and re.search(r":\s*(?:string|number|boolean)\b", params):
+            notes.append(
+                f"form action `{name}` appears to be used directly but its server-action signature takes primitive params; direct form actions receive FormData"
+            )
+            break
+    local_gap = _js_ts_local_import_gap_summary(repo, js_added_by_path)
+    if local_gap:
+        notes.append(local_gap)
+    return "; ".join(notes[:4])
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1539,9 +2209,8 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
-    the gap to the model directly is the cheapest way to close it.
+    which files the task says to edit but that haven't been touched. Surfacing
+    the gap directly is the cheapest way to close incomplete multi-file fixes.
     """
     required = _extract_issue_path_mentions(issue_text)
     if not required:
@@ -1552,6 +2221,83 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+_INTEGRATION_ISSUE_HINTS: Tuple[str, ...] = (
+    "route", "routing", "router", "page", "screen", "view", "sidebar",
+    "navigation", "nav", "menu", "endpoint", "api", "controller", "service",
+    "handler", "wire", "integrate", "dashboard",
+)
+
+_INTEGRATION_ENTRYPOINT_RE = re.compile(
+    r"(^|/)(app|main|index|router|routes|urls|sidebar|navigation|nav|menu|"
+    r"controller|controllers|service|services|api|server|layout|dashboard)"
+    r"([./_-]|$)|"
+    r"(App|Main|Router|Routes|Sidebar|Navigation|Nav|Menu|Controller|Service|Layout|Dashboard)\."
+)
+
+_IMPLEMENTATION_FILE_RE = re.compile(
+    r"(^|/)(components?|pages?|views?|screens?|features?|modules?|services?|controllers?|api)/"
+    r"|[A-Z][A-Za-z0-9_]*(Page|View|Screen|Component|Panel|Card|Form|Modal|Controller|Service)\."
+)
+
+
+def _integration_gap_summary(patch: str, issue_text: str) -> str:
+    """Heuristic for patches that add code but may not wire it into entrypoints."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    if not any(hint in issue_lower for hint in _INTEGRATION_ISSUE_HINTS):
+        return ""
+    changed = _patch_changed_files(patch)
+    if not changed or any(_INTEGRATION_ENTRYPOINT_RE.search(path) for path in changed):
+        return ""
+    implementation_paths = [path for path in changed if _IMPLEMENTATION_FILE_RE.search(path)]
+    added = _patch_added_text(patch)
+    added_mentions_integration = bool(
+        re.search(
+            r"\b(route|routes|router|navigate|navigation|sidebar|menu|endpoint|"
+            r"controller|service|handler|app\.|urlpatterns|path\(|Route\b|"
+            r"useNavigate|Link\b|NavLink|RouterProvider)\b",
+            added,
+        )
+    )
+    if not implementation_paths and not added_mentions_integration:
+        return ""
+    examples = ", ".join((implementation_paths or changed)[:6])
+    return (
+        "patch adds implementation-like files or code but no obvious route/nav/API "
+        f"entrypoint was touched. Changed implementation paths: {examples}"
+    )
+
+
+_ARTIFACT_REQUESTS: Tuple[Tuple[str, Tuple[str, ...], "re.Pattern[str]"], ...] = (
+    ("tests", ("test", "tests", "testing", "regression", "spec"), re.compile(r"(^|/)(tests?|__tests__|specs?)/|(_test|test_|\.test\.|\.spec\.)", re.IGNORECASE)),
+    ("docs", ("doc", "docs", "documentation", "readme", "guide", "adr"), re.compile(r"(^|/)(docs?|adr|guides?)/|(^|/)(readme|changelog|adr)[^/]*\.(md|rst|txt)$", re.IGNORECASE)),
+    ("version/package metadata", ("version", "bump", "package.json", "pyproject", "pom.xml", "gradle", "cargo.toml"), re.compile(r"(^|/)(package\.json|pyproject\.toml|pom\.xml|build\.gradle|build\.gradle\.kts|cargo\.toml|setup\.py|setup\.cfg|pubspec\.yaml|composer\.json)$", re.IGNORECASE)),
+    ("schema/migration", ("schema", "migration", "migrations", "sql", "prisma", "ddl"), re.compile(r"(^|/)(migrations?|schema|prisma)/|schema\.(sql|prisma)$|\.(sql)$", re.IGNORECASE)),
+    ("i18n/locale", ("i18n", "locale", "locales", "translation", "translations", "lang"), re.compile(r"(^|/)(i18n|locales?|lang|translations?)/|\.(po|pot|strings)$", re.IGNORECASE)),
+    ("fixture/sample", ("fixture", "fixtures", "sample", "example"), re.compile(r"(^|/)(fixtures?|samples?|examples?)/", re.IGNORECASE)),
+)
+
+
+def _issue_has_artifact_hint(issue_lower: str, hints: Tuple[str, ...]) -> bool:
+    return any(re.search(r"(?<![a-z0-9_])" + re.escape(hint) + r"(?![a-z0-9_])", issue_lower) for hint in hints)
+
+
+def _requested_artifact_gap_summary(patch: str, issue_text: str) -> str:
+    """Find explicitly requested artifact classes missing from the patch."""
+    if not patch.strip():
+        return ""
+    issue_lower = issue_text.lower()
+    changed = _patch_changed_files(patch)
+    missing: List[str] = []
+    for label, hints, path_re in _ARTIFACT_REQUESTS:
+        if _issue_has_artifact_hint(issue_lower, hints) and not any(path_re.search(path) for path in changed):
+            missing.append(label)
+    if not missing:
+        return ""
+    return "task text appears to request these artifact(s), but no matching files were touched: " + ", ".join(missing[:6])
 
 
 # -----------------------------
@@ -1644,10 +2390,10 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
+    Reviewers and compilers catch "extra closing brace" / "duplicate brace"
+    regressions quickly. This naive counter ignores braces inside string and
+    comment context (best-effort) and reports an imbalance with file + count
+    delta.
     """
     full = (repo / relative_path).resolve()
     try:
@@ -1739,7 +2485,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model and targeted verification.
         if result:
             errors.append(result)
     return errors
@@ -2312,8 +3058,8 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_symbol(symbol: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -2324,16 +3070,21 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked_set
+            and _context_file_allowed(line.strip())
+        ]
+
+    hits: Dict[str, int] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        futures = {pool.submit(_grep_symbol, symbol): symbol for symbol in symbols}
+        for future in concurrent.futures.as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     return hits
 
 
@@ -2415,6 +3166,38 @@ When several fixes are correct, choose the one that changes fewest files, smalle
 
 When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
 
+For aggregate/API behavior, search existing settings/config/service helpers before writing formulas. Preserve existing semantics such as include/exclude flags, freshness helpers, period resolution, access checks, and response shapes instead of creating parallel ad hoc logic.
+
+When adding property access on an existing API object, inspect the type/interface, serializer, or nearby existing usage first. Prefer established fields such as `thumbnail_url` / `image_url` over invented aliases like `thumbnail`, and update every consumer only when the data model truly changes.
+
+When adding settings/store-backed UI, inspect the store/provider/schema first and use exact existing keys, setter names, units, and derived-mode flags. Do not invent nearby-sounding names.
+
+When defining a helper passed to a framework callback (`map`, `map_dataframe`, route/action handler, event callback, serializer hook), verify the caller supplies every required positional parameter. If the framework controls invocation, use keyword arguments, defaults, or a wrapper so the callback cannot fail due to a missing argument.
+
+For Next.js/server actions used by `<form action={...}>`, remember the framework passes `FormData` unless you explicitly bind/wrap arguments. Do not wire a primitive `(id: string)` action directly to a form.
+
+For CLI frameworks, defining a command function is not enough; register it on the actual root command/group the executable invokes. Match the existing decorator style (`@main.command`, `@app.command`, `main.add_command`, etc.).
+
+For package scripts or config entries that invoke a file (`node scripts/x.js`, `bash bin/x`, `python tools/x.py`), ensure that file already exists or is created in the same patch. Do not point scripts at a filename that differs from the file you added.
+
+For Supabase/functions config, preserve existing `[functions.*]` blocks cleanly. Add the new function as its own block with the repo's established `entrypoint`, `import_map`, and `verify_jwt` convention; do not hardcode localhost function URLs in frontend code.
+
+For i18n/localization tasks, update every layer the existing app uses: backend locale entries, frontend/template `data-i18n` bindings, header/loader registration, and CSS/layout when requested. Use the locale helper already present in the controller rather than raw env access, and translate non-English locale files instead of copying English text.
+
+For gated flows (lead capture, onboarding, identity required before chat/API call), collect required user data before the protected action, keep the pending message/action, then resume that exact action after the form submits.
+
+For OAuth/browser handoff flows that launch a CLI, do not hardcode machine-specific binary paths. Prefer existing command resolution or `/usr/bin/env`, stream stdout/stderr, extract the auth URL as soon as it appears, and keep loading/error state accurate until the existing recheck/preflight confirms completion.
+
+For form/UI redesign tasks that mention visible labels, styled labels, or exact row structure, preserve labels unless the issue explicitly says to hide/remove them. Do not use collapsed/hidden labels just to achieve layout.
+
+For calendar, budget, or daily-rate logic, compute the actual current month length from date APIs when props/config are absent. Avoid defaulting month length to 31 or dividing by `today - 1` unless the existing code clearly uses that convention.
+
+When adding persisted DB/model fields, include the full propagation path: migration or ensure-column handling for existing databases, read/write/upsert, serializer/API payloads, metadata copies, and call-site compatibility. If a signature must change, add safe defaults or update every caller in the same patch.
+
+In `"use client"` files, import only browser-safe helpers. Do not import from modules that own server routes, filesystem/env access, DB clients, or server-only integrations; create or reuse a client-side wrapper when needed.
+
+Avoid adding a new UI/library dependency unless the issue requires it or the repo already uses it. If using a third-party component, inspect its documented prop and callback names in local types/examples before guessing.
+
 ====================================================================
 SURGICAL EDITING
 ====================================================================
@@ -2446,7 +3229,9 @@ When 3+ consecutive statements share the same shape, prefer a loop / map / list 
 TESTS AND VERIFICATION
 ====================================================================
 
-Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
+Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. When constructing model/state fixtures, copy existing constructors and field shapes exactly instead of inventing plausible rows. Never weaken, skip, delete, or loosen existing tests to pass.
+
+When adding regression fixtures for parsers/binary scanners/cache pickers, make the fixture travel through the same public code path as production. Preserve required prelude bytes, markers, wrappers, cache-clearing setup, and ordering from nearby fixtures instead of asserting only the helper in isolation.
 
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
@@ -2458,7 +3243,7 @@ STYLE, COMMENTS, AND PUBLIC API
 
 Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
 
-Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to maintainers. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
 
@@ -2474,7 +3259,7 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
 
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Before using a new object property or store key, inspect the declared type, store/provider, or adjacent existing usage; do not guess names from UI labels. In client components, keep imports browser-safe and avoid server-only modules. For form/server actions, match the framework's FormData/bind calling convention. Missing one = lower score.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
@@ -2503,9 +3288,9 @@ Do NOT change:
 SAFETY
 ====================================================================
 
-No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
+No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or private validation metadata.
 
-Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
+Do not write code comments, log messages, or strings that discuss evaluator policy or validation outcomes. Keep repository changes focused on the user-visible bug or feature.
 '''
 
 
@@ -2532,11 +3317,19 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them; incomplete solutions usually fail tests or maintainer review.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+
+Before adding a property access on an existing response/model object, verify the exact field name from the type/interface or adjacent usage. Do not invent aliases from UI wording.
+
+Before implementing aggregate endpoint math or state flags, inspect existing settings/config/service helpers and preserve their semantics. For store-backed UI, inspect exact store key names before setting new values. When passing a helper to a framework callback, verify the callback will receive every required argument. In client-side JS/TS files, avoid importing server-only helpers; use a browser-safe wrapper instead.
+
+For buttons inside forms that are not meant to submit (toggle password, forgot password, close/cancel, modal controls), keep `type="button"`.
+
+For package/config/script changes, verify referenced files and config block names exist after the patch. For Supabase functions, avoid localhost URLs and preserve JWT/import-map conventions. For i18n, wire both locale data and the template/loader path.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
@@ -2678,18 +3471,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Review your patch for correctness, completeness, and "
+        "maintainer-quality diff scope:\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE:\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -2776,6 +3569,36 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
         "<final>summary</final>.\n\n"
         "Task:\n"
         f"{short}\n"
+    )
+
+
+def build_completeness_nudge_prompt(summary: str, issue_text: str) -> str:
+    return (
+        "Completeness check: your patch may solve a local piece of the task "
+        "without making it reachable, or it may omit an explicitly requested "
+        "supporting artifact/manifest update, or it may contain a small JS/TS "
+        "diff-shape hazard that breaks runtime behavior.\n\n"
+        f"{summary}\n\n"
+        "Before finalizing, inspect the relevant convention and make only the "
+        "minimal missing edit: route/router/sidebar/menu wiring, API/controller/"
+        "service registration, main/index entrypoint, tests/specs, docs/README, "
+        "version/package metadata, migration/schema, locale file, or fixture. "
+        "For JS/TS data objects, verify field names against local types or "
+        "nearby usage before changing property access. For callback helpers, "
+        "verify framework-provided arguments match the helper signature; direct "
+        "form actions usually receive FormData. For aggregate/API logic, reuse "
+        "existing settings/config/service helpers instead of hardcoding parallel behavior. "
+        "For local named imports, ensure the imported helper is actually exported. "
+        "For CLI commands, ensure the new command is registered on the invoked root group. "
+        "For package scripts/config blocks, verify referenced files and function blocks exist. "
+        "For Supabase/i18n changes, preserve established config/loader conventions. "
+        "For OAuth/browser handoff, avoid hardcoded binary paths and open auth URLs before waiting for process exit. "
+        "For label/date/fixture/schema changes, preserve visible labels, real calendar math, realistic fixtures, and DB migration/call-site compatibility. "
+        "If the patch is already complete through an existing convention, finish "
+        "with <final>summary</final> and name that convention. Do not broaden the "
+        "feature beyond the task.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
     )
 
 
@@ -2867,6 +3690,9 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
+# Grace window added on top of the cooperative budget so a blocking I/O stall
+# that slips past the budget check still gets cut before the docker hard wall.
+_DEADLINE_GRACE_SECONDS = 8.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2963,6 +3789,41 @@ def solve(
     )
 
 
+def _run_with_deadline(
+    fn: Callable[[], Dict[str, Any]],
+    deadline: float,
+    repo: Optional[Path],
+) -> Dict[str, Any]:
+    """Run an attempt in a worker and return the on-disk patch if it stalls."""
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="solve-deadline"
+    )
+    future = executor.submit(fn)
+    try:
+        result = future.result(timeout=deadline)
+        executor.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        salvage = ""
+        try:
+            if repo is not None:
+                salvage = get_patch(repo)
+        except Exception:
+            salvage = ""
+        cleaned = _sanitize_patch(salvage) if salvage else ""
+        executor.shutdown(wait=False)
+        return AgentResult(
+            patch=cleaned,
+            logs=(
+                f"DEADLINE_SALVAGE: hit hard deadline {deadline:.0f}s; "
+                f"returning on-disk patch ({len(cleaned.splitlines())} lines)."
+            ),
+            steps=0,
+            cost=0.0,
+            success=bool(cleaned.strip()),
+        ).to_dict()
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Run multi-shot solving, salvaging the current patch on unexpected errors."""
     repo_path = kwargs["repo_path"]
@@ -2976,7 +3837,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_started = time.monotonic()
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        _deadline1 = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS)) + _DEADLINE_GRACE_SECONDS
+        _result1 = _run_with_deadline(lambda: _solve_attempt(**kwargs), _deadline1, _multishot_repo_obj)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -3008,7 +3870,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
+        _kwargs2 = {**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap}
+        _result2 = _run_with_deadline(lambda: _solve_attempt(**_kwargs2), _attempt2_budget + _DEADLINE_GRACE_SECONDS, _multishot_repo_obj)
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
@@ -3070,6 +3933,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    completeness_nudges_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3094,6 +3958,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
 
+    def clean_worktree_noise() -> None:
+        cleaned_noise = _cleanup_noise_worktree_paths(repo)
+        if cleaned_noise:
+            logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
+
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
 
@@ -3106,12 +3975,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. completeness-nudge — make implementation reachable / add requested artifacts
+            7. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, completeness_nudges_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        clean_worktree_noise()
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3130,8 +4001,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # v20 edge — close the architectural hole at the empty-patch early
         # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
+        # a final empty patch cannot satisfy the task.
         if not patch.strip():
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
@@ -3141,6 +4011,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "HAIL_MARY_QUEUED: patch empty at refinement gate",
                 )
                 return True
+            return False
+
+        remaining = time_remaining()
+        if remaining < _REFINEMENT_MIN_BUDGET:
+            logs.append(
+                f"REFINEMENT_BUDGET_EXHAUSTED: {remaining:.1f}s remaining "
+                f"< _REFINEMENT_MIN_BUDGET={_REFINEMENT_MIN_BUDGET}s; "
+                "skipping refinement gates to preserve patch return."
+            )
             return False
 
         # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
@@ -3204,7 +4083,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge — addressing them is higher-value
+        # express user-visible requirements, so addressing them is higher-value
         # than covering additional file paths.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
@@ -3230,24 +4109,66 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            implied = _implied_target_paths(repo, issue, patch) if not missing else []
+            if missing or relocation_gap or implied:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
-                marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
+                if implied:
+                    logs.append("FIRE: implied_target_paths=" + ",".join(implied))
+                hinted_paths = list(missing) + [p for p in implied if p not in missing]
+                marker_paths = ", ".join(hinted_paths) if hinted_paths else "(no literal paths; relocation-only)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
                     + ("\n  [+relocation-gap]" if relocation_gap else "")
+                    + ("\n  [+implied-targets]" if implied else "")
                 )
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
+                        hinted_paths, issue, relocation_gap=relocation_gap
                     ),
                     marker,
+                )
+                return True
+
+        if completeness_nudges_used < MAX_COMPLETENESS_NUDGES:
+            # v10: collect up to 3 independent hazard categories in one nudge so
+            # a single refinement turn can carry multi-flaw feedback. v8/v9 used
+            # `or` and only surfaced the first hazard, which wasted refinement
+            # budget when several gates fired on the same patch.
+            hazard_sources = (
+                _integration_gap_summary(patch, issue),
+                _requested_artifact_gap_summary(patch, issue),
+                _dependency_manifest_gap_summary(repo, patch),
+                _package_script_reference_gap_summary(repo, patch),
+                _config_patch_hazard_summary(patch),
+                _general_patch_hazard_summary(patch),
+                _migration_gap_summary(patch),
+                _js_ts_patch_hazard_summary(patch, repo),
+            )
+            hazards: List[str] = []
+            for hazard in hazard_sources:
+                if not hazard:
+                    continue
+                if hazard in hazards:
+                    continue
+                hazards.append(hazard)
+                if len(hazards) >= 3:
+                    break
+            completeness_summary = " | ".join(hazards)
+            if completeness_summary:
+                completeness_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_completeness_nudge_prompt(completeness_summary, issue),
+                    "COMPLETENESS_NUDGE_QUEUED:\n  " + completeness_summary[:240],
                 )
                 return True
 
@@ -3292,13 +4213,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
+                clean_worktree_noise()
                 modified_files = _patch_changed_files(get_patch(repo))
                 stripped = _strip_preloaded_section(
                     original_initial,
@@ -3350,8 +4270,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 consecutive_model_errors += 1
                 # If we already have any patch staged in the repo, stop early
                 # and return that patch rather than wiping everything because
-                # the proxy hiccuped. Empty patches score 0; partial patches
-                # can still earn cursor-similarity credit.
+                # the proxy hiccuped. A partial patch can still contain a useful
+                # maintainer-quality repair.
+                clean_worktree_noise()
                 if get_patch(repo).strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
@@ -3382,6 +4303,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 consecutive_no_command += 1
+                clean_worktree_noise()
                 patch = get_patch(repo)
                 if patch.strip():
                     if maybe_queue_refinement(response_text):
@@ -3407,7 +4329,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
+                if out_of_time():
+                    logs.append("WALL_CLOCK_STOP_MID_BATCH: time exhausted between commands")
+                    break
+
                 if step >= 4 or command_index > 1:
+                    clean_worktree_noise()
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
@@ -3437,6 +4364,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "Continue with one command at a time if more work remains."
                 )
 
+            if final is not None:
+                clean_worktree_noise()
             if final is not None and get_patch(repo).strip():
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
@@ -3450,6 +4379,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
+                clean_worktree_noise()
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
@@ -3470,9 +4400,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
+            clean_worktree_noise()
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
+        clean_worktree_noise()
         patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
@@ -3491,6 +4423,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
+                cleaned_noise = _cleanup_noise_worktree_paths(repo)
+                if cleaned_noise:
+                    logs.append("\nRAW_WORKTREE_CLEANUP:\n  " + "\n  ".join(cleaned_noise))
                 patch = get_patch(repo)
             except Exception:
                 pass
@@ -3512,30 +4447,38 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
-        "traceback",
-        "assertionerror",
-        "syntaxerror",
-        "exception",
-    ]
+    nonzero_fail_re = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
 
     good_markers = [
         " passed",
         " all passed",
         " tests passed",
         "success",
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+    ]
+
+    static_bad_markers = [
+        "traceback",
+        "assertionerror",
+        "syntaxerror",
+        "exception",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(nonzero_fail_re.search(lower))
+        or any(marker in lower for marker in static_bad_markers)
+    )
+    if stderr_body and (
+        bool(nonzero_fail_re.search(stderr_body))
+        or any(marker in stderr_body for marker in static_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
