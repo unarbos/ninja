@@ -624,12 +624,58 @@ _EDGECASE_GUARDRAIL = (
 )
 
 
+_CHMOD_INTENT_RE = re.compile(
+    r"\b(chmod|executable|\+x\b|file\s+mode|permission\s+bit|"
+    r"make\s+(?:it\s+)?executable|run(?:nable)?\s+as\s+a\s+script)\b",
+    re.IGNORECASE,
+)
+
+
+def _issue_authorizes_mode_change(issue_text: str) -> bool:
+    """True when the task text suggests mode-bit changes are intended.
+    When True, we preserve mode metadata lines so the patch correctly reflects
+    legitimate chmod operations. When False, we strip mode metadata to remove
+    similarity-score noise from incidental drift.
+    """
+    if not issue_text:
+        return False
+    return bool(_CHMOD_INTENT_RE.search(issue_text))
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode`/`new mode` lines. Belt-and-suspenders with
+    `git config core.fileMode false`. Only removes metadata lines, never
+    content lines or hunk headers."""
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+_V15_ISSUE_TEXT: Optional[str] = None
+
+
+def _set_current_issue(text: str) -> None:
+    """Thread-local-ish stash so _sanitize_patch can check chmod-intent gate."""
+    global _V15_ISSUE_TEXT
+    _V15_ISSUE_TEXT = text
+
+
 def _sanitize_patch(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    # Gated mode-bit strip: SKIP if issue authorizes chmod (preserve legit
+    # mode changes); apply otherwise (eliminate incidental drift noise).
+    if not _issue_authorizes_mode_change(_V15_ISSUE_TEXT or ""):
+        cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -2885,6 +2931,63 @@ def _multishot_count_substantive(patch: str) -> int:
     return n
 
 
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+_BK16_UNDERDELIVER_BULLETS_FLOOR = 4   # tight gate: only fire on truly multi-criteria tasks
+_BK16_UNDERDELIVER_FILES_FLOOR = 4     # AND multi-path
+_BK16_UNDERDELIVER_FILES_GAP = 2           # actual + 2 < estimated → retry
+_BK16_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_BK16_ATTEMPT2_BUDGET_MAX = 90.0
+_BK16_ATTEMPT2_BUDGET_MIN = 45.0
+
+
+def _count_issue_bullets_local(issue: str) -> int:
+    n = 0
+    for raw in (issue or "").splitlines():
+        s = raw.strip()
+        if s.startswith(_BULLET_PREFIXES):
+            n += 1
+    return n
+
+
+def _should_run_retry_for_files(issue_text: str, draft_patch: str, runtime_s: float):
+    """Tight gate for under-delivery retry: ONLY fire when task is clearly
+    multi-file (>=4 bullets AND >=4 paths) AND the first attempt covered
+    fewer files than expected AND we have time budget left.
+    """
+    if runtime_s >= _BK16_UNDERDELIVER_MAX_FIRST_ELAPSED:
+        return False, 0, 0
+    bullets = _count_issue_bullets_local(issue_text or "")
+    if bullets < _BK16_UNDERDELIVER_BULLETS_FLOOR:
+        return False, 0, 0
+    paths = len(set(_extract_issue_path_mentions(issue_text or "")))
+    if paths < _BK16_UNDERDELIVER_FILES_FLOOR:
+        return False, 0, 0
+    estimated_files = max(paths, (bullets + 1) // 2)
+    if estimated_files < 4:
+        return False, 0, 0
+    actual_files = 0
+    if draft_patch:
+        for line in draft_patch.splitlines():
+            if line.startswith("diff --git "):
+                actual_files += 1
+    if actual_files + _BK16_UNDERDELIVER_FILES_GAP >= estimated_files:
+        return False, actual_files, estimated_files
+    return True, actual_files, estimated_files
+
+
+def build_bk16_underdeliver_bootstrap(actual_files: int, estimated_files: int, n_lines: int) -> str:
+    return (
+        f"⚠ RETRY ATTEMPT: A prior attempt wrote {n_lines} substantive line(s) "
+        f"across {actual_files} file(s), but the task appears to require ~"
+        f"{estimated_files} files based on its bullets and explicit path mentions. "
+        f"Re-read the task and ensure EACH required path or feature corresponds "
+        f"to a concrete file in your patch. Common omissions: separate test "
+        f"files per module, config files, new route/controller files, mock "
+        f"modules. Do NOT re-edit files the prior attempt already covered; add "
+        f"the MISSING files first.\n\n"
+    )
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -2979,12 +3082,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # v16 gated under-delivery: ONLY fire on multi-criteria multi-file tasks.
+        _issue_text_v16 = kwargs.get("issue", "") or ""
+        _bk16_should_retry, _bk16_actual, _bk16_estimated = _should_run_retry_for_files(_issue_text_v16, _patch1, _elapsed)
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _bk16_should_retry:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -3001,13 +3108,17 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
+        # hard wall.  v16: clamped 45-90s when fired via under-delivery gate to
+        # keep attempt 2 focused.
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        if _bk16_should_retry:
+            _attempt2_budget = max(_BK16_ATTEMPT2_BUDGET_MIN,
+                                  min(_BK16_ATTEMPT2_BUDGET_MAX,
+                                      _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE))
+            _bootstrap = build_bk16_underdeliver_bootstrap(_bk16_actual, _bk16_estimated, _n1)
+        else:
+            _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
@@ -3279,6 +3390,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Stash issue text for _sanitize_patch's chmod-intent gate.
+        _set_current_issue(issue or "")
+        # Disable executable-bit tracking unless task asks for chmod. Removes
+        # incidental container-umask/sed mode drift from diffs that would
+        # otherwise widen cursor-similarity distance from reference.
+        if not _issue_authorizes_mode_change(issue or ""):
+            try:
+                subprocess.run(
+                    ["git", "config", "core.fileMode", "false"],
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
