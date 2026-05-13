@@ -2743,15 +2743,21 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
-def build_coverage_nudge_prompt(missing_paths: List[str], issue_text: str) -> str:
-    """Tell the model which issue-mentioned paths are still untouched.
-
-    Incomplete coverage is common on multi-file tasks. When the issue names
-    specific files and the draft skips them, surface that gap directly — much
-    cheaper than hoping the self-check catches it.
-    """
+def build_coverage_nudge_prompt(
+    missing_paths: List[str],
+    issue_text: str,
+    relocation_gap: bool = False,
+) -> str:
+    """Tell the model which issue-mentioned paths are still untouched."""
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
+    relocation_hint = ""
+    if relocation_gap:
+        relocation_hint = (
+            "RELOCATION GAP - task implies a file at a NEW path but patch has no "
+            "`new file mode` header. Create the new file then update importers.\n\n"
+        )
     return (
+        f"{relocation_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -4017,6 +4023,20 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+_RELOCATION_PHRASE_RE = re.compile(r"(?:(?:move|relocate|rebuild|extract|split|migrate|reorganize)\s+(?:\S+\s+){0,6}?(?:page|pages|file|files|component|components|module|modules|screen|screens|view|views|directory|folder|location|path)|(?:correct|fix|update|change)\s+(?:the\s+)?import\s+path|(?:create|add)\s+(?:\S+\s+){0,4}?(?:new|separate|standalone)\s+(?:file|page|component|module|screen|view)|to\s+(?:its|a|the)\s+(?:new|own|proper|correct)\s+(?:location|path|directory|folder|module|file)|(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate)", re.IGNORECASE)
+
+
+def _issue_implies_relocation(issue_text: str) -> bool:
+    return bool(_RELOCATION_PHRASE_RE.search(issue_text))
+
+
+def _patch_creates_any_new_file(patch: str) -> bool:
+    for line in patch.splitlines():
+        if line.startswith("new file mode ") or line.startswith("rename to "):
+            return True
+    return False
+
+
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     """Original solve loop, callable through kwargs to avoid re-stating the
     validator-protected parameter signature outside of solve()."""
@@ -4195,15 +4215,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            if missing:
+            relocation_gap = (
+                _issue_implies_relocation(issue) and not _patch_creates_any_new_file(patch)
+            )
+            if missing or relocation_gap:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(missing, issue),
-                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing),
+                    build_coverage_nudge_prompt(missing, issue, relocation_gap=relocation_gap),
+                    "COVERAGE_NUDGE_QUEUED:\n  " + ", ".join(missing)
+                    + (" [relocation_gap]" if relocation_gap else ""),
                 )
                 return True
 
