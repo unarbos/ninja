@@ -108,6 +108,8 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -997,6 +999,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
+    files = _augment_with_directory_siblings(files, tracked_set)
 
     parts: List[str] = []
     included: List[str] = []
@@ -1089,6 +1092,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1111,6 +1115,8 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Boost files whose path/name matches identifier-shaped tokens from the issue.
+        score += 35 * id_boost.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1198,6 +1204,45 @@ def _looks_like_integration_surface(relative_path: str) -> bool:
         return True
     tokens = _split_path_tokens(relative_path)
     return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+_DIRECTORY_SIBLING_BASENAMES = {
+    "layout", "index", "page", "route", "loading", "error", "metadata",
+    "manifest", "head", "template", "_meta", "_root", "styles", "types",
+    "constants", "schema",
+}
+
+
+def _augment_with_directory_siblings(
+    files: List[str], tracked_set: set, limit: int = 3
+) -> List[str]:
+    """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
+
+    Targets high-leverage basenames (layout, index, schema, etc.) that commonly
+    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
+    """
+    try:
+        if not files:
+            return files
+        top = files[0]
+        top_dir = str(Path(top).parent).replace("\\", "/")
+        if top_dir in {"", "."}:
+            return files
+        seen = set(files)
+        siblings: List[str] = []
+        for candidate in tracked_set:
+            if candidate in seen:
+                continue
+            cpath = Path(candidate)
+            if str(cpath.parent).replace("\\", "/") != top_dir:
+                continue
+            if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
+                siblings.append(candidate)
+            if len(siblings) >= limit:
+                break
+        return files + siblings[:limit]
+    except Exception:
+        return files
 
 
 def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
@@ -1530,6 +1575,91 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+_NEW_FILE_RE = re.compile(
+    r"^--- /dev/null\n\+\+\+ b/(.+?)$",
+    re.MULTILINE,
+)
+_RELOCATION_TRIGGERS = re.compile(
+    r"\b(move|rename|extract|belongs under|new location|create a new|convert to)\b",
+    re.IGNORECASE,
+)
+
+
+def _patch_newly_created_files(patch: str) -> List[str]:
+    """Return paths of files created from scratch (--- /dev/null) in the patch."""
+    try:
+        return [m.group(1) for m in _NEW_FILE_RE.finditer(patch)]
+    except Exception:
+        return []
+
+
+def _check_inplace_intent(
+    patch: str, issue_text: str, tracked_set: set
+) -> List[str]:
+    """Return advisories when the patch creates a new file while an existing same-basename file was not edited.
+
+    Catches the 'new file at wrong path instead of in-place refactor' failure mode.
+    Suppressed when the issue contains a relocation trigger phrase.
+    """
+    try:
+        if _RELOCATION_TRIGGERS.search(issue_text):
+            return []
+        advisories: List[str] = []
+        changed = set(_patch_changed_files(patch))
+        for new_path in _patch_newly_created_files(patch)[:6]:
+            new_basename = Path(new_path).name
+            for existing in tracked_set:
+                if existing in changed:
+                    continue
+                if Path(existing).name == new_basename:
+                    advisories.append(
+                        f"created new file {new_path!r} while existing {existing!r} "
+                        "with same name was untouched"
+                    )
+                    break
+            if len(advisories) >= 3:
+                break
+        return advisories
+    except Exception:
+        return []
+
+
+_REMOVED_DEF_RES = (
+    re.compile(r"^-\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^-\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+    re.compile(r"^-\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^-\s*export\s+(?:default\s+)?(?:const|function|class)\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"^-\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+    re.compile(r"^-\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"),
+)
+
+
+def _patch_removed_definitions(patch: str, cap: int = 8) -> List[str]:
+    """Return names of definitions removed by the patch (def/class/function/export/func/fn lines).
+
+    Pure diff-text scan — no subprocess, no I/O. Used to build a caller-audit advisory.
+    """
+    try:
+        seen: set = set()
+        results: List[str] = []
+        for line in patch.splitlines():
+            if not line.startswith("-"):
+                continue
+            for pattern in _REMOVED_DEF_RES:
+                m = pattern.match(line)
+                if m:
+                    name = m.group(1)
+                    if name not in seen:
+                        seen.add(name)
+                        results.append(name)
+                    break
+            if len(results) >= cap:
+                break
+        return results
+    except Exception:
+        return []
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1638,6 +1768,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".php",
 }
 
 
@@ -2299,6 +2432,52 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
+_IDENTIFIER_STOPWORDS = {
+    "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
+    "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
+    "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
+}
+
+_CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
+_HOOK_RE = re.compile(r"\b(use|get|set|fetch|handle|build|create)[A-Z][a-zA-Z0-9_]{2,}\b")
+_SNAKE_RE = re.compile(r"\b([a-z][a-zA-Z0-9]+_[a-z][a-zA-Z0-9_]+)\b")
+
+
+def _issue_identifier_path_boost(
+    issue_text: str, tracked_files: List[str], cap: int = 20
+) -> Dict[str, int]:
+    """Return per-file hit counts for identifier-shaped tokens extracted from the issue text.
+
+    Uses only path-segment substring matching — no I/O, no subprocess.
+    Weight 35 per hit matches the existing path-mention scoring bonus.
+    """
+    try:
+        identifiers: set = set()
+        for m in _CAMEL_RE.finditer(issue_text):
+            tok = m.group(1)
+            if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
+                identifiers.add(tok.lower())
+        for m in _HOOK_RE.finditer(issue_text):
+            if len(identifiers) < cap:
+                identifiers.add(m.group(0).lower())
+        for m in _SNAKE_RE.finditer(issue_text):
+            if len(identifiers) < cap:
+                identifiers.add(m.group(1).lower())
+        if not identifiers:
+            return {}
+        boost: Dict[str, int] = {}
+        for rel in tracked_files:
+            path_obj = Path(rel)
+            basename_lower = path_obj.name.lower()
+            parent_lower = str(path_obj.parent).lower()
+            hits = sum(1 for ident in identifiers if ident in basename_lower or ident in parent_lower)
+            if hits:
+                boost[rel] = hits
+        return boost
+    except Exception:
+        return {}
+
+
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
@@ -2632,6 +2811,7 @@ def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
     relocation_gap: bool = False,
+    removed_names: Optional[List[str]] = None,
 ) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
@@ -2655,8 +2835,17 @@ def build_coverage_nudge_prompt(
             "importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
+    removed_hint = ""
+    if removed_names:
+        names_str = ", ".join(removed_names[:8])
+        removed_hint = (
+            f"AUDIT: this patch removes/renames the following names — "
+            f"verify every caller has been updated: {names_str}. "
+            "Run `git grep` for each before <final> if uncertain.\n\n"
+        )
     return (
         f"{relocation_hint}"
+        f"{removed_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2670,13 +2859,26 @@ def build_coverage_nudge_prompt(
     )
 
 
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
+def build_self_check_prompt(
+    patch: str,
+    issue_text: str,
+    inplace_advisories: Optional[List[str]] = None,
+) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+    advisory_block = ""
+    if inplace_advisories:
+        bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
+        advisory_block = (
+            "\nIN-PLACE EDIT WARNINGS (check before finalizing):\n"
+            f"  {bullets}\n"
+            "If the task is a refactor (not a new-file relocation), fix each by editing "
+            "the EXISTING file rather than creating a new one at a different path.\n"
+        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
@@ -2693,7 +2895,8 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "  - No new helper functions or defensive checks not required by the task\n"
+        f"{advisory_block}\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -2807,6 +3010,63 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
+    )
+
+
+def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+    """Extract file paths recently read by the model from the last `window` log entries.
+
+    Scans for paths surfaced via read_file/cat observations so the mid-loop
+    hail-mary prompt can suggest concrete edit targets. Pure Python; no subprocess.
+    """
+    try:
+        path_re = re.compile(r"(?:^|\s|/|')([A-Za-z0-9_.\-/]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|rb|swift|svelte|md|json|toml|yaml|yml|sh))\b")
+        seen: set = set()
+        results: List[str] = []
+        for entry in logs[-window:]:
+            for m in path_re.finditer(entry):
+                p = m.group(1).lstrip("/")
+                if p and p not in seen and len(p) >= 4:
+                    seen.add(p)
+                    results.append(p)
+                    if len(results) >= 8:
+                        return results
+        return results
+    except Exception:
+        return []
+
+
+def build_mid_loop_hail_mary_prompt(
+    issue_text: str,
+    elapsed: float,
+    budget: float,
+    last_observed_paths: List[str],
+) -> str:
+    """Emergency prompt fired mid-loop when no edit has been made and >55% of wall-clock is gone.
+
+    Tells the model explicitly: stop reading, pick the most likely target file,
+    and emit edit_file commands now.
+    """
+    pct = int(100 * elapsed / budget) if budget > 0 else 55
+    path_hint = ""
+    if last_observed_paths:
+        path_hint = (
+            "\n\nFiles you have already read (most likely candidates for the fix):\n"
+            + "".join(f"  - {p}\n" for p in last_observed_paths[:5])
+        )
+    short_issue = issue_text[:800] if len(issue_text) > 800 else issue_text
+    return (
+        f"MID-LOOP BUDGET ALERT: {pct}% of wall-clock is gone and no code has been edited yet.\n\n"
+        "STOP READING FILES. You must emit edit commands NOW.\n\n"
+        "Pick the single most likely file to fix based on the issue and what you have already read. "
+        "Use `sed -i`, a python heredoc, or `python - <<'PY' ... PY` to make the smallest "
+        "targeted change that addresses the ROOT CAUSE. Do not run broad searches. "
+        "If you are still uncertain, make a best-effort minimal edit to the most plausible location "
+        "and iterate.\n"
+        f"{path_hint}\n"
+        "Task (reminder):\n"
+        f"{short_issue}\n\n"
+        "Emit your edit command(s) now, then run one verification command, then <final>."
     )
 
 
@@ -3070,6 +3330,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    mid_loop_hail_mary_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3245,7 +3506,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
+                        missing, issue, relocation_gap=relocation_gap,
+                        removed_names=_patch_removed_definitions(patch),
                     ),
                     marker,
                 )
@@ -3266,9 +3528,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
+            _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
+                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -3281,6 +3544,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
+        _tracked_set_for_checks: set = set(_tracked_files(repo))
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3322,6 +3586,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            _elapsed_now = time.monotonic() - solve_started_at
+            if (
+                mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
+                and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+                and not get_patch(repo).strip()
+            ):
+                mid_loop_hail_mary_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_mid_loop_hail_mary_prompt(
+                        issue, _elapsed_now, wall_clock_budget,
+                        _recently_observed_paths(logs),
+                    ),
+                })
+                logs.append("MID_LOOP_HAIL_MARY_FIRED")
+                continue
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
