@@ -49,6 +49,8 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
 import os
 import re
@@ -61,7 +63,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 # -----------------------------
@@ -108,6 +110,10 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+# Validator per-task timeout is derived from Cursor elapsed and has a hard
+# 120s floor. The value is not passed into solve(), so preserve any non-empty
+# patch before the external Docker kill can erase the round.
+PATCH_SOFT_RETURN_SECONDS = 92.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -118,8 +124,16 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_LITERAL_NUDGES = 1     # surface exact quoted constants/labels absent from added lines
+MAX_ERROR_NUDGES = 1       # surface missing explicit fallback/retry/error paths
+MAX_DUPLICATE_SYMBOL_NUDGES = 1  # catch added replacement symbols left duplicated
+MAX_REGISTRY_WIRING_NUDGES = 1   # catch leaf-only provider/route/command implementations
+MAX_GENERATED_OUTPUT_NUDGES = 1  # catch generated data files rewritten to empty datasets
+MAX_URL_WORKFLOW_NUDGES = 1  # catch URL/prefill/suggestion flows that only patch one side
+MAX_REPORT_PIPELINE_NUDGES = 1  # catch report/export/table patches that miss UI/backend/data legs
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_LOCKFILE_NUDGES = 1    # package.json dependency changes should keep tracked lockfiles in sync
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -153,7 +167,10 @@ DANGEROUS_PATTERNS = [
     r"\biptables\b",
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
-    r"\bchmod\s+-R\s+777\s+/",
+    # Permission changes show up as mode-only diff churn and have repeatedly
+    # hurt otherwise-correct duel patches. The system prompt forbids chmod, so
+    # enforce that at command time instead of relying only on final cleanup.
+    r"\bchmod\b",
     r"\bcurl\b",
     r"\bwget\b",
     r"\bscp\b",
@@ -162,10 +179,31 @@ DANGEROUS_PATTERNS = [
     r"\bnc\b",
     r"\bncat\b",
     r"\btelnet\b",
-    # Bulk-staging hides working-tree changes from get_patch() (which uses
-    # git diff, not git diff HEAD) and can include .pyc / __pycache__ files
-    # in the submitted patch.  Individual `git add <file>` is not blocked.
-    r"\bgit\s+add\s+(-A|--all|\.)(\s|$)",
+    # Package installs and remote git commands waste the validator sandbox
+    # budget and often modify manifests/lockfiles without solving the issue.
+    r"\bpip3?\s+install\b",
+    r"\bpython3?\s+-m\s+pip\s+install\b",
+    r"\bnpm\s+(install|i|ci|update|add)\b",
+    r"\bpnpm\s+(install|i|add|update)\b",
+    r"\byarn\s+(add|install|upgrade|remove)\b",
+    r"^\s*yarn\s*$",
+    r"\bbun\s+(install|i|add)\b",
+    r"\bcargo\s+(add|install|update)\b",
+    r"\bgo\s+(get|install)\b",
+    r"\bgo\s+mod\s+(download|tidy)\b",
+    r"\bbundle\s+(install|update)\b",
+    r"\bgem\s+install\b",
+    r"\bcomposer\s+(install|require|update)\b",
+    r"\bmvn\s+(install|dependency:resolve|dependency:tree)\b",
+    r"\b(apt|apt-get|yum|dnf|brew|pacman|zypper)\s+install\b",
+    r"\bgit\s+(clone|fetch|pull|push)\b",
+    r"\bgit\s+remote\s+(update|add|set-url)\b",
+    # Staging hides working-tree changes from get_patch() (which uses git diff,
+    # not git diff --cached). No task requires staging inside the solver.
+    r"\bgit\s+add\b",
+    # The solver should never rewrite repo state; losing the working-tree patch
+    # is worse than returning a small imperfect diff.
+    r"\bgit\s+(checkout|clean|reset|restore|switch)\b",
     # Committing advances HEAD so git diff returns empty — the validator
     # receives a blank patch even though source files were changed correctly.
     r"\bgit\s+commit\b",
@@ -220,6 +258,45 @@ def _truncate(text: str, max_chars: int) -> str:
         + " chars]...\n\n"
         + text[-half:]
     )
+
+
+_ERROR_MARKERS: Tuple[str, ...] = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "RuntimeError",
+    "ReferenceError",
+    "NameError",
+    "FAIL ",
+    "FAILED ",
+    "error TS",
+    "panic:",
+)
+
+
+def _truncate_around_error(text: str, max_chars: int) -> str:
+    """Truncate long output around the first actionable error marker."""
+    if len(text) <= max_chars:
+        return text
+    first_marker = -1
+    for marker in _ERROR_MARKERS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_marker < 0 or idx < first_marker):
+            first_marker = idx
+    half = max_chars // 2
+    if first_marker < 0 or first_marker < half or first_marker > len(text) - half:
+        return _truncate(text, max_chars)
+    start = max(0, first_marker - max_chars // 3)
+    end = min(len(text), start + max_chars)
+    prefix = "" if start == 0 else f"...[head {start} chars]...\n"
+    suffix = "" if end == len(text) else f"\n...[tail {len(text) - end} chars]..."
+    return prefix + text[start:end] + suffix
 
 
 def _safe_join_logs(logs: List[str]) -> str:
@@ -439,8 +516,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_OBSERVATION_CHARS),
-            stderr=_truncate(proc.stderr or "", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(proc.stdout or "", MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(proc.stderr or "", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
         )
 
@@ -455,8 +532,8 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         return CommandResult(
             command=command,
             exit_code=124,
-            stdout=_truncate(stdout, MAX_OBSERVATION_CHARS),
-            stderr=_truncate(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
+            stdout=_truncate_around_error(stdout, MAX_OBSERVATION_CHARS),
+            stderr=_truncate_around_error(stderr + f"\nCommand timed out after {timeout}s.", MAX_OBSERVATION_CHARS),
             duration_sec=time.time() - start,
             timed_out=True,
         )
@@ -630,6 +707,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_change_headers(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -719,6 +797,41 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+def _strip_mode_change_headers(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if (
+            block.startswith("diff --git ")
+            and "\n@@ " in block
+            and "\nold mode " in block
+            and "\nnew mode " in block
+            and "\nnew file mode " not in block
+            and "\ndeleted file mode " not in block
+        ):
+            lines = [
+                line
+                for line in block.splitlines()
+                if not line.startswith("old mode ") and not line.startswith("new mode ")
+            ]
+            rebuilt = "\n".join(lines)
+            if block.endswith("\n") and not rebuilt.endswith("\n"):
+                rebuilt += "\n"
+            kept.append(rebuilt)
+            continue
+        kept.append(block)
+
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     if path.suffix in {".pyc", ".pyo"}:
@@ -769,6 +882,7 @@ TEXT_FILE_EXTENSIONS = {
     ".cpp",
     ".cs",
     ".css",
+    ".dart",
     ".env",
     ".gradle",
     ".go",
@@ -802,12 +916,15 @@ TEXT_FILE_EXTENSIONS = {
     ".xml",
     ".yaml",
     ".yml",
+    ".zig",
 }
 
 TEXT_FILE_BASENAMES = {
     "Dockerfile",
     "Gemfile",
+    "gradlew",
     "Makefile",
+    "mvnw",
     "Podfile",
 }
 
@@ -844,45 +961,99 @@ _PROJECT_HINT_FILES: Tuple[str, ...] = (
     "tox.ini",
     "Makefile",
     "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "gradle.properties",
     "Cargo.toml",
     "jest.config.js",
     "vitest.config.ts",
 )
 
 _INTEGRATION_PATH_MARKERS: Tuple[str, ...] = (
+    "action",
+    "actions",
     "api",
     "app",
+    "auth",
     "client",
+    "command",
+    "commands",
     "component",
     "components",
     "config",
+    "control",
+    "controls",
     "controller",
     "controllers",
+    "csv",
     "context",
     "db",
+    "dto",
+    "dtos",
+    "entity",
+    "entities",
+    "filter",
+    "filters",
     "form",
     "handler",
     "handlers",
+    "hook",
+    "hooks",
+    "export",
+    "exports",
     "layout",
+    "middleware",
     "migration",
     "migrations",
     "model",
     "models",
+    "pdf",
     "page",
     "pages",
+    "mapper",
+    "mappers",
     "repository",
     "repositories",
     "route",
     "routes",
     "router",
+    "runtime",
     "schema",
     "schemas",
     "screen",
     "screens",
+    "security",
+    "serializer",
+    "serializers",
     "service",
     "services",
+    "session",
+    "slice",
+    "slices",
+    "state",
     "store",
+    "template",
+    "templates",
+    "hud",
+    "input",
+    "integration",
+    "integrations",
+    "keyboard",
+    "navigation",
+    "provider",
+    "providers",
+    "report",
+    "reports",
+    "resource",
+    "resources",
+    "table",
     "types",
+    "validation",
+    "validator",
+    "validators",
     "view",
     "views",
 )
@@ -891,10 +1062,13 @@ _INTEGRATION_ROOT_FILES: Tuple[str, ...] = (
     "Dockerfile",
     "Makefile",
     "build.gradle",
+    "build.gradle.kts",
     "docker-compose.yml",
     "package.json",
+    "pom.xml",
     "pyproject.toml",
     "settings.gradle",
+    "settings.gradle.kts",
 )
 
 
@@ -1189,6 +1363,10 @@ def _split_path_tokens(relative_path: str) -> set:
         for token in re.findall(r"[a-z0-9]+", part.lower()):
             if len(token) >= 3:
                 tokens.add(token)
+        for token in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", part):
+            token = token.lower()
+            if len(token) >= 3:
+                tokens.add(token)
     return tokens
 
 
@@ -1307,7 +1485,7 @@ def _context_file_allowed(relative_path: str) -> bool:
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
     pattern = re.compile(
-        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|env|go|gradle|graphql|h|hpp|html|java|js|jsx|json|kt|lock|md|php|properties|proto|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml))(?![\w/-]|\.[A-Za-z0-9])",
+        r"(?<![\w.-])([\w./-]+\.(?:c|cc|cpp|cs|css|dart|env|go|gradle|graphql|h|hpp|html|java|js|jsx|json|kt|lock|md|php|properties|proto|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|vue|xml|ya?ml|zig))(?![\w/-]|\.[A-Za-z0-9])",
         re.IGNORECASE,
     )
     mentions: List[str] = []
@@ -1530,6 +1708,80 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _patch_added_line_numbers(patch: str) -> Dict[str, set]:
+    """Map changed paths to line numbers added in the post-patch file."""
+    added: Dict[str, set] = {}
+    current_file: Optional[str] = None
+    current_new_line: Optional[int] = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            current_file = None
+            current_new_line = None
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+                added.setdefault(current_file, set())
+            continue
+        if current_file is None:
+            continue
+        hunk_match = hunk_re.match(line)
+        if hunk_match:
+            current_new_line = int(hunk_match.group(1))
+            continue
+        if current_new_line is None:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added[current_file].add(current_new_line)
+            current_new_line += 1
+        elif line.startswith("-"):
+            continue
+        else:
+            current_new_line += 1
+
+    return {path: lines for path, lines in added.items() if lines}
+
+
+def _patch_added_lines(patch: str) -> Dict[str, List[Tuple[int, str]]]:
+    """Map changed paths to `(new_line_number, added_line_text)` entries."""
+    added: Dict[str, List[Tuple[int, str]]] = {}
+    current_file: Optional[str] = None
+    current_new_line: Optional[int] = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            current_file = None
+            current_new_line = None
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+                added.setdefault(current_file, [])
+            continue
+        if current_file is None:
+            continue
+        hunk_match = hunk_re.match(line)
+        if hunk_match:
+            current_new_line = int(hunk_match.group(1))
+            continue
+        if current_new_line is None:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added[current_file].append((current_new_line, line[1:]))
+            current_new_line += 1
+        elif line.startswith("-"):
+            continue
+        else:
+            current_new_line += 1
+
+    return {path: rows for path, rows in added.items() if rows}
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1554,6 +1806,79 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
+_PACKAGE_LOCKFILE_NAMES: Tuple[str, ...] = (
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+)
+_PACKAGE_DEP_SECTION_RE = re.compile(
+    r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"\s*:'
+)
+_PACKAGE_DEP_ENTRY_RE = re.compile(r'^[+-]\s*"[^"]+"\s*:\s*"[^"]+"')
+_PACKAGE_OTHER_SECTION_RE = re.compile(
+    r'"(?:bin|config|engines|exports|imports|main|module|scripts)"\s*:'
+)
+
+
+def _patch_file_block(patch: str, relative_path: str) -> str:
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    marker = f" b/{relative_path}"
+    for block in blocks:
+        first = block.splitlines()[0] if block else ""
+        if first.endswith(marker):
+            return block
+    return ""
+
+
+def _patch_changes_package_dependencies(patch: str, manifest_path: str) -> bool:
+    block = _patch_file_block(patch, manifest_path)
+    if not block:
+        return False
+    hunks = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+    for hunk in hunks:
+        if not hunk.startswith("@@ "):
+            continue
+        has_dep_section = bool(_PACKAGE_DEP_SECTION_RE.search(hunk))
+        has_other_section = bool(_PACKAGE_OTHER_SECTION_RE.search(hunk))
+        for line in hunk.splitlines():
+            if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
+                continue
+            if _PACKAGE_DEP_SECTION_RE.search(line) and re.search(r'"[^"]+"\s*:\s*"[^"]+"', line):
+                return True
+            if _PACKAGE_DEP_ENTRY_RE.match(line) and (has_dep_section or not has_other_section):
+                return True
+    return False
+
+
+def _tracked_package_lockfiles(manifest_path: str, tracked: set) -> List[str]:
+    parent = Path(manifest_path).parent
+    out: List[str] = []
+    for name in _PACKAGE_LOCKFILE_NAMES:
+        candidate = name if str(parent) in {"", "."} else str(parent / name)
+        candidate = candidate.replace("\\", "/")
+        if candidate in tracked:
+            out.append(candidate)
+    return out
+
+
+def _missing_package_lockfile_updates(repo: Path, patch: str) -> List[str]:
+    changed = set(_patch_changed_files(patch))
+    if not changed:
+        return []
+    tracked = set(_tracked_files(repo))
+    missing: List[str] = []
+    for relative_path in sorted(changed):
+        if Path(relative_path).name != "package.json":
+            continue
+        if not _patch_changes_package_dependencies(patch, relative_path):
+            continue
+        lockfiles = _tracked_package_lockfiles(relative_path, tracked)
+        if lockfiles and not any(lockfile in changed for lockfile in lockfiles):
+            missing.append(f"{relative_path} -> {', '.join(lockfiles)}")
+    return missing
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -1566,6 +1891,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 
 
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
+_TYPESCRIPT_CHECK_TIMEOUT = 12
 
 
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1588,6 +1914,150 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}:{exc.lineno}: {exc.msg}"
     except Exception as exc:
         return f"{relative_path}: parse failure: {exc}"
+
+
+_PYTHON_BUILTINS = set(dir(builtins))
+
+
+class _PythonStoreCollector(ast.NodeVisitor):
+    def __init__(self, *, include_args: bool = False) -> None:
+        self.names: set = set()
+        self.include_args = include_args
+
+    def visit_arg(self, node: ast.arg) -> None:
+        if self.include_args:
+            self.names.add(node.arg)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Param)):
+            self.names.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.names.add(alias.asname or alias.name.split(".", 1)[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+
+def _python_file_uses_star_import(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            return True
+    return False
+
+
+def _collect_python_stores(nodes: List[ast.stmt], *, include_args: bool = False) -> set:
+    collector = _PythonStoreCollector(include_args=include_args)
+    for node in nodes:
+        collector.visit(node)
+    return collector.names
+
+
+def _python_function_scope_defs(node: ast.AST) -> set:
+    names: set = set()
+    args = getattr(node, "args", None)
+    if args is not None:
+        for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+            names.add(arg.arg)
+        if args.vararg:
+            names.add(args.vararg.arg)
+        if args.kwarg:
+            names.add(args.kwarg.arg)
+    body = getattr(node, "body", [])
+    if isinstance(body, list):
+        names.update(_collect_python_stores(body))
+    return names
+
+
+def _check_python_undefined_added_names(
+    repo: Path,
+    relative_path: str,
+    added_lines: set,
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except Exception:
+        return []
+    if _python_file_uses_star_import(tree):
+        return []
+
+    module_defs = _collect_python_stores(tree.body)
+    errors: List[str] = []
+
+    class LoadVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scopes: List[set] = [set(module_defs)]
+
+        def _defined(self, name: str) -> bool:
+            return name in _PYTHON_BUILTINS or any(name in scope for scope in reversed(self.scopes))
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if (
+                isinstance(node.ctx, ast.Load)
+                and getattr(node, "lineno", None) in added_lines
+                and not self._defined(node.id)
+            ):
+                errors.append(
+                    f"{relative_path}:{node.lineno}: Python undefined name on added line: {node.id}"
+                )
+            if len(errors) >= limit:
+                return
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            for item in list(node.decorator_list) + list(node.args.defaults) + list(node.args.kw_defaults):
+                if item is not None:
+                    self.visit(item)
+            self.scopes.append(_python_function_scope_defs(node))
+            for stmt in node.body:
+                if len(errors) >= limit:
+                    break
+                self.visit(stmt)
+            self.scopes.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.visit_FunctionDef(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self.scopes.append(_python_function_scope_defs(node))
+            self.visit(node.body)
+            self.scopes.pop()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            for item in list(node.decorator_list) + list(node.bases) + [kw.value for kw in node.keywords]:
+                self.visit(item)
+            class_defs = _collect_python_stores(node.body)
+            self.scopes.append(class_defs)
+            for stmt in node.body:
+                if len(errors) >= limit:
+                    break
+                self.visit(stmt)
+            self.scopes.pop()
+
+    LoadVisitor().visit(tree)
+    return errors[:limit]
 
 
 def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1626,6 +2096,40 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
+def _check_go_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`gofmt -e -d file.go` parses Go without modifying the file."""
+    if not _has_executable("gofmt"):
+        return None
+    proc_result = run_command(
+        f"gofmt -e -d {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code == 0:
+        return None
+    msg = (proc_result.stderr or proc_result.stdout or "").strip()
+    if not msg:
+        msg = "gofmt parse failed"
+    return f"{relative_path}: {msg.splitlines()[0]}"
+
+
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`php -l file.php` parses PHP without executing it."""
+    if not _has_executable("php"):
+        return None
+    proc_result = run_command(
+        f"php -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code == 0:
+        return None
+    msg = (proc_result.stderr or proc_result.stdout or "").strip()
+    if not msg:
+        msg = "php -l failed"
+    return f"{relative_path}: {msg.splitlines()[0]}"
+
+
 # Languages where ' is unambiguously a string delimiter. The brace-balance
 # parser below treats ' as a string-mode toggle, which produces false
 # positives on:
@@ -1639,6 +2143,12 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
 }
+_JAVA_PUBLIC_TYPE_RE = re.compile(
+    r"^\s*public\s+(?:abstract\s+|final\s+|sealed\s+|non-sealed\s+)*"
+    r"(class|interface|enum|record)\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+_JAVA_PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;", re.MULTILINE)
 
 
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
@@ -1717,6 +2227,1250 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _java_package_and_public_types(text: str) -> Tuple[str, List[str]]:
+    package_match = _JAVA_PACKAGE_RE.search(text)
+    package_name = package_match.group(1) if package_match else ""
+    return package_name, [match.group(2) for match in _JAVA_PUBLIC_TYPE_RE.finditer(text)]
+
+
+def _check_java_duplicate_public_types(repo: Path, changed_paths: List[str], limit: int = 6) -> List[str]:
+    java_paths = [
+        path for path in changed_paths
+        if Path(path).suffix.lower() == ".java" and (repo / path).is_file()
+    ]
+    if not java_paths:
+        return []
+
+    tracked_java = [
+        path for path in _tracked_files(repo)
+        if Path(path).suffix.lower() == ".java" and (repo / path).is_file()
+    ]
+    existing: Dict[Tuple[str, str], str] = {}
+    for path in tracked_java:
+        try:
+            text = (repo / path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        package_name, types = _java_package_and_public_types(text)
+        for type_name in types:
+            existing.setdefault((package_name, type_name), path)
+
+    errors: List[str] = []
+    for path in java_paths:
+        try:
+            text = (repo / path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        package_name, types = _java_package_and_public_types(text)
+        for type_name in types:
+            other = existing.get((package_name, type_name))
+            if other and other != path:
+                fqcn = f"{package_name}.{type_name}" if package_name else type_name
+                errors.append(f"Java duplicate public type: {fqcn} also defined in {other}")
+                if len(errors) >= limit:
+                    return errors
+    return errors
+
+
+def _typescript_checker_command(repo: Path) -> str:
+    if not (repo / "tsconfig.json").is_file():
+        return ""
+    local_tsc = repo / "node_modules" / ".bin" / "tsc"
+    if local_tsc.is_file():
+        return "./node_modules/.bin/tsc --noEmit --pretty false"
+    if _has_executable("tsc"):
+        return "tsc --noEmit --pretty false"
+    return ""
+
+
+def _filter_typescript_errors(output: str, changed_paths: List[str], limit: int = 8) -> List[str]:
+    if not output.strip() or not changed_paths:
+        return []
+    normalized_paths = [path.replace("\\", "/") for path in changed_paths]
+    errors: List[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or "error TS" not in line:
+            continue
+        normalized_line = line.replace("\\", "/")
+        if not any(path in normalized_line or Path(path).name in normalized_line for path in normalized_paths):
+            continue
+        errors.append(line)
+        if len(errors) >= limit:
+            break
+    return errors
+
+
+def _check_typescript_project(repo: Path, changed_paths: List[str]) -> List[str]:
+    command = _typescript_checker_command(repo)
+    if not command:
+        return []
+    result = run_command(command, repo, timeout=_TYPESCRIPT_CHECK_TIMEOUT)
+    if result.exit_code == 0:
+        return []
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    errors = _filter_typescript_errors(output, changed_paths)
+    if not errors:
+        return []
+    return [f"TypeScript check: {error}" for error in errors]
+
+
+_JSX_COMPONENT_TAG_RE = re.compile(r"<([A-Z][A-Za-z0-9_$]*)\b")
+_JSX_TAG_RE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9_$:.-]*)([^<>]*?)(/?)\s*>")
+_JSX_ATTR_NAME_RE = re.compile(r"(?<![A-Za-z0-9_$:.-])([A-Za-z_$][\w$:-]*)\s*=")
+_JSX_VOID_TAGS = frozenset({
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+})
+_IMPORT_LINE_RE = re.compile(r"^\s*import\s+(.+?)\s+from\s+['\"]", re.MULTILINE)
+_IMPORT_SIDE_EFFECT_RE = re.compile(r"^\s*import\s+['\"]", re.MULTILINE)
+_LOCAL_DEFAULT_IMPORT_RE = re.compile(
+    r"^\s*import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*(?:\{|\*))?\s+from\s+['\"](\.[^'\"]+)['\"]",
+    re.MULTILINE,
+)
+_REQUIRE_BINDING_RE = re.compile(
+    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(",
+    re.MULTILINE,
+)
+_LOCAL_IMPORT_SPEC_RE = re.compile(
+    r"(?:\bfrom\s*|\bimport\s*\(|\brequire\s*\(|^\s*import\s*)['\"](\.[^'\"]+)['\"]"
+)
+_LOCAL_EXPORT_SPEC_RE = re.compile(r"^\s*export\b.*\bfrom\s*['\"](\.[^'\"]+)['\"]")
+_IMPORT_NAMESPACE_RE = re.compile(r"^\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]", re.MULTILINE)
+_JS_DECL_BINDING_RE = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b")
+_JS_DESTRUCTURE_BINDING_RE = re.compile(r"\b(?:const|let|var)\s+[\[{]([^=]{1,300})[\]}]\s*=")
+_JS_FUNCTION_PARAM_RE = re.compile(r"\bfunction(?:\s+[A-Za-z_$][\w$]*)?\s*\(([^)]{0,300})\)")
+_JS_ARROW_PARAM_RE = re.compile(r"(?:^|[=({,])\s*\(?\s*([^)=]{1,200}?)\s*\)?\s*=>", re.MULTILINE)
+_JS_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_ADDED_CALL_RE = re.compile(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(")
+_JS_MEMBER_BASE_RE = re.compile(r"(?<![.\w$])(router|history)\.")
+_JS_TYPE_BINDING_RE = re.compile(r"\b(?:class|interface|type|enum)\s+([A-Za-z_$][\w$]*)\b")
+_JS_UPPERCASE_IDENTIFIER_RE = re.compile(r"(?<![.\w$])([A-Z][A-Z0-9_]{2,})(?![\w$])")
+_JS_GLOBAL_CALLS = frozenset({
+    "setTimeout",
+    "setInterval",
+    "setImmediate",
+})
+_JS_GLOBAL_CONSTANTS = frozenset({
+    "CSS",
+    "HTML",
+    "JSON",
+    "JSX",
+    "Math",
+    "URL",
+    "XML",
+})
+_JS_COMMON_BOUND_CALLS = frozenset({
+    "useState",
+    "useEffect",
+    "useMemo",
+    "useCallback",
+    "useRef",
+    "useReducer",
+    "useContext",
+    "useRouter",
+    "useNavigate",
+})
+_JS_DUPLICATE_BINDING_IGNORE = frozenset({
+    "children",
+    "context",
+    "ctx",
+    "data",
+    "e",
+    "err",
+    "error",
+    "event",
+    "id",
+    "idx",
+    "index",
+    "input",
+    "item",
+    "items",
+    "key",
+    "name",
+    "next",
+    "output",
+    "props",
+    "ref",
+    "req",
+    "res",
+    "response",
+    "result",
+    "type",
+    "value",
+    "values",
+})
+_LOCAL_IMPORT_EXTENSIONS: Tuple[str, ...] = (
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".css",
+    ".scss",
+    ".sass",
+)
+_DEFAULT_EXPORT_RE = re.compile(r"\bexport\s+default\b|\bmodule\.exports\s*=", re.MULTILINE)
+_REACT_NAMESPACE_RE = re.compile(r"\bReact\.")
+_REACT_IMPORT_RE = re.compile(
+    r"^\s*import\s+(?:type\s+)?(?:\*\s+as\s+React|React(?:\s*,|\s+from)|type\s+\{\s*ReactNode\b|\{\s*ReactNode\b)",
+    re.MULTILINE,
+)
+_USE_CLIENT_DIRECTIVE_RE = re.compile(r"^\s*['\"]use client['\"]\s*;?\s*$")
+_NEXT_CLIENT_ONLY_RE = re.compile(
+    r"\b(?:useState|useEffect|useLayoutEffect|useReducer|useRef)\s*\(|"
+    r"\bon(?:Click|Change|Submit|Input|KeyDown|KeyUp|MouseDown|MouseUp|PointerDown|PointerUp)\s*=|"
+    r"\b(?:window|document|localStorage|sessionStorage)\.",
+    re.IGNORECASE,
+)
+_FORM_ACTION_NAME_RE = re.compile(r"\b(?:action|formAction)\s*=\s*\{\s*([A-Za-z_$][\w$]*)\s*\}")
+_STATIC_IMPORT_RE = re.compile(r"^\s*import\s+(?:type\s+)?(?:.+?\s+from\s+)?['\"][^'\"]+['\"]")
+_LOCAL_NAMED_IMPORT_RE = re.compile(
+    r"^\s*import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['\"](\.[^'\"]+)['\"]",
+    re.MULTILINE,
+)
+_NAMED_IMPORT_CLAUSE_RE = re.compile(r"^\s*import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['\"][^'\"]+['\"]")
+_IMPORT_BINDING_RE = re.compile(r"^\s*import\s+(?:type\s+)?(.+?)\s+from\s+['\"][^'\"]+['\"]")
+_IMPORT_NAMESPACE_BINDING_RE = re.compile(r"^\s*\*\s+as\s+([A-Za-z_$][\w$]*)\s*$")
+_JS_FUNCTION_DECL_BINDING_RE = re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")
+_JS_SCOPE_FUNCTION_RE = re.compile(
+    r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function(?:\s+([A-Za-z_$][\w$]*))?\s*\([^)]*\)"
+)
+_JS_SCOPE_ARROW_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"(?:memo|forwardRef\s*)?\(?(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\)?\s*=>"
+)
+_JS_SCOPE_CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b")
+_EXPRESS_ROUTE_CALL_RE = re.compile(
+    r"^\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\.\s*"
+    r"(get|post|put|patch|delete|all|use)\s*\(\s*(['\"])(/[^'\"]*)\3",
+    re.IGNORECASE,
+)
+_ROUTE_CONTAINER_HINTS = frozenset({"app", "router", "routes", "server"})
+_ASYNC_FUNCTION_RE_TEMPLATE = r"(?:export\s+)?async\s+function\s+{name}\s*\(([^)]*)\)"
+_ASYNC_CONST_RE_TEMPLATE = r"(?:export\s+)?(?:const|let)\s+{name}\s*=\s*async\s*\(([^)]*)\)"
+_CSS_JS_STYLE_IMPORT_RE = re.compile(r"^\s*import\s+(?:.+?\s+from\s+)?['\"][^'\"]+['\"]\s*;?\s*$")
+_NAMED_EXPORT_DECL_RE = re.compile(
+    r"^\s*export\s+(?:(?:async\s+)?function|class|type|interface|enum|const|let|var)\s+([A-Za-z_$][\w$]*)\b",
+    re.MULTILINE,
+)
+_EXPORT_LIST_RE = re.compile(r"^\s*export\s*\{([^}]+)\}", re.MULTILINE)
+
+
+def _imported_jsx_names(source: str) -> set:
+    names: set = set()
+    for match in _IMPORT_LINE_RE.finditer(source):
+        clause = match.group(1).strip()
+        if not clause or clause.startswith("*"):
+            continue
+        if clause.startswith("{"):
+            default_part = ""
+            named_part = clause
+        elif "{" in clause:
+            default_part = clause.split("{", 1)[0].strip().rstrip(",")
+            named_part = "{" + clause.split("{", 1)[1]
+        else:
+            default_part = clause.split(",", 1)[0].strip()
+            named_part = ""
+        if default_part and re.match(r"^[A-Za-z_$][\w$]*$", default_part):
+            names.add(default_part)
+        if named_part:
+            body = named_part.strip().strip("{}")
+            for item in body.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                alias_match = re.search(r"\bas\s+([A-Za-z_$][\w$]*)$", item)
+                if alias_match:
+                    names.add(alias_match.group(1))
+                else:
+                    base = item.split(":", 1)[0].strip()
+                    if re.match(r"^[A-Za-z_$][\w$]*$", base):
+                        names.add(base)
+    for match in _REQUIRE_BINDING_RE.finditer(source):
+        names.add(match.group(1))
+    return names
+
+
+def _defined_jsx_names(source: str) -> set:
+    names: set = set()
+    for line in source.splitlines():
+        symbol = _line_defines_symbol(line)
+        if symbol:
+            names.add(symbol)
+    return names
+
+
+def _js_binding_names(source: str) -> set:
+    names = _imported_jsx_names(source) | _defined_jsx_names(source)
+    names.update(_IMPORT_NAMESPACE_RE.findall(source))
+    names.update(_JS_DECL_BINDING_RE.findall(source))
+    names.update(_JS_TYPE_BINDING_RE.findall(source))
+    for match in _JS_DESTRUCTURE_BINDING_RE.finditer(source):
+        names.update(_JS_IDENTIFIER_RE.findall(match.group(1)))
+    for match in _JS_FUNCTION_PARAM_RE.finditer(source):
+        names.update(_JS_IDENTIFIER_RE.findall(match.group(1)))
+    for match in _JS_ARROW_PARAM_RE.finditer(source):
+        param_text = match.group(1)
+        if any(token in param_text for token in ("+", "-", "*", "/", "?", ":", ";")):
+            continue
+        names.update(_JS_IDENTIFIER_RE.findall(param_text))
+    return names
+
+
+def _js_action_names_to_check(text: str) -> set:
+    names: set = set()
+    for name in _JS_ADDED_CALL_RE.findall(text):
+        if name in _JS_GLOBAL_CALLS:
+            continue
+        if name in {"dispatch", "navigate"}:
+            names.add(name)
+        elif name in _JS_COMMON_BOUND_CALLS:
+            names.add(name)
+        elif re.match(r"set[A-Z][A-Za-z0-9_$]*$", name):
+            names.add(name)
+    names.update(_JS_MEMBER_BASE_RE.findall(text))
+    return names
+
+
+def _check_added_js_action_bindings(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    available = _js_binding_names(source)
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        for name in sorted(_js_action_names_to_check(text)):
+            if name in available:
+                continue
+            errors.append(f"{relative_path}:{line_no}: JS action/state variable not defined or imported: {name}")
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _check_added_js_undefined_constants(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    available = _js_binding_names(source) | _JS_GLOBAL_CONSTANTS
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        masked = _mask_jsx_string_and_comment_spans(text)
+        for match in _JS_UPPERCASE_IDENTIFIER_RE.finditer(masked):
+            name = match.group(1)
+            if name in available:
+                continue
+            rest = masked[match.end():]
+            if rest.lstrip().startswith(":"):
+                continue
+            errors.append(f"{relative_path}:{line_no}: JS constant not defined or imported: {name}")
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _check_invalid_named_import_syntax(relative_path: str, added_lines: List[Tuple[int, str]]) -> List[str]:
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        match = _NAMED_IMPORT_CLAUSE_RE.match(text)
+        if not match:
+            continue
+        for item in match.group(1).split(","):
+            raw = item.strip()
+            if raw.startswith("type "):
+                raw = raw[len("type "):].strip()
+            imported = raw.split(" as ", 1)[0].strip()
+            if "." not in imported:
+                continue
+            errors.append(f"{relative_path}:{line_no}: invalid named import syntax for dotted member `{imported}`")
+    return errors
+
+
+def _check_jsx_added_component_names(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    available = _imported_jsx_names(source) | _defined_jsx_names(source)
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        for name in _JSX_COMPONENT_TAG_RE.findall(text):
+            if name in available:
+                continue
+            errors.append(f"{relative_path}:{line_no}: JSX component not imported or defined: {name}")
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _check_css_js_style_imports(relative_path: str, added_lines: List[Tuple[int, str]]) -> List[str]:
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        if _CSS_JS_STYLE_IMPORT_RE.match(text):
+            errors.append(f"{relative_path}:{line_no}: CSS file contains JS-style import; use @import or import CSS from JS")
+    return errors
+
+
+def _strip_jsx_comments(source: str) -> str:
+    return re.sub(r"\{/\*.*?\*/\}", "", source, flags=re.DOTALL)
+
+
+def _mask_jsx_string_and_comment_spans(source: str) -> str:
+    """Blank JS string/comment spans before regex-based JSX tag matching."""
+    chars = list(source)
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            else:
+                chars[i] = " "
+            i += 1
+            continue
+        if in_block_comment:
+            chars[i] = "\n" if ch == "\n" else " "
+            if ch == "*" and nxt == "/":
+                chars[i + 1] = " "
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            chars[i] = "\n" if ch == "\n" else " "
+            if ch == "\\" and nxt:
+                chars[i + 1] = "\n" if nxt == "\n" else " "
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            chars[i] = chars[i + 1] = " "
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            chars[i] = chars[i + 1] = " "
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ('"', "'", "`"):
+            chars[i] = " "
+            in_str = ch
+            i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _check_jsx_tag_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = _mask_jsx_string_and_comment_spans(
+            _strip_jsx_comments(full.read_text(encoding="utf-8", errors="replace"))
+        )
+    except Exception:
+        return None
+
+    stack: List[Tuple[str, int]] = []
+    for match in _JSX_TAG_RE.finditer(source):
+        closing, name, attrs, self_close = match.groups()
+        lowered = name.lower()
+        line_no = source.count("\n", 0, match.start()) + 1
+        if name.startswith("!") or name.startswith("?"):
+            continue
+        if closing:
+            if not stack:
+                return f"{relative_path}:{line_no}: JSX closing tag without opener: </{name}>"
+            open_name, open_line = stack.pop()
+            if open_name != name:
+                return (
+                    f"{relative_path}:{line_no}: JSX tag mismatch: "
+                    f"<{open_name}> opened at line {open_line}, closed by </{name}>"
+                )
+            continue
+        if self_close or attrs.strip().endswith("/") or lowered in _JSX_VOID_TAGS:
+            continue
+        stack.append((name, line_no))
+    if stack:
+        open_name, open_line = stack[-1]
+        return f"{relative_path}:{open_line}: JSX tag not closed: <{open_name}>"
+    return None
+
+
+def _check_jsx_duplicate_attributes(
+    repo: Path,
+    relative_path: str,
+    added_line_numbers: set,
+    limit: int = 6,
+) -> List[str]:
+    if not added_line_numbers:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = _mask_jsx_string_and_comment_spans(
+            _strip_jsx_comments(full.read_text(encoding="utf-8", errors="replace"))
+        )
+    except Exception:
+        return []
+    errors: List[str] = []
+    for match in _JSX_TAG_RE.finditer(source):
+        closing, name, attrs, _self_close = match.groups()
+        if closing or name.startswith(("!", "?")):
+            continue
+        start_line = source.count("\n", 0, match.start()) + 1
+        end_line = source.count("\n", 0, match.end()) + 1
+        if not any(line_no in added_line_numbers for line_no in range(start_line, end_line + 1)):
+            continue
+        seen: Dict[str, int] = {}
+        for attr_match in _JSX_ATTR_NAME_RE.finditer(attrs):
+            attr_name = attr_match.group(1)
+            if attr_name not in seen:
+                seen[attr_name] = attr_match.start()
+                continue
+            errors.append(f"{relative_path}:{start_line}: JSX duplicate attribute on <{name}>: {attr_name}")
+            break
+        if len(errors) >= limit:
+            return errors
+    return errors
+
+
+def _local_import_candidates(repo: Path, relative_path: str, specifier: str) -> List[Path]:
+    clean = specifier.split("?", 1)[0].split("#", 1)[0]
+    base = (repo / relative_path).parent / clean
+    candidates = [base]
+    if base.suffix:
+        candidates.append(base / "index")
+    else:
+        candidates.extend(Path(str(base) + suffix) for suffix in _LOCAL_IMPORT_EXTENSIONS)
+        candidates.extend(base / f"index{suffix}" for suffix in _LOCAL_IMPORT_EXTENSIONS)
+    return candidates
+
+
+def _local_import_exists(repo: Path, relative_path: str, specifier: str) -> bool:
+    root = repo.resolve()
+    for candidate in _local_import_candidates(repo, relative_path, specifier):
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (ValueError, RuntimeError):
+            continue
+        if resolved.is_file():
+            return True
+    return False
+
+
+def _resolve_local_import_file(repo: Path, relative_path: str, specifier: str) -> Optional[Path]:
+    root = repo.resolve()
+    for candidate in _local_import_candidates(repo, relative_path, specifier):
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (ValueError, RuntimeError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _check_added_local_imports(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        specs = _LOCAL_IMPORT_SPEC_RE.findall(text) + _LOCAL_EXPORT_SPEC_RE.findall(text)
+        for specifier in specs:
+            if _local_import_exists(repo, relative_path, specifier):
+                continue
+            errors.append(f"{relative_path}:{line_no}: local import target not found: {specifier}")
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _check_added_local_default_imports(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        for _name, specifier in _LOCAL_DEFAULT_IMPORT_RE.findall(text):
+            target = _resolve_local_import_file(repo, relative_path, specifier)
+            if target is None:
+                continue
+            try:
+                target_text = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if _DEFAULT_EXPORT_RE.search(target_text):
+                continue
+            errors.append(f"{relative_path}:{line_no}: local default import target has no default export: {specifier}")
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _named_import_export_names(clause: str) -> List[str]:
+    names: List[str] = []
+    for item in clause.split(","):
+        item = item.strip()
+        if item.startswith("type "):
+            item = item[len("type "):].strip()
+        if not item:
+            continue
+        alias_match = re.match(r"([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", item)
+        if alias_match:
+            names.append(alias_match.group(1))
+            continue
+        name = item.split(":", 1)[0].strip()
+        if re.match(r"^[A-Za-z_$][\w$]*$", name):
+            names.append(name)
+    return names
+
+
+def _js_exported_names(source: str) -> set:
+    names = set(_NAMED_EXPORT_DECL_RE.findall(source))
+    for match in _EXPORT_LIST_RE.finditer(source):
+        for item in match.group(1).split(","):
+            item = item.strip()
+            if item.startswith("type "):
+                item = item[len("type "):].strip()
+            if not item:
+                continue
+            alias_match = re.match(r"([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", item)
+            if alias_match:
+                names.add(alias_match.group(2))
+                continue
+            name = item.split(":", 1)[0].strip()
+            if re.match(r"^[A-Za-z_$][\w$]*$", name):
+                names.add(name)
+    if _DEFAULT_EXPORT_RE.search(source):
+        names.add("default")
+    return names
+
+
+def _check_added_local_named_imports(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        for clause, specifier in _LOCAL_NAMED_IMPORT_RE.findall(text):
+            target = _resolve_local_import_file(repo, relative_path, specifier)
+            if target is None:
+                continue
+            try:
+                target_text = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            exported = _js_exported_names(target_text)
+            for name in _named_import_export_names(clause):
+                if name in exported:
+                    continue
+                errors.append(f"{relative_path}:{line_no}: local named import target has no export `{name}`: {specifier}")
+                if len(errors) >= limit:
+                    return errors
+    return errors
+
+
+def _check_react_namespace_import(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not _REACT_NAMESPACE_RE.search(source):
+        return None
+    if _REACT_IMPORT_RE.search(source):
+        return None
+    for idx, line in enumerate(source.splitlines(), start=1):
+        if _REACT_NAMESPACE_RE.search(line):
+            return f"{relative_path}:{idx}: React namespace used without importing React"
+    return None
+
+
+def _path_looks_like_next_app_router_component(relative_path: str) -> bool:
+    path = Path(relative_path)
+    parts = path.parts
+    if "app" not in parts:
+        return False
+    if "api" in parts:
+        return False
+    return path.suffix.lower() in {".tsx", ".jsx"}
+
+
+def _has_use_client_directive(source: str) -> bool:
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            continue
+        if stripped.startswith("/*") or stripped.startswith("*"):
+            continue
+        return bool(_USE_CLIENT_DIRECTIVE_RE.match(line))
+    return False
+
+
+def _check_next_server_component_client_usage(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 4,
+) -> List[str]:
+    if not added_lines or not _path_looks_like_next_app_router_component(relative_path):
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    if _has_use_client_directive(source):
+        return []
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        if not _NEXT_CLIENT_ONLY_RE.search(text):
+            continue
+        errors.append(f"{relative_path}:{line_no}: client-only React/DOM usage in Next.js app file without 'use client'")
+        if len(errors) >= limit:
+            return errors
+    return errors
+
+
+def _looks_like_use_client_directive_attempt(stripped: str) -> bool:
+    lowered = stripped.lower()
+    if "use client" not in lowered:
+        return False
+    if _USE_CLIENT_DIRECTIVE_RE.match(stripped):
+        return False
+    if len(stripped) > 48:
+        return False
+    return lowered.startswith(("use client", "'use", '"use', "`use"))
+
+
+def _iter_js_statement_lines(source: str) -> Iterable[Tuple[int, str]]:
+    in_block_comment = False
+    for idx, line in enumerate(source.splitlines(), start=1):
+        stripped = line.strip()
+        if in_block_comment:
+            if "*/" in stripped:
+                stripped = stripped.split("*/", 1)[1].strip()
+                in_block_comment = False
+            else:
+                continue
+        while stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
+                stripped = ""
+                break
+            stripped = stripped.split("*/", 1)[1].strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        yield idx, stripped
+
+
+def _check_use_client_directive_placement(repo: Path, relative_path: str) -> Optional[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    seen_statement = False
+    for line_no, stripped in _iter_js_statement_lines(source):
+        if _USE_CLIENT_DIRECTIVE_RE.match(stripped):
+            if seen_statement:
+                return f"{relative_path}:{line_no}: 'use client' directive must be the first statement before imports"
+            return None
+        if _looks_like_use_client_directive_attempt(stripped):
+            return f"{relative_path}:{line_no}: malformed 'use client' directive"
+        seen_statement = True
+    return None
+
+
+def _js_brace_depths_by_line(source: str) -> Dict[int, int]:
+    masked = _mask_jsx_string_and_comment_spans(source)
+    depths: Dict[int, int] = {}
+    depth = 0
+    for idx, line in enumerate(masked.splitlines(), start=1):
+        depths[idx] = max(depth, 0)
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            depth = 0
+    return depths
+
+
+def _check_static_import_inside_block(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 4,
+) -> List[str]:
+    if not added_lines:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    depths = _js_brace_depths_by_line(source)
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        if not _STATIC_IMPORT_RE.match(text):
+            continue
+        if depths.get(line_no, 0) <= 0:
+            continue
+        errors.append(f"{relative_path}:{line_no}: static import inside a block; move it to module scope")
+        if len(errors) >= limit:
+            return errors
+    return errors
+
+
+def _import_binding_names_from_line(line: str) -> set:
+    match = _IMPORT_BINDING_RE.match(line)
+    if not match:
+        return set()
+    clause = match.group(1).strip()
+    names: set = set()
+    namespace_match = _IMPORT_NAMESPACE_BINDING_RE.match(clause)
+    if namespace_match:
+        names.add(namespace_match.group(1))
+        return names
+    if clause.startswith("{"):
+        names.update(_named_import_export_names(clause.strip().strip("{}")))
+        return names
+    default_part = clause.split(",", 1)[0].strip()
+    if re.match(r"^[A-Za-z_$][\w$]*$", default_part):
+        names.add(default_part)
+    if "{" in clause:
+        names.update(_named_import_export_names(clause.split("{", 1)[1].split("}", 1)[0]))
+    namespace_match = re.search(r"\*\s+as\s+([A-Za-z_$][\w$]*)", clause)
+    if namespace_match:
+        names.add(namespace_match.group(1))
+    return names
+
+
+def _js_declared_binding_names_from_line(line: str) -> set:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("//", "/*", "*")):
+        return set()
+    names = set(_import_binding_names_from_line(line))
+    function_match = _JS_FUNCTION_DECL_BINDING_RE.match(line)
+    if function_match:
+        names.add(function_match.group(1))
+    names.update(_JS_DECL_BINDING_RE.findall(line))
+    array_match = re.search(r"\b(?:const|let|var)\s+\[([^\]]{1,300})\]\s*=", line)
+    if array_match:
+        names.update(_JS_IDENTIFIER_RE.findall(array_match.group(1)))
+    names.update(_JS_TYPE_BINDING_RE.findall(line))
+    return {name for name in names if name not in _JS_DUPLICATE_BINDING_IGNORE}
+
+
+def _js_scope_name_for_line(line: str, line_no: int) -> Optional[str]:
+    match = _JS_SCOPE_FUNCTION_RE.match(line)
+    if match:
+        return match.group(1) or f"default@{line_no}"
+    match = _JS_SCOPE_ARROW_RE.match(line)
+    if match:
+        return match.group(1)
+    match = _JS_SCOPE_CLASS_RE.match(line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _js_binding_records(source: str) -> List[Tuple[str, Tuple[str, ...], int, int]]:
+    masked = _mask_jsx_string_and_comment_spans(source)
+    masked_lines = masked.splitlines()
+    source_lines = source.splitlines()
+    records: List[Tuple[str, Tuple[str, ...], int, int]] = []
+    scope_stack: List[Tuple[int, str]] = []
+    depth = 0
+    for idx, line in enumerate(source_lines, start=1):
+        while scope_stack and depth <= scope_stack[-1][0]:
+            scope_stack.pop()
+        scope_path = tuple(name for _exit_depth, name in scope_stack)
+        for name in _js_declared_binding_names_from_line(line):
+            records.append((name, scope_path, depth, idx))
+        scope_name = _js_scope_name_for_line(line, idx)
+        masked_line = masked_lines[idx - 1] if idx - 1 < len(masked_lines) else ""
+        next_depth = max(0, depth + masked_line.count("{") - masked_line.count("}"))
+        if scope_name and next_depth > depth:
+            scope_stack.append((depth, scope_name))
+        depth = next_depth
+    return records
+
+
+def _check_duplicate_js_bindings(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines:
+        return []
+    candidate_names: set = set()
+    for _line_no, text in added_lines:
+        candidate_names.update(_js_declared_binding_names_from_line(text))
+    if not candidate_names:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    seen: Dict[Tuple[Tuple[str, ...], int, str], int] = {}
+    errors: List[str] = []
+    for name, scope_path, depth, line_no in _js_binding_records(source):
+        if name not in candidate_names:
+            continue
+        key = (scope_path, depth, name)
+        first_line = seen.get(key)
+        if first_line is None:
+            seen[key] = line_no
+            continue
+        errors.append(
+            f"{relative_path}:{line_no}: duplicate JS/TS binding in same scope: {name} (also line {first_line})"
+        )
+        if len(errors) >= limit:
+            return errors
+    return errors
+
+
+def _route_container_looks_like_router(container: str) -> bool:
+    tail = container.split(".")[-1].lower()
+    return tail in _ROUTE_CONTAINER_HINTS or tail.endswith("router") or tail.endswith("routes")
+
+
+def _route_segments(path: str) -> List[str]:
+    clean = path.split("?", 1)[0].split("#", 1)[0].strip()
+    return [segment for segment in clean.strip("/").split("/") if segment]
+
+
+def _route_first_segment_is_static(path: str) -> bool:
+    segments = _route_segments(path)
+    if not segments:
+        return False
+    first = segments[0]
+    return not first.startswith(":") and first not in {"*", "(.*)"} and "*" not in first
+
+
+def _route_first_segment_is_dynamic(path: str) -> bool:
+    segments = _route_segments(path)
+    if not segments:
+        return False
+    first = segments[0]
+    return first.startswith(":") or first in {"*", "(.*)"} or "*" in first
+
+
+def _route_methods_overlap(first: str, second: str) -> bool:
+    first = first.lower()
+    second = second.lower()
+    return first == second or first in {"all", "use"} or second in {"all", "use"}
+
+
+def _dynamic_route_can_shadow_static(dynamic_path: str, static_path: str, dynamic_method: str) -> bool:
+    dynamic_segments = _route_segments(dynamic_path)
+    static_segments = _route_segments(static_path)
+    if not dynamic_segments or not static_segments:
+        return False
+    if not _route_first_segment_is_dynamic(dynamic_path) or not _route_first_segment_is_static(static_path):
+        return False
+    if dynamic_method.lower() == "use":
+        return len(dynamic_segments) <= len(static_segments)
+    return len(dynamic_segments) == 1 or len(dynamic_segments) == len(static_segments)
+
+
+def _express_route_records(source: str) -> List[Tuple[int, str, str, str]]:
+    records: List[Tuple[int, str, str, str]] = []
+    for idx, line in enumerate(source.splitlines(), start=1):
+        match = _EXPRESS_ROUTE_CALL_RE.match(line)
+        if not match:
+            continue
+        container, method, _quote, path = match.groups()
+        if not _route_container_looks_like_router(container):
+            continue
+        records.append((idx, container, method.lower(), path))
+    return records
+
+
+def _route_records_from_added_lines(added_lines: List[Tuple[int, str]]) -> List[Tuple[int, str, str, str]]:
+    records: List[Tuple[int, str, str, str]] = []
+    for line_no, text in added_lines:
+        match = _EXPRESS_ROUTE_CALL_RE.match(text)
+        if not match:
+            continue
+        container, method, _quote, path = match.groups()
+        if not _route_container_looks_like_router(container):
+            continue
+        records.append((line_no, container, method.lower(), path))
+    return records
+
+
+def _check_express_route_shadowing(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    added_routes = _route_records_from_added_lines(added_lines)
+    if not added_routes:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    routes = _express_route_records(source)
+    errors: List[str] = []
+    for line_no, container, method, path in added_routes:
+        if _route_first_segment_is_static(path):
+            for prev_line, prev_container, prev_method, prev_path in routes:
+                if prev_line >= line_no or prev_container != container:
+                    continue
+                if not _route_methods_overlap(prev_method, method):
+                    continue
+                if not _dynamic_route_can_shadow_static(prev_path, path, prev_method):
+                    continue
+                errors.append(
+                    f"{relative_path}:{line_no}: static route `{path}` is after earlier dynamic route "
+                    f"`{prev_path}` on {container}; place static routes first"
+                )
+                break
+        elif _route_first_segment_is_dynamic(path):
+            for next_line, next_container, next_method, next_path in routes:
+                if next_line <= line_no or next_container != container:
+                    continue
+                if not _route_methods_overlap(method, next_method):
+                    continue
+                if not _dynamic_route_can_shadow_static(path, next_path, method):
+                    continue
+                errors.append(
+                    f"{relative_path}:{line_no}: dynamic route `{path}` is before later static route "
+                    f"`{next_path}` on {container}; place static routes first"
+                )
+                break
+        if len(errors) >= limit:
+            return errors
+    return errors
+
+
+def _named_local_imports(source: str) -> Dict[str, str]:
+    imports: Dict[str, str] = {}
+    for match in _LOCAL_NAMED_IMPORT_RE.finditer(source):
+        specifier = match.group(2)
+        for item in match.group(1).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            alias_match = re.match(r"([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", item)
+            if alias_match:
+                imports[alias_match.group(2)] = specifier
+                continue
+            name = item.split(":", 1)[0].strip()
+            if re.match(r"^[A-Za-z_$][\w$]*$", name):
+                imports[name] = specifier
+    return imports
+
+
+def _find_async_function_params(source: str, name: str) -> Optional[str]:
+    escaped = re.escape(name)
+    patterns = (
+        re.compile(_ASYNC_FUNCTION_RE_TEMPLATE.format(name=escaped), re.MULTILINE),
+        re.compile(_ASYNC_CONST_RE_TEMPLATE.format(name=escaped), re.MULTILINE),
+    )
+    for pattern in patterns:
+        match = pattern.search(source)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _server_action_params_accept_form_data(params: str) -> bool:
+    if not params:
+        return True
+    first = params.split(",", 1)[0].strip()
+    return bool(re.search(r"\bFormData\b|\bformData\b", first))
+
+
+def _server_action_params_for_name(
+    repo: Path,
+    relative_path: str,
+    source: str,
+    import_map: Dict[str, str],
+    name: str,
+) -> Optional[str]:
+    local_params = _find_async_function_params(source, name)
+    if local_params is not None:
+        return local_params
+    specifier = import_map.get(name)
+    if not specifier:
+        return None
+    target = _resolve_local_import_file(repo, relative_path, specifier)
+    if target is None:
+        return None
+    try:
+        target_source = target.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return _find_async_function_params(target_source, name)
+
+
+def _check_server_action_form_bindings(
+    repo: Path,
+    relative_path: str,
+    added_lines: List[Tuple[int, str]],
+    limit: int = 6,
+) -> List[str]:
+    if not added_lines or Path(relative_path).suffix.lower() not in {".tsx", ".jsx"}:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    import_map = _named_local_imports(source)
+    errors: List[str] = []
+    for line_no, text in added_lines:
+        for action_name in _FORM_ACTION_NAME_RE.findall(text):
+            params = _server_action_params_for_name(repo, relative_path, source, import_map, action_name)
+            if params is None or _server_action_params_accept_form_data(params):
+                continue
+            errors.append(
+                f"{relative_path}:{line_no}: form action `{action_name}` first parameter is not FormData"
+            )
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1725,11 +3479,20 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     silently passed through.
     """
     errors: List[str] = []
-    for relative_path in _patch_changed_files(patch):
+    changed_files = _patch_changed_files(patch)
+    added_line_numbers = _patch_added_line_numbers(patch)
+    added_lines_by_file = _patch_added_lines(patch)
+    for relative_path in changed_files:
         suffix = Path(relative_path).suffix.lower()
         result: Optional[str] = None
         if suffix == ".py":
             result = _check_python_syntax_one(repo, relative_path)
+            if result is None:
+                errors.extend(
+                    _check_python_undefined_added_names(
+                        repo, relative_path, added_line_numbers.get(relative_path, set())
+                    )
+                )
         elif suffix in {".js", ".mjs", ".cjs"}:
             result = _check_node_syntax_one(repo, relative_path)
             if result is None and suffix == ".js":
@@ -1737,11 +3500,129 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        elif suffix == ".go":
+            result = _check_go_syntax_one(repo, relative_path)
+        elif suffix == ".php":
+            result = _check_php_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+        if suffix in {".jsx", ".tsx"}:
+            jsx_balance_error = _check_jsx_tag_balance_one(repo, relative_path)
+            if jsx_balance_error:
+                errors.append(jsx_balance_error)
+            errors.extend(
+                _check_jsx_duplicate_attributes(
+                    repo,
+                    relative_path,
+                    added_line_numbers.get(relative_path, set()),
+                )
+            )
+            errors.extend(
+                _check_jsx_added_component_names(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            react_namespace_error = _check_react_namespace_import(repo, relative_path)
+            if react_namespace_error:
+                errors.append(react_namespace_error)
+            errors.extend(
+                _check_next_server_component_client_usage(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_server_action_form_bindings(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+        if suffix in {".css", ".scss", ".sass"}:
+            errors.extend(
+                _check_css_js_style_imports(
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            use_client_error = _check_use_client_directive_placement(repo, relative_path)
+            if use_client_error:
+                errors.append(use_client_error)
+            errors.extend(
+                _check_static_import_inside_block(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_duplicate_js_bindings(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_express_route_shadowing(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_invalid_named_import_syntax(
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_added_local_imports(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_added_js_undefined_constants(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_added_local_default_imports(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_added_local_named_imports(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+            errors.extend(
+                _check_added_js_action_bindings(
+                    repo,
+                    relative_path,
+                    added_lines_by_file.get(relative_path, []),
+                )
+            )
+    ts_paths = [
+        path for path in changed_files
+        if Path(path).suffix.lower() in {".ts", ".tsx"}
+    ]
+    errors.extend(_check_typescript_project(repo, ts_paths))
+    errors.extend(_check_java_duplicate_public_types(repo, changed_files))
     return errors
 
 
@@ -1759,6 +3640,15 @@ def _has_executable(name: str) -> bool:
         return shutil.which(name) is not None
     except Exception:
         return False
+
+
+def _pubspec_uses_flutter(repo: Path) -> bool:
+    try:
+        text = (repo / "pubspec.yaml").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    lowered = text.lower()
+    return "sdk: flutter" in lowered or "\nflutter:" in lowered or "flutter_test:" in lowered
 
 
 def _shell_quote(value: str) -> str:
@@ -1801,7 +3691,18 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
+    ("{stem}.java", "src/test/java/{stem}Test.java"),
+    ("{stem}.java", "{dir}/{stem}Test.java"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    ("{stem}.php", "tests/Feature/{stem}Test.php"),
+    ("{stem}.php", "tests/Unit/{stem}Test.php"),
+    ("{stem}.php", "tests/{stem}Test.php"),
+    ("{stem}.php", "{dir}/{stem}Test.php"),
+    ("{stem}.dart", "test/{stem}_test.dart"),
+    ("{stem}.dart", "{dir}/{stem}_test.dart"),
+    ("{stem}.dart", "{dir}/../test/{stem}_test.dart"),
+    ("{stem}.zig", "{dir}/{stem}_test.zig"),
+    ("{stem}.zig", "test/{stem}_test.zig"),
 )
 
 
@@ -1816,6 +3717,19 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
     if not stem or not suffix:
         return None
     parent = str(path.parent) if str(path.parent) not in {".", ""} else ""
+    if suffix == ".java":
+        parts = list(path.parts)
+        marker = ["src", "main", "java"]
+        for idx in range(0, max(0, len(parts) - len(marker) + 1)):
+            if parts[idx:idx + len(marker)] != marker:
+                continue
+            package_parts = parts[idx + len(marker):-1]
+            for test_stem in (f"{stem}Test", f"{stem}Tests"):
+                candidate = Path("src/test/java", *package_parts, f"{test_stem}.java")
+                normalized = str(candidate)
+                if normalized in tracked and _context_file_allowed(normalized):
+                    return normalized
+            break
     for source_template, test_template in _TEST_PARTNER_TEMPLATES:
         if not source_template.endswith(suffix):
             continue
@@ -1843,6 +3757,42 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _go_test_package_arg(test_path: str) -> str:
+    parent = str(Path(test_path).parent).replace("\\", "/")
+    if parent in {"", "."}:
+        return "."
+    return "./" + parent.lstrip("./")
+
+
+def _php_companion_test_commands(repo: Path, test_path: str) -> List[List[str]]:
+    commands: List[List[str]] = []
+    if _has_executable("php"):
+        if (repo / "vendor" / "bin" / "phpunit").is_file():
+            commands.append(["php", "vendor/bin/phpunit", "--stop-on-failure", test_path])
+        if (repo / "artisan").is_file():
+            commands.append(["php", "artisan", "test", "--stop-on-failure", test_path])
+    if _has_executable("phpunit"):
+        commands.append(["phpunit", "--stop-on-failure", test_path])
+    return commands
+
+
+def _java_companion_test_commands(repo: Path, test_path: str) -> List[List[str]]:
+    class_name = Path(test_path).stem
+    commands: List[List[str]] = []
+    if (repo / "mvnw").is_file():
+        commands.append(["sh", "./mvnw", "-q", f"-Dtest={class_name}", "test"])
+    elif (repo / "pom.xml").is_file() and _has_executable("mvn"):
+        commands.append(["mvn", "-q", f"-Dtest={class_name}", "test"])
+    if (repo / "gradlew").is_file():
+        commands.append(["sh", "./gradlew", "--no-daemon", "test", "--tests", f"*{class_name}"])
+    elif (
+        any((repo / name).is_file() for name in ("build.gradle", "build.gradle.kts"))
+        and _has_executable("gradle")
+    ):
+        commands.append(["gradle", "--no-daemon", "test", "--tests", f"*{class_name}"])
+    return commands
+
+
 def _run_companion_test(
     repo: Path,
     test_path: str,
@@ -1856,9 +3806,14 @@ def _run_companion_test(
       - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
         the failure when output indicates pytest itself isn't importable
         (ModuleNotFoundError) — that's not a real test failure.
-      - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
-        they require project-level config we can't synthesize in 8s on an
-        unknown repo.
+      - JS: `node --check <test_path>`. TypeScript companion tests are skipped
+        here because `node --check` cannot parse `.ts`/`.tsx`; changed TS files
+        are covered by the project `tsc --noEmit` syntax gate instead.
+      - Go: `go test ./package` for the companion test's package. This catches
+        compile errors, unused imports, and undefined identifiers that `gofmt`
+        parse checks miss.
+      - PHP: path-scoped PHPUnit or Laravel artisan test when available.
+      - Java: path-scoped Maven/Gradle test when a wrapper or runner exists.
       - Other languages: skipped (returns None).
 
     Errors (timeout, runner missing, exception) intentionally degrade to None
@@ -1919,8 +3874,12 @@ def _run_companion_test(
 
         return None  # no runner produced a usable signal
 
-    # ---- JS / TS ----
-    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+    # ---- TypeScript ----
+    if suffix in {".ts", ".tsx"}:
+        return None
+
+    # ---- JavaScript ----
+    if suffix in {".js", ".jsx", ".cjs", ".mjs"}:
         if not _has_executable("node"):
             return None
         try:
@@ -1935,6 +3894,129 @@ def _run_companion_test(
             )
         except subprocess.TimeoutExpired:
             return f"Companion test `{test_path}` parse timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    # ---- Go ----
+    if suffix == ".go":
+        if not _has_executable("go"):
+            return None
+        package_arg = _go_test_package_arg(test_path)
+        try:
+            proc = subprocess.run(
+                ["go", "test", package_arg],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    # ---- Java / Maven / Gradle ----
+    if suffix == ".java":
+        runner_cmds = _java_companion_test_commands(repo, test_path)
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if proc.returncode == 0:
+                return None
+            return output[-2400:] if len(output) > 2400 else output
+        return None
+
+    # ---- PHP / PHPUnit / Laravel ----
+    if suffix == ".php":
+        runner_cmds = _php_companion_test_commands(repo, test_path)
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if proc.returncode == 0:
+                return None
+            return output[-2400:] if len(output) > 2400 else output
+        return None
+
+    # ---- Dart / Flutter ----
+    if suffix == ".dart":
+        runner_cmds: List[List[str]] = []
+        if _has_executable("flutter") and _pubspec_uses_flutter(repo):
+            runner_cmds.append(["flutter", "test", test_path])
+        if _has_executable("dart"):
+            runner_cmds.append(["dart", "test", test_path])
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if proc.returncode == 0:
+                return None
+            return output[-2400:] if len(output) > 2400 else output
+        return None
+
+    # ---- Zig ----
+    if suffix == ".zig":
+        if not _has_executable("zig"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["zig", "test", test_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
         except Exception:
             return None
         if proc.returncode == 0:
@@ -2165,6 +4247,566 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
         if hits * 2 < len(keywords):
             missing.append(crit)
     return missing
+
+
+# -----------------------------
+# Literal-evidence detection
+# -----------------------------
+#
+# Public duel rationales repeatedly penalize near-miss constants: using a nearby
+# enum instead of the exact quoted ad unit, omitting an exact "N/A" display
+# value, or adding the behavior without the requested label/class/route text.
+# This gate is deliberately conservative: it ignores source-file paths and
+# removal contexts, then nudges only when an exact-looking quoted literal from
+# the issue is absent from added lines.
+
+_QUOTED_LITERAL_RE = re.compile(
+    r"`([^`\n]{1,120})`|\"([^\"\n]{1,120})\"|'([^'\n]{1,80})'"
+)
+_LITERAL_CONTEXT_HINT_RE = re.compile(
+    r"\b(exact|literal|quoted|string|constant|value|id|label|message|text|"
+    r"button|header|title|status|route|path|url|endpoint|class|selector|"
+    r"field|key|set|use|replace|return|display|show|save|render)\b",
+    re.IGNORECASE,
+)
+_LITERAL_REMOVAL_CONTEXT_RE = re.compile(
+    r"\b(remove|delete|drop|strip|avoid|without|no longer|stop using|old)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_source_path_literal(text: str) -> bool:
+    value = text.strip()
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    if "/" not in value and "\\" not in value and "." not in value:
+        return False
+    suffix = Path(value.replace("\\", "/")).suffix.lower()
+    if suffix in TEXT_FILE_EXTENSIONS:
+        return True
+    if Path(value.replace("\\", "/")).name in TEXT_FILE_BASENAMES:
+        return True
+    return False
+
+
+def _literal_has_code_shape(text: str) -> bool:
+    value = text.strip()
+    if any(ch.isdigit() for ch in value):
+        return True
+    if re.search(r"[/@:=#.$_{}()[\]-]", value):
+        return True
+    if 2 <= len(value) <= 16 and value.upper() == value and re.search(r"[A-Z]", value):
+        return True
+    return False
+
+
+def _extract_required_literals(issue_text: str) -> List[str]:
+    if not issue_text:
+        return []
+    literals: List[str] = []
+    seen: set = set()
+    for match in _QUOTED_LITERAL_RE.finditer(issue_text):
+        literal = next(group for group in match.groups() if group is not None).strip()
+        if len(literal) < 2 or len(literal) > 96:
+            continue
+        if literal in seen:
+            continue
+        if _looks_like_source_path_literal(literal):
+            continue
+        before = issue_text[max(0, match.start() - 70):match.start()]
+        context = issue_text[max(0, match.start() - 70):min(len(issue_text), match.end() + 70)]
+        if _LITERAL_REMOVAL_CONTEXT_RE.search(before):
+            continue
+        word_count = len(re.findall(r"[A-Za-z0-9]+", literal))
+        if word_count > 8 and not _literal_has_code_shape(literal):
+            continue
+        if not _literal_has_code_shape(literal) and not _LITERAL_CONTEXT_HINT_RE.search(context):
+            continue
+        seen.add(literal)
+        literals.append(literal)
+        if len(literals) >= 8:
+            break
+    return literals
+
+
+def _missing_required_literals(patch: str, issue_text: str) -> List[str]:
+    literals = _extract_required_literals(issue_text)
+    if not literals:
+        return []
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    if not added.strip():
+        return literals
+    return [literal for literal in literals if literal not in added]
+
+
+# -----------------------------
+# Error-handling gap detection
+# -----------------------------
+#
+# Public rounds and current miner PRs point at a recurring miss: the issue asks
+# for graceful fallback, retries, timeout handling, or error recovery, but the
+# patch only implements the happy path. Detect explicit handling requirements
+# and nudge when the added lines contain no recognizable handling branch.
+
+_ERROR_HANDLING_REQUEST_RE = re.compile(
+    r"\b("
+    r"error handling|handle (?:the )?(?:error|errors|failure|failures|exception|exceptions)|"
+    r"gracefully|graceful(?:ly)? handle|fallback|fall back|retry|retries|timeout|"
+    r"recover|recovery|abort(?:ed)?|cancel(?:led|lation)?|onerror|catch(?:es|ing)?|"
+    r"exception|failed request|network failure|parse failure|invalid response"
+    r")\b",
+    re.IGNORECASE,
+)
+_ERROR_HANDLING_ADDED_RE = re.compile(
+    r"\b("
+    r"try|catch|except|finally|rescue|ensure|fallback|retry|timeout|abort|"
+    r"cancel|recover|recovery|onError|isError|hasError|error|errors|exception|"
+    r"raise|throw|reject|statusCode|response\\.ok|signal|AbortController|"
+    r"Result|Err|failure|failed"
+    r")\b|\.catch\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _issue_requires_error_handling(issue_text: str) -> bool:
+    if not issue_text:
+        return False
+    return bool(_ERROR_HANDLING_REQUEST_RE.search(issue_text))
+
+
+def _patch_adds_error_handling(patch: str) -> bool:
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    return bool(_ERROR_HANDLING_ADDED_RE.search(added))
+
+
+def _missing_error_handling_gap(patch: str, issue_text: str) -> bool:
+    return _issue_requires_error_handling(issue_text) and not _patch_adds_error_handling(patch)
+
+
+# -----------------------------
+# Generated-output empty dataset detection
+# -----------------------------
+#
+# Feed/parser/data-generation rounds lose hard when a patch fixes parser code
+# but replaces tracked generated output with empty totals/sections/trending.
+# This gate is intentionally narrow: only feed/generated-data tasks, only
+# data-output-looking files, and only when the diff removes non-zero counts
+# while adding empty count/array markers.
+
+_GENERATED_OUTPUT_CONTEXT_RE = re.compile(
+    r"\b("
+    r"article|articles|atom|count|counts|data\.js|data\.json|dataset|feed|feeds|"
+    r"fixture|fixtures|generate|generated|parser|parsing|regenerate|rss|"
+    r"section|sections|snapshot|summary|summaries|title|titles|trending"
+    r")\b",
+    re.IGNORECASE,
+)
+_GENERATED_EMPTY_OK_RE = re.compile(
+    r"\b(clear|empty|reset|remove all|delete all|zero out|wipe)\b",
+    re.IGNORECASE,
+)
+_GENERATED_OUTPUT_NAMES = frozenset({
+    "data.js",
+    "data.json",
+    "dataset.js",
+    "dataset.json",
+    "feed.json",
+    "feeds.json",
+    "fixture.json",
+    "fixtures.json",
+})
+_GENERATED_EMPTY_COUNT_RE = re.compile(
+    r"['\"]?(?:total|count|articleCount|itemCount|recordCount)['\"]?\s*[:=]\s*0\b",
+    re.IGNORECASE,
+)
+_GENERATED_POPULATED_COUNT_RE = re.compile(
+    r"['\"]?(?:total|count|articleCount|itemCount|recordCount)['\"]?\s*[:=]\s*[1-9]\d*",
+    re.IGNORECASE,
+)
+_GENERATED_EMPTY_ARRAY_RE = re.compile(
+    r"['\"]?(?:articles|entries|items|posts|records|rows|sections|trending)['\"]?\s*[:=]\s*\[\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _issue_mentions_generated_output(issue_text: str) -> bool:
+    if not issue_text or _GENERATED_EMPTY_OK_RE.search(issue_text):
+        return False
+    return bool(_GENERATED_OUTPUT_CONTEXT_RE.search(issue_text))
+
+
+def _path_looks_like_generated_output(relative_path: str) -> bool:
+    path = Path(relative_path)
+    name = path.name.lower()
+    if name in _GENERATED_OUTPUT_NAMES:
+        return True
+    if path.suffix.lower() in {".json", ".js"}:
+        tokens = _split_path_tokens(relative_path)
+        return bool(tokens & {"data", "dataset", "feed", "feeds", "fixture", "fixtures", "generated"})
+    return False
+
+
+def _patch_empty_generated_output_paths(patch: str, issue_text: str) -> List[str]:
+    if not patch.strip() or not _issue_mentions_generated_output(issue_text):
+        return []
+    empty_paths: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        if not _path_looks_like_generated_output(relative_path):
+            continue
+        block = _patch_file_block(patch, relative_path)
+        if not block:
+            continue
+        added = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        removed = "\n".join(
+            line[1:] for line in block.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
+        empty_marker_count = (
+            int(bool(_GENERATED_EMPTY_COUNT_RE.search(added)))
+            + len(_GENERATED_EMPTY_ARRAY_RE.findall(added))
+        )
+        if empty_marker_count >= 2 and _GENERATED_POPULATED_COUNT_RE.search(removed):
+            empty_paths.append(relative_path)
+    return empty_paths
+
+
+def _missing_generated_output_gap(patch: str, issue_text: str) -> bool:
+    return bool(_patch_empty_generated_output_paths(patch, issue_text))
+
+
+# -----------------------------
+# Registry / entrypoint wiring gap detection
+# -----------------------------
+#
+# Public duel losses around provider additions show a common near miss: the
+# patch implements a leaf adapter but never wires it into the selector,
+# registry, dispatcher, route table, or export barrel that makes it reachable.
+# Keep this conservative: require explicit integration/wiring language in the
+# issue, then accept either a registry-looking file path or registry-looking
+# added code as evidence.
+
+_REGISTRY_WIRING_NOUN_RE = re.compile(
+    r"\b("
+    r"adapter|backend|command|controller|dispatcher|driver|endpoint|handler|"
+    r"integration|page|plugin|procedure|provider|route|screen|subcommand|worker"
+    r")\b",
+    re.IGNORECASE,
+)
+_REGISTRY_WIRING_ACTION_RE = re.compile(
+    r"\b("
+    r"detect|determine|dispatch|enable|expose|factory|integrate|lookup|register|"
+    r"registration|resolve|route|routing|select|selector|support|wire|wiring"
+    r")\b",
+    re.IGNORECASE,
+)
+_REGISTRY_ADD_ENTRYPOINT_RE = re.compile(
+    r"\b(add|create|introduce|new)\b.{0,80}\b("
+    r"adapter|backend|command|driver|endpoint|integration|page|plugin|"
+    r"procedure|provider|route|screen|subcommand|worker"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_REGISTRY_WIRING_FILE_TOKENS = frozenset({
+    "app",
+    "barrel",
+    "cli",
+    "command",
+    "commands",
+    "determine",
+    "dispatch",
+    "dispatcher",
+    "entry",
+    "factory",
+    "factories",
+    "index",
+    "main",
+    "registry",
+    "registries",
+    "resolve",
+    "resolver",
+    "route",
+    "routes",
+    "router",
+    "select",
+    "selector",
+    "server",
+})
+_REGISTRY_WIRING_ADDED_RE = re.compile(
+    r"\b("
+    r"determine[A-Za-z0-9_]*|register[A-Za-z0-9_]*|dispatch[A-Za-z0-9_]*|"
+    r"resolve[A-Za-z0-9_]*|select[A-Za-z0-9_]*|registry|router|routes|"
+    r"providers?\s*[\[.=]|adapters?\s*[\[.=]|case\s+['\"]|"
+    r"program\.command|app\.(?:get|post|put|patch|delete|use)|"
+    r"router\.(?:get|post|put|patch|delete|use)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _issue_requires_registry_wiring(issue_text: str) -> bool:
+    if not issue_text:
+        return False
+    if _REGISTRY_ADD_ENTRYPOINT_RE.search(issue_text):
+        return True
+    return bool(
+        _REGISTRY_WIRING_NOUN_RE.search(issue_text)
+        and _REGISTRY_WIRING_ACTION_RE.search(issue_text)
+    )
+
+
+def _path_looks_like_registry_wiring(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.name in {"package.json", "routes.rb", "urls.py"}:
+        return True
+    tokens = _split_path_tokens(path.name)
+    return bool(tokens & _REGISTRY_WIRING_FILE_TOKENS)
+
+
+def _patch_touches_registry_wiring(patch: str) -> bool:
+    for relative_path in _patch_changed_files(patch):
+        if _path_looks_like_registry_wiring(relative_path):
+            return True
+    added = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    return bool(_REGISTRY_WIRING_ADDED_RE.search(added))
+
+
+def _missing_registry_wiring_gap(patch: str, issue_text: str) -> bool:
+    if not patch.strip():
+        return False
+    return _issue_requires_registry_wiring(issue_text) and not _patch_touches_registry_wiring(patch)
+
+
+# -----------------------------
+# URL workflow / report pipeline gap detection
+# -----------------------------
+#
+# Public timeout clusters repeatedly involved cross-view workflows where a
+# partial patch looked plausible but missed one leg: query-param prefill without
+# a quick link, auto-suggest logic without source/target exclusion, or export
+# routes/views without controller/data parity. Keep these gates conservative by
+# requiring explicit issue language and only nudging for the named missing leg.
+
+_URL_QUERY_RE = re.compile(
+    r"\b(url|query\s+params?|search\s+params?|prefill|pre-fill|deep\s+link|"
+    r"permalink|sync(?:hronize)?)\b",
+    re.IGNORECASE,
+)
+_URL_NAV_RE = re.compile(
+    r"\b(quick\s+link|link\s+to|navigate|navigation|router|route\s+to|open\s+the|"
+    r"go\s+to|redirect)\b",
+    re.IGNORECASE,
+)
+_URL_SUGGEST_RE = re.compile(
+    r"\b(auto-?suggest|suggest(?:ion)?|recommend|one-click|closest|candidate|"
+    r"match(?:ing)?\s+target|target\s+selection)\b",
+    re.IGNORECASE,
+)
+_URL_SOURCE_TARGET_RE = re.compile(r"\bsource\b.{0,80}\btarget\b|\btarget\b.{0,80}\bsource\b", re.IGNORECASE | re.DOTALL)
+_URL_QUERY_ADDED_RE = re.compile(
+    r"\b(urlsearchparams|usesearchparams|searchparams|location\.search|router\.query|"
+    r"request\.get|request\.args|params\.get|queryparams|querystring)\b",
+    re.IGNORECASE,
+)
+_URL_NAV_ADDED_RE = re.compile(
+    r"(?:\brouter\.push\b|\bnavigate\s*\(|\bhistory\.push\b|\bredirect\s*\(|\bhref\s*=|\bto\s*=|<link\b)",
+    re.IGNORECASE,
+)
+_URL_SUGGEST_ADDED_RE = re.compile(
+    r"\b(suggest|recommend|candidate|closest|filter\s*\(|sort\s*\(|reduce\s*\(|"
+    r"math\.abs|price|score|target)\b",
+    re.IGNORECASE,
+)
+_URL_SOURCE_TARGET_GUARD_RE = re.compile(
+    r"(source[a-z0-9_]*\s*!==?\s*target[a-z0-9_]*|target[a-z0-9_]*\s*!==?\s*source[a-z0-9_]*|"
+    r"code\s*!==?\s*source[a-z0-9_]*|source[a-z0-9_]*\s*!==?\s*code)",
+    re.IGNORECASE,
+)
+
+
+def _url_workflow_missing_parts(patch: str, issue_text: str) -> List[str]:
+    if not patch.strip() or not issue_text:
+        return []
+    wants_query = bool(_URL_QUERY_RE.search(issue_text))
+    wants_nav = bool(_URL_NAV_RE.search(issue_text))
+    wants_suggest = bool(_URL_SUGGEST_RE.search(issue_text))
+    if sum([wants_query, wants_nav, wants_suggest]) < 2 and not (wants_query and "sync" in issue_text.lower()):
+        return []
+
+    added = _patch_added_text(patch)
+    missing: List[str] = []
+    if wants_query and not _URL_QUERY_ADDED_RE.search(added):
+        missing.append("URL/query-param read + state sync")
+    if wants_nav and not _URL_NAV_ADDED_RE.search(added):
+        missing.append("quick-link/navigation that writes the params")
+    if wants_suggest and not _URL_SUGGEST_ADDED_RE.search(added):
+        missing.append("suggestion/candidate selection logic")
+    if wants_suggest and _URL_SOURCE_TARGET_RE.search(issue_text) and not _URL_SOURCE_TARGET_GUARD_RE.search(added):
+        missing.append("exclude the source item from suggested targets")
+    return missing
+
+
+def _missing_url_workflow_gap(patch: str, issue_text: str) -> bool:
+    return bool(_url_workflow_missing_parts(patch, issue_text))
+
+
+_REPORT_CONTEXT_RE = re.compile(
+    r"\b(pdf|csv|export|download|report|dashboard|metric|risk[- ]?score|"
+    r"attendance|progress|table|card|column|row|dataset)\b",
+    re.IGNORECASE,
+)
+_REPORT_UI_REQUEST_RE = re.compile(
+    r"\b(button|link|dashboard|view|page|screen|blade|template|table|card|"
+    r"column|row|display|show|visible)\b",
+    re.IGNORECASE,
+)
+_REPORT_BACKEND_REQUEST_RE = re.compile(
+    r"\b(route|controller|action|endpoint|pdf|csv|export|download|dompdf|"
+    r"response)\b",
+    re.IGNORECASE,
+)
+_REPORT_DATA_REQUEST_RE = re.compile(
+    r"\b(sort|filter|risk[- ]?score|attendance|progress|null|missing|n/a|"
+    r"dataset|producer|query|count|metric|actual|orders?|rows?|columns?)\b",
+    re.IGNORECASE,
+)
+_REPORT_UI_ADDED_RE = re.compile(
+    r"(?:\b(?:button|table|columns?|rows?|render|blade|tsx|vue|template|view|card|dashboard)\b|"
+    r"\bhref\s*=|<a\b|<button\b)",
+    re.IGNORECASE,
+)
+_REPORT_BACKEND_ADDED_RE = re.compile(
+    r"\b(route::|router\.|app\.(?:get|post|put|patch|delete)|controller|"
+    r"export[a-z0-9_]*\s*\(|download|response|dompdf|pdf|csv|stream)\b",
+    re.IGNORECASE,
+)
+_REPORT_DATA_ADDED_RE = re.compile(
+    r"\b(sort|filter|risk|score|attendance|progress|null|none|n/a|dataset|"
+    r"query|select|count|metric|actual|order|row|column)\b",
+    re.IGNORECASE,
+)
+
+
+def _report_pipeline_missing_parts(patch: str, issue_text: str) -> List[str]:
+    if not patch.strip() or not issue_text or not _REPORT_CONTEXT_RE.search(issue_text):
+        return []
+    added = _patch_added_text(patch)
+    wants_ui = bool(_REPORT_UI_REQUEST_RE.search(issue_text))
+    wants_backend = bool(_REPORT_BACKEND_REQUEST_RE.search(issue_text))
+    wants_data = bool(_REPORT_DATA_REQUEST_RE.search(issue_text))
+    if sum([wants_ui, wants_backend, wants_data]) < 2:
+        return []
+
+    missing: List[str] = []
+    if wants_ui and not _REPORT_UI_ADDED_RE.search(added):
+        missing.append("visible report UI/table/card/button")
+    if wants_backend and not _REPORT_BACKEND_ADDED_RE.search(added):
+        missing.append("route/controller/export action")
+    if wants_data and not _REPORT_DATA_ADDED_RE.search(added):
+        missing.append("dataset/sort/null-status producer logic")
+    if "pdf" in issue_text.lower() and "csv" in issue_text.lower():
+        if "pdf" not in added or "csv" not in added:
+            missing.append("CSV/PDF parity")
+    return missing
+
+
+def _missing_report_pipeline_gap(patch: str, issue_text: str) -> bool:
+    return bool(_report_pipeline_missing_parts(patch, issue_text))
+
+
+# -----------------------------
+# Duplicate-symbol detection
+# -----------------------------
+#
+# Several public rounds lose because a patch adds a replacement handler/helper
+# while leaving the previous definition in place. Syntax checks often pass
+# because Python and JS allow later definitions to shadow earlier ones. Keep the
+# detector conservative: only definitions that are top-level or nearly so, and
+# only names introduced by added lines.
+
+_SYMBOL_DEF_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^class\s+([A-Za-z_]\w*)\s*[:(]"),
+    re.compile(
+        r"^\s{0,2}(?:export\s+(?:default\s+)?)?(?:async\s+)?"
+        r"function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^;{]+)?\{"
+    ),
+    re.compile(
+        r"^\s{0,2}(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*"
+        r"(?:[:=][^;\n]*)?(?:=>|function\b)"
+    ),
+    re.compile(r"^\s{0,2}func\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s{0,2}(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*[<(]"),
+    re.compile(r"^\s{0,2}(?:public\s+|private\s+|internal\s+|protected\s+|open\s+)?fun\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s{0,2}(?:public\s+|private\s+|internal\s+|protected\s+|fileprivate\s+)?func\s+([A-Za-z_]\w*)\s*\("),
+)
+
+
+def _line_defines_symbol(line: str) -> Optional[str]:
+    if line.lstrip().startswith(("#", "//", "/*", "*")):
+        return None
+    for pattern in _SYMBOL_DEF_PATTERNS:
+        match = pattern.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _patch_added_symbol_definitions(patch: str) -> Dict[str, set]:
+    result: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/"):]
+            continue
+        if not current_file or not line.startswith("+") or line.startswith("+++"):
+            continue
+        if current_file.endswith(".d.ts"):
+            continue
+        symbol = _line_defines_symbol(line[1:])
+        if symbol:
+            result.setdefault(current_file, set()).add(symbol)
+    return result
+
+
+def _file_duplicate_symbols(repo: Path, relative_path: str, candidate_names: set) -> List[str]:
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.is_file():
+        return []
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    counts: Dict[str, int] = {name: 0 for name in candidate_names}
+    for line in text.splitlines():
+        symbol = _line_defines_symbol(line)
+        if symbol in counts:
+            counts[symbol] += 1
+    return sorted(name for name, count in counts.items() if count >= 2)
+
+
+def _find_duplicate_symbols(repo: Path, patch: str) -> Dict[str, List[str]]:
+    duplicates: Dict[str, List[str]] = {}
+    for path, names in _patch_added_symbol_definitions(patch).items():
+        found = _file_duplicate_symbols(repo, path, names)
+        if found:
+            duplicates[path] = found
+    return duplicates
 
 
 # -----------------------------
@@ -2446,7 +5088,7 @@ When 3+ consecutive statements share the same shape, prefer a loop / map / list 
 TESTS AND VERIFICATION
 ====================================================================
 
-Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
+Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Do not invent tests that require guessed constructors, mock shapes, imports, snapshots, or fixtures unless you run that exact test and fix it. An unverified speculative test that does not compile is worse than no test. Never weaken, skip, delete, or loosen existing tests to pass.
 
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
@@ -2466,19 +5108,63 @@ Preserve public API and backwards compatibility unless the issue explicitly requ
 
 Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
 
+When the issue states a count or universal scope — "both endpoints", "all units", "every route", "six learning paths", "three old pages", "two required tests" — enumerate those items before editing and verify the final patch covers the same count. Missing one item is worse than a small style mismatch. If the code has an existing registry/list/table for those items, update that registry instead of adding an isolated implementation.
+
+When adding categories, learning paths, quiz outcomes, dashboard cards, navigation links, tabs, or menu items, update the destination/detail rendering too. A selector that offers six choices is incomplete unless the page/view/component that renders the selected choice also has six corresponding data entries and sections. Prefer extending the existing data table/map that drives those pages over hardcoding only the visible buttons.
+
+For state-machine, workflow, navigation, realtime, or game/interaction tasks, update the whole flow, not just the enum/type: the trigger that starts it, pending state, confirmation/action key, active runtime transition, cancellation/error path, cleanup on signal loss/unmount, and every originating context (watch/docked/modal/page). For autopilot, NPC, route-to-target, escort, rob, or interact-key flows, wire route initiation from every originating context, pending action handoff, arrival/too-far messaging, interact/E execution, signal-loss cancellation, and phase-specific preconditions such as stationless entity targets. Preserve existing state shape and use the established store/action location.
+
+For URL-driven workflow tasks (query params, prefill/sync, quick links, suggested targets, one-click navigation), implement both sides of the journey: the destination reads params into state and clears stale state when params disappear, the originating view writes the same param names, and suggestion candidates use the real domain data source while excluding the source item itself from targets.
+
+For multiplayer, classroom, lobby, room, scoreboard, or ranking UI tasks, decide whether the new state must be visible to all participants. If so, store it in the existing room/session/server state and update the action/API/broadcast path; do not keep it as local component state only. Ranking lists should use the requested sort keys exactly, include required rank/difference/time/score fields, preserve reveal/active-round visibility rules, and update CSS/module styles for every new class name.
+
 ====================================================================
 LANGUAGE-SPECIFIC COMPLETENESS RULES
 ====================================================================
 
 **Java:** Write complete method bodies — never use \'// similar logic\' stubs. Cascade all call-site changes when modifying signatures. Include all imports.
 
+**Spring / Java web apps:** For controller, view, API, login/logout, CSRF, role, or security tasks, update the full chain: entity/DTO/repository method if data changes, service method if business logic changes, controller route and model attributes, template/view names, security/CSRF rules, and navigation or redirects. Avoid duplicate controller/bean/class names. Verify endpoint mappings with the smallest Maven/Gradle test or compile command available.
+
 **C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
 
 **TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
 
+**Next.js / React client apps:** Keep `"use client"` as the first statement before imports in client components. Do not move browser-only APIs, hooks, EventSource, event handlers, or window/document/localStorage access into App Router server modules. If an `app/` page/layout component needs `onClick`, `useEffect`, `useState`, `window`, or `document`, either move that behavior into an imported client component or add `"use client"` at the very top only when making the whole file a client component is appropriate. When changing shared fetch/stream/SSE helpers, update every page/component call site and preserve abort/signal/error handling. SSE parsing must handle separate `event:` and `data:` lines across chunks.
+
+For JSX edits, keep each opening tag structurally valid: one parent element for returned siblings, no duplicate attributes such as two `className`, `style`, `inputMode`, or `onClick` props on the same tag, and no function declarations/imports inserted inside returned JSX.
+
+**Next.js server actions and forms:** A direct `<form action={someAction}>` or `<button formAction={someAction}>` passes a `FormData` object as the first argument. If the server action expects an id/string/state argument first, bind it explicitly (`someAction.bind(null, id)`) or wrap it in the established action-state pattern. Do not wire string-id actions directly to forms.
+
+**React layout shell tasks:** When adding a Footer/Header/MainLayout/AppLayout/Shell, create the reusable layout component and wrap every page the task names (for example Login and Dashboard) without removing existing page behavior such as logout, data fetches, or vertical centering. Default imports must point to files with default exports; if you type `children` as `React.ReactNode`, import React or use an existing `ReactNode` type import.
+
+**Project/card/media UI tasks:** When adding image/link/title/description fields, placeholder images, search, or card fallbacks, propagate one consistent data shape through sample data/API mapping, form state, submit payload, filtering/search, and the actual rendered card component. Put invalid-URL and `onError` fallback logic in the component that renders `<img>`, guard against fallback loops, and do not split `title` vs `name` or `image` vs `imageUrl` unless existing code already maps those names.
+
+**Provider / adapter registries:** When adding or changing a provider, adapter, integration, plugin, route, command, worker procedure, or dispatcher target, update the selector/registry/factory/export barrel that makes it reachable. For LLM/provider tasks this includes provider detection by hostname/model, determineProvider or factory registration, outbound request shaping in the provider path, tests aligned to that path, and no mutation of source history unless explicitly required.
+
+**Persistence / storage migrations:** For Netlify Blobs, Supabase, S3, filesystem-to-DB, or admin/public content persistence tasks, preserve existing route/API contracts and local fallback behavior unless explicitly removed. Update both admin mutation endpoints and public read endpoints, image upload/delete paths, frontend data shape mapping, and any filtering fields. Never introduce hardcoded secrets, debug credentials, or a replacement app/router structure just to add storage.
+
+**Export / report / dashboard tasks:** For PDF, CSV, export button, report table, risk-score, attendance/progress, or dashboard metric tasks, wire the whole reporting path: visible button/link, route/controller/action, shared sorting/filtering, CSV/PDF parity, null or missing display values such as `N/A`, enum/case-sensitive status values, and the dataset producer feeding the export. Do not only add a download helper while leaving the UI or controller data stale. For table/card rewrites, update both the data producer and the renderer/columns/rows in the same patch; a new metric in data that never appears in the rendered table still fails.
+
+**Laravel / Inertia / Vue:** Controller `Inertia::render()` names must match the actual page path exactly. When moving a page under Settings or another layout, update routes, route names, breadcrumbs/nav, layout wrappers, controller props, and the existing model/query conventions together. Avoid raw-table rewrites when an established model, scope, or resource already owns the data.
+
+**Android / Kotlin / Compose mobile UI:** When a task asks for screen redesign, ad placement, badges, pinned cards, or padding changes, update the actual screen/composable that renders the list, not just constants. Preserve requested ad unit IDs or quoted constants exactly, remove/insert banner/interstitial cards at the requested position, and verify any note/count/status badge comes from the real list state.
+
+**Protocol / protobuf / worker RPC:** For proto, worker, packet, async request/reply, or procedure-routing tasks, update exactly one message/enum definition, the serialization/builders, route dispatch, worker send path, reply correlation, timeout/error handling, and generated/type declarations if present. Avoid duplicate proto messages/classes and verify the request and reply use the same procedure/type IDs.
+
+**Data / ML / visualization pipelines:** When adding CSV fields, metrics, anchors, priors, loader columns, or plots, propagate the field through extraction, schema/header, loader/parser, visualizer configuration, and CLI/run scripts. Preserve batch/sample dimensions when indexing tensors or predictions; hidden tests often use more than one sample.
+
+**Generated data / feed outputs:** When changing a feed parser, HTML/entity cleanup, serializer, generator, fixture, snapshot, or tracked data output (`data.js`, JSON fixtures, rendered counts), update generated output only through the existing generator or fixture flow. Never replace populated generated data with `total: 0`, empty `sections`, empty `trending`, or other empty arrays unless the issue explicitly asks to clear it. If the generator emits empty output, fix the input path/parser/HTML decoding instead of committing the empty artifact. Prefer JSON serialization over manual apostrophe/backslash escaping.
+
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
+
+**CLI / command / route additions:** If the task adds, renames, moves, or exposes a command, subcommand, route, screen, management command, or executable entry point, the implementation is incomplete until the root registration is updated. Check the project’s existing wiring pattern and update it in the same patch: argparse subparsers, Click/Typer decorators or `add_typer`, commander/yargs program registration, package.json `bin`/scripts, framework route tables, Django/Flask/Rails command registration, exports/index barrels, or router manifests. After patching, verify the entry point is reachable with the smallest help/list/route test available.
+
+For Express/Nest-style route files, route order is part of correctness: place static routes first, adding literal routes such as `/check-duplicate`, `/upcoming`, `/admin`, or `/reports` before broad parameter/catch-all routes such as `/:id`, `/:slug`, or `*`. A route that exists in the diff but is shadowed by an earlier dynamic route still fails the task.
+
+For duplicate-detection or customer/lead matching endpoints, support the exact accepted query/body shapes: if the route accepts either email or phone, do not require both; never call `toLowerCase()` or string methods on an optional field before defaulting it; normalize both input phone numbers and stored phone numbers before comparing; and keep create/sync response shapes compatible with existing callers.
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
@@ -2779,6 +5465,163 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_lockfile_nudge_prompt(missing: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {item}" for item in missing[:6]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Lockfile gap — your patch changes package.json dependency/version "
+        "entries, but the tracked sibling lockfile was NOT updated:\n"
+        f"  {bullets}\n\n"
+        "This often loses similarity/correctness because the reference patch "
+        "keeps dependency manifests and lockfiles consistent. Decide now:\n"
+        "  - If the dependency change is required, update the matching lockfile "
+        "with the smallest consistent edit using the existing package-manager "
+        "format. Do not invent unrelated dependency churn.\n"
+        "  - If the dependency change is not required for the task, revert the "
+        "package.json dependency change instead.\n\n"
+        "After the lockfile/revert edit, run a quick targeted verification if "
+        "available, then emit <final>summary</final>.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_literal_nudge_prompt(missing_literals: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {literal}" for literal in missing_literals[:8]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Literal-evidence gap — the task quotes exact constants, labels, "
+        "routes, status values, or display strings that are not present in "
+        "your patch's added lines:\n"
+        f"  {bullets}\n\n"
+        "For each literal, decide now:\n"
+        "  - If the task requires that exact value, update the owning code to "
+        "use it exactly, including case and punctuation.\n"
+        "  - If the existing code already contains it and no added line should "
+        "repeat it, keep the patch small and explain that in <final>.\n"
+        "  - Do not hardcode example data unless the task asks for that exact "
+        "literal as a constant, label, route, or expected display value.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_error_handling_nudge_prompt(issue_text: str) -> str:
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Error-handling gap — the task explicitly asks for fallback, retry, "
+        "timeout, cancellation, graceful failure, or error recovery, but your "
+        "patch's added lines do not show any recognizable handling branch.\n\n"
+        "Inspect the owning code path and decide:\n"
+        "  - If the requested behavior is missing, add the smallest established "
+        "error/fallback/retry path in the same owner function or helper.\n"
+        "  - Preserve existing API shapes and error messages unless the task "
+        "requires changing them.\n"
+        "  - If existing code already handles the path and no edit is needed, "
+        "keep the patch small and explain that in <final>.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_generated_output_nudge_prompt(paths: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {path}" for path in paths[:6]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Generated-output gap — your patch rewrites tracked generated data to "
+        "an empty dataset, but the task is about preserving or regenerating "
+        "real feed/data output.\n\n"
+        "Affected generated output:\n"
+        f"  {bullets}\n\n"
+        "Do not commit `total: 0`, empty `sections`, empty `trending`, or empty "
+        "article/item arrays when the previous file was populated. Either rerun "
+        "the existing generator with the correct fixtures/input, or revert the "
+        "generated output and fix the parser/serializer so it can regenerate "
+        "the real counts. For feed/HTML fixes, decode entities before stripping "
+        "tags and rely on JSON serialization instead of manual apostrophe or "
+        "backslash escaping.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_registry_wiring_nudge_prompt(issue_text: str) -> str:
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Registry-wiring gap — the task asks for an integration surface such "
+        "as a provider, adapter, route, command, screen, worker procedure, or "
+        "dispatcher path to be registered, selected, detected, exposed, or "
+        "wired, but your patch only shows leaf implementation changes.\n\n"
+        "Inspect the existing registry/selector/dispatcher/export/entrypoint "
+        "pattern and update the smallest owning file that makes the new "
+        "surface reachable. For provider tasks, check provider selection such "
+        "as determineProvider/factory/registry code, hostname/model detection, "
+        "exports, and the outbound request path; do not leave a provider class "
+        "or pipeline-only sanitizer disconnected from selection.\n\n"
+        "Then run the smallest targeted syntax/test check and emit "
+        "<final>summary</final>.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_url_workflow_nudge_prompt(missing_parts: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {part}" for part in missing_parts[:5]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "URL-workflow gap — the task describes a URL/query-param, prefill/sync, "
+        "quick-link, or auto-suggest flow, but your patch appears to cover only "
+        "part of that cross-view behavior.\n\n"
+        "Missing workflow leg(s):\n"
+        f"  {bullets}\n\n"
+        "Inspect the existing page/router/store pattern and wire the whole user "
+        "journey: read params into local state, keep the URL/state in sync when "
+        "the task asks for it, add the originating quick link with the same "
+        "param names, and make suggestion candidates use the task's real data "
+        "source while excluding the source item itself. Keep the patch narrow.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_report_pipeline_nudge_prompt(missing_parts: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {part}" for part in missing_parts[:5]) or "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Report/export pipeline gap — the task spans reporting UI, export "
+        "backend, rendered tables/cards, and/or data producers, but the patch "
+        "does not clearly update every requested leg.\n\n"
+        "Missing reporting leg(s):\n"
+        f"  {bullets}\n\n"
+        "Patch the smallest owning files so the visible button/table/card, "
+        "route/controller/export action, CSV/PDF parity, sort/filter behavior, "
+        "null or N/A display, and dataset producer agree. Do not leave a route "
+        "without a controller action, a PDF/CSV view without the dashboard "
+        "button, or a data-side field without the rendered table/card column.\n\n"
+        "Task:\n"
+        f"{short}\n"
+    )
+
+
+def build_duplicate_symbol_nudge_prompt(duplicates: Dict[str, List[str]]) -> str:
+    bullets: List[str] = []
+    for path, names in duplicates.items():
+        for name in names:
+            bullets.append(f"- {path}: `{name}` is now defined more than once")
+    return (
+        "Duplicate-symbol gap — your patch added a function/class/helper whose "
+        "name already exists in the same file. This usually means you added a "
+        "replacement implementation but left the old one behind, causing "
+        "shadowing or compile/runtime failures.\n\n"
+        "Affected definitions:\n"
+        f"{chr(10).join(bullets[:8])}\n\n"
+        "Open each affected file, keep the correct implementation, and remove "
+        "the obsolete duplicate. Do not rename both implementations to dodge "
+        "the issue; preserve the API expected by existing call sites. Then run "
+        "the smallest syntax/test check available and emit <final>summary</final>."
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -2931,6 +5774,13 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _patch_soft_return_due(patch: str, solve_started_at: float, *, now: Optional[float] = None) -> bool:
+    if not patch.strip():
+        return False
+    elapsed = (time.monotonic() if now is None else now) - solve_started_at
+    return elapsed >= PATCH_SOFT_RETURN_SECONDS
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2985,6 +5835,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _result1
 
         _elapsed = time.monotonic() - _multishot_started
+        if _elapsed >= PATCH_SOFT_RETURN_SECONDS:
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "near_validator_timeout_floor"
+            return _result1
+
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -3076,6 +5931,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    lockfile_nudges_used = 0
+    literal_nudges_used = 0
+    error_nudges_used = 0
+    duplicate_symbol_nudges_used = 0
+    registry_wiring_nudges_used = 0
+    generated_output_nudges_used = 0
+    url_workflow_nudges_used = 0
+    report_pipeline_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3104,14 +5967,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             2. syntax — quote any parser error back at the model
             3. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            4. duplicate/deletion/lockfile/criteria/coverage structural nudges
+            5. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, lockfile_nudges_used, literal_nudges_used, error_nudges_used, duplicate_symbol_nudges_used, registry_wiring_nudges_used, generated_output_nudges_used, url_workflow_nudges_used, report_pipeline_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3148,7 +6010,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Gate order: syntax → test → deletion → lockfile → generated-output → literal → error → URL/report/registry → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -3187,6 +6049,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        if duplicate_symbol_nudges_used < MAX_DUPLICATE_SYMBOL_NUDGES:
+            duplicate_symbols = _find_duplicate_symbols(repo, patch)
+            if duplicate_symbols:
+                duplicate_symbol_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duplicate_symbol_nudge_prompt(duplicate_symbols),
+                    "DUPLICATE_SYMBOL_NUDGE_QUEUED:\n  "
+                    + " | ".join(
+                        f"{path}: {', '.join(names)}"
+                        for path, names in duplicate_symbols.items()
+                    ),
+                )
+                return True
+
         # Deletion gap: issue says remove/delete/replace but patch has no deletions.
         # Fires before criteria/coverage: a missing removal is a structural omission,
         # not a coverage gap — surface it while refinement budget remains.
@@ -3200,6 +6080,98 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_deletion_nudge_prompt(issue),
                     "DELETION_NUDGE_QUEUED: issue requires removal but patch has no deletion lines",
+                )
+                return True
+
+        if lockfile_nudges_used < MAX_LOCKFILE_NUDGES:
+            missing_lockfiles = _missing_package_lockfile_updates(repo, patch)
+            if missing_lockfiles:
+                lockfile_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_lockfile_nudge_prompt(missing_lockfiles, issue),
+                    "LOCKFILE_NUDGE_QUEUED:\n  " + " | ".join(missing_lockfiles[:4]),
+                )
+                return True
+
+        if generated_output_nudges_used < MAX_GENERATED_OUTPUT_NUDGES:
+            empty_generated_paths = _patch_empty_generated_output_paths(patch, issue)
+            if empty_generated_paths:
+                generated_output_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_generated_output_nudge_prompt(empty_generated_paths, issue),
+                    "GENERATED_OUTPUT_NUDGE_QUEUED:\n  " + " | ".join(empty_generated_paths[:4]),
+                )
+                return True
+
+        if literal_nudges_used < MAX_LITERAL_NUDGES:
+            missing_literals = _missing_required_literals(patch, issue)
+            if missing_literals:
+                literal_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_literal_nudge_prompt(missing_literals, issue),
+                    "LITERAL_NUDGE_QUEUED:\n  " + " | ".join(missing_literals[:4]),
+                )
+                return True
+
+        if error_nudges_used < MAX_ERROR_NUDGES:
+            if _missing_error_handling_gap(patch, issue):
+                error_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_error_handling_nudge_prompt(issue),
+                    "ERROR_HANDLING_NUDGE_QUEUED",
+                )
+                return True
+
+        if url_workflow_nudges_used < MAX_URL_WORKFLOW_NUDGES:
+            missing_url_parts = _url_workflow_missing_parts(patch, issue)
+            if missing_url_parts:
+                url_workflow_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_url_workflow_nudge_prompt(missing_url_parts, issue),
+                    "URL_WORKFLOW_NUDGE_QUEUED:\n  " + " | ".join(missing_url_parts[:4]),
+                )
+                return True
+
+        if report_pipeline_nudges_used < MAX_REPORT_PIPELINE_NUDGES:
+            missing_report_parts = _report_pipeline_missing_parts(patch, issue)
+            if missing_report_parts:
+                report_pipeline_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_report_pipeline_nudge_prompt(missing_report_parts, issue),
+                    "REPORT_PIPELINE_NUDGE_QUEUED:\n  " + " | ".join(missing_report_parts[:4]),
+                )
+                return True
+
+        if registry_wiring_nudges_used < MAX_REGISTRY_WIRING_NUDGES:
+            if _missing_registry_wiring_gap(patch, issue):
+                registry_wiring_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_registry_wiring_nudge_prompt(issue),
+                    "REGISTRY_WIRING_NUDGE_QUEUED",
                 )
                 return True
 
@@ -3297,9 +6269,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
+            patch_at_step_start = get_patch(repo)
+            if _patch_soft_return_due(patch_at_step_start, solve_started_at):
+                logs.append(
+                    "PATCH_SOFT_RETURN:\n"
+                    f"elapsed={time.monotonic() - solve_started_at:.1f}s "
+                    f"threshold={PATCH_SOFT_RETURN_SECONDS:.1f}s -- "
+                    "returning best patch before the validator's minimum "
+                    "external timeout can kill the round."
+                )
+                success = True
+                break
+
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
+                modified_files = _patch_changed_files(patch_at_step_start)
                 stripped = _strip_preloaded_section(
                     original_initial,
                     preloaded_files,
@@ -3409,6 +6393,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
+                    if _patch_soft_return_due(patch, solve_started_at):
+                        logs.append(
+                            "PATCH_SOFT_RETURN:\n"
+                            f"elapsed={time.monotonic() - solve_started_at:.1f}s "
+                            f"threshold={PATCH_SOFT_RETURN_SECONDS:.1f}s -- "
+                            "returning best patch after command execution "
+                            "before external timeout."
+                        )
+                        success = True
+                        break
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
@@ -3557,8 +6551,16 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\btsc\b",
         r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
+        r"\bzig\s+(build|test)\b",
+        r"\bdart\s+(test|analyze)\b",
+        r"\bflutter\s+(test|analyze)\b",
+        r"\bswift\s+(test|build)\b",
         r"\bmvn\s+test\b",
         r"\bgradle(w)?\s+test\b",
+        r"\bphpunit\b",
+        r"\bcomposer\s+(test|run\s+(test|lint|check))\b",
+        r"\brspec\b",
+        r"\bbundle\s+exec\s+(rspec|rubocop)\b",
         r"\bmake\s+(test|check|lint)\b",
         r"\bruff\b",
         r"\beslint\b",
