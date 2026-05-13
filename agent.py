@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -108,6 +109,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_PATCH_STABILITY_FORCED_FINAL_STEPS = 3
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -721,13 +723,18 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:  # F2
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:                  # F2
         return True
     generated_parts = {
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        ".tox",                       # F2: tox virtualenv cache
+        ".idea", ".vscode",           # F2: IDE state
+        ".next", ".turbo",            # F2: Next/Turborepo build out
         "node_modules",
         "coverage",
         "dist",
@@ -736,14 +743,7 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".git",
     }
     generated_suffixes = {
-        ".class",
-        ".o",
-        ".obj",
-        ".so",
-        ".dll",
-        ".dylib",
-        ".exe",
-        ".bin",
+        ".class", ".o", ".obj", ".so", ".dll", ".dylib", ".exe", ".bin",
     }
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
 
@@ -1051,6 +1051,86 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+# Match CamelCase identifiers with 3+ chars (e.g. `JobCardForm`,
+# `TransactionActions`, `usePickleball`).
+_BASENAME_CAMEL_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<ident>(?:[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]+"
+    r"|[A-Z][a-z][A-Za-z0-9]{2,}))"
+    r"(?![A-Za-z0-9])"
+)
+# Match bare filename references like `JobCardForm.tsx` or `useAuth.ts`.
+_BASENAME_FILE_RE = re.compile(
+    r"(?<![A-Za-z0-9/])"
+    r"(?P<base>[A-Za-z_][A-Za-z0-9_]{2,}\."
+    r"(?:tsx|ts|jsx|js|mjs|cjs|py|go|rs|java|swift|kt|cs|cpp|c|h|hpp|php|rb))"
+    r"(?![A-Za-z0-9])"
+)
+_BASENAME_ANCHOR_MAX = 4  # cap so we never blow past partner-augmenter limits
+
+
+def _basename_anchor_preload(
+    issue_text: str, tracked: List[str]
+) -> List[str]:
+    """Extract bare CamelCase identifiers and bare basenames from the
+    issue text, look them up against tracked files, and return paths
+    that match. Pure-functional; returns at most _BASENAME_ANCHOR_MAX
+    paths in stable order. Fail-safe."""
+    try:
+        if not isinstance(issue_text, str) or not issue_text:
+            return []
+        if not tracked:
+            return []
+        tokens: List[str] = []
+        seen: set = set()
+        for match in _BASENAME_FILE_RE.finditer(issue_text):
+            base = match.group("base")
+            if base.lower() not in seen:
+                tokens.append(base)
+                seen.add(base.lower())
+        for match in _BASENAME_CAMEL_RE.finditer(issue_text):
+            ident = match.group("ident")
+            if ident.lower() not in seen and len(ident) >= 5:
+                tokens.append(ident)
+                seen.add(ident.lower())
+        if not tokens:
+            return []
+        anchors: List[str] = []
+        anchor_seen: set = set()
+        for token in tokens:
+            token_lower = token.lower()
+            # 1. exact basename match (with or without ext)
+            for relative_path in tracked:
+                name = Path(relative_path).name
+                stem = Path(relative_path).stem
+                hit = (
+                    name.lower() == token_lower
+                    or stem.lower() == token_lower
+                )
+                if hit and relative_path not in anchor_seen:
+                    if _context_file_allowed(relative_path):
+                        anchors.append(relative_path)
+                        anchor_seen.add(relative_path)
+            if len(anchors) >= _BASENAME_ANCHOR_MAX:
+                break
+            # 2. substring-in-basename fallback
+            for relative_path in tracked:
+                name_lower = Path(relative_path).name.lower()
+                if (
+                    token_lower in name_lower
+                    and relative_path not in anchor_seen
+                    and _context_file_allowed(relative_path)
+                ):
+                    anchors.append(relative_path)
+                    anchor_seen.add(relative_path)
+                if len(anchors) >= _BASENAME_ANCHOR_MAX:
+                    break
+            if len(anchors) >= _BASENAME_ANCHOR_MAX:
+                break
+        return anchors[:_BASENAME_ANCHOR_MAX]
+    except Exception:
+        return []
+
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
@@ -1066,10 +1146,18 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     path_mentions = _extract_issue_path_mentions(issue)
     mentioned: List[str] = []
     tracked_set = set(tracked)
+    try:
+        basename_anchors = _basename_anchor_preload(issue, tracked)
+    except Exception:
+        basename_anchors = []
+    for anchor in basename_anchors:
+        if anchor not in mentioned and anchor in tracked_set:
+            mentioned.append(anchor)
     for mention in path_mentions:
         normalized = mention.strip("./")
         if normalized in tracked_set and _context_file_allowed(normalized):
-            mentioned.append(normalized)
+            if normalized not in mentioned:
+                mentioned.append(normalized)
 
     # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
     # `email_notificacoes`) are deliberate signals from the task author about
@@ -1638,6 +1726,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt",          # floor F1
+    ".c", ".cc", ".cpp", ".h", ".hpp",     # floor F1
+    ".cs", ".php",                         # floor F1
 }
 
 
@@ -2233,6 +2324,52 @@ def _issue_implies_relocation(issue_text: str) -> bool:
     return bool(_RELOCATION_PHRASE_RE.search(issue_text))
 
 
+_NEW_FILE_HEADER_RE = re.compile(
+    r"^diff --git a/(\S+) b/(\S+)\nnew file mode \d+",
+    re.MULTILINE,
+)
+
+
+def _check_shadow_file_creation(
+    patch: str, tracked_basenames_to_paths: Dict[str, List[str]]
+) -> List[str]:
+    """Detect new-file additions whose basename already exists at a
+    different path in the tracked file set. Returns at most 2 findings
+    so the polish prompt stays short. Pure-functional; fail-safe."""
+    try:
+        if not isinstance(patch, str) or not patch.strip():
+            return []
+        findings: List[str] = []
+        for match in _NEW_FILE_HEADER_RE.finditer(patch):
+            new_path = (match.group(2) or "").strip()
+            if not new_path:
+                continue
+            base = Path(new_path).name
+            if not base or len(base) < 3:
+                continue
+            existing = tracked_basenames_to_paths.get(base) or []
+            existing = [p for p in existing if p != new_path]
+            if not existing:
+                continue
+            findings.append(
+                f"SHADOW_FILE_CREATE: patch adds NEW file `{new_path}` "
+                f"but `{base}` already exists at: {', '.join(existing[:3])}. "
+                "If the task asked you to modify or refactor that component, "
+                "you almost certainly want to EDIT the existing file in "
+                "place rather than create a shadow file at a different path. "
+                "If a new file is genuinely intended (relocation phrasing), "
+                "you must also delete or update the old path. Re-read the "
+                "task spec: does it say 'modify X', 'refactor X', 'use the "
+                "existing X', or 'switch X to ...'? If yes, replace your "
+                "new-file write with an edit to the existing path."
+            )
+            if len(findings) >= 2:
+                break
+        return findings
+    except Exception:
+        return []
+
+
 def _patch_creates_any_new_file(patch: str) -> bool:
     """True if the patch contains at least one `new file mode` header.
 
@@ -2498,6 +2635,33 @@ Do NOT change:
 - File permissions or mode bits (chmod is forbidden)
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
+
+====================================================================
+EXISTING-FILE PROTOCOL
+====================================================================
+
+When the task names a component, hook, file, controller, or identifier
+that ALREADY exists in the repo, your edits MUST land on that existing
+path. Creating a shadow file at a parallel path is the modal validator-
+duel loss in this competition.
+
+- Locate-first: before any `cat > NEWPATH <<EOF` write, search the
+  repo (`git ls-files | grep`, ripgrep, find) for files whose basename
+  matches the task\'s named component. If a match exists, EDIT that
+  path; do NOT create a sibling file at a new path.
+- Identifier-grounded: if the task says "use dispatch from
+  usePickleball()" or "register via determineProvider" or "extend the
+  existing X", the patch must IMPORT and CALL those exact identifiers.
+  Re-grep the repo to confirm the name and signature before writing.
+- Singleton-removal cascade: when removing a top-level import or
+  global from a file, every remaining function in that file that
+  references the symbol must be converted or the import restored.
+  One unconverted handler raises NameError at runtime.
+- Outbound-message immutability: when filtering or transforming a
+  list of messages flowing through a pipeline (e.g. stripping
+  reasoning_content), build a sanitized COPY of each dict; do NOT
+  mutate fields on the original (`msg["content"] = ...`). In-place
+  mutation pollutes shared state for downstream readers.
 
 ====================================================================
 SAFETY
@@ -3077,6 +3241,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
     solve_started_at = time.monotonic()
+    _patch_stability_hash: Optional[str] = None
+    _patch_stability_streak = 0
+    _patch_stability_fired = False
 
     def time_remaining() -> float:
         return wall_clock_budget - (time.monotonic() - solve_started_at)
@@ -3253,13 +3420,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
-            if junk:
+            try:
+                _basename_index: Dict[str, List[str]] = {}
+                for _p in _tracked_files(repo):
+                    _basename_index.setdefault(Path(_p).name, []).append(_p)
+                _shadow_findings = _check_shadow_file_creation(patch, _basename_index)
+            except Exception:
+                _shadow_findings = []
+            if junk or _shadow_findings:
                 polish_turns_used += 1
                 total_refinement_turns_used += 1
+                _polish_prompt = build_polish_prompt(junk or "")
+                if _shadow_findings:
+                    _polish_prompt = "\n".join(_shadow_findings) + "\n\n" + _polish_prompt
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                    _polish_prompt,
+                    "POLISH_TURN_QUEUED:\n  " + (junk or "(shadow-file-create)"),
                 )
                 return True
 
@@ -3322,6 +3499,51 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            # Patch-stability forced-final: when the patch hash is unchanged
+            # across consecutive steps AND the patch is substantive, force a
+            # final emit instead of letting the model keep exploring.
+            try:
+                _current_patch = get_patch(repo)
+                _current_hash = hashlib.sha1(_current_patch.encode("utf-8")).hexdigest()
+                _current_substantive = _multishot_count_substantive(_current_patch)
+            except Exception:
+                _current_patch = ""
+                _current_hash = ""
+                _current_substantive = 0
+
+            if _current_hash and _current_hash == _patch_stability_hash:
+                _patch_stability_streak += 1
+            else:
+                _patch_stability_hash = _current_hash
+                _patch_stability_streak = 1
+
+            if (
+                not _patch_stability_fired
+                and _current_substantive >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+                and _patch_stability_streak >= _PATCH_STABILITY_FORCED_FINAL_STEPS
+            ):
+                try:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "PATCH_STABILITY_FORCED_FINAL: your last "
+                            f"{_patch_stability_streak} step(s) have not changed the "
+                            "staged diff. The patch is substantive. STOP issuing "
+                            "<command> blocks and emit exactly one <final>summary"
+                            "</final> block now so refinement passes can run. Do "
+                            "NOT propose further grep/find/test commands. If the "
+                            "patch has a real gap, refinement turns will surface it."
+                        ),
+                    })
+                    _patch_stability_fired = True
+                    logs.append(
+                        f"PATCH_STABILITY_FORCED_FINAL: step={step} "
+                        f"streak={_patch_stability_streak} "
+                        f"substantive={_current_substantive}"
+                    )
+                except Exception:
+                    pass
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
