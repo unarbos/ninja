@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -59,6 +60,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1001,7 +1003,27 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # v4 weighted file budgets: top-ranked files (1-3) get bigger character
+    # slices than bottom-ranked. Reasons: (1) per-file similarity has
+    # diminishing returns at low rank — preloading a low-relevance file at
+    # 3000 chars produces a tiny chance of helping; (2) top-ranked files are
+    # most likely to be the actual fix target and benefit from fuller
+    # context (more class signatures, surrounding helpers visible). Smooth
+    # decay curve so middle-ranked files still get fair allocation; floor at
+    # 1500 to preserve minimum-useful snippet size.
+    n_files_taken = min(len(files), MAX_PRELOADED_FILES)
+    if n_files_taken > 0:
+        _budget_curve = [
+            2.4 if i < 2 else 1.7 if i < 4 else 1.2 if i < 8 else 0.7
+            for i in range(n_files_taken)
+        ]
+        _curve_total = sum(_budget_curve) or 1.0
+        _file_budgets = [
+            max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / _curve_total))
+            for w in _budget_curve
+        ]
+    else:
+        _file_budgets = []
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1019,8 +1041,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for _idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = (
+            _file_budgets[_idx] if _idx < len(_file_budgets) else 1500
+        )
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1050,6 +1075,75 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+_TERM_RARITY_BASE = 3  # the prior flat per-term weight; preserved as the floor
+_TERM_RARITY_CAP = 8
+_DOC_FREQUENCY_TERM_CAP = 12
+_DOC_FREQUENCY_GREP_TIMEOUT = 3.0
+_DOC_FREQUENCY_MIN_TERM_LEN = 3
+
+
+def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
+    """Document frequency per term: how many tracked files contain it.
+
+    Used to give a rarity bonus on top of the flat per-term ranking score,
+    never a penalty. Independent fixed-string case-insensitive git-grep per
+    term, capped at _DOC_FREQUENCY_TERM_CAP terms with a short per-call
+    timeout so a wide issue cannot stall the ranker. Runs the grep calls in
+    parallel because each term is independent — cuts the wall-clock spent
+    in ranking on issues with many terms (the dominant ranker cost) from
+    O(N * timeout_budget) to roughly O(timeout_budget). Returns {} on any
+    failure; callers fall back to _TERM_RARITY_BASE (the prior flat weight).
+    """
+    capped_terms = [t for t in terms[:_DOC_FREQUENCY_TERM_CAP]]
+    df: Dict[str, int] = {t: 0 for t in capped_terms}
+    workable = [
+        t for t in capped_terms
+        if t and len(t) >= _DOC_FREQUENCY_MIN_TERM_LEN
+    ]
+    if not workable:
+        return df
+
+    def _count_term(term: str) -> Tuple[str, int]:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+                check=False,
+            )
+        except Exception:
+            return term, 0
+        if proc.returncode != 0:
+            return term, 0
+        return term, proc.stdout.count("\n")
+
+    with ThreadPoolExecutor(max_workers=min(len(workable), 8)) as pool:
+        futures = {pool.submit(_count_term, t): t for t in workable}
+        for future in as_completed(futures):
+            try:
+                term, count = future.result()
+            except Exception:
+                continue
+            df[term] = count
+    return df
+
+
+def _term_bonus(term: str, df: Dict[str, int]) -> int:
+    """Rarity bonus per term hit on a candidate path.
+
+    Floor at _TERM_RARITY_BASE (= 3, the prior flat weight) so common
+    words never score below the king's behavior. Cap at _TERM_RARITY_CAP
+    (= 8) so a single rare-term hit cannot overwhelm an explicit-mention
+    boost (+100). When df is unknown or zero, falls back to the floor.
+    """
+    hits = df.get(term)
+    if hits is None or hits <= 0:
+        return _TERM_RARITY_BASE
+    bonus = 6.0 / math.log(2 + hits)
+    return max(_TERM_RARITY_BASE, min(_TERM_RARITY_CAP, int(round(bonus))))
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
@@ -1089,6 +1183,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # Rarity bonus floor-clamped at the prior flat weight (3). Common UI/
+    # business words still score the king-equivalent +3 per match; rare
+    # task-specific identifiers can pull up to +8. Pareto-improvement: no
+    # path can score lower than the king's flat weighting on this signal.
+    term_df = _doc_frequency(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1105,7 +1204,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -1158,8 +1257,8 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-    hits: Dict[str, int] = {}
-    for term in terms:
+
+    def _grep_term(term: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
@@ -1170,13 +1269,21 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
                 timeout=3,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if relative_path and relative_path in tracked:
-                hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
+        futures = {pool.submit(_grep_term, t): t for t in terms}
+        for future in as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
+
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1255,9 +1362,17 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        # Smart token-in-path: short tokens (< 5 chars) must match a whole
+        # path-word component (e.g. "api" only matches "src/api/" not
+        # "build/capi.js"); longer tokens can use raw substring because
+        # length-5+ matches are far less likely to false-positive. Reduces
+        # noise from generic 3-4 char issue tokens.
+        path_words = _split_path_tokens(relative_path)
+        def _token_in_path(tok: str) -> bool:
+            return tok in path_words if len(tok) < 5 else tok in path_lower
+        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
+        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
+        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -2312,8 +2427,8 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+
+    def _grep_symbol(symbol: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -2324,16 +2439,21 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked_set
+            and _context_file_allowed(line.strip())
+        ]
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        futures = {pool.submit(_grep_symbol, s): s for s in symbols}
+        for future in as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     return hits
 
 
@@ -2344,9 +2464,41 @@ def _symbol_grep_hits(
 # MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
 # agent. Prompt improvements are encouraged as long as they respect the
 # validator-owned boundaries above.
-SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
+SYSTEM_PROMPT = '''SCORING CONSTRAINT — READ FIRST, READ AGAIN BEFORE EVERY EDIT
+====================================================================
+The reference patch for this task is statistically 1-2 files and under 30 lines (range: 1-3 files, 1-50 lines). Patches larger than this score LOWER on similarity regardless of correctness. Every extra file you touch, every extra hunk, every helper / abstraction / "while I\'m here" cleanup directly costs you the round.
 
-You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
+If you can state the fix in ONE sentence and it touches ONE function — make that edit NOW in this response without any inspection commands.
+
+You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
+
+====================================================================
+HOW YOU ARE SCORED — DETAIL
+====================================================================
+
+A hidden judge ranks your patch against another agent\'s patch on the SAME task. Your score has two halves of equal weight:
+
+  HALF 1 — SIMILARITY-TO-REFERENCE (~50%)
+    Your diff is compared, file-by-file and hunk-by-hunk, to a hidden REFERENCE patch written by a senior maintainer who actually owns this codebase. The score is highest when your patch:
+      * touches the SAME files the reference touches (no extras, no omissions),
+      * deletes/replaces the SAME original lines,
+      * inserts code with similar tokens and edit shape,
+      * has the same overall edit shape (one small hunk vs many widespread hunks).
+    Touching files the reference does NOT touch DIRECTLY LOWERS this score.
+
+  HALF 2 — LLM JUDGE (~50%)
+    A separate LLM compares your patch and the opponent\'s against the same reference. It rewards correctness, completeness, and tight alignment with the task/reference. It explicitly PENALIZES "unrelated churn", incomplete fixes, manipulation, and empty/timeout solutions. The reference patch is privileged context for the judge — your patch is judged against THAT direction, not against your own interpretation.
+
+  WINNING REQUIRES STRICT INEQUALITY: ties go to the opponent. So every extra unrelated hunk and every missing required hunk costs you the round.
+
+THE REFERENCE PATCH IS ALMOST ALWAYS:
+  * 1–3 files, 1–50 lines.
+  * Edits the OWNER of the behavior (parser/serializer/validator/route/etc.).
+  * Uses constants, helpers, libraries, and patterns ALREADY present in the repo.
+  * Adds NO new files, NO new helpers, NO new tests, NO refactors unless the issue text literally requires them.
+  * Preserves comments, formatting, naming, imports, and public API exactly.
+
+YOUR ENTIRE STRATEGY: produce the SMALLEST patch that fully satisfies the issue, looking exactly like what the maintainer who knows this codebase would write.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -2369,17 +2521,18 @@ Your first response MUST contain a `<plan>` block followed immediately by one fo
 First response format:
 
 <plan>
-- Requirement: restate every explicit issue requirement.
-- Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
-- Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
-- Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Likely target: name likely files/functions/classes/modules to inspect or modify.
-- Strategy: smallest root-cause fix likely to satisfy the issue.
-- Verification: targeted test command expected after patching.
+- Requirement: restate the main fix the issue asks for.
+- Requirement: restate each EXPLICIT secondary clause / edge case / "also" / "must" / "should not" the issue actually contains. Do NOT invent acceptance criteria the issue does not state.
+- Likely target: name 1–3 likely files/functions to inspect first. Prefer files already in the preloaded snippets.
+- Smallest fix: describe the 1–10 line change you expect to make, in which function. If the fix needs more than ~50 lines, re-read the issue — most reference patches are smaller than that.
+- SCOPE LOCK: state EXACTLY in ONE sentence the FILE, the FUNCTION (or block), and the LINE RANGE you will change (e.g. `SCOPE LOCK: src/parser.py :: parse_header :: lines 120-128`). If you cannot name a target file/function from the preloaded snippets and the issue text, your next command MUST be a single focused grep — and your second response MUST start with the SCOPE LOCK line before any other content. Touching anything outside the locked file/function later in this round is scope creep and will be reverted.
+- Verification: one targeted test command after patching, or "no targeted test exists" if the repo has no usable test for this area.
 </plan>
 <command>
 focused inspection command
 </command>
+
+REWARD INACTION: if after reading the issue the fix is one sentence and one function, EMIT the SCOPE LOCK and the edit command in the SAME first response — skip the inspection step. Exploration you do not need costs steps, costs wall-clock, and tempts the model to touch extra files.
 
 Never emit markdown fences around `<plan>`, `<command>`, or `<final>`.
 
@@ -2389,19 +2542,28 @@ Never emit `<final>` before a required code change has been made and verificatio
 ISSUE CONTRACT
 ====================================================================
 
-Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
+Treat the issue as a contract. Extract every EXPLICITLY STATED requirement before editing — main task, bullet points, acceptance criteria, exact error strings, edge cases, and backwards-compat constraints.
 
-If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
+Distinguish what the issue STATES from what you might GUESS:
+  * STATED requirements MUST all be addressed.
+  * GUESSED "integration points" the issue does NOT mention are most likely scope creep — leave them alone.
 
-Evidence priority when picking what to patch: explicit issue text > failing/expected tests > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
+If the issue is ambiguous, do NOT ask for clarification. Infer intent from nearby code, tests, and existing patterns, and pick the SMALLEST plausible maintainer fix that preserves unrelated behavior.
+
+Evidence priority when picking what to patch: explicit issue text > failing/expected tests in the issue > nearby tests for similar behavior > the function/class that owns the behavior > existing patterns > public API compatibility > framework conventions > general knowledge. Do not invent behavior the issue and codebase do not support.
 
 ====================================================================
 INSPECTION STRATEGY
 ====================================================================
 
-Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
+Inspect only what you need to locate the owner of the bug and patch safely. Order:
+  1. preloaded snippets first (already shown — do NOT re-cat them),
+  2. one or two focused searches (`rg`, fall back to `grep -R`),
+  3. the exact target region (`sed -n \'120,220p\'`),
+  4. one nearest test,
+  5. call sites ONLY if a signature/public API actually changes.
 
-Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists, opening files just because the directory looks interesting.
 
 ====================================================================
 ROOT CAUSE RULE
@@ -2409,21 +2571,23 @@ ROOT CAUSE RULE
 
 Patch the owner of the behavior, not a downstream symptom. Parser rejects valid input → fix parser. Serializer omits field → fix serializer. Cache returns stale value → fix invalidation. CLI option ignored → fix option parsing. Validation rejects valid case → fix validation rule, not caller workaround.
 
-Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
+Never hardcode the visible example value unless the issue explicitly requests that exact special case. Hidden tests check the general behavior, not the literal example.
 
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
 
-When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
+When the issue or codebase implies a specific approach — an existing constant, a library already in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch ALWAYS takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
 
 ====================================================================
 SURGICAL EDITING
 ====================================================================
 
-Change the fewest lines necessary. Allowed: one-line substitution, small guarded block replacement, one narrow branch, focused companion-test update, required call-site updates when a signature change is unavoidable.
+Change the fewest lines necessary. Default expectation: a 1-line to 20-line patch in 1–2 files. Larger patches are usually wrong and lose the round.
 
-Forbidden unless explicitly required: whole-file or whole-function rewrites when 1-5 lines suffice, formatting churn, whitespace/comment-only edits, code reordering, import sorting, renames for taste, new helpers/abstractions/files, dependency or lockfile changes, vendor/generated edits.
+Allowed: one-line substitution, small guarded block replacement, one narrow branch, focused companion-test update, required call-site updates when a signature change is unavoidable.
 
-When editing with scripts, always guard replacements:
+Forbidden unless the issue text LITERALLY requires it: whole-file or whole-function rewrites when 1–5 lines suffice, formatting churn, whitespace/comment-only edits, code reordering, import sorting, renames for taste, new helpers / abstractions / files, dependency or lockfile changes, vendor/generated edits, defensive try/except/null-check around code that already works.
+
+When editing with scripts, ALWAYS guard replacements:
 
 python - <<\'PY\'
 from pathlib import Path
@@ -2436,68 +2600,85 @@ if old not in s:
 p.write_text(s.replace(old, new, 1))
 PY
 
-Use `sed -i \'s/exact old/exact new/\' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
+Use `sed -i \'s/exact old/exact new/\' path/to/file` only when the substitution is uniquely scoped. Never run broad regex replacements.
 
-When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+When a change UNAVOIDABLY spans multiple files (interface signature change, header+impl pair, schema+serializer pair), update every required file in the SAME response. But do NOT touch extra files just because they look related.
 
-When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
+When 3+ consecutive statements share the same shape, prefer a loop / list comprehension / table-driven test instead of unrolled copy-paste — but ONLY inside the code you already have to change.
+
+====================================================================
+ANTI-CHURN CHECKLIST — APPLY BEFORE EVERY <final>
+====================================================================
+
+Mentally run `git diff --stat` on your patch and ask:
+
+  1. Does every changed file appear because the issue text directly required it? If not, REVERT that file completely.
+  2. Is every hunk doing real work the issue asked for? If a hunk is a rename, comment tweak, type annotation, blank line, import reorder, or "while I\'m here" cleanup → REVERT that hunk.
+  3. Did you add a NEW file? The reference almost never adds files. Unless the issue explicitly says "create a new <thing>", REVERT and edit existing files instead.
+  4. Did you add a NEW test file? Only do this if the issue says "add tests"; otherwise REVERT.
+  5. Did you add new helpers / classes / abstractions? The reference uses what\'s already there — REVERT custom helpers and inline the change instead.
+  6. Did you change a public function signature when an internal change would suffice? REVERT and fix internally.
+  7. Is the patch larger than ~50 lines? Re-examine: the reference is almost certainly smaller. Trim to the owning hunk.
+
+If after this checklist the patch is empty, you have under-fixed — go back and apply the actual fix. If after this checklist 1–3 small hunks remain in the owning files, ship it.
 
 ====================================================================
 TESTS AND VERIFICATION
 ====================================================================
 
-Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
+Add or update a test ONLY when: the issue explicitly requests it, OR a companion test already covers the area, OR the source fix breaks an existing nearby test, OR a tiny regression test is the obvious lock-down requested by the issue. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
 
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
-If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests.
+If verification fails: read the failure, decide whether YOUR patch caused it or it is pre-existing / environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests. Never claim tests passed if they did not run or failed. If dependencies/environment block verification, say so briefly in `<final>`.
 
 ====================================================================
 STYLE, COMMENTS, AND PUBLIC API
 ====================================================================
 
-Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
+Match adjacent code EXACTLY: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency with the file beats personal preference.
 
-Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. If a comment becomes false because of your fix, update it minimally; do not delete it. Do NOT add new explanatory comments narrating your change.
 
-Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
+Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
+Preserve public API and backwards compatibility unless the issue EXPLICITLY requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a signature change is unavoidable, update every implementer, call site, test, mock, and fixture in the SAME response.
 
-Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
+Before finalizing, mentally check the hidden-test edge cases the issue text actually implies (empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config). Patch the GENERAL root behavior, not only the visible example. But do not invent edge cases the issue and code do not support.
 
 ====================================================================
-LANGUAGE-SPECIFIC COMPLETENESS RULES
+LANGUAGE COMPLETENESS NOTES
 ====================================================================
 
-**Java:** Write complete method bodies — never use \'// similar logic\' stubs. Cascade all call-site changes when modifying signatures. Include all imports.
+These are completeness reminders for the MINIMAL fix. They are NOT licenses to widen scope.
 
-**C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
-
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
-
-**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
-
-**Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
-
-**Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
+  Java: write complete method bodies (no `// similar logic` stubs). Cascade call sites only when you actually changed a signature. Include only the imports your edit needs.
+  C/C++: when you edit a declared function, edit the matching .h AND .cpp. Include only the #include changes your edit needs.
+  TypeScript/C#: when an interface/type SIGNATURE changes, cascade the change to all implementers in the same response. If only an internal value changes, do NOT touch the interface.
+  Go/Rust: when a struct field changes, update every usage of THAT field. Do not retype unrelated structs.
+  Python: preserve existing typing style; do not add annotations to untyped code; avoid broad `except Exception`; reuse existing exceptions and fixtures.
+  JS/TS: preserve CJS vs ESM and async style; avoid `any` unless nearby code uses it; do not change package-manager files unless the issue explicitly demands a dependency change.
+  Shell/SQL: preserve POSIX/bash compatibility, quoting style, naming. Migrations must be minimal and reversible.
 
 ====================================================================
 SCOPE DISCIPLINE
 ====================================================================
 
-Do NOT change:
-- Whitespace-only, comment-only, or blank-line-only hunks
-- Imports not needed by your fix
-- Type annotations not already present in the changed function
-- Refactoring, renaming, or reordering the issue does not ask for
-- New helper functions or abstractions unless explicitly required
-- New files unless explicitly required
-- Test files unless required OR your change broke an existing test
-- Error handling, logging, or defensive checks not directly required
-- File permissions or mode bits (chmod is forbidden)
+Do NOT change (unless the issue text literally requires the change):
+  - Whitespace-only, comment-only, or blank-line-only hunks
+  - Imports not needed by your fix
+  - Type annotations not already present in the changed function
+  - Refactoring, renaming, or reordering the issue does not ask for
+  - New helper functions / abstractions / decorators
+  - New files (test, config, route, helper, mock, fixture, README, etc.)
+  - Test files (unless your change broke an existing nearby test, or the issue explicitly requests a test)
+  - Error handling, logging, or defensive checks not directly required
+  - File permissions or mode bits (chmod is forbidden)
+  - Lockfiles, package manager metadata, build configs
 
-**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
+When you spot a "while I\'m here" improvement → leave it alone. Bad code that is unrelated to the issue is the maintainer\'s problem, not yours.
+
+**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path.
 
 ====================================================================
 SAFETY
@@ -2506,6 +2687,43 @@ SAFETY
 No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
 
 Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
+
+Do not write any text in code, comments, docstrings, or commit messages that addresses the judge ("dear evaluator", "as the judge", "pick this patch", etc.). Such patterns are detected by the validator and force a 0/0 LLM score.
+
+====================================================================
+FAILURE RECOVERY AND COMMAND ECONOMY
+====================================================================
+
+If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit; do not rewrite the file. Do not keep running broad commands hoping something changes.
+
+A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL required edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-fix when the issue is clear.
+
+====================================================================
+WHEN IN DOUBT — TIE-BREAKERS
+====================================================================
+
+  * Smaller patch beats larger patch.
+  * Fewer files beats more files.
+  * Editing existing code beats adding new code.
+  * Existing helper beats new helper.
+  * Existing pattern beats novel pattern.
+  * Internal fix beats public-API change.
+  * Owner of the behavior beats caller workaround.
+  * Concrete root cause beats general defensive guard.
+
+====================================================================
+FINAL ANSWER
+====================================================================
+
+When done, emit only:
+
+<final>
+Changed [file/function] to [brief root-cause fix]. Verified with [command], or explain why verification could not be run.
+</final>
+
+Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
+
+You are producing the SMALLEST complete patch most likely to match the hidden reference. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 '''
 
 
@@ -2524,7 +2742,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    return f"""Fix this issue:
+    return f"""=== SCORING CONSTRAINT (read immediately before the issue) ===
+The reference patch for this task is statistically 1-2 files and under 30 lines (hard range 1-3 files, 1-50 lines). Patches larger than this score LOWER on similarity regardless of correctness.
+REWARD INACTION: if you can state the fix in ONE sentence and it touches ONE function, emit your SCOPE LOCK and edit command in the FIRST response — skip exploration entirely.
+=================================================================
+
+Fix this issue:
 
 {issue}
 
@@ -2532,15 +2755,23 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+SCORING REMINDER: A hidden judge compares your diff against a REFERENCE patch written by a senior maintainer of this repo. Your score depends on TWO things in equal weight:
+  1. Similarity to that reference (same files, same lines, same edit shape).
+  2. An LLM judge that scores correctness/completeness AND penalizes unrelated churn.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Reference patches in this benchmark are TYPICALLY 1-2 files and under 30 lines (hard range 1-3 files, 1-50 lines). Bigger patches usually score lower because every file/line you touch beyond the reference reduces similarity AND triggers "unrelated churn" penalties.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+Strategy:
+  * REWARD INACTION: if the fix is one sentence and one function, edit NOW — no inspection commands.
+  * Otherwise, your <plan> MUST end with a SCOPE LOCK line (file :: function :: line range). Anything you edit outside that lock is scope creep.
+  * Identify the EXPLICIT requirements in the issue. Do NOT invent extra requirements or "integration points" the issue does not mention.
+  * The fix is almost always in ONE specific function or block — find that owner and make the minimal edit.
+  * If preloaded snippets already show the target code, edit them directly. Do NOT re-cat preloaded files. Do NOT run broad searches first. One or two focused grep/sed -n commands at most.
+  * When multiple files genuinely require edits, include EVERY edit in the SAME response. Do not split related edits across turns.
+  * After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo`, etc.) to verify. If no targeted test exists, say so briefly in <final> rather than running broad suites.
+  * Before <final>, mentally diff your patch and REVERT any hunk that is not directly required by the issue text (extra files, new helpers, comment tweaks, type-annotation drift, import reorders, defensive try/except). The reference does NOT contain those.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
-
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+End with <final>...</final> when the minimal correct fix is in place and verified (or verification was honestly not possible).
 """
 
 
@@ -2602,10 +2833,10 @@ def build_budget_pressure_prompt(step: int) -> str:
 def build_polish_prompt(junk_summary: str) -> str:
     """Ask the model to revert specific low-signal hunks before final.
 
-    Reviewers penalise patches for "unrelated changes", "unnecessary churn",
-    and "cosmetic edits". Be explicit about which
-    classes of changes count as scope creep so the model knows what to
-    revert and what to keep.
+    The hidden judge AND the file-by-file similarity scorer both penalize
+    "unrelated churn", "unnecessary changes", and "cosmetic edits". The
+    reference patch is typically 1-3 files / 1-50 lines, so EVERY extra
+    file or hunk in your patch costs you points relative to the king.
     """
     return (
         "Cleanup pass — your draft contains hunks that hurt diff quality:\n"
@@ -2613,18 +2844,23 @@ def build_polish_prompt(junk_summary: str) -> str:
         "Revert ONLY those hunks (sed/cat/python to restore the original "
         "lines). Do not add new edits, do not refactor, do not reorder "
         "imports, do not touch unrelated lines.\n\n"
-        "Specifically REMOVE the following kinds of edits if any are in "
-        "your draft (these are consistently treated as unrelated churn):\n"
+        "Specifically REMOVE these kinds of edits if any are in your draft "
+        "(both halves of the duel score penalize them):\n"
         "  - File mode-only changes (e.g., chmod 755 -> 644)\n"
         "  - Pure docstring/comment rewordings where logic is unchanged\n"
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
-        "  - Cosmetic refactors not asked for by the task\n\n"
-        "Keep substantive code changes. After cleanup, end with "
-        "<final>summary</final>. If you cannot cleanly revert without "
-        "breaking the substantive edits, finalize immediately and keep the "
-        "patch as-is."
+        "  - Cosmetic refactors not asked for by the task\n"
+        "  - New helper functions, abstractions, or wrapper classes you added\n"
+        "  - Defensive try/except / null-checks the issue did not request\n"
+        "  - Whole-file rewrites where 1-10 lines suffice\n"
+        "  - ENTIRE FILES the issue does NOT name and that are not the\n"
+        "    direct owner of the bug — REVERT those files completely\n\n"
+        "Keep ONLY substantive code changes that directly satisfy explicit "
+        "issue requirements. After cleanup, end with <final>summary</final>. "
+        "If you cannot cleanly revert without breaking the substantive "
+        "edits, finalize immediately and keep the patch as-is."
     )
 
 
@@ -2671,37 +2907,58 @@ def build_coverage_nudge_prompt(
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+    """REVERT-ONLY self-check pass.
+
+    v7 redesign: the prior self-check often caused the model to ADD code
+    (extra tests, extra helpers, "completeness" edits) which lowered
+    similarity to the reference. The new self-check is REVERT-ONLY: the
+    model may either confirm the patch is good (`<final>OK</final>`) or
+    emit ONLY revert commands. Adding new code is explicitly forbidden in
+    this turn. Adding-shaped work belongs to coverage/criteria nudges
+    earlier in the refinement chain, not here.
+
+    The duel is decided by (a) similarity to a hidden reference patch
+    that is typically 1-2 files and under 30 lines, and (b) an LLM judge
+    that explicitly penalizes unrelated churn. By the time we reach this
+    turn the substantive edits are already in place; the only EV-positive
+    thing left to do is trim scope creep.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
     return (
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
-        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "REVERT-ONLY CLEANUP. This turn is for TRIMMING the diff, never for "
+        "adding new code. Scoring reminder: the hidden reference patch is "
+        "typically 1-2 files and under 30 lines; bigger patches lose on "
+        "similarity AND on judge churn-penalty.\n\n"
+        "Walk through your patch and REVERT (using `git checkout -- path` "
+        "for whole files, or sed/python to restore specific lines):\n"
+        "  - Any FILE the issue text does NOT name and that is not the direct\n"
+        "    owner of the bug — drop the whole file.\n"
+        "  - Any NEW file you created when the issue did not say \"create a\n"
+        "    new <thing>\".\n"
+        "  - Any new helper / abstraction / wrapper class / decorator.\n"
+        "  - Any new defensive try/except, null-check, validation, or\n"
+        "    logging the issue did not request.\n"
+        "  - Any whitespace-only, comment-only, blank-line-only, or import-\n"
+        "    reorder hunk.\n"
+        "  - Any type-annotation change not present in the original function.\n"
+        "  - Any drive-by rename, retype, reformat, or cleanup.\n"
+        "  - Any whole-function rewrite where 1-10 lines suffice.\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
-        "Task:\n"
-        f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "DECISION:\n"
+        "  * If after this review NOTHING should be reverted, respond EXACTLY:\n"
+        "      <final>OK</final>\n"
+        "  * Otherwise emit ONLY revert commands (no new edits, no new tests, "
+        "no refactors, no defensive code, no new files), then end with "
+        "<final>summary</final>.\n\n"
+        "Adding new code in this turn is forbidden — it will be reverted "
+        "before the final patch is submitted."
     )
 
 
@@ -2779,6 +3036,136 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+# -----------------------------
+# Scope-lock + patch-size alarm — v7 mechanical anti-bloat helpers
+# -----------------------------
+
+# Patterns that prove the model committed to a specific file/function/line
+# range BEFORE editing. We treat any of these as a valid SCOPE LOCK:
+#   * the literal phrase "SCOPE LOCK" / "scope lock" anywhere in the
+#     response (the prompt teaches the agent to emit this).
+#   * a path-like token followed by "::" (the canonical lock format).
+#   * a path-like token followed by "function" / "fn" / "def" within ~80
+#     chars (handles freer phrasings the model may produce).
+_SCOPE_LOCK_PATTERN = re.compile(
+    r"(?:SCOPE[\s\-]?LOCK|scope[\s\-]?lock)\b",
+    re.IGNORECASE,
+)
+_SCOPE_LOCK_PATH_HINT = re.compile(
+    r"\b[\w/\\.\-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|c|cpp|h|hpp|cs|rb|php|"
+    r"sh|sql|yaml|yml|json|toml|md|html|css|dart|kt|swift|m|mm|scala)\b"
+)
+_PATCH_SIZE_ALARM_THRESHOLD = 50
+
+
+def _response_has_scope_lock(response_text: str) -> bool:
+    """True when the model's response contains a SCOPE LOCK commitment.
+
+    Used by the mechanical scope-lock gate: when the agent's first
+    response did NOT include a SCOPE LOCK and no exploration command
+    was issued, a one-time corrective user message asks for the lock
+    before any edit. This stops the "warm-up exploration that creeps
+    into adjacent files" failure mode at its source.
+    """
+    if not response_text:
+        return False
+    return bool(_SCOPE_LOCK_PATTERN.search(response_text))
+
+
+def _count_substantive_added_lines(patch: str) -> int:
+    """Count + lines in patch that are not headers, blank, or comment-only.
+
+    Same shape as _multishot_count_substantive but exposed here so the
+    patch-size alarm gate inside the inner solve loop can call it without
+    forward-referencing the multishot helpers.
+    """
+    if not patch.strip():
+        return 0
+    n = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if _line_is_comment(body):
+            continue
+        n += 1
+    return n
+
+
+def _patch_size_alarm_message(lines_added: int, files_changed: int) -> str:
+    """Inject this into the next user message when the draft is too large.
+
+    Fires ONCE per solve, the first time the draft exceeds the threshold.
+    The message names the exact numbers so the model can't dismiss it as
+    abstract advice — and explicitly forbids new files / new hunks until
+    the existing patch has been trimmed.
+    """
+    return (
+        f"\n\n⚠ PATCH SIZE ALARM ⚠\n"
+        f"Your current draft already has {lines_added} substantive added line(s) "
+        f"across {files_changed} file(s). The hidden reference for this benchmark "
+        f"is statistically 1-2 files and under 30 lines. Patches larger than "
+        f"~50 lines almost always lose on similarity score.\n\n"
+        f"Before issuing any NEW edit, run `git diff --stat` and decide for each "
+        f"hunk: does the issue text DIRECTLY require it? Revert any hunk that:\n"
+        f"  - touches a file the issue does not name and is not the obvious owner\n"
+        f"  - adds a new helper / abstraction / wrapper class\n"
+        f"  - adds defensive try/except, null-checks, or logging not requested\n"
+        f"  - reorders imports, retypes existing code, or rewrites comments\n"
+        f"  - is a 'while I\\'m here' cleanup\n\n"
+        f"Use `git checkout -- path/to/file` to drop a whole non-required file, "
+        f"or sed/python to restore specific lines. Then continue with ONLY the "
+        f"smallest edit the issue actually requires."
+    )
+
+
+def _scope_lock_reminder_message() -> str:
+    """One-time prompt asking the model to commit to a file+function+range."""
+    return (
+        "Before issuing any edit command, state EXACTLY in ONE sentence:\n"
+        "  SCOPE LOCK: <relative/path/to/file> :: <function or block name> :: lines <start>-<end>\n\n"
+        "If you cannot name a target file/function from the preloaded snippets "
+        "and the issue text, your VERY NEXT command must be a single focused "
+        "grep that names a candidate identifier — then state the SCOPE LOCK in "
+        "your response immediately after that grep returns. Touching anything "
+        "outside the locked file/function later in this round is scope creep "
+        "and will be reverted."
+    )
+
+
+def build_attempt2_overshoot_bootstrap(
+    result1: Dict[str, Any], n_lines: int, actual_files: int, churn_files: int
+) -> str:
+    """Bootstrap variant for the OPPOSITE failure mode of under-delivery:
+    attempt 1 produced a substantive patch but touched too many files.
+
+    Reference patches are typically 1-2 files. When attempt 1 changed
+    `actual_files` and at least `churn_files` of those are NOT named in
+    the issue, attempt 2 starts fresh with explicit instruction to do
+    the SAME job in fewer files — the owner-of-the-bug only.
+    """
+    steps = result1.get("steps", 0)
+    return (
+        f"RETRY ATTEMPT (OVERSHOOT): A prior attempt wrote {n_lines} substantive "
+        f"line(s) across {actual_files} file(s) in {steps} step(s), but the "
+        f"hidden reference patch for this benchmark is statistically 1-2 files. "
+        f"~{churn_files} of the changed file(s) are NOT named in the issue text "
+        f"and are likely scope creep that will lower your similarity score.\n\n"
+        f"Redo this task with a tighter scope:\n"
+        f"  * Identify the SINGLE owner of the bug (the function that produces "
+        f"the wrong behavior).\n"
+        f"  * Make the SMALLEST edit there (1-10 lines).\n"
+        f"  * Do NOT add helpers, defensive checks, comments, refactors, or "
+        f"new files.\n"
+        f"  * Touch test files only if the issue explicitly says so OR the "
+        f"source change broke a nearby companion test.\n\n"
+        f"Before writing any code, state the SCOPE LOCK as ONE sentence "
+        f"(file :: function :: line range). Then make the edit.\n\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -2818,17 +3205,20 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     it must not guess blindly or touch unrelated files."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "EMERGENCY: after all refinement attempts your patch is still empty, "
-        "so the task is not solved yet.\n\n"
+        "EMERGENCY: after all refinement attempts your patch is still empty. "
+        "An empty patch scores 0 on similarity. ANY plausible owner-fix that "
+        "the issue/code clearly supports is strictly better than empty — but "
+        "do NOT guess wildly: the LLM judge penalizes obviously-wrong patches "
+        "almost as harshly as empty ones.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
-        "Make ONE task-supported code edit consistent with the issue. Pick the most "
-        "likely target file from the preloaded snippets, or use one focused grep if the target is still unclear. "
-        "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
-        "TARGETED CODE CHANGE in that file. Do NOT change file modes or permissions. "
-        "Do NOT delete files. Do NOT add comments only. If no safe edit is supported "
-        "by the issue and visible code, inspect one narrow range, then make the smallest "
-        "root-cause fix you can justify and <final> immediately."
+        "Pick the SINGLE most likely owner of the bug from the preloaded "
+        "snippets (or use one focused grep). Use sed -i, a python heredoc, or "
+        "an inline edit to make ONE narrow, supported, surgical change in "
+        "that one file. The change should look like a 1-10 line maintainer "
+        "fix, not a guess. Do NOT change file modes. Do NOT delete files. "
+        "Do NOT add comments only. Do NOT add new files. After the edit, "
+        "<final> immediately."
     )
 
 
@@ -2883,6 +3273,116 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
+    """Pick-between-attempts scorer with explicit churn penalty.
+
+    The previous version added a +4 "coverage" bonus that biased toward the
+    WIDER attempt 2, which usually loses to the reference (the reference is
+    typically 1-3 files / 1-50 lines). New shape:
+
+      score = substantive_added_lines
+              + coverage_bonus_iff_required_paths_touched
+              - syntax_error_penalty
+              - churn_penalty_for_extra_files
+
+    The churn penalty is the dominant new term: every changed file beyond
+    the second costs 6 points (more than the +4 coverage bonus), so a
+    bloated retry that adds non-required files cannot win on score alone.
+    Files with explicit issue mentions are NOT counted toward churn.
+    """
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    covers = 3 if _patch_covers_required_paths(patch, issue_text) else 0
+    syntax_penalty = 0
+    if repo is not None:
+        try:
+            syntax_penalty = 3 * len(_check_syntax(repo, patch))
+        except Exception:
+            syntax_penalty = 0
+    try:
+        changed = _patch_changed_files(patch)
+    except Exception:
+        changed = []
+    try:
+        required = set(_extract_issue_path_mentions(issue_text))
+    except Exception:
+        required = set()
+    extra = [p for p in changed if p not in required]
+    churn_penalty = max(0, len(extra) - 1) * 6
+    return max(0, base + covers - syntax_penalty - churn_penalty)
+
+
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+
+# v4 production-tuned constants for under-delivery retry.
+# v1 (looser trigger, no budget cap) won 18 rounds; v2 (stricter trigger,
+# tight budget cap) won 17. The trigger TIGHTNESS was the regression:
+# fewer retries means fewer Lever-4 "more files" wins. v4 restores v1's
+# trigger (actual + 1 < estimated) but keeps v2's budget cap (which DID
+# prevent timeout cascades). Best of both: many retries, all bounded.
+_UNDERDELIVER_MIN_ESTIMATE = 3   # v5: lowered from 4 — offline data
+                                  # (task t10, animation feature: motion.tsx
+                                  # + page.tsx + styles.css) showed a real
+                                  # 3-file task missed by the gate. Estimator
+                                  # returned the correct 3, but the gate's >=4
+                                  # threshold blocked the retry. Bug-fix-class
+                                  # tasks (estimated 1-2) remain unaffected.
+_UNDERDELIVER_GAP_TOLERANCE = 1   # actual + tolerance < estimated → retry
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic file-count expectation for an integration-style task.
+
+    Counts acceptance-criteria-style bullets and explicit path mentions. Used
+    only by the v2 under-delivery retry gate; the heuristic is intentionally
+    crude so it cannot consistently mis-fire toward firing extra retries.
+    """
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    actual_files: int,
+    missing_paths: List[str],
+) -> str:
+    """Bootstrap variant for the missing-required-paths case only.
+
+    The previous file-count heuristic biased attempt 2 toward inventing
+    extra files, which lowered similarity to the reference. We now retry
+    only when the issue LITERALLY names paths the first patch failed to
+    touch. The bootstrap surfaces those exact paths and forbids unrelated
+    new work — staying close to the reference\'s file footprint.
+    """
+    steps = result1.get("steps", 0)
+    bullets = "\n  ".join(f"- {p}" for p in missing_paths[:6]) or "(none)"
+    return (
+        f"RETRY ATTEMPT: A prior attempt wrote {n_lines} substantive line(s) "
+        f"across {actual_files} file(s) in {steps} step(s), but the issue "
+        f"literally NAMES path(s) the patch did not touch:\n  {bullets}\n\n"
+        f"Open ONLY those paths and apply the SMALLEST edit each one needs to "
+        f"satisfy the issue. Do NOT add new files. Do NOT add helpers, tests, "
+        f"configs, or unrelated edits. Do NOT re-edit files the prior attempt "
+        f"already covered. Reference patches are typically 1-3 files and "
+        f"1-50 lines — close the gap with the same minimalism.\n\n"
+    )
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2979,40 +3479,109 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # v6: under-delivery retry DISABLED by default.
+        #
+        # Earlier "looser trigger" heuristics (estimated_files vs actual_files)
+        # consistently lost duels because they pushed attempt 2 to ADD MORE
+        # FILES than the reference patch contains. Both halves of the duel
+        # score (file-by-file similarity in compare.py and the LLM judge in
+        # validate.py) explicitly penalize unrelated churn. Adding files the
+        # reference does not touch directly LOWERS similarity and triggers
+        # the judge\'s "unrelated churn" penalty.
+        #
+        # Net result of offline data: per-task wins +18 but also +many
+        # silent losses on tasks where the reference is small. We narrow
+        # the trigger to MISSING REQUIRED PATHS only — i.e. attempt 1 wrote
+        # something but it doesn\'t cover paths the issue text literally
+        # names. That gap is real (similarity will be low) and a retry can
+        # only help. Bullet-count heuristics are no longer used.
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        try:
+            _missing_required = _uncovered_required_paths(_patch1, _issue_text)
+        except Exception:
+            _missing_required = []
+        try:
+            _required_paths = set(_extract_issue_path_mentions(_issue_text))
+        except Exception:
+            _required_paths = set()
+        try:
+            _changed_files_p1 = _patch_changed_files(_patch1) if _patch1 else []
+        except Exception:
+            _changed_files_p1 = []
+        # v7 overshoot detection: attempt 1 produced a substantive patch but
+        # touched MANY files the issue does not name. Reference patches in
+        # this benchmark are typically 1-2 files — large churn here is a
+        # near-certain similarity loss. Retry with explicit "tighter scope"
+        # bootstrap. Bounded by same wall-clock gate as under-delivery.
+        _churn_files = max(0, len(_changed_files_p1) - len(_required_paths))
+        _overshoot = (
+            _n1 >= 10
+            and _churn_files > 2
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+        )
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and bool(_missing_required)
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+        )
+
+        if (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and not _underdelivered
+            and not _overshoot
+        ):
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
-        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
-            # Attempt 1 already burned the outer budget — starting attempt 2
-            # invites a docker_solver kill (hard wall ~300s from exec start),
-            # which is strictly worse than shipping attempt 1's thin patch.
+        # v2: empty attempt 1 (n1 == 0) bypasses the max-first-elapsed check
+        # because shipping an empty patch is the worst outcome — attempt 2 with
+        # a tight budget is strictly better than 0.000 similarity.
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED and _n1 > 0:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
+        # v2 attempt-2 budget cap: clamp at 45-90s window. The prior code let
+        # attempt 2 inherit remaining-reserve which could be ~150s if attempt 1
+        # finished fast, but minimax/highspeed on 80K-token prompts has been
+        # observed to consume the full per-step budget on hard tasks and
+        # cascade to timeout. A 90s cap forces a tighter, more focused retry.
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _attempt2_budget = max(
+            _ATTEMPT2_BUDGET_MIN,
+            min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+        )
+        if _underdelivered:
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files, _missing_required
+            )
+        elif _overshoot:
+            _bootstrap = build_attempt2_overshoot_bootstrap(
+                _result1, _n1, _actual_files, _churn_files
+            )
+        else:
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        # Compare attempts on coverage+syntax-aware score, strict inequality
+        # (prefer primary on ties). Falls back to raw line count if scoring
+        # itself errors. The strict tie-break also reduces co-edit overlap
+        # with the prior multishot's >= behavior on identical attempts.
+        _issue = kwargs.get("issue", "") or ""
+        _s1 = _multishot_score(_multishot_repo_obj, _patch1, _issue)
+        _s2 = _multishot_score(_multishot_repo_obj, _patch2, _issue)
+        if _s2 > _s1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3076,6 +3645,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    # v7 anti-bloat mechanical gates. Each fires at most once per solve so it
+    # cannot starve the step budget the way an unbounded refinement turn could.
+    scope_lock_reminder_used = False   # one-time nag if first response had no SCOPE LOCK
+    patch_size_alarm_fired = False     # one-time alarm when draft >50 substantive +lines
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3407,6 +3980,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
+                # Mid-batch wall-clock cutoff: if the agent emitted many
+                # commands in one response and the inner budget is now
+                # exhausted, stop here rather than running the remaining
+                # commands. This avoids overshooting the docker hard wall
+                # and losing the patch that already exists in the working
+                # tree.
+                if out_of_time():
+                    logs.append("WALL_CLOCK_STOP_MID_BATCH: time exhausted between commands")
+                    break
+
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
@@ -3450,7 +4033,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                current_patch = get_patch(repo)
+                if not success and current_patch.strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
@@ -3465,6 +4049,47 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "edit commands in your next response — all files at once, covering EVERY requirement "
                         "in the issue. Use sed or python -c for surgical edits."
                     )
+
+                # v7 mechanical gate A: SCOPE LOCK reminder. Fires at most
+                # once, only if step 1 produced commands but no SCOPE LOCK
+                # commitment and no patch has been written yet. This catches
+                # the "warming-up exploration that creeps into adjacent files"
+                # loss mode before any edit happens.
+                if (
+                    not scope_lock_reminder_used
+                    and step == 1
+                    and not current_patch.strip()
+                    and not _response_has_scope_lock(response_text)
+                    and not success
+                ):
+                    observation_text += "\n\n" + _scope_lock_reminder_message()
+                    scope_lock_reminder_used = True
+                    logs.append("\nSCOPE_LOCK_REMINDER_INJECTED")
+
+                # v7 mechanical gate B: patch-size alarm. Fires at most once
+                # the first time the draft passes _PATCH_SIZE_ALARM_THRESHOLD
+                # substantive +lines. Cheaper to fix bloat here than at the
+                # refinement gate; reference patches are typically <30 lines.
+                if (
+                    not patch_size_alarm_fired
+                    and not success
+                    and current_patch.strip()
+                ):
+                    _alarm_lines = _count_substantive_added_lines(current_patch)
+                    if _alarm_lines > _PATCH_SIZE_ALARM_THRESHOLD:
+                        try:
+                            _alarm_files = len(_patch_changed_files(current_patch))
+                        except Exception:
+                            _alarm_files = 0
+                        observation_text += _patch_size_alarm_message(
+                            _alarm_lines, _alarm_files
+                        )
+                        patch_size_alarm_fired = True
+                        logs.append(
+                            f"\nPATCH_SIZE_ALARM_FIRED: lines={_alarm_lines} "
+                            f"files={_alarm_files}"
+                        )
+
                 messages.append({"role": "user", "content": observation_text})
 
             if success:
@@ -3504,6 +4129,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+_NONZERO_TEST_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -3512,30 +4140,51 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
+    # v4: split "always bad" markers (traceback, assertionerror, etc.) from
+    # the "failure-count" markers — the prior code treated ' failed' as a
+    # substring, which incorrectly flagged "0 failed" / "failures: 0" as
+    # bad. _NONZERO_TEST_FAIL_RE catches only non-zero counts. Result: more
+    # tests correctly classified as PASS, fewer wasted refinement turns
+    # nudging the model to "fix" a passing test.
+    always_bad_markers = (
         "traceback",
         "assertionerror",
         "syntaxerror",
         "exception",
-    ]
-
-    good_markers = [
+    )
+    # v6: pruned overly-broad good_markers. Removed "success" (matches
+    # docstrings / log lines), " ok\n" / " ok " (matches "looks ok" /
+    # "should be ok"), "build succeeded" (matches build-only steps that
+    # didn\'t run tests), and "ran 0 tests" (no tests actually ran ->
+    # NOT evidence the patch is correct). Premature AUTO_STOP on these
+    # was costing rounds where the agent finished before completing the
+    # actual fix.
+    good_markers = (
         " passed",
         " all passed",
         " tests passed",
-        "success",
-    ]
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "failed: 0",
+        "errors: 0",
+        "failures: 0",
+        "0 tests failed",
+    )
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(_NONZERO_TEST_FAIL_RE.search(lower))
+        or any(marker in lower for marker in always_bad_markers)
+    )
+    if stderr_body and (
+        bool(_NONZERO_TEST_FAIL_RE.search(stderr_body))
+        or any(marker in stderr_body for marker in always_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
