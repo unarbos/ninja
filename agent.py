@@ -60,9 +60,6 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
-# Refinement-turn budgets: each turn shows the model its draft and asks for one
-# specific kind of correction. They are mutually exclusive so the agent never
-# loops indefinitely on a borderline patch.
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
@@ -78,13 +75,6 @@ MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinement
                                 # hard wall).
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
-# Recent-commit injection: small in-context style anchors from the staged repo's
-# real history. The validator clones the real repo with full git history; the
-# pilot stages snapshots with one synthetic commit so this is a no-op locally
-# but high-leverage live. Recent commits are concrete examples of this
-# codebase's style — showing the model 1-2 actual examples teaches the codebase's
-# idioms (variable conventions, hunk shape, test-touch patterns) far better than
-# any abstract prompt rule.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
