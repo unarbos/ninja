@@ -90,8 +90,23 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
-MAX_PRELOADED_FILES = 18              # rounds on issues spanning multiple modules
+MAX_PRELOADED_CONTEXT_CHARS = 25000  # P4-α: halved 50000→25000. Suite analysis
+                                     # showed avg prompt_tokens/request ≈ 14.5K
+                                     # × ~10 requests dominated the budget; the
+                                     # preload block alone was ~12.5K tokens
+                                     # being re-sent every request. Halving frees
+                                     # ~6K tokens/request × 10 = ~60K tokens of
+                                     # extra runway before token_limit_exceeded.
+MAX_PRELOADED_FILES = 12              # halved 18→12 in lockstep with the chars
+                                     # cap so per-file budget stays meaningful
+                                     # (~2K chars/file). Cutting only the chars
+                                     # cap would have no effect — the floor at
+                                     # max(1500, MAX_CHARS//N_FILES) clamps and
+                                     # we'd merely preload fewer same-sized
+                                     # files. Forces _rank_context_files to be
+                                     # more selective on cross-module issues;
+                                     # the bash exploration loop can still cat
+                                     # additional files when needed.
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
@@ -814,13 +829,17 @@ TEXT_FILE_BASENAMES = {
 CONTEXT_SKIP_PARTS = {
     ".git",
     ".next",
+    ".parcel-cache",
     ".pytest_cache",
+    ".turbo",
     ".venv",
     "__pycache__",
+    "__snapshots__",
     "build",
     "coverage",
     "dist",
     "node_modules",
+    "out",
     "target",
     "vendor",
 }
@@ -833,6 +852,20 @@ SECRETISH_PARTS = {
     "credentials",
     "secret",
     "secrets",
+}
+
+LOCKFILE_BASENAMES = {
+    "bun.lockb",
+    "cargo.lock",
+    "composer.lock",
+    "gemfile.lock",
+    "go.sum",
+    "package-lock.json",
+    "pipfile.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "yarn.lock",
 }
 
 
@@ -1299,6 +1332,8 @@ def _context_file_allowed(relative_path: str) -> bool:
     if parts_lower & CONTEXT_SKIP_PARTS:
         return False
     if name_lower.startswith(".env") or name_lower in SECRETISH_PARTS or parts_lower & SECRETISH_PARTS:
+        return False
+    if name_lower in LOCKFILE_BASENAMES:
         return False
     if path.name not in TEXT_FILE_BASENAMES and path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
         return False
@@ -2207,6 +2242,33 @@ _RELOCATION_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Phrases that imply the patch should ADD a new API surface (verb/endpoint/
+# handler/route/etc.) as a brand-new module — not a relocation. Pairs with
+# `_patch_creates_any_new_file`: when the issue says "add a new X verb" or
+# "<plural noun> must be registered" but the patch only edits existing
+# files, we fire the same single-shot coverage nudge so the model creates
+# the new module via `cat > path/to/new_file.ext <<EOF`. Strictly orthogonal
+# to `_RELOCATION_PHRASE_RE`: the noun set here (verb/endpoint/route/...)
+# does not appear in that pattern, so the two detectors never double-fire.
+_CREATION_PHRASE_RE = re.compile(
+    r"(?:"
+    r"\b(?:add|implement|introduce|register|expose|provide|build)\s+"
+    r"(?:a\s+|an\s+|the\s+)?(?:new\s+)?"
+    r"(?:rpc\s+|api\s+|graphql\s+|http\s+|rest\s+)?"
+    r"(?:verb|verbs|endpoint|endpoints|route|routes|handler|handlers|"
+    r"controller|controllers|command|commands|service|services|"
+    r"action|actions|hook|hooks|middleware|middlewares|"
+    r"listener|listeners|subscriber|subscribers|"
+    r"resolver|resolvers|mutation|mutations|query|queries|"
+    r"migration|migrations|webhook|webhooks)"
+    r"|"
+    r"\b(?:verbs?|endpoints?|routes?|handlers?|migrations?|webhooks?|resolvers?)"
+    r"\s+(?:must|should|needs?\s+to)\s+be\s+"
+    r"(?:registered|added|implemented|introduced|created|exposed)"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _patch_has_deletions(patch: str) -> bool:
     """True if the patch contains at least one substantive deletion line."""
@@ -2231,6 +2293,21 @@ def _issue_implies_relocation(issue_text: str) -> bool:
     patch only edits the OLD-path file instead of creating a new one.
     """
     return bool(_RELOCATION_PHRASE_RE.search(issue_text))
+
+
+def _issue_implies_creation(issue_text: str) -> bool:
+    """True if the issue text implies a NEW API surface should be added.
+
+    Catches the common feature-add pattern that `_issue_implies_relocation`
+    misses: phrases like "Add a new users.resolve RPC verb", "Implement
+    handler X", "Both verbs must be registered". When the issue uses these
+    phrases but the patch contains no `new file mode` header, the model
+    almost always under-delivers (edits an existing file slightly instead
+    of adding the new module). Same gap-detection family as
+    `_issue_implies_relocation`; both feed the same coverage-nudge prompt
+    so behavior on existing winning patches is unchanged.
+    """
+    return bool(_CREATION_PHRASE_RE.search(issue_text))
 
 
 def _patch_creates_any_new_file(patch: str) -> bool:
@@ -3227,7 +3304,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             # only edited the old-path file. Fire the same single-shot
             # coverage nudge with a relocation-specific hint at the top.
             relocation_gap = (
-                _issue_implies_relocation(issue)
+                (_issue_implies_relocation(issue) or _issue_implies_creation(issue))
                 and not _patch_creates_any_new_file(patch)
             )
             if missing or relocation_gap:
@@ -3262,6 +3339,52 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"POLISH_TURN_QUEUED:\n  {junk}",
                 )
                 return True
+
+        # P3-β: confident early-exit. The self-check below fires UNCONDITIONALLY
+        # while budget remains, even when the patch is already structurally
+        # clean. On a strong first draft this round-trips the entire diff back
+        # through the model (~30K tokens) and frequently introduces noise on
+        # an already-good patch. By the time we reach this gate, every
+        # deterministic check above has either already fired (we wouldn't be
+        # here) or found no problems on a stale snapshot. Re-validate the
+        # current patch fresh against the same structural gates the model's
+        # self-review can only weakly approximate; if all pass and the patch
+        # is substantive, finalize without spending a turn on self-check.
+        # Strictly conservative: any single failed check falls through to the
+        # original self-check path. Survives a future refactor: only depends
+        # on the public-shaped helper signatures, not on internal flow.
+        patch_substantive = sum(
+            1
+            for ln in patch.splitlines()
+            if (ln.startswith("+") and not ln.startswith("+++") and ln[1:].strip())
+            or (ln.startswith("-") and not ln.startswith("---") and ln[1:].strip())
+        ) >= 3
+        if patch_substantive:
+            fresh_syntax_errors = _check_syntax(repo, patch)
+            fresh_missing = _uncovered_required_paths(patch, issue)
+            fresh_unaddressed = _unaddressed_criteria(patch, issue)
+            fresh_junk = _diff_low_signal_summary(patch)
+            fresh_deletion_gap = (
+                _issue_requires_deletion(issue) and not _patch_has_deletions(patch)
+            )
+            fresh_creation_gap = (
+                (_issue_implies_relocation(issue) or _issue_implies_creation(issue))
+                and not _patch_creates_any_new_file(patch)
+            )
+            if not (
+                fresh_syntax_errors
+                or fresh_missing
+                or fresh_unaddressed
+                or fresh_junk
+                or fresh_deletion_gap
+                or fresh_creation_gap
+            ):
+                logs.append(
+                    "CONFIDENT_EARLY_EXIT: structural gates clean "
+                    f"(refine_turns_used={total_refinement_turns_used}, "
+                    f"self_check_skipped=1)"
+                )
+                return False
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
