@@ -1046,29 +1046,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if preflight:
         parts.append(preflight)
 
-    # v42: prepend acceptance-criteria checklist (port from v40)
-
-
+    # Prepend acceptance-criteria checklist (extracted from issue text).
     try:
-
-
         _v42_crit = _v42_extract_acceptance_criteria(issue)
-
-
         _v42_block = _v42_format_criteria_checklist(_v42_crit)
-
-
     except Exception:
-
-
         _v42_block = ""
-
-
     if _v42_block:
-
-
-        return _v42_block + "\n\n" + "\n\n".join(parts), included
-
+        parts.insert(0, _v42_block)
 
     return "\n\n".join(parts), included
 
@@ -2460,10 +2445,10 @@ def _symbol_grep_hits(
 # Prompting
 # -----------------------------
 
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
-SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
+# LEGACY prompt — kept here for position stability vs upstream main. The LIVE
+# prompt used by the inner agent is SYSTEM_PROMPT defined further below.
+# This name is intentionally inert (no shadowing of the live prompt).
+_LEGACY_SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
 You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
 
@@ -3066,7 +3051,7 @@ def _multishot_quality(
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
 # ============================================================
-# v42 PORT — acceptance-criteria checklist (from v40)
+# Acceptance-criteria checklist injected into preloaded context.
 # ============================================================
 # Parse issue text into discrete acceptance criteria, inject as a
 # CHECKLIST into preloaded context. Targets the LLM judge's biggest
@@ -3156,7 +3141,7 @@ _TEST_PATH_PATTERNS = (
 # ============================================================
 
 # ============================================================
-# v44 PORT — UID 46 content-quality mechanisms (PR#1264 oleksandrhordiienko63-byte)
+# Content-quality mechanisms: quoted-evidence ranker, test-quality gate.
 # 1. _quoted_evidence_paths: rank boost for files with issue-quoted phrases
 # 2. _is_test_path + _check_test_quality_one + _patch_added_names_set: test quality gate
 # 3. build_budget_pressure_escalation_prompt: escalating budget warning
@@ -3463,7 +3448,7 @@ def build_budget_pressure_escalation_prompt(step: int, elapsed: float, budget: f
 # ============================================================
 
 # ============================================================
-# v47 PORT — Code Quality constants
+# Code-quality constants.
 # ============================================================
 _CORRUPTION_LINE_RE_LIST = (
     (re.compile(r"^EOF\s*$"), "shell heredoc 'EOF' marker leaked into source"),
@@ -3750,7 +3735,7 @@ def _contract_preservation_gap_summary(repo: Path, patch: str) -> List[str]:
 # ============================================================
 
 # ============================================================
-# v50 PORT — Emergency single-shot fallback (port from UID 247 / PR518)
+# Emergency single-shot fallback: fires when multishot returns empty.
 # Fires ONE last-chance edit when the regular solve returns empty patch.
 # Targets the wall-clock-timeout failure mode observed in v47 on hard tasks.
 # ============================================================
