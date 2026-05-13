@@ -2996,7 +2996,13 @@ _BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6."
 # fewer retries means fewer Lever-4 "more files" wins. v4 restores v1's
 # trigger (actual + 1 < estimated) but keeps v2's budget cap (which DID
 # prevent timeout cascades). Best of both: many retries, all bounded.
-_UNDERDELIVER_MIN_ESTIMATE = 4
+_UNDERDELIVER_MIN_ESTIMATE = 3   # v5: lowered from 4 — offline data
+                                  # (task t10, animation feature: motion.tsx
+                                  # + page.tsx + styles.css) showed a real
+                                  # 3-file task missed by the gate. Estimator
+                                  # returned the correct 3, but the gate's >=4
+                                  # threshold blocked the retry. Bug-fix-class
+                                  # tasks (estimated 1-2) remain unaffected.
 _UNDERDELIVER_GAP_TOLERANCE = 1   # actual + tolerance < estimated → retry
 _UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
 _ATTEMPT2_BUDGET_MAX = 90.0
