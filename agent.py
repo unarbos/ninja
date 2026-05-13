@@ -120,11 +120,12 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
-MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_UNDERDELIVER_TURNS = 1 # surface partial fanout when patch touches fewer files than the issue implies
+MAX_TOTAL_REFINEMENT_TURNS = 4  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
-                                # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
-                                # bounded budget so extra turns can't push the process past the docker
-                                # hard wall).
+                                # Raised 3→4 to make room for the underdeliver-nudge gate alongside
+                                # criteria/coverage; multishot timing fix still bounds attempt 2 so
+                                # the extra turn cannot push past the docker hard wall.
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -612,8 +613,16 @@ _EDGECASE_GUARDRAIL = (
     "as the judge",
     "dear evaluator",
     "dear judge",
+    "choose king",
     "choose challenger",
+    "pick king",
+    "pick challenger",
+    "select king",
+    "select challenger",
+    "king is correct",
     "challenger is correct",
+    "king wins",
+    "challenger wins",
     "the evaluator should",
     "the judge should",
     "other candidate is malicious",
@@ -621,6 +630,16 @@ _EDGECASE_GUARDRAIL = (
     "automatic fail",
     "grader",
     "reward model",
+    "choose candidate_a",
+    "choose candidate_b",
+    "pick candidate_a",
+    "pick candidate_b",
+    "select candidate_a",
+    "select candidate_b",
+    "candidate_a is correct",
+    "candidate_b is correct",
+    "candidate_a wins",
+    "candidate_b wins",
 )
 
 
@@ -1142,16 +1161,17 @@ _RESCUE_RANKER_MAX_TERMS = 6
 
 def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]:
     """Rescue-ranker: when _rank_context_files produces no strong signal,
-    scan tracked files by raw issue-term match count. Catches tasks where
+    scan tracked files by issue-term match count. Catches tasks where
     the issue references concepts that don't appear as identifiers (e.g.
     natural-language bug description with no class/function names). Distinct
     from _symbol_grep_hits which only searches for code-shaped tokens; this
     one treats the issue as plain English, lower-cased, fixed-string, and
-    counts the number of distinct issue terms each file matches.
+    weights each term by its inverse document frequency over the tracked
+    corpus so that common English words contribute almost nothing.
 
-    Returns up to _RESCUE_RANKER_MAX_FALLBACK_FILES paths that matched at
-    least 2 distinct issue terms. Empty when the issue is too generic to
-    yield multi-term matches.
+    Returns up to _RESCUE_RANKER_MAX_FALLBACK_FILES paths whose summed
+    tf-idf score exceeds the per-issue threshold. Empty when the issue is
+    too generic to yield a confident ranking.
     """
     if not tracked:
         return []
@@ -1204,9 +1224,11 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
     """Append a few likely integration files after direct hits and tests.
 
     The agent was already good at finding the local function named by an issue,
-    but duel losses showed repeated misses in adjacent wiring: routes, API
-    clients, schemas, migrations, UI entry pages, and build metadata. This keeps
-    the direct ranking intact and only appends high-confidence neighbors.
+    but duel losses showed repeated misses in adjacent wiring. For each anchor
+    we walk `git log --name-only` to find files that were historically co-edited
+    in the same commits, then keep the most-recently-touched neighbors. The
+    direct ranking is left intact; only high-confidence co-change partners are
+    appended.
     """
     if not files or not tracked:
         return files
@@ -1428,7 +1450,9 @@ def _hunk_is_comment_only(added: List[str], removed: List[str]) -> bool:
 
 
 def _strip_low_signal_hunks(diff_output: str) -> str:
-    """Drop blank-only / whitespace-only / comment-only hunks from each file.
+    """Drop low-signal hunks from each file: blank-only, whitespace-only,
+    comment-only, pure import-reorder, and local-rename-only edits where the
+    only difference is an identifier swap with no semantic delta.
 
     Whole-file blocks with no @@ markers are kept verbatim because they are
     file-create / file-delete / binary patches that the hunk classifier
@@ -1552,6 +1576,67 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+# Plurals + fanout phrasing that commonly imply multi-file scope. Used by
+# _estimate_issue_file_count below. Keep narrow: nouns whose plural form in
+# an issue almost always means more than one file (component, route, locale)
+# rather than colloquial counts ("changes", "fixes").
+_FANOUT_ALL_RE = re.compile(
+    r"\b(all|every|each)\s+(?:of\s+)?(?:the\s+)?"
+    r"(pages?|dictionaries?|locales?|translations?|components?|routes?|"
+    r"files?|callers?|consumers?|imports?|endpoints?|handlers?|templates?|"
+    r"screens?|views?|tabs?|forms?|tests?)\b",
+    re.IGNORECASE,
+)
+_FANOUT_PLURAL_RE = re.compile(
+    r"\b(components?|pages?|routes?|endpoints?|tests?|migrations?|locales?|"
+    r"templates?|modules?|widgets?|hooks?|reducers?|controllers?|models?|"
+    r"views?|screens?|dictionaries?|translations?)\b",
+    re.IGNORECASE,
+)
+
+
+def _estimate_issue_file_count(
+    issue_text: str,
+    repo_summary: str = "",
+    preloaded_paths: Optional[List[str]] = None,
+) -> int:
+    """Heuristic upper-bound estimate of files the issue implies touching.
+
+    Returns 1 when the issue has no fanout signal — caller MUST treat ==1 as
+    "no underdeliver opinion" (don't fire the nudge). Returns 2-8 when prose
+    contains plural nouns, explicit path mentions, or "all/every X" phrasing.
+    Designed to be conservative: false-positive nudge wastes a refinement
+    turn, false-negative just keeps the king's current behaviour.
+    """
+    if not issue_text:
+        return 1
+    est = 1
+    hints: List[str] = []
+    paths = _extract_issue_path_mentions(issue_text)
+    if paths:
+        # explicit path mentions are strong evidence of intended scope
+        bump = min(5, len(paths))
+        est += bump
+        hints.append(f"paths={bump}")
+    if _FANOUT_ALL_RE.search(issue_text):
+        est += 2
+        hints.append("all-every")
+    distinct_plural_nouns: List[str] = []
+    for m in _FANOUT_PLURAL_RE.finditer(issue_text):
+        noun = m.group(1).lower().rstrip("s")
+        if noun not in distinct_plural_nouns:
+            distinct_plural_nouns.append(noun)
+        if len(distinct_plural_nouns) >= 2:
+            break
+    if distinct_plural_nouns:
+        est += len(distinct_plural_nouns)
+        hints.append(f"plurals={','.join(distinct_plural_nouns)}")
+    if est <= 1:
+        return 1
+    est = max(2, min(8, est))
+    return est
 
 
 # -----------------------------
@@ -2740,6 +2825,40 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
     )
 
 
+def build_underdeliver_nudge_prompt(
+    issue_text: str,
+    actual_files: int,
+    estimate_files: int,
+    touched: List[str],
+) -> str:
+    """Tell the model its patch touched far fewer files than the issue implies.
+
+    Targets the partial-fanout failure mode (king_analysis P1, todo D2): prose
+    issues without bulleted criteria silently pass the criteria-nudge gate, so
+    a 1-file patch ships against a 5-file requirement. Surface the gap with
+    the actual file count vs estimate, and ask the model to enumerate the
+    remaining surfaces before declaring done.
+    """
+    touched_list = ", ".join(touched[:8]) if touched else "(none)"
+    short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
+    return (
+        "Underdeliver gap — your patch touched "
+        f"{actual_files} file(s) ({touched_list}), but the issue describes "
+        f"changes spanning at least {estimate_files} files (plural nouns / "
+        "explicit paths / 'all|every' phrasing in the brief).\n\n"
+        "List the additional file paths the task implies — UI components, "
+        "siblings of the file you edited, locale dictionaries, templates, "
+        "tests, package manifests, planning notes — then either:\n"
+        "  (a) edit each one with the minimal change the task requires; OR\n"
+        "  (b) if you genuinely covered the task in fewer files, end with "
+        "<final>summary</final> explaining why the others are not in scope.\n\n"
+        "Do NOT invent new requirements. Do NOT rewrite working code. Keep "
+        "every additional edit surgical.\n\n"
+        "Task (for reference):\n"
+        f"{short}\n"
+    )
+
+
 def build_gap_edit_prompt(issue_text: str) -> str:
     short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
     return (
@@ -2931,6 +3050,98 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+# Diff-fence regexes used by _salvage_patch_from_logs (D1). The model
+# sometimes emits the unified diff in chat (markdown ```diff fence or
+# bare `--- a/... +++ b/...` block) but never wraps a corresponding
+# `<command>` to apply it — patch returns empty.
+_SALVAGE_FENCED_DIFF_RE = re.compile(
+    r"```(?:diff|patch)?\s*\n((?:---\s+(?:a/|/dev/null).*?\n\+\+\+\s+(?:b/|/dev/null).*?\n(?:@@|new file mode|deleted file mode)[\s\S]*?))\n```",
+    re.MULTILINE,
+)
+_SALVAGE_BARE_DIFF_RE = re.compile(
+    r"(?:^|\n)(diff --git a/.+? b/.+?\n[\s\S]+?)(?=\n(?:diff --git |```|===== STEP |MODEL_RESPONSE:|MODEL_ERROR|$))",
+)
+_SALVAGE_BARE_UNIFIED_RE = re.compile(
+    r"(?:^|\n)(---\s+a/.+?\n\+\+\+\s+b/.+?\n@@[\s\S]+?)(?=\n(?:---\s+a/|diff --git |```|===== STEP |MODEL_RESPONSE:|$))",
+)
+
+
+def _extract_diff_blocks_from_text(text: str) -> List[str]:
+    """Return candidate unified-diff strings found inside arbitrary text.
+
+    Looks for: (1) ```diff/```patch fenced blocks containing `--- a/...`,
+    (2) bare `diff --git a/X b/Y` stanzas (preferred — most complete),
+    (3) bare `--- a/... +++ b/...` blocks without the `diff --git` header.
+    Duplicates and very short fragments are filtered out.
+    """
+    if not text:
+        return []
+    blocks: List[str] = []
+    seen: set = set()
+
+    def _add(candidate: str) -> None:
+        s = candidate.strip()
+        if not s or len(s) < 30:
+            return
+        if s in seen:
+            return
+        seen.add(s)
+        if not s.endswith("\n"):
+            s += "\n"
+        blocks.append(s)
+
+    for m in _SALVAGE_BARE_DIFF_RE.finditer(text):
+        _add(m.group(1))
+    for m in _SALVAGE_FENCED_DIFF_RE.finditer(text):
+        _add(m.group(1))
+    for m in _SALVAGE_BARE_UNIFIED_RE.finditer(text):
+        _add(m.group(1))
+    return blocks
+
+
+def _salvage_patch_from_logs(
+    logs_text: str,
+    repo: Optional[Path],
+    initial_head: Optional[str],
+) -> Tuple[str, str]:
+    """Walk `MODEL_RESPONSE:` slices in logs (newest first) looking for a
+    unified diff the model emitted but never applied via `<command>`.
+    Each candidate is tried via `_multishot_apply_patch` against a clean
+    HEAD. Returns (salvaged_patch, marker_log_line) on success, else ("", "").
+
+    Mirrors karolmanijak992 mechanism (todo D1 §6).
+    """
+    if not logs_text or repo is None:
+        return "", ""
+    slices = re.split(r"(?=^MODEL_RESPONSE:)", logs_text, flags=re.MULTILINE)
+    blocks_tried = 0
+    for chunk in reversed(slices):
+        if "MODEL_RESPONSE:" not in chunk:
+            continue
+        candidates = _extract_diff_blocks_from_text(chunk)
+        for candidate in candidates:
+            blocks_tried += 1
+            if blocks_tried > 12:
+                return "", ""
+            try:
+                _multishot_revert(repo, initial_head)
+            except Exception:
+                pass
+            if not _multishot_apply_patch(repo, candidate):
+                continue
+            try:
+                salvaged = get_patch(repo)
+            except Exception:
+                salvaged = ""
+            if salvaged and salvaged.strip():
+                marker = (
+                    f"FIRE: salvage_patch_from_messages_applied "
+                    f"blocks_tried={blocks_tried} chars={len(salvaged)}"
+                )
+                return salvaged, marker
+    return "", ""
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2976,19 +3187,38 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_started = time.monotonic()
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
+        def _finalise(result: Dict[str, Any]) -> Dict[str, Any]:
+            # D1: if the multishot driver would return an empty patch, scan
+            # the assistant's MODEL_RESPONSE slices in `logs` for a unified
+            # diff the model emitted but never applied via `<command>`, and
+            # try to apply it. Cheap floor-lift — no effect when patch is
+            # already non-empty.
+            patch_text = (result.get("patch") or "")
+            if patch_text.strip():
+                return result
+            logs_text = result.get("logs") or ""
+            salvaged, marker = _salvage_patch_from_logs(
+                logs_text, _multishot_repo_obj, _multishot_initial_head,
+            )
+            if salvaged:
+                result["patch"] = salvaged
+                result["success"] = True
+                result["logs"] = (logs_text + "\n" + marker).strip()
+            return result
+
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
         if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
-            return _result1
+            return _finalise(_result1)
 
         _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
+            return _finalise(_result1)
 
         if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
             # Attempt 1 already burned the outer budget — starting attempt 2
@@ -2996,7 +3226,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             # which is strictly worse than shipping attempt 1's thin patch.
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
-            return _result1
+            return _finalise(_result1)
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -3015,7 +3245,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _n2 >= _n1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
-            return _result2
+            # Stash attempt-1's logs so salvage can fence-walk both attempts'
+            # MODEL_RESPONSE history when attempt 2's patch is still empty.
+            if not (_result2.get("patch") or "").strip():
+                _result2["logs"] = ((_result1.get("logs") or "") + "\n"
+                                    + (_result2.get("logs") or "")).strip()
+            return _finalise(_result2)
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
@@ -3023,7 +3258,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_apply_patch(_multishot_repo_obj, _patch1)
         _result1["multishot_attempts"] = 2
         _result1["multishot_winner"] = "primary"
-        return _result1
+        # If primary patch is empty, fold attempt-2 logs in for salvage.
+        if not _patch1.strip():
+            _result1["logs"] = ((_result1.get("logs") or "") + "\n"
+                                + (_result2.get("logs") or "")).strip()
+        return _finalise(_result1)
 
     except Exception as exc:
         salvaged = ""
@@ -3076,6 +3315,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    underdeliver_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3351,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, underdeliver_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3217,6 +3457,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_criteria_nudge_prompt(unaddressed, issue),
                     "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
+                )
+                return True
+
+        # Underdeliver-nudge: prose issues without bullets bypass the
+        # criteria-nudge gate, so a 1-file patch can ship against a 5-file
+        # requirement (king_analysis P1 / todo D2). When the implied scope
+        # exceeds what the patch touches, surface the gap before coverage.
+        if underdeliver_nudges_used < MAX_UNDERDELIVER_TURNS:
+            estimate = _estimate_issue_file_count(issue, repo_summary, preloaded_files)
+            touched = _patch_changed_files(patch)
+            actual = len(touched)
+            if estimate >= 2 and actual < estimate:
+                underdeliver_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                logs.append(
+                    f"FIRE: underdeliver_nudge_queued estimate={estimate} actual={actual}"
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_underdeliver_nudge_prompt(issue, actual, estimate, touched),
+                    f"UNDERDELIVER_NUDGE_QUEUED: estimate={estimate} actual={actual}",
                 )
                 return True
 
