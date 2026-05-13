@@ -59,6 +59,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -116,11 +117,14 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_COVERAGE_NUDGES = 1    # B16 REVERT: doubling caused bench-pr3 -0.391 regression across 3 runs; model retried PE that consistently failed
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
-MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_PARALLEL_NUDGES = 1    # nudge toward <parallel_edits> when model is doing multi-file work sequentially
+MAX_FOLLOWUP_NUDGES = 1    # after a successful fanout, push for a second fanout if uncovered criteria remain
+MAX_CRITIC_REFINEMENTS = 1  # critic LLM may refine the plan once per solve; if model re-emits suspicious paths, trust it
+MAX_TOTAL_REFINEMENT_TURNS = 3  # B16 REVERT
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
@@ -396,8 +400,93 @@ def chat_completion(
 
 # MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
 # repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
+# cat-result cache. When the model re-cats a file it's already
+# read AND the file content hasn't changed, short-circuit with an abbreviated
+# observation. Saves wall-clock budget and shrinks the context window. Only
+# applies to read-only commands targeting a single existing text file in the
+# repo (cat, head, tail). Anything else bypasses the cache.
+_CAT_SINGLE_FILE_RE = re.compile(
+    r"^\s*(?:cat|head|tail)\s+(?:-[a-zA-Z]+\s+\S+\s+|-\w+\s+|-\w+=\d+\s+)*([^\-\s][^\s|;&<>]*)\s*$",
+)
+
+
+def _maybe_cat_short_circuit(
+    command: str, repo: Path, cache: Dict[str, Any],
+) -> Optional[CommandResult]:
+    """Short-circuit repeat reads of the same file.
+
+    Improvement #2 from variance analysis: prevent pagination by hard-
+    capping the number of reads per file regardless of command shape.
+
+    Detects ALL read shapes (cat, sed -n, head, tail, piped variants)
+    via _extract_read_target. Tracks per-path read count.
+
+    Returns short-circuit CommandResult when EITHER:
+      - file content unchanged since last read (exact-repeat)
+      - file has been read >= 2 times already (pagination cap)
+
+    Otherwise None (caller should run_command normally). Updates cache
+    as a side effect — count increments on every match.
+
+    Cache value shape: {'count': int, 'hash': str | None}
+    """
+    rel = _extract_read_target(command)
+    if not rel:
+        return None
+    try:
+        full = (repo / rel).resolve()
+        full.relative_to(repo.resolve())
+    except (ValueError, OSError):
+        return None
+    if not full.is_file():
+        return None
+    try:
+        data = full.read_bytes()
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None  # binary; let run_command handle it
+    import hashlib
+    h = hashlib.sha256(data).hexdigest()
+    entry = cache.get(rel)
+    if entry is None:
+        entry = {"count": 0, "hash": None}
+    prev_hash = entry.get("hash")
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["hash"] = h
+    cache[rel] = entry
+    count = entry["count"]
+    # Hard cap: 3+ reads of same file → stub. Pagination prevention.
+    if count >= 3:
+        return CommandResult(
+            command=command,
+            exit_code=0,
+            stdout=(
+                f"[read-cache-cap: {rel} already read {count} times this "
+                "solve. The model has the file content from prior reads — "
+                "stop reading and start editing. To address a specific "
+                "section, use a sed -i or python heredoc that targets it "
+                "directly. Further reads will keep returning this stub."
+            ),
+            stderr="",
+            duration_sec=0.0,
+        )
+    # Exact-repeat short-circuit (content unchanged): preserve legacy
+    # behavior for 2nd reads with identical content.
+    if prev_hash == h and prev_hash is not None:
+        return CommandResult(
+            command=command,
+            exit_code=0,
+            stdout=(
+                f"[cached: {rel} unchanged since earlier read; "
+                f"size {len(data)} bytes, sha256 {h[:12]}]"
+            ),
+            stderr="",
+            duration_sec=0.0,
+        )
+    return None
+
+
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -521,6 +610,944 @@ def extract_command(model_text: str) -> Optional[str]:
     return commands[0] if commands else None
 
 
+# -----------------------------
+# Parallel-edits fan-out tool # -----------------------------
+#
+# The dominant local failure mode in qualitative trace reading is "plan
+# enumerates N target files but wall-clock runs out after editing K<<N".
+# Each file edit costs ~15-30s of model generation, spread sequentially
+# across N model rounds. On multi-file tasks (test-07 with 5 plan files
+# + 21 ref files; bench-pr5 with 25 ref files) this is the binding
+# constraint.
+#
+# The `<parallel_edits>` tool lets the model fan out N INDEPENDENT file
+# edits as concurrent sub-LLM calls. Each sub-call receives a focused
+# prompt (issue + that file's content + per-file instruction) and returns
+# ONE python heredoc that applies the change. The harness substitutes
+# the parallel-edits block in the model's response with N synthesized
+# <command> blocks so the existing command-execution loop processes them
+# normally.
+#
+# Speedup math: N sequential edits @ ~20s each = 20*N seconds. N parallel
+# edits = max(per-call latency) ≈ 20-30s regardless of N (rate-limit
+# permitting). For test-07 with 5+ files: ~150s saved per round.
+
+# Accept both `<parallel_edits>...</parallel_edits>` (canonical) and
+# `[parallel_edits]...[/parallel_edits]` (minimax-m2.7 has been observed
+# emitting square-bracket markers; bench-pr1 lost the
+# JwtAuthenticationFilter.java creation because the old strict regex
+# silently dropped a `[parallel_edits]` block). Opening and closing
+# delimiters do not have to match — the block ends at the first closing
+# variant after the opening delimiter.
+_PARALLEL_EDITS_BLOCK_RE = re.compile(
+    r"[<\[]parallel_edits[>\]]\s*(.*?)\s*[<\[]/parallel_edits[>\]]",
+    re.IGNORECASE | re.DOTALL,
+)
+_PARALLEL_EDIT_ITEM_RE = re.compile(
+    r"<edit\s+file\s*=\s*[\"']([^\"']+)[\"']\s*>\s*(.*?)\s*</edit>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MD_FENCE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+\-]*\s*\n(.*?)\n```", re.DOTALL)
+_PYTHON_HEREDOC_RE = re.compile(
+    r"^\s*python3\s+-\s+<<\s*'?PY'?\s*\n(.*?)\n\s*PY\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+_CAT_HEREDOC_RE = re.compile(
+    r"^\s*cat\s+>\s*\S+\s*<<\s*'?EOF'?\s*\n.*?\nEOF\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+# Ralph-loop parallel sub-agents. Each Ralph sub-agent OWNS its file —
+# its own LLM conversation, its own shell execution, its own iteration loop
+# until DONE_VERIFIED or a defined stop condition. No truncation in the
+# sub-agent's brief: a Phase-1 prompt-generator LLM call assembles a rich
+# self-contained brief (issue + full target file + full sibling contents +
+# style notes + acceptance contract) for each Ralph sub-agent in parallel,
+# THEN the Ralph sub-agents run in parallel using those briefs.
+#
+# Architecture (3 phases, all parallel within each phase):
+# Phase 0  Orchestrator emits <parallel_edits> with N (file, instruction) pairs.
+# Phase 1  N concurrent prompt-gen LLM calls produce N rich briefs.
+# Phase 2  N concurrent Ralph loops; each runs:
+# loop until <done/> verified OR stop condition:
+# emit command → run via subprocess (kill-able) → observe → next iter
+# Phase 3  Orchestrator receives a plain-text summary of what happened per file.
+#
+# Each Ralph sub-agent runs commands DIRECTLY via run_command() inside its
+# thread — subprocess.run timeouts are enforceable, unlike HTTP socket
+# timeouts which can't kill slow-streaming LLM responses mid-flight.
+# Concurrency caps. Worst-case proxy call count per solve = orchestrator
+# turns (typ. 8-15) + critic calls (<= MAX_CRITIC_REFINEMENTS=1) + sub-agent
+# iterations per fanout (<= MAX_PER_BATCH * ~6 iters); peak concurrent
+# connections to the validator proxy <= MAX_WORKERS + 1 (orchestrator).
+_RALPH_MAX_PER_BATCH = 4   # accepted edits per fanout; overflow queues to next
+                           # turn via PARALLEL_EDITS_OVERFLOW signal.
+_RALPH_MAX_WORKERS = 4     # max concurrent sub-agent chat sessions.
+# Per-call timeouts are backstops, not steering. Sub-agents are gated by
+# progress (file_changed across iters) and by overall_deadline, not by a
+# tight per-call kill. Set high so slow-but-productive calls survive.
+_RALPH_PER_ITER_TIMEOUT = 90
+_RALPH_SUBPROCESS_TIMEOUT = 60
+_RALPH_BATCH_WALL_CAP = 200  # the meaningful deadline; overshoots per-call
+                             # by up to per_iter_timeout - 30
+_RALPH_MIN_BUDGET = 45
+_RALPH_ITER_SAFETY = 15
+
+
+def _strip_html_comments(text: str) -> str:
+    """Remove <!-- ... --> comments. Prevents stray `<command>` text inside
+    a comment body from being matched by extract_commands as a real tag."""
+    return _HTML_COMMENT_RE.sub("", text)
+
+
+def _normalize_subagent_output(text: str) -> str:
+    """Strip markdown code fences and leading prose from sub-agent output.
+    1/5 sub-agents wrapped the command in ```python3 ...```
+    causing bash parse errors."""
+    text = text.strip()
+    # If the WHOLE response is a single fenced block, unwrap it.
+    fence_match = _MD_FENCE_BLOCK_RE.match(text)
+    if fence_match:
+        return fence_match.group(1).strip()
+    # Otherwise strip any fence lines that appear standalone.
+    lines = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _extract_bare_heredoc(text: str) -> Optional[str]:
+    """If text contains a python3 or cat heredoc but no <command> tags,
+    return the heredoc body so the orchestrator can wrap it. Sub-agents
+    occasionally emit the heredoc directly without wrapper tags."""
+    py = _PYTHON_HEREDOC_RE.search(text)
+    if py:
+        start, end = py.span()
+        return text[start:end].strip()
+    cat = _CAT_HEREDOC_RE.search(text)
+    if cat:
+        start, end = cat.span()
+        return text[start:end].strip()
+    return None
+
+
+def _validate_python_heredoc(cmd: str) -> Optional[str]:
+    """If cmd is a `python3 - <<'PY' ... PY` heredoc, compile the body to
+    catch SyntaxError BEFORE shipping the command to the executor. Returns
+    None if syntax is OK or cmd is not a python heredoc; returns error
+    string if syntax is broken. 2/5 test-07 sub-agents
+    produced Python with leaked PHP `$variable` or `\\U` escape errors."""
+    m = _PYTHON_HEREDOC_RE.search(cmd)
+    if not m:
+        return None
+    body = m.group(1)
+    try:
+        compile(body, "<subagent-heredoc>", "exec")
+        return None
+    except SyntaxError as e:
+        return f"SyntaxError line {e.lineno}: {e.msg}"
+
+
+def _read_file_full(repo: Path, relative_path: str) -> Optional[str]:
+    """Read FULL file content, no truncation. Returns None when the file
+    doesn't exist (sub-agent should create it) or is binary."""
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return None
+    if not path.exists():
+        return None
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_parallel_edits(model_text: str) -> List[Tuple[str, str]]:
+    """Parse <parallel_edits> blocks. Returns list of (file_path, instruction)
+    pairs across ALL parallel_edits blocks in the response. File paths are
+    normalized (strips docker-workdir `/work/repo/` prefix) so PE dispatch
+    resolves correctly even when the model emits absolute paths."""
+    out: List[Tuple[str, str]] = []
+    for block_match in _PARALLEL_EDITS_BLOCK_RE.finditer(model_text):
+        block = block_match.group(1)
+        for item_match in _PARALLEL_EDIT_ITEM_RE.finditer(block):
+            path = _normalize_repo_path(item_match.group(1))
+            instr = item_match.group(2).strip()
+            if path and instr:
+                out.append((path, instr))
+    return out
+
+
+def _looks_like_attempted_pe(model_text: str) -> bool:
+    """Return True if the model's output mentions parallel_edits markup
+    but could not be parsed by `_extract_parallel_edits`.
+
+    bench-pr1 hit this: model emitted `[parallel_edits]...<edit file=
+    "...">.</edit>...</parallel_edits>` (mismatched brackets) and the
+    orchestrator silently lost the edits, firing PATCH_READY on a patch
+    that was missing the new JwtAuthenticationFilter.java file. After B1
+    the canonical regex tolerates that specific shape, but the model can
+    still emit other malformations (forgotten closing tag, typo in
+    `<edit_file=`, extra whitespace). Detecting attempt-without-parse
+    lets us nudge the model to re-emit instead of giving up.
+    """
+    if "parallel_edits" not in model_text and "<edit " not in model_text:
+        return False
+    return not _extract_parallel_edits(model_text)
+
+
+# B7: extension hints from issue text. When the issue explicitly names a
+# file format ("Blade template", "Rust file", "shell script"), edits to
+# files with unrelated extensions are likely wrong-file picks. fresh-01
+# said "update the Blade template" — the agent edited `.php` (a controller
+# class) alongside `.blade.php` (the template). Keep the list short and
+# specific; broad hints over-fire on mixed-type tasks.
+_EXTENSION_HINTS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("blade template", (".blade.php",)),
+    ("rust", (".rs",)),
+    ("python script", (".py",)),
+    ("python module", (".py",)),
+    ("typescript", (".ts", ".tsx")),
+    ("javascript file", (".js", ".jsx", ".mjs")),
+    ("shell script", (".sh", ".bash", ".zsh")),
+    ("yaml file", (".yml", ".yaml")),
+    ("yaml config", (".yml", ".yaml")),
+    ("markdown", (".md",)),
+    ("json config", (".json",)),
+]
+
+
+def _extension_hint_findings(
+    edits: List[Tuple[str, str]], issue: str,
+) -> List[Dict[str, Any]]:
+    """For each edit whose file extension doesn't match an explicit
+    extension hint in the issue, emit a soft finding for the critic.
+    Misses fire only when the issue text contains a specific format
+    keyword AND at least one matching-extension file is already in the
+    batch (so we don't penalize edits that are the only thing the model
+    has produced)."""
+    issue_lower = issue.lower()
+    matched_hints: List[Tuple[str, Tuple[str, ...]]] = []
+    for kw, exts in _EXTENSION_HINTS:
+        if kw in issue_lower:
+            matched_hints.append((kw, exts))
+    if not matched_hints:
+        return []
+    # Collapse all expected suffixes from all matched hints.
+    expected: Set[str] = set()
+    keywords_found: List[str] = []
+    for kw, exts in matched_hints:
+        for e in exts:
+            expected.add(e)
+        keywords_found.append(kw)
+    # If NONE of the edits matches the expected extensions, the hint
+    # might be a red herring (e.g. issue says "blade template" while
+    # discussing it but real changes are elsewhere). Don't flag in that
+    # case — only flag when at least one edit DOES match, so mismatches
+    # are visible as outliers.
+    any_match = any(
+        any(fp.lower().endswith(e) for e in expected) for fp, _ in edits
+    )
+    if not any_match:
+        return []
+    findings: List[Dict[str, Any]] = []
+    for fp, _instr in edits:
+        if any(fp.lower().endswith(e) for e in expected):
+            continue
+        findings.append({
+            "file": fp,
+            "issue": "extension_mismatch",
+            "issue_keywords": keywords_found,
+            "expected_extensions": sorted(expected),
+            "actual_path": fp,
+        })
+    return findings
+
+
+def _parse_and_validate_edits(
+    edits: List[Tuple[str, str]], repo: Path, issue: str = "",
+) -> List[Dict[str, Any]]:
+    """Deterministic check: for each edit, classify the path against the
+    repo's actual filesystem state. Returns a list of findings (one per
+    suspicious edit). Empty list = nothing fishy; fanout can proceed
+    directly. Costs ~1ms per path; no LLM call.
+    """
+    findings: List[Dict[str, Any]] = []
+    # B7: extension hint mismatches based on the issue text.
+    findings.extend(_extension_hint_findings(edits, issue))
+    repo_resolved = repo.resolve()
+    for fp, instr in edits:
+        full = (repo / fp).resolve()
+        try:
+            full.relative_to(repo_resolved)
+        except ValueError:
+            findings.append({
+                "file": fp, "issue": "path_outside_repo",
+                "detail": "edit path resolves outside the repo root",
+            })
+            continue
+        if full.exists():
+            continue  # existing file — fine
+        parent = full.parent
+        if not parent.exists():
+            # Likely-invented directory. Find the closest existing ancestor
+            # and list its children so the critic / model can compare.
+            anc = parent
+            while anc != repo_resolved and not anc.exists():
+                anc = anc.parent
+            anc_children = []
+            try:
+                anc_children = sorted(
+                    [c.name + ("/" if c.is_dir() else "") for c in anc.iterdir()
+                     if not c.name.startswith(".")]
+                )[:20]
+            except Exception:
+                anc_children = []
+            try:
+                rel_parent = str(parent.relative_to(repo_resolved))
+            except ValueError:
+                rel_parent = str(parent)
+            try:
+                rel_anc = str(anc.relative_to(repo_resolved)) if anc != repo_resolved else "."
+            except ValueError:
+                rel_anc = str(anc)
+            findings.append({
+                "file": fp, "issue": "path_nonexistent_parent",
+                "missing_parent": rel_parent,
+                "closest_existing_ancestor": rel_anc,
+                "ancestor_children": anc_children,
+            })
+            continue
+        # Parent exists; new file in an existing dir. Check sibling naming.
+        try:
+            siblings = sorted(
+                [c.name for c in parent.iterdir()
+                 if c.is_file() and not c.name.startswith(".")]
+            )
+        except Exception:
+            siblings = []
+        if len(siblings) >= 3:
+            # Established dir — check if new file's name diverges. Heuristic:
+            # if all siblings share an extension and the new file uses a
+            # different one, that's a flag. Beyond that we let the LLM judge.
+            new_ext = Path(fp).suffix
+            sib_exts = {Path(s).suffix for s in siblings}
+            if new_ext and new_ext not in sib_exts:
+                findings.append({
+                    "file": fp, "issue": "convention_extension_diverge",
+                    "siblings": siblings[:8],
+                    "new_extension": new_ext,
+                    "sibling_extensions": sorted(sib_exts),
+                })
+            else:
+                # Surface siblings even without a clear divergence — the
+                # critic can decide if the name pattern fits.
+                findings.append({
+                    "file": fp, "issue": "new_file_in_populated_dir",
+                    "siblings": siblings[:8],
+                })
+    return findings
+
+
+def _critique_findings(
+    findings: List[Dict[str, Any]],
+    parallel_edits_block: str,
+    issue: str,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    timeout: int = 25,
+) -> Dict[str, Any]:
+    """LLM critic. Fires only when _parse_and_validate_edits returned
+    findings. Interprets the findings + plan context, returns either:
+        {"verdict": "proceed", "reason": "..."}    — let fanout run as-is
+        {"verdict": "refine",  "message": "..."}    — push refinement turn
+    On any error / parse failure, returns proceed (never block fanout)."""
+    if not findings:
+        return {"verdict": "proceed", "reason": "no findings"}
+
+    finding_lines = []
+    for f in findings:
+        line = f"  - {f.get('file', '?')}  :: {f.get('issue', '?')}"
+        if f.get("ancestor_children"):
+            line += f" (closest ancestor contains: {', '.join(f['ancestor_children'][:8])})"
+        elif f.get("siblings"):
+            line += f" (parent dir contains: {', '.join(f['siblings'][:8])})"
+        if f.get("missing_parent"):
+            line += f" [missing: {f['missing_parent']}]"
+        # B7: extension-mismatch detail
+        if f.get("issue") == "extension_mismatch":
+            kws = ", ".join(f.get("issue_keywords") or [])
+            exts = ", ".join(f.get("expected_extensions") or [])
+            line += (
+                f" (issue mentions [{kws}] which implies {exts}; "
+                f"this file does not match)"
+            )
+        finding_lines.append(line)
+    findings_text = "\n".join(finding_lines)
+
+    sys_msg = (
+        "You are a code-edit-plan critic. A deterministic check has flagged "
+        "the following paths in the orchestrator's proposed plan. Decide "
+        "whether each is a real problem (invented filename, wrong dir) or "
+        "an intentional new feature.\n\n"
+        "Reply with EXACTLY ONE JSON object on a single line:\n"
+        '  {"verdict": "proceed"}            — flagged paths are fine\n'
+        '  {"verdict": "refine", "message": "..."} — push back to model\n\n'
+        "Be conservative — if you're unsure, choose proceed (a false "
+        "refinement burns a turn). Refine only when the path is clearly "
+        "wrong (typo, mis-translation of an issue word into a dir name) "
+        "AND you can suggest a better alternative based on the siblings "
+        "listed. Keep the refine message short (<300 chars), specific, "
+        "and actionable."
+    )
+    user_msg = (
+        f"ISSUE (context, truncated):\n{issue[:1500]}\n\n"
+        f"ORCHESTRATOR'S PROPOSED EDITS:\n{parallel_edits_block[:3000]}\n\n"
+        f"DETERMINISTIC FINDINGS:\n{findings_text}\n\n"
+        "Output the JSON verdict now."
+    )
+    try:
+        content, _cost, _info = chat_completion(
+            [{"role": "system", "content": sys_msg},
+             {"role": "user", "content": user_msg}],
+            model, api_base, api_key,
+            max_tokens=400,
+            timeout=timeout,
+            max_retries=0,
+        )
+    except Exception as e:
+        return {"verdict": "proceed", "reason": f"critic_error: {type(e).__name__}"}
+
+    # Find the JSON object in the response (model may wrap in prose)
+    raw = (content or "").strip()
+    m = re.search(r"\{.*?\"verdict\"\s*:\s*\"(?:proceed|refine)\".*?\}", raw, re.DOTALL)
+    if not m:
+        return {"verdict": "proceed", "reason": "critic_unparseable"}
+    try:
+        import json as _json
+        parsed = _json.loads(m.group(0))
+    except Exception:
+        return {"verdict": "proceed", "reason": "critic_json_error"}
+    if parsed.get("verdict") not in ("proceed", "refine"):
+        return {"verdict": "proceed", "reason": "critic_invalid_verdict"}
+    return parsed
+
+
+def _assemble_subagent_brief(
+    issue: str,
+    target_file: str,
+    instruction: str,
+    repo: Path,
+    sibling_paths: List[str],
+) -> str:
+    """Deterministic template assembly for a sub-agent's brief. No LLM call —
+    the orchestrator's `instruction` flows verbatim into the brief's GOAL,
+    eliminating the paraphrase drift that a brief-generator LLM would add.
+    Sibling files are appended as reference-only context.
+    """
+    target_content = _read_file_full(repo, target_file)
+    target_blob = (
+        target_content if target_content is not None else "[file does not exist yet]"
+    )
+    sibling_blocks: List[str] = []
+    for sp in sibling_paths:
+        if sp == target_file:
+            continue
+        sc = _read_file_full(repo, sp)
+        body = sc if sc is not None else "[file does not exist yet]"
+        sibling_blocks.append(
+            f"\n--- {sp} (reference only, do NOT modify) ---\n{body}\n--- end {sp} ---\n"
+        )
+    siblings_text = "".join(sibling_blocks) if sibling_blocks else "(none)\n"
+    return (
+        f"## GOAL\n{instruction.strip()}\n\n"
+        f"## YOUR FILE: {target_file}\n"
+        f"```\n{target_blob}\n```\n\n"
+        f"## ISSUE (full context)\n{issue}\n\n"
+        f"## RELATED FILES (reference only; do not edit)\n{siblings_text}"
+    )
+
+
+_RALPH_DONE_RE = re.compile(r"<\s*done\s*/?\s*>", re.IGNORECASE)
+_RALPH_BLOCKED_RE = re.compile(r"<\s*blocked\s*>([^<]*)</\s*blocked\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _ralph_subagent(
+    brief: str,
+    target_file: str,
+    repo: Path,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    overall_deadline: float,
+    per_iter_timeout: int = _RALPH_PER_ITER_TIMEOUT,
+    cmd_timeout: int = _RALPH_SUBPROCESS_TIMEOUT,
+    iter_safety: int = _RALPH_ITER_SAFETY,
+) -> Dict[str, Any]:
+    """PHASE 2: one Ralph loop for ONE file. Iterates until DONE or
+    wall-clock exhausted. No artificial iter cap — the loop runs as long
+    as overall_deadline allows. `iter_safety` is only a runaway-prevention
+    net (15) for the case where the deadline check is somehow bypassed.
+
+    STOP CONDITIONS (the "defined stop"):
+      - DONE_VERIFIED      : sub-agent emitted <done/> AND file actually changed
+      - WALL_CLOCK         : overall_deadline exceeded mid-iter
+      - VERIFY_LOOP        : 3 consecutive silent no-op writes (exit 0 + no change)
+      - LLM_ERROR          : chat_completion failed (no retry — wall-clock is fixed)
+      - DONE_UNVERIFIED    : sub-agent said done twice but file still unchanged
+      - ITER_SAFETY        : the safety net tripped (should never happen normally)
+
+    Returns: {"status": str, "iters": int, "summary": str}.
+    """
+    sub_system = (
+        "You iterate toward a GOAL by doing ONE meaningful unit of work per "
+        "turn. Your file is " + target_file + ". You may edit ONLY that file; "
+        "related files are reference-only.\n\n"
+        "Each turn, emit STATE then ACTION in that order:\n\n"
+        "<state>\n"
+        "- did: what this iter changed or learned (empty on turn 1)\n"
+        "- next: the ONE thing this turn will do\n"
+        "- blocker: any obstacle (or 'none')\n"
+        "</state>\n\n"
+        "Then exactly ONE of:\n"
+        "  <command>python3 - <<'PY' ... PY</command>  — one shell action\n"
+        "  <done/>                                       — GOAL verifiably met\n"
+        "  <blocked>reason</blocked>                     — stuck; hand back\n\n"
+        "Loop principles:\n"
+        "- ONE unit per iter. Don't try to do everything in one heredoc.\n"
+        "- The brief already shows your file's current content — do NOT re-read "
+        "it just to look. Turn 1 is for a write or for a focused diagnostic.\n"
+        "- After a successful write, the NEXT turn verifies (grep/cat) before "
+        "<done/>. Never claim done without verifying.\n"
+        "- If 2 consecutive iters produce no file change, emit <blocked>.\n\n"
+        "Command format:\n"
+        "  python3 - <<'PY' ... PY  inside <command>...</command>.\n"
+        "  No markdown fences. Use raw triple-strings r'''...''' for file "
+        "content. After any replace/sub, `assert new != original` to catch "
+        "no-ops.\n\n"
+        "The orchestrator chose this file and its sibling files; if your edit "
+        "references a sibling type/import/function, use the name as written in "
+        "the related-files section — do NOT invent or rename."
+    )
+    file_before_initial = _read_file_full(repo, target_file) or ""
+    messages = [
+        {"role": "system", "content": sub_system},
+        {"role": "user", "content": (
+            f"BRIEF:\n{brief}\n\nBEGIN iterating. Emit your first <command> or <done/>."
+        )},
+    ]
+    iters = 0
+    consecutive_silent_noops = 0
+    done_attempts_without_change = 0
+    # Once the file has been edited successfully, any subsequent no-op
+    # iter is verification waste — file_changed=True at the edit iter is
+    # authoritative. Force DONE_VERIFIED on the first post-edit no-op so
+    # other sub-agents in the batch (with harder work to do) get the
+    # remaining wall-clock budget. fresh-05 de.json sub-agent previously
+    # spent 7 iters of verification after a successful edit at i1.
+    file_has_been_edited = False
+    # Capture per-iter trace so VERIFY_LOOP / LLM_ERROR causes are visible
+    # in the orchestrator's solve.json. Bounded to avoid bloat.
+    trace_lines: List[str] = []
+    def _trace(line: str) -> None:
+        if len(trace_lines) < 40:  # ~40 entries × ~250 chars = ~10kb max per sub-agent
+            trace_lines.append(line[:250])
+
+    while iters < iter_safety:
+        # B4: iter 1 always runs, regardless of remaining deadline. Every
+        # sub-agent must get at least one shot at editing — losing a file
+        # entirely (status=WALL_CLOCK iters=0) was the dominant cost on
+        # fresh-05 foryou.js. From iter 2 onward, respect the deadline so
+        # easy files yield the wall-clock to harder ones.
+        # Per-iter cost is ~25s LLM + ~1s shell, so we need at least 30s
+        # of headroom to start a further iter.
+        if iters >= 1 and time.monotonic() + 30 > overall_deadline:
+            return {"status": "WALL_CLOCK", "iters": iters,
+                    "summary": f"deadline at iter {iters}; not enough headroom for another",
+                    "trace": trace_lines}
+        iters += 1
+        # B9: retry one time on transient LLM error if we have headroom.
+        # Previous behavior returned LLM_ERROR on the first failed call
+        # (bench-pr1 ApiError.java sub-agent died on a single proxy
+        # timeout). With ~25s per call and per-batch caps of 150s+, one
+        # retry costs little; loss-of-sub-agent costs the full file
+        # contribution. Cap the retry so persistent failures still exit.
+        content = None
+        last_exc: Optional[Exception] = None
+        for _attempt in range(2):
+            try:
+                content, _cost, _info = chat_completion(
+                    messages, model, api_base, api_key,
+                    max_tokens=4000, timeout=per_iter_timeout,
+                    max_retries=0,
+                )
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                _trace(
+                    f"i{iters} LLM_RETRY a{_attempt} {type(e).__name__}: "
+                    f"{str(e)[:100]}"
+                )
+                # only retry if we have headroom for another call
+                if _attempt == 0 and time.monotonic() + 40 < overall_deadline:
+                    continue
+                break
+        if last_exc is not None:
+            _trace(f"i{iters} LLM_ERROR {type(last_exc).__name__}: {str(last_exc)[:120]}")
+            return {"status": "LLM_ERROR", "iters": iters,
+                    "summary": f"{type(last_exc).__name__}: {str(last_exc)[:160]}",
+                    "trace": trace_lines}
+
+        normalized = _normalize_subagent_output(content or "")
+        # Trace the model's response shape (not full content — too noisy)
+        resp_shape = (
+            f"len={len(normalized)} done={bool(_RALPH_DONE_RE.search(normalized))} "
+            f"cmd={'<command>' in normalized} bare_heredoc={bool(_extract_bare_heredoc(normalized))}"
+        )
+
+        # BLOCKED branch — sub-agent self-reports it's stuck. Hand back to
+        # orchestrator with the stated reason; preserves any landed edits.
+        blocked_m = _RALPH_BLOCKED_RE.search(normalized)
+        if blocked_m:
+            reason = blocked_m.group(1).strip()[:200]
+            _trace(f"i{iters} BLOCKED {reason[:80]}")
+            return {"status": "BLOCKED", "iters": iters,
+                    "summary": f"sub-agent self-blocked: {reason}",
+                    "trace": trace_lines}
+
+        # DONE branch
+        if _RALPH_DONE_RE.search(normalized):
+            file_after = _read_file_full(repo, target_file) or ""
+            if file_after != file_before_initial:
+                _trace(f"i{iters} DONE_VERIFIED delta={len(file_after) - len(file_before_initial):+d}")
+                return {"status": "DONE_VERIFIED", "iters": iters,
+                        "summary": f"file delta {len(file_after) - len(file_before_initial):+d} chars",
+                        "trace": trace_lines}
+            _trace(f"i{iters} DONE_BUT_UNCHANGED attempt={done_attempts_without_change+1}")
+            done_attempts_without_change += 1
+            if done_attempts_without_change >= 2:
+                return {"status": "DONE_UNVERIFIED", "iters": iters,
+                        "summary": "sub-agent said done 2× but file unchanged",
+                        "trace": trace_lines}
+            # Push back once and let it retry
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                f"VERIFY_FAIL: you emitted <done/> but {target_file} is UNCHANGED "
+                "from its starting state. Either (a) make an actual edit and re-emit "
+                "<done/> after, or (b) re-emit <done/> with a one-line reason for "
+                "why no edit is needed."
+            )})
+            continue
+
+        # COMMAND branch
+        cmd_list = extract_commands(normalized)
+        cmd: Optional[str] = cmd_list[0] if cmd_list else _extract_bare_heredoc(normalized)
+        if not cmd:
+            _trace(f"i{iters} NO_COMMAND resp:{resp_shape}")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                "NO_COMMAND: your response had neither <command>...</command> nor "
+                "<done/>. Emit EXACTLY ONE of them now. Do not use markdown fences."
+            )})
+            continue
+
+        # Trace command shape (head only — full body would balloon)
+        cmd_head = cmd[:120].replace("\n", " | ")
+        # Classify: is this a WRITE command or a pure-read?
+        # Writes contain .write_text(, .write_bytes(, `cat > path <<`,
+        # `tee path`, or a redirection. Reads are just read_text + print.
+        is_write = bool(re.search(
+            r"\.write_text\s*\(|\.write_bytes\s*\(|"
+            r"cat\s+>\s*\S|"
+            r"\btee\s+\S|"
+            r"open\s*\([^,)]*,\s*['\"][wa]b?\+?['\"]\s*[,)]",
+            cmd,
+        ))
+        # On iter 1, refuse pure-read commands. Reroute back to the sub-agent
+        # with explicit feedback. This addresses the dominant test-07 failure
+        # mode: sub-agents reading the file 3× and never writing → VERIFY_LOOP
+        # without ever attempting an edit.
+        if iters == 1 and not is_write:
+            _trace(f"i{iters} ITER1_NO_WRITE rerouted cmd:{cmd_head}")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                f"ITER1_VIOLATION: your first command was a pure read "
+                f"(no .write_text / cat > / tee / open(...,'w')). The brief "
+                f"already contains the current content of {target_file}; "
+                "re-reading it is a wasted iteration.\n\n"
+                "Emit a WRITE command NOW that applies your intended edit. "
+                "Use one of:\n"
+                "  • pathlib.Path('{file}').write_text(new_content)\n"
+                "  • Read+modify+write where you assert new != original\n"
+                "  • cat > " + target_file + " <<'EOF' ... EOF (full rewrite)\n\n"
+                "Do NOT re-read the file."
+            ).replace("{file}", target_file)})
+            continue
+        # Pre-validate python heredoc body so the sub-agent sees the syntax
+        # error in feedback rather than burning a shell exec on it.
+        syn_err = _validate_python_heredoc(cmd)
+        if syn_err:
+            _trace(f"i{iters} SYNTAX_ERR {syn_err[:80]} cmd_head: {cmd_head}")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                f"SYNTAX_ERROR in your python heredoc body: {syn_err}.\n"
+                "Common causes: PHP/JS $variable written as a Python statement; "
+                "backslash escapes (\\U, \\n) outside a raw string. Use r'''...''' "
+                "for file content. Retry with corrected python."
+            )})
+            continue
+
+        file_before_iter = _read_file_full(repo, target_file) or ""
+        result = run_command(cmd, repo, timeout=cmd_timeout)
+        file_after_iter = _read_file_full(repo, target_file) or ""
+        file_changed = file_after_iter != file_before_iter
+        stderr_head = (result.stderr[:140] or "").replace("\n", " | ")
+        _trace(
+            f"i{iters} exit={result.exit_code} chg={file_changed} "
+            f"sz {len(file_before_iter)}->{len(file_after_iter)} "
+            f"cmd:{cmd_head} stderr:{stderr_head}"
+        )
+
+        # Track whether we've EVER successfully edited the file. Once we
+        # have, no-ops are verification (harmless); before, they're
+        # stuck-writes (real problem).
+        if file_changed:
+            file_has_been_edited = True
+            consecutive_silent_noops = 0
+        elif result.exit_code == 0:
+            if file_has_been_edited:
+                # B3: an edit already landed; the next no-op iter is the
+                # sub-agent "verifying" the edit visually. That work is
+                # wasted — file_changed=True at the edit iter is already
+                # authoritative. Force DONE_VERIFIED immediately so other
+                # sub-agents (with harder work to do) get the wall-clock.
+                # Previously this path ran up to ~7 iters with 2 OVER_VERIFY
+                # nudge LLM calls before exit; on fresh-05 de.json spent
+                # 7 iters after a successful edit at i1, starving
+                # bot/commands/foryou.js to WALL_CLOCK (0 iter).
+                _trace(f"i{iters} DONE_VERIFIED force-exit on first post-edit no-op")
+                file_after = _read_file_full(repo, target_file) or ""
+                return {"status": "DONE_VERIFIED", "iters": iters,
+                        "summary": f"file delta {len(file_after) - len(file_before_initial):+d} chars; "
+                                   "force-exit on first post-edit verify",
+                        "trace": trace_lines}
+            else:
+                # Pre-edit no-ops: probably stuck-writes (pattern not
+                # matching, etc). Bail after 3.
+                consecutive_silent_noops += 1
+                if consecutive_silent_noops >= 3:
+                    return {"status": "VERIFY_LOOP", "iters": iters,
+                            "summary": "3 consecutive silent no-op writes BEFORE first successful edit; sub-agent stuck",
+                            "trace": trace_lines}
+        else:
+            consecutive_silent_noops = 0
+
+        # Build observation for next iteration
+        obs_parts = [
+            f"OBSERVATION (iter {iters}):",
+            f"EXIT_CODE: {result.exit_code}",
+            f"DURATION: {result.duration_sec:.2f}s",
+            f"FILE_CHANGED: {file_changed} (size {len(file_before_iter)} -> {len(file_after_iter)} bytes)",
+        ]
+        if result.stdout.strip():
+            obs_parts.append(f"STDOUT:\n{result.stdout[:1500]}")
+        if result.stderr.strip():
+            obs_parts.append(f"STDERR:\n{result.stderr[:1500]}")
+        if result.exit_code != 0:
+            obs_parts.append("Command FAILED. Read STDERR carefully and fix the specific issue.")
+        elif not file_changed:
+            obs_parts.append(
+                "NOTE: command succeeded but file is UNCHANGED. Likely causes: "
+                "your re.sub/str.replace pattern did not match; you read the file "
+                "but did not write it; the edit was a no-op. Investigate before retrying."
+            )
+        obs_parts.append(
+            "If you have VERIFIED the file now matches the acceptance contract "
+            "(via cat/grep, not by hope), emit <done/>. Otherwise iterate."
+        )
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": "\n".join(obs_parts)})
+
+    return {"status": "ITER_SAFETY", "iters": iters,
+            "summary": f"hit iter_safety={iter_safety} (deadline check failed)",
+            "trace": trace_lines}
+
+
+def _run_ralph_parallel(
+    edits: List[Tuple[str, str]],
+    *,
+    issue: str,
+    repo: Path,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    batch_wall_cap: int = _RALPH_BATCH_WALL_CAP,
+) -> List[Dict[str, Any]]:
+    """Spawn N parallel Ralph sub-agents (one per file). Each owns its file,
+    iterates with python heredocs until <done/>, <blocked/>, or wall-clock.
+
+    Per-call timeout is a backstop; the real budget gate is overall_deadline.
+    Smaller batch_wall_cap → tighter per-iter timeout so more iters can fit.
+    """
+    import concurrent.futures
+    capped = edits[:_RALPH_MAX_PER_BATCH]
+    sibling_paths = [fp for fp, _ in capped]
+    overall_deadline = time.monotonic() + batch_wall_cap
+
+    if batch_wall_cap >= 150:
+        phase2_per_iter = _RALPH_PER_ITER_TIMEOUT
+    elif batch_wall_cap >= 100:
+        phase2_per_iter = 60
+    else:
+        phase2_per_iter = 40
+
+    # Assemble briefs deterministically from the orchestrator's instructions.
+    # No LLM call here — the orchestrator's `instruction` flows verbatim into
+    # the brief's GOAL section, avoiding the paraphrase drift of a separate
+    # brief-generator LLM.
+    briefs: List[str] = [
+        _assemble_subagent_brief(issue, fp, instr, repo, sibling_paths)
+        for fp, instr in capped
+    ]
+
+    # Run parallel Ralph loops. Workers stay busy via pool queue — when one
+    # sub-agent finishes (DONE_VERIFIED, BLOCKED, etc.), the pool picks the
+    # next queued sub-agent.
+    results: List[Optional[Dict[str, Any]]] = [None] * len(capped)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_RALPH_MAX_WORKERS) as pool:
+        futs = {
+            pool.submit(
+                _ralph_subagent,
+                briefs[i], capped[i][0], repo,
+                model, api_base, api_key,
+                overall_deadline,
+                phase2_per_iter,
+                _RALPH_SUBPROCESS_TIMEOUT,
+            ): i
+            for i in range(len(capped))
+        }
+        remaining = max(5, int(overall_deadline - time.monotonic()))
+        try:
+            for f in concurrent.futures.as_completed(futs, timeout=remaining):
+                idx = futs[f]
+                res = f.result()
+                res["file_path"] = capped[idx][0]
+                # Attach the brief head for orchestrator-log visibility.
+                res["brief_head"] = briefs[idx][:2000]
+                results[idx] = res
+        except concurrent.futures.TimeoutError:
+            # B4: instead of immediately marking stragglers as WALL_CLOCK
+            # (0 iter), give them a 30s grace window to finish iter 1.
+            # On fresh-05, bot/commands/foryou.js — a critical reference
+            # target — got WALL_CLOCK (0 iter) because the batch hit its
+            # cap while foryou.js's first LLM call was still in flight.
+            # Losing an entire file's contribution costs ~0.1-0.3 score;
+            # a 30s overshoot of the batch cap costs nothing visible.
+            pending = [f for f in futs.keys() if not f.done()]
+            if pending:
+                try:
+                    for f in concurrent.futures.as_completed(pending, timeout=30):
+                        idx = futs[f]
+                        res = f.result()
+                        res["file_path"] = capped[idx][0]
+                        res["brief_head"] = briefs[idx][:2000]
+                        results[idx] = res
+                except concurrent.futures.TimeoutError:
+                    pass
+            for f_, idx in futs.items():
+                if not f_.done():
+                    results[idx] = {
+                        "file_path": capped[idx][0],
+                        "status": "WALL_CLOCK",
+                        "iters": 0,
+                        "summary": "batch_wall_cap_exceeded_plus_grace",
+                    }
+                    f_.cancel()
+
+    # Defensive fill for any missing slots
+    for i in range(len(capped)):
+        if results[i] is None:
+            results[i] = {
+                "file_path": capped[i][0],
+                "status": "UNKNOWN",
+                "iters": 0,
+                "summary": "missing_result",
+            }
+    return results
+
+
+def _replace_parallel_edits_with_summary(
+    model_text: str,
+    ralph_results: List[Dict[str, Any]],
+    dropped_paths: Optional[List[str]] = None,
+) -> str:
+    """PHASE 3: replace the <parallel_edits> block with a plain-text
+    summary of what each Ralph sub-agent achieved. Not <command> blocks —
+    the sub-agents already executed their edits inside their own threads.
+    The orchestrator's next turn sees the summary as context for what
+    state the repo is in.
+
+    `dropped_paths` lists files the model requested but that exceeded
+    _RALPH_MAX_PER_BATCH; surfaced so the next turn can retry them in a
+    second parallel_edits block.
+
+    B12: surface FAILED sub-agents (LLM_ERROR / WALL_CLOCK iters=0)
+    explicitly as a "retry needed" list. Without this the model only
+    saw a status code in the summary line and often treated the batch
+    as complete. bench-pr2 v9o: 3 of 4 sub-agents failed via LLM_ERROR
+    and the model never reissued them.
+    """
+    if not ralph_results and not dropped_paths:
+        return model_text
+    lines = ["[parallel_edits_done] Ralph-loop sub-agents finished:"]
+    for r in ralph_results:
+        safe_path = r["file_path"].replace("<", "&lt;").replace(">", "&gt;")
+        safe_sum = (r.get("summary") or "").replace("<", "&lt;").replace(">", "&gt;")[:240]
+        lines.append(
+            f"  - {safe_path} :: {r.get('status', '?')} "
+            f"({r.get('iters', 0)} iters) :: {safe_sum}"
+        )
+    needs_retry = [
+        r["file_path"] for r in ralph_results
+        if r.get("status") in ("LLM_ERROR", "WALL_CLOCK")
+        or (r.get("status") == "WALL_CLOCK" and r.get("iters", 0) == 0)
+    ]
+    if needs_retry:
+        lines.append(
+            f"[parallel_edits_retry_needed] {len(needs_retry)} sub-agent(s) "
+            f"did NOT successfully edit their file (LLM timeout / wall-clock). "
+            f"Retry them in your NEXT <parallel_edits> block:"
+        )
+        for p in needs_retry[:16]:
+            safe_p = p.replace("<", "&lt;").replace(">", "&gt;")
+            lines.append(f"  - {safe_p}")
+    if dropped_paths:
+        lines.append(
+            f"[parallel_edits_dropped] {len(dropped_paths)} files exceeded "
+            f"per-batch cap; emit another <parallel_edits> next turn for:"
+        )
+        for p in dropped_paths[:16]:
+            safe_p = p.replace("<", "&lt;").replace(">", "&gt;")
+            lines.append(f"  - {safe_p}")
+    replacement = "\n".join(lines)
+    result, _n = _PARALLEL_EDITS_BLOCK_RE.subn(lambda _m: replacement, model_text, count=1)
+    result = _PARALLEL_EDITS_BLOCK_RE.sub(lambda _m: "", result)
+    return result
+
+
 def extract_final(model_text: str) -> Optional[str]:
     match = FINAL_RE.search(model_text)
     if not match:
@@ -549,7 +1576,7 @@ def ensure_git_repo(repo: Path) -> None:
     )
 
 
-def get_patch(repo: Path) -> str:
+def get_patch(repo: Path, issue: str = "") -> str:
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -598,12 +1625,33 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return _sanitize_patch(diff_output)
+    return _sanitize_patch(diff_output, issue_text=issue)
 
 
-"""Reserved substrings used by the final patch cleanup pass to handle rare
-edge-case outputs safely. Keeping this list centralized makes the safeguard
-easy to apply without complicating the main editing flow."""
+# B15: when the issue explicitly mentions formatting/style/indentation as
+# the goal, whitespace-only and comment-only hunks are NOT junk — they
+# are the work product. fresh-03 ("uniform spacing in macros, reorder
+# includes") had its real edits stripped because the strip classifier
+# treated them as low-signal. Disable the strip in that case.
+_STYLE_TASK_KEYWORDS = (
+    "indentation", "indent", "spacing", "whitespace", "formatting",
+    "format", "style", "reformat", "lint", "consistent indentation",
+    "uniform spacing", "trailing whitespace", "blank lines", "blank-lines",
+)
+
+
+def _issue_is_style_task(issue_text: str) -> bool:
+    """True when the issue's primary goal is formatting/style. Suppresses
+    low-signal-hunk stripping which would otherwise erase the actual edits.
+    """
+    if not issue_text:
+        return False
+    lower = issue_text.lower()
+    return any(kw in lower for kw in _STYLE_TASK_KEYWORDS)
+
+
+# Edge-case guardrail: strip content lines containing evaluator-addressed
+# strings that would otherwise make a valid patch unusable.
 _EDGECASE_GUARDRAIL = (
     "ignore previous instructions",
     "ignore prior instructions",
@@ -624,16 +1672,21 @@ _EDGECASE_GUARDRAIL = (
 )
 
 
-def _sanitize_patch(diff_output: str) -> str:
+def _sanitize_patch(diff_output: str, issue_text: str = "") -> str:
+    """Remove patch blocks that consistently score as noise, never fixes.
+
+    When `issue_text` indicates a style/formatting task, skip the
+    low-signal-hunk strip so the real edits survive. Always run the
+    edge-case guardrail to scrub evaluator-addressed strings.
+    """
     if not diff_output.strip():
         return diff_output
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
-    cleaned = _strip_low_signal_hunks(cleaned)
+    if not _issue_is_style_task(issue_text):
+        cleaned = _strip_low_signal_hunks(cleaned)
 
-    # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
-    # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
     if cleaned and any(trigger in cleaned.lower() for trigger in _EDGECASE_GUARDRAIL):
         kept: List[str] = []
         for line in cleaned.splitlines():
@@ -951,6 +2004,36 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+def _preloaded_dir_summary(included_paths: List[str], max_per_dir: int = 8) -> str:
+    """Group the already-preloaded paths by their parent directory and emit
+    a one-line summary per dir. When the model later creates a new file, it
+    has seen the sibling basenames and is less likely to invent a divergent
+    name. Projection of already-loaded data; zero new I/O. Bounded by
+    max_per_dir per directory so a heavily-preloaded folder doesn't bloat.
+    """
+    if not included_paths:
+        return ""
+    from collections import defaultdict
+    by_dir: Dict[str, List[str]] = defaultdict(list)
+    for p in included_paths:
+        parent, _, name = p.rpartition("/")
+        if not name:
+            continue
+        by_dir[parent or "."].append(name)
+    if not by_dir:
+        return ""
+    lines: List[str] = []
+    for parent in sorted(by_dir):
+        names = sorted(set(by_dir[parent]))
+        head = names[:max_per_dir]
+        suffix = f" (+{len(names) - max_per_dir} more)" if len(names) > max_per_dir else ""
+        lines.append(f"  {parent}/ — {', '.join(head)}{suffix}")
+    return (
+        "### preloaded files by directory (naming convention hint)\n"
+        + "\n".join(lines)
+    )
+
+
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -992,6 +2075,24 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
             existing = set(files)
             files = [f for f in rescue_files if f not in existing] + files
 
+    # B10: distinctive-phrase grep — runs unconditionally (very cheap)
+    # and surfaces hits as a high-priority banner. Catches cases where
+    # the issue contains a verbatim string (multilingual UI text, error
+    # messages, code constants) that only appears in one or two files.
+    # fresh-01: agent's `find` output included the right file at the top
+    # but the model picked a wrong file because filenames matched a
+    # different issue term; a "this file contains '<phrase>'" hint is
+    # decisive evidence.
+    phrase_grep = _distinctive_phrase_grep(repo, issue, tracked_set)
+    phrase_match_files: List[str] = []
+    for _phrase, hits in phrase_grep:
+        for h in hits:
+            if h not in phrase_match_files:
+                phrase_match_files.append(h)
+    if phrase_match_files:
+        existing = set(files)
+        files = [f for f in phrase_match_files if f not in existing] + files
+
     if not files:
         return "", []
 
@@ -1001,7 +2102,34 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # Improvement #5 (ported from PR #1326): weighted per-file preload budgets.
+    # Top-3 files get 2x weight, files 4-8 get 1x, 9+ get 0.6x. Total stays
+    # within MAX_PRELOADED_CONTEXT_CHARS. Surfaces more from highest-ranked
+    # files where the actual edit target almost always lives.
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
+
+    if phrase_grep:
+        # B10 banner. Show each phrase + the files containing it. Place
+        # BEFORE the rescue-ranker banner so the strongest evidence is
+        # at the top of the preload.
+        lines = ["### content-search hint"]
+        lines.append(
+            "The issue contains distinctive verbatim strings. The "
+            "following file(s) contain those strings literally — they "
+            "are the most likely targets. Inspect them first, BEFORE "
+            "narrowing path-based searches:"
+        )
+        for phrase, hits in phrase_grep:
+            display = phrase if len(phrase) <= 70 else phrase[:67] + "..."
+            lines.append(f"  - {display!r}")
+            for h in hits[:3]:
+                lines.append(f"      → {h}")
+        phrase_banner = "\n".join(lines) + "\n"
+        parts.append(phrase_banner)
+        used += len(phrase_banner)
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1019,8 +2147,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
+        snippet = _read_context_file_sections(
+            repo, relative_path, issue, budget_for_file,
+        )
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1034,6 +2165,15 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
         parts.append(project_hints)
         used += len(project_hints)
+
+    # directory-conventions block. Group preloaded
+    # paths by parent dir; show basenames so the model can see naming
+    # patterns when it later creates new files. Pure projection of data
+    # already present — zero new I/O, no LLM calls, no skeleton.
+    dir_summary = _preloaded_dir_summary(included)
+    if dir_summary:
+        parts.append(dir_summary)
+        used += len(dir_summary)
 
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
@@ -1103,7 +2243,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 35
         if name_lower and name_lower in issue_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
             score += 16
         score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
@@ -1140,6 +2280,121 @@ _RESCUE_RANKER_MIN_TERM_LEN = 5
 _RESCUE_RANKER_MAX_TERMS = 6
 
 
+# Non-ASCII phrase regex. Bounded to a single line — `[A-Za-z ]` not `\s`
+# — so we never capture across newlines, which produced prose fragments
+# like "...destination URL.\nThe" on test-02 v9o.
+_DISTINCTIVE_PHRASE_RE_NONASCII = re.compile(
+    r"[A-Za-z]*[^\x00-\x7f][A-Za-z À-￿]{6,}[^\x00-\x7f][A-Za-z]*"
+)
+
+# Common English stop-words used to reject prose-fragment phrases. A
+# phrase with 2+ of these is almost certainly sentence-fragment prose
+# that won't grep-match meaningfully.
+_PHRASE_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "if", "in", "is", "it", "its", "of", "on", "or", "that",
+    "the", "their", "then", "to", "was", "were", "when", "which", "with",
+})
+
+
+def _phrase_is_prose_fragment(phrase: str) -> bool:
+    """Reject phrases that look like English sentence fragments. Such
+    phrases over-match in git grep and surface irrelevant files as
+    spurious B10 banner hits (test-02 v9o regression source)."""
+    tokens = re.findall(r"[A-Za-z]+", phrase.lower())
+    if len(tokens) <= 1:
+        return False
+    stop_n = sum(1 for t in tokens if t in _PHRASE_STOPWORDS)
+    # 2+ stop-words suggests it's sentence-shape (e.g. "the X is Y").
+    return stop_n >= 2
+
+
+def _extract_distinctive_phrases(issue_text: str) -> List[str]:
+    """Pull verbatim-quotable strings out of an issue:
+      - text segments containing non-ASCII characters (multilingual hints)
+      - quoted strings (single/double/backtick) of >= 8 characters
+
+    These phrases are highly likely to appear verbatim in source files.
+    fresh-01 referenced a Turkish UI string ("butonuna tıklamakta sorun
+    yaşıyorsanız ...") that only existed in
+    `resources/views/vendor/notifications/email.blade.php`. The agent
+    saw that file in `find` output and ignored it because the filename
+    didn't match — but a content-search would have been decisive.
+
+    Returns up to 3 phrases sorted by length descending (longest first
+    is most distinctive). Caller should de-duplicate against already
+    preloaded files.
+    """
+    if not issue_text:
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for m in _DISTINCTIVE_PHRASE_RE_NONASCII.finditer(issue_text):
+        s = m.group(0).strip()
+        if not (10 <= len(s) <= 80) or s in seen:
+            continue
+        if _phrase_is_prose_fragment(s):
+            continue
+        out.append(s)
+        seen.add(s)
+    for q in ["'", '"', '`']:
+        pat = q + r"([^" + re.escape(q) + r"\n]{8,80})" + q
+        for m in re.finditer(pat, issue_text):
+            s = m.group(1).strip()
+            if not s or s in seen:
+                continue
+            # Reject one-word quotes (mostly identifiers handled by
+            # _symbol_grep_hits already) — distinctive phrases are
+            # multi-word.
+            if " " not in s and len(s) < 20:
+                continue
+            if _phrase_is_prose_fragment(s):
+                continue
+            out.append(s)
+            seen.add(s)
+    out.sort(key=len, reverse=True)
+    return out[:3]
+
+
+def _distinctive_phrase_grep(
+    repo: Path, issue_text: str, tracked: set,
+) -> List[Tuple[str, List[str]]]:
+    """For each distinctive phrase, run `git grep -l -F -- '<phrase>'`
+    against the tracked set and return (phrase, matching_files) pairs
+    for phrases that hit at least one tracked file.
+
+    Higher-signal than _broad_grep_fallback: long verbatim phrases are
+    far less likely to occur in unrelated files than single keywords.
+    """
+    phrases = _extract_distinctive_phrases(issue_text)
+    if not phrases or not tracked:
+        return []
+    pairs: List[Tuple[str, List[str]]] = []
+    for phrase in phrases:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", phrase],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        hits = [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+        if hits:
+            # Cap matches per phrase — a phrase that hits 20 files is
+            # too generic to be useful.
+            pairs.append((phrase, hits[:5]))
+    return pairs
+
+
 def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]:
     """Rescue-ranker: when _rank_context_files produces no strong signal,
     scan tracked files by raw issue-term match count. Catches tasks where
@@ -1158,25 +2413,29 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-    hits: Dict[str, int] = {}
-    for term in terms:
+    # Parallelized grep (ported from PR #1326): saves ~1-3s on preload
+    # setup compared to sequential, freeing wall-clock for editing.
+    def _grep_term(term: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3,
+                cwd=str(repo), capture_output=True, text=True, timeout=3,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if relative_path and relative_path in tracked:
-                hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked
+        ]
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
+        futures = {pool.submit(_grep_term, t): t for t in terms}
+        for future in as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1255,9 +2514,12 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
-        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
-        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
+        path_words = _split_path_tokens(relative_path)
+        def _token_in_path(tok: str) -> bool:
+            return tok in path_words if len(tok) < 5 else tok in path_lower
+        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
+        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
+        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -1371,6 +2633,136 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     return _truncate(text, max_chars)
 
 
+_STRICT_IDENT_RE = re.compile(
+    # snake_case or SCREAMING_SNAKE_CASE (must have at least one underscore)
+    r"\b([A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+)\b"
+    # OR CamelCase (must have lowercase->uppercase transition)
+    r"|\b([A-Z][a-z]+[A-Z][A-Za-z0-9]+)\b"
+    # OR all-caps with digits (e.g. UTF8, JSON)
+    r"|\b([A-Z]{2,}\d+[A-Z0-9]*)\b"
+    # OR backtick-wrapped identifiers
+    r"|`([A-Za-z_][\w./-]+)`"
+)
+
+
+def _extract_strict_identifiers(issue_text: str, max_n: int = 16) -> List[str]:
+    """Stricter than _extract_issue_symbols: only compound identifiers
+    (snake_case, CamelCase, ALL_CAPS_WITH_DIGITS) or backtick-quoted
+    code refs. Skips generic English nouns like "prediction", "model",
+    "loop" that match too much file content for section preload.
+    """
+    out: List[str] = []
+    seen: set = set()
+    for m in _STRICT_IDENT_RE.finditer(issue_text):
+        tok = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        if not tok or tok in seen:
+            continue
+        if len(tok) < 4:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def _read_context_file_sections(
+    repo: Path, relative_path: str, issue_text: str, max_chars: int,
+) -> str:
+    """Improvement #1: section-targeted preload for large files.
+
+    For files that don't fit in `max_chars`, extract the sections that
+    contain issue-mentioned identifiers (±25 lines around each match)
+    instead of the first max_chars of the file. fresh-04 needs this:
+    loop_worker.rs is 2300 lines and the issue references identifiers
+    scattered through it (calculate_backoff, OPENAI_MODEL, build_prompt,
+    extract_json, etc) — the model can't see them all in the head and
+    paginates the whole file looking.
+
+    Uses `_extract_strict_identifiers` (compound/CamelCase/SCREAMING
+    identifiers only) — looser symbol extraction picks up generic
+    nouns like "model" that match too many lines for sections to be
+    useful.
+
+    Falls back to truncated full content when:
+      - file is small enough to fit (≤ max_chars)
+      - no symbols in the issue match the file content
+    """
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return ""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    # Small files: full truncated content (legacy behavior).
+    if len(text) <= max_chars:
+        return _truncate(text, max_chars)
+    # Large files: section-targeted preload using strict identifiers
+    # only (avoid generic-noun blast radius).
+    symbols = _extract_strict_identifiers(issue_text)
+    if not symbols:
+        return _truncate(text, max_chars)
+    lines = text.splitlines()
+    # Find line numbers (1-based) containing any symbol.
+    hit_lines: List[Tuple[int, List[str]]] = []
+    for ln_no, line in enumerate(lines, 1):
+        matched_syms = [s for s in symbols if s in line]
+        if matched_syms:
+            hit_lines.append((ln_no, matched_syms))
+    if not hit_lines:
+        return _truncate(text, max_chars)
+    # Group nearby hits (within 60 lines) into single sections.
+    sections: List[Tuple[int, int, List[str]]] = []  # (start, end, matched_syms)
+    cur_start = max(1, hit_lines[0][0] - 25)
+    cur_end = min(len(lines), hit_lines[0][0] + 25)
+    cur_syms: List[str] = list(hit_lines[0][1])
+    for ln_no, syms in hit_lines[1:]:
+        new_start = max(1, ln_no - 25)
+        new_end = min(len(lines), ln_no + 25)
+        if new_start <= cur_end + 5:  # overlap / adjacent → merge
+            cur_end = max(cur_end, new_end)
+            for s in syms:
+                if s not in cur_syms:
+                    cur_syms.append(s)
+        else:
+            sections.append((cur_start, cur_end, cur_syms))
+            cur_start, cur_end, cur_syms = new_start, new_end, list(syms)
+    sections.append((cur_start, cur_end, cur_syms))
+    # Render sections with headers, respecting max_chars.
+    out_parts: List[str] = []
+    used = 0
+    head = (
+        f"[section-preload: {relative_path} is large ({len(text):,} chars); "
+        "showing only sections containing issue-mentioned identifiers]\n"
+    )
+    out_parts.append(head)
+    used += len(head)
+    for start, end, syms in sections:
+        section_lines = lines[start - 1:end]
+        sym_label = ", ".join(syms[:5])
+        block = (
+            f"\n# === lines {start}-{end} (matches: {sym_label}) ===\n"
+            + "\n".join(f"{n}: {ln}" for n, ln in zip(range(start, end + 1), section_lines))
+            + "\n"
+        )
+        if used + len(block) > max_chars:
+            # Truncate the section to fit if it's the first one; otherwise stop.
+            if not out_parts[1:]:  # no real section yet
+                remaining = max_chars - used - 80
+                if remaining > 200:
+                    out_parts.append(block[:remaining] + "\n[... section truncated]\n")
+            break
+        out_parts.append(block)
+        used += len(block)
+    return "".join(out_parts)
+
+
 # -----------------------------
 # Hunk classifiers + diff hygiene
 # -----------------------------
@@ -1379,12 +2771,12 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
 # comment / blank-line edits, and patches that cover the wrong files. The
 # helpers below detect both. They're applied at two stages:
 #
-#   1. At patch-return time: low-signal hunks are silently dropped from the
-#      final diff (so the validator never sees them).
-#   2. Inside the loop: when the model's draft contains junk, we queue a
-#      "polish" turn that asks the model to revert those hunks itself, since
-#      doing so cleanly is safer than mechanical filtering for borderline cases
-#      (e.g., a comment edit that genuinely matters).
+# 1. At patch-return time: low-signal hunks are silently dropped from the
+# final diff (so the validator never sees them).
+# 2. Inside the loop: when the model's draft contains junk, we queue a
+# "polish" turn that asks the model to revert those hunks itself, since
+# doing so cleanly is safer than mechanical filtering for borderline cases
+# (e.g., a comment edit that genuinely matters).
 
 _COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
 _BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
@@ -1530,6 +2922,254 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _patch_change_lines(patch: str) -> int:
+    """Count lines of real content change in a unified diff.
+
+    Excludes the `+++` / `---` header lines and any non-`+`/`-` lines.
+    Used by the budget-pressure gate to distinguish "patch has only a
+    trivial 1-line incidental edit" from "patch has substantive work."
+    """
+    n = 0
+    for line in patch.split("\n"):
+        if not line:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line[0] in "+-":
+            n += 1
+    return n
+
+
+_READ_CMD_HEADS = {"cat", "less", "more", "head", "tail"}
+
+
+def _normalize_repo_path(path: str) -> str:
+    """Strip docker-workdir absolute prefix (`/work/repo/`) and leading
+    slash so the same file produces a consistent string regardless of
+    how the model wrote it. The agent runs inside docker with
+    CWD=/work/repo; the model alternates between relative and absolute
+    paths mid-solve (observed on fresh-04 v9o: step 1 used relative,
+    steps 3+ used /work/repo/...). Path detectors and PE dispatch need
+    a normalized form.
+    """
+    if not path:
+        return path
+    s = path.strip().strip("'\"")
+    for prefix in ("/work/repo/", "/work/", "./"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    s = s.lstrip("/")
+    return s
+
+
+_PYTHON_READ_OPEN_RE = re.compile(
+    r"open\s*\(\s*['\"]([^'\"]+)['\"]"
+    r"(?:\s*,\s*['\"](r|rb|rt)['\"])?\s*[,)]"
+)
+_PYTHON_READ_PATH_RE = re.compile(
+    r"Path\s*\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\."
+    r"(?:read_text|read_bytes|read)\s*\("
+)
+_PYTHON_WRITE_HINT_RE = re.compile(
+    r"\.write_text\s*\(|\.write_bytes\s*\(|"
+    r"open\s*\([^,)]+,\s*['\"][wa]b?\+?['\"]\s*[,)]"
+)
+
+
+def _extract_python_read_target(cmd: str) -> Optional[str]:
+    """If `cmd` is a `python3 - <<'PY'` heredoc that ONLY reads (no
+    writes), return the first read target. Returns None if the body
+    has any write hint (`.write_text(`, `open(X, 'w')`, etc) — those
+    are legitimate edits, not pagination.
+
+    Handles patterns:
+      - `open('FILE').read()` / `open('FILE', 'r').read()`
+      - `Path('FILE').read_text()`
+
+    Helps catch the fresh-04 v9z3 evasion: after the cat/sed cache
+    fired, the model switched to python3 heredocs to keep reading
+    loop_worker.rs without our pagination detector noticing.
+    """
+    if "python" not in cmd.split("\n", 1)[0]:
+        return None
+    if _PYTHON_WRITE_HINT_RE.search(cmd):
+        return None  # has writes — let it run, not a pure read
+    m = _PYTHON_READ_OPEN_RE.search(cmd)
+    if m and ".read" in cmd:  # confirm a read call exists somewhere
+        return _normalize_repo_path(m.group(1))
+    m = _PYTHON_READ_PATH_RE.search(cmd)
+    if m:
+        return _normalize_repo_path(m.group(1))
+    return None
+
+
+def _extract_read_target(cmd: str) -> Optional[str]:
+    """If `cmd` is a pure read (cat / sed -n / head / tail / less / more)
+    on a single file, return that path. Used by the pagination-loop
+    detector — fresh-04 spent 22 consecutive read commands on the same
+    2300-line Rust file before WALL_CLOCK without ever writing.
+
+    Also handles `cat -n FILE | sed -n '...p'` (the model's preferred
+    paginate form on fresh-04 v9s — pipes a read through sed for line
+    numbers). The detector must accept this shape, not reject it as
+    "compound command".
+
+    Also handles `python3 - <<'PY' open(FILE).read() PY` heredocs (the
+    model's evasion pattern after the cat cache started firing on
+    fresh-04 v9z3).
+
+    Returns None for genuinely compound commands (redirects, &&, ;, etc).
+    Path is normalized so /work/repo/X and X produce the same string.
+    """
+    # Python heredoc reads — check first so we don't reject them as
+    # compound commands via the pipe/redirect guard below.
+    py_target = _extract_python_read_target(cmd)
+    if py_target:
+        return py_target
+    first_line = cmd.strip().split("\n")[0].strip()
+    if not first_line:
+        return None
+    # Reject true compound commands but allow simple pipe-through-filter
+    # since paginate-via-pipe is common: `cat -n FILE | sed -n '...p'`.
+    if any(tok in first_line for tok in [">", "<", ";", "&&", "||", "$(", "`"]):
+        return None
+    parts = first_line.split()
+    if not parts:
+        return None
+    # Special case: piped reads. e.g. `cat -n FILE | sed -n '200,500p'`
+    if "|" in first_line:
+        # Split on the first pipe, examine each side.
+        lhs, rhs = first_line.split("|", 1)
+        lhs_parts = lhs.split()
+        rhs_first = rhs.strip().split()
+        if not lhs_parts:
+            return None
+        if lhs_parts[0] not in _READ_CMD_HEADS:
+            return None
+        # RHS must also be a pure-read filter (sed -n, head, tail) — no
+        # mutation.
+        if not rhs_first:
+            return None
+        if rhs_first[0] not in {"sed", "head", "tail", "less", "more"}:
+            return None
+        if rhs_first[0] == "sed" and "-n" not in rhs_first:
+            return None
+        # Extract path from LHS (last non-flag token).
+        for tok in reversed(lhs_parts[1:]):
+            s = tok.strip("'\"")
+            if not s or s.startswith("-"):
+                continue
+            if "/" in s or "." in s or re.match(r"^[A-Za-z_][\w-]*$", s):
+                return _normalize_repo_path(s)
+        return None
+    head = parts[0]
+    if head == "sed":
+        if "-n" not in parts:
+            return None
+    elif head not in _READ_CMD_HEADS:
+        return None
+    for tok in reversed(parts[1:]):
+        s = tok.strip("'\"")
+        if not s or s.startswith("-"):
+            continue
+        # sed address range like '100,200p' — skip
+        if re.match(r"^\d+(?:,\d+)?[pPdq]?$", s):
+            continue
+        if "/" in s or "." in s or re.match(r"^[A-Za-z_][\w-]*$", s):
+            return _normalize_repo_path(s)
+    return None
+
+
+def _revert_docker_mount_mode_artifacts(repo: Path) -> int:
+    """Restore HEAD permission bits on files the agent did NOT touch.
+
+    Docker volume mounts on macOS and some Linux configs flip executable
+    bits on shell scripts (100755 <-> 100644) AT MOUNT TIME, before the
+    agent process starts. The agent never reads, edits, or chmods these
+    files; the bit-flip is a property of the container's mount layer, not
+    a solver action.
+
+    Scope is intentionally tight to prevent any chance of overwriting a
+    legitimate agent change: a block is reverted ONLY when the diff has a
+    mode change AND NO content hunks AND is not a new-file or
+    deleted-file diff. If the agent intentionally edits a file's contents,
+    the block carries `@@` hunk headers and is skipped here. If the agent
+    creates a new script with executable bit set, the block carries
+    `new file mode` and is skipped here.
+
+    Returns the count of files restored, for accounting only.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--binary"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        diff = proc.stdout or ""
+    except Exception:
+        return 0
+    if not diff or "diff --git " not in diff:
+        return 0
+    n = 0
+    for block in re.split(r"(?m)^(?=diff --git )", diff):
+        if not block.startswith("diff --git "):
+            continue
+        has_mode = bool(re.search(r"(?m)^(?:old|new) mode \d+", block))
+        has_hunks = bool(re.search(r"(?m)^@@ ", block))
+        has_new_file = bool(re.search(r"(?m)^new file mode \d+", block))
+        has_delete = bool(re.search(r"(?m)^deleted file mode \d+", block))
+        if not has_mode or has_hunks or has_new_file or has_delete:
+            continue
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", block.splitlines()[0])
+        if not m:
+            continue
+        path = m.group(2)
+        try:
+            proc = subprocess.run(
+                ["git", "checkout", "HEAD", "--", path],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _strip_mode_only_hunks(patch: str) -> str:
+    """Remove diff blocks that only change file mode with no content edits.
+
+    Belt-and-braces complement to `_revert_docker_mount_mode_artifacts`:
+    that function restores the working tree, this function strips the same
+    blocks from any patch we return as a return-value to callers that
+    consume the agent's reported patch directly.
+    """
+    if not patch or "diff --git " not in patch:
+        return patch
+    blocks = re.split(r"(?m)^(?=diff --git )", patch)
+    kept: List[str] = []
+    for block in blocks:
+        if not block.strip():
+            continue
+        if not block.startswith("diff --git "):
+            kept.append(block)
+            continue
+        has_mode = bool(re.search(r"(?m)^(?:old|new) mode \d+", block))
+        has_hunks = bool(re.search(r"(?m)^@@ ", block))
+        has_new_file = bool(re.search(r"(?m)^new file mode \d+", block))
+        has_delete = bool(re.search(r"(?m)^deleted file mode \d+", block))
+        if has_mode and not (has_hunks or has_new_file or has_delete):
+            continue
+        kept.append(block)
+    return "".join(kept)
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1629,10 +3269,10 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # Languages where ' is unambiguously a string delimiter. The brace-balance
 # parser below treats ' as a string-mode toggle, which produces false
 # positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
-#     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust — `'a` is a lifetime annotation
-#   - Go — `'X'` is a rune literal
+# - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
+# (so `char c = '}';` flips into string mode and eats until next ')
+# - Rust — `'a` is a lifetime annotation
+# - Go — `'X'` is a rune literal
 # Net effect of including those: a single `'X'` in any function would yield
 # a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
 # to JS-family + Swift, where ' is a real string delimiter.
@@ -2182,32 +3822,6 @@ _DELETION_VERB_RE = re.compile(
 )
 
 
-# Phrases that imply the patch should CREATE a file at a NEW path rather than
-# (or in addition to) editing the old-path file. Covers king_analysis P1:
-# "import path … to the new location", "rebuild as separate components",
-# "move X to Y", "create … under …". Pairs the verb/instruction with a
-# nearby noun ("page"/"file"/"component"/"location"/"path"/"module"/"screen"
-# /"directory") within ~6 intervening words so colloquial uses of "move" or
-# "rebuild" don't fire on unrelated tasks.
-_RELOCATION_PHRASE_RE = re.compile(
-    r"(?:"
-    r"(?:move|relocate|rebuild|extract|split|migrate|reorganize)\s+(?:\S+\s+){0,6}?"
-    r"(?:page|pages|file|files|component|components|module|modules|screen|screens|view|views|directory|folder|location|path)"
-    r"|"
-    r"(?:correct|fix|update|change)\s+(?:the\s+)?import\s+path"
-    r"|"
-    r"(?:create|add)\s+(?:\S+\s+){0,4}?(?:new|separate|standalone)\s+"
-    r"(?:file|page|component|module|screen|view)"
-    r"|"
-    r"to\s+(?:its|a|the)\s+(?:new|own|proper|correct)\s+"
-    r"(?:location|path|directory|folder|module|file)"
-    r"|"
-    r"(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _patch_has_deletions(patch: str) -> bool:
     """True if the patch contains at least one substantive deletion line."""
     for line in patch.splitlines():
@@ -2220,33 +3834,6 @@ def _patch_has_deletions(patch: str) -> bool:
 def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
-
-
-def _issue_implies_relocation(issue_text: str) -> bool:
-    """True if the issue text implies a file should be CREATED at a new path.
-
-    Triggers on phrasing like "correct the import path … to the new location",
-    "rebuild as separate components", "move X to its own file", "create a
-    new screen file". Used by the coverage-nudge gate to detect when the
-    patch only edits the OLD-path file instead of creating a new one.
-    """
-    return bool(_RELOCATION_PHRASE_RE.search(issue_text))
-
-
-def _patch_creates_any_new_file(patch: str) -> bool:
-    """True if the patch contains at least one `new file mode` header.
-
-    Used together with `_issue_implies_relocation` to detect the king's P1
-    half-relocation pattern: issue says "move/relocate/rebuild as new file"
-    but the patch only edits an existing file.
-    """
-    for line in patch.splitlines():
-        if line.startswith("new file mode "):
-            return True
-        # `git mv`-equivalent renames also count as creating-at-new-path.
-        if line.startswith("rename to "):
-            return True
-    return False
 
 
 # -----------------------------
@@ -2312,28 +3899,28 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-    hits: Dict[str, int] = {}
-    for symbol in symbols:
+    def _grep_symbol(symbol: str) -> List[str]:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=4,
+                cwd=str(repo), capture_output=True, text=True, timeout=4,
             )
         except Exception:
-            continue
+            return []
         if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            relative_path = line.strip()
-            if not relative_path or relative_path not in tracked_set:
-                continue
-            if not _context_file_allowed(relative_path):
-                continue
-            hits[relative_path] = hits.get(relative_path, 0) + 1
+            return []
+        return [
+            line.strip() for line in proc.stdout.splitlines()
+            if line.strip() and line.strip() in tracked_set
+            and _context_file_allowed(line.strip())
+        ]
+
+    hits: Dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        futures = {pool.submit(_grep_symbol, s): s for s in symbols}
+        for future in as_completed(futures):
+            for path in future.result():
+                hits[path] = hits.get(path, 0) + 1
     return hits
 
 
@@ -2374,7 +3961,8 @@ First response format:
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
-- Strategy: smallest root-cause fix likely to satisfy the issue.
+- Edits: for each likely target, ONE line in the form `path/to/file: <specific change you will write>`. Do NOT say "examine" or "inspect" — commit to a concrete write. If unsure of exact lines, still commit to the file and approach.
+- Strategy: smallest root-cause fix; surgical edits, no "examine then decide" — your next command after the plan should already be moving toward a write.
 - Verification: targeted test command expected after patching.
 </plan>
 <command>
@@ -2478,8 +4066,6 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
-**Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
-
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
 ====================================================================
@@ -2497,8 +4083,6 @@ Do NOT change:
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
 
-**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
-
 ====================================================================
 SAFETY
 ====================================================================
@@ -2506,6 +4090,19 @@ SAFETY
 No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
 
 Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
+
+====================================================================
+PARALLEL EDITS (optional, multi-file only)
+====================================================================
+
+For multi-file tasks (3+ INDEPENDENT files already identified from preloaded snippets), you may emit:
+
+<parallel_edits>
+<edit file="path/to/foo.py">one-paragraph instruction for THIS file</edit>
+<edit file="path/to/bar.tsx">one-paragraph instruction for THIS file</edit>
+</parallel_edits>
+
+Concurrent sub-agents will execute the edits in parallel (cap 6 per batch). For single-file or sequential-by-nature work, normal `<command>` is faster and clearer.
 '''
 
 
@@ -2587,15 +4184,25 @@ your command here
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
-            "Budget check: no repo change yet. "
+            "Budget check: no substantive edits yet. "
             "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
             "A precise sed or python -c is better than another grep. Stop exploring."
         )
+    if step < 8:
+        return (
+            "Hard budget check: patch is still trivial or stalled. "
+            "Your next command MUST make a substantive code change — even a best-effort edit to the most obvious location. "
+            "Do not read files or run tests until after real edits exist. "
+            "Use `sed -i` or a python one-liner to make the targeted edit now."
+        )
     return (
-        "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        f"STOP READING. Step {step} and the patch is still trivial or has stopped growing. "
+        "You have already paged through enough of the file. Your NEXT command MUST be a write "
+        "command — `sed -i 's/old/new/' path` or `python3 - <<'PY'` writing "
+        "to the file. NOT another `sed -n` / `cat` / `grep`. NOT another "
+        "`<plan>`. A WRITE. Even a guess is better than continuing to read. "
+        "If you don't know exactly what to change, edit the most likely line "
+        "based on your best understanding so far."
     )
 
 
@@ -2628,6 +4235,83 @@ def build_polish_prompt(junk_summary: str) -> str:
     )
 
 
+def build_parallel_nudge_prompt(
+    changed_files: List[str],
+    remaining_paths: List[str],
+    issue_text: str,
+) -> str:
+    """nudge the model toward <parallel_edits> when we detect it's doing
+    multi-file work sequentially. Fires when the patch already shows ≥3
+    changed files AND there are still issue-mentioned paths untouched."""
+    todo_block = "\n  ".join(f"- {p}" for p in remaining_paths[:6]) or "(see issue)"
+    if changed_files:
+        intro = (
+            "Multi-file efficiency check — you've already edited:\n"
+            "  " + "\n  ".join(f"- {p}" for p in changed_files[:6]) + "\n\n"
+            "...sequentially. These paths still need work:\n"
+            f"  {todo_block}\n\n"
+            "Sequential <command> blocks for distinct files burn wall-clock you "
+            "may not get back. Switch to `<parallel_edits>` for the remaining "
+            "files NOW."
+        )
+    else:
+        # Exploration-spree variant: no edits yet, model has been cat/grep'ing.
+        intro = (
+            "Wall-clock check — you've spent several turns exploring without "
+            "editing any file. The issue lists multiple acceptance criteria "
+            "implying these targets:\n"
+            f"  {todo_block}\n\n"
+            "Stop reading and start editing. Emit `<parallel_edits>` for the "
+            "files the issue requires — sequential <command> writes will not "
+            "fit in remaining wall-clock."
+        )
+    return (
+        intro + "\n\n"
+        "One <edit file=\"...\"> per file, with a concise instruction. The "
+        "Ralph sub-agents will execute them in parallel and you'll see a "
+        "[parallel_edits_done] summary on your next turn.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n\n"
+        "Emit `<parallel_edits>` now."
+    )
+
+
+# B13: phrases that imply the patch should CREATE a file at a NEW path
+# rather than (or in addition to) editing the old-path file. Ported from
+# the current king (PR #1298). Covers "move X to Y", "rebuild as separate
+# components", "correct the import path to the new location", etc.
+_RELOCATION_PHRASE_RE = re.compile(
+    r"(?:"
+    r"(?:move|relocate|rebuild|extract|split|migrate|reorganize)\s+(?:\S+\s+){0,6}?"
+    r"(?:page|pages|file|files|component|components|module|modules|screen|screens|view|views|directory|folder|location|path)"
+    r"|"
+    r"(?:correct|fix|update|change)\s+(?:the\s+)?import\s+path"
+    r"|"
+    r"(?:create|add)\s+(?:\S+\s+){0,4}?(?:new|separate|standalone)\s+"
+    r"(?:file|page|component|module|screen|view)"
+    r"|"
+    r"to\s+(?:its|a|the)\s+(?:new|own|proper|correct)\s+"
+    r"(?:location|path|directory|folder|module|file)"
+    r"|"
+    r"(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _issue_implies_relocation(issue_text: str) -> bool:
+    """True if the issue text implies a file should be CREATED at a new path."""
+    return bool(_RELOCATION_PHRASE_RE.search(issue_text))
+
+
+def _patch_creates_any_new_file(patch: str) -> bool:
+    """True if the patch contains at least one `new file mode` header or rename."""
+    for line in patch.splitlines():
+        if line.startswith("new file mode ") or line.startswith("rename to "):
+            return True
+    return False
+
+
 def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
@@ -2638,8 +4322,7 @@ def build_coverage_nudge_prompt(
     Incomplete coverage is common on multi-file tasks. When the issue names
     specific files and the draft skips them, surface that gap directly — much
     cheaper than hoping the self-check catches it. When `relocation_gap` is
-    set, also instruct the model to CREATE a new file at the implied path
-    (king_analysis P1 fix: don't just edit the old-path file).
+    set, also instruct the model to CREATE a new file at the implied path.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     relocation_hint = ""
@@ -3076,6 +4759,38 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    parallel_nudges_used = 0
+    parallel_edits_fanouts_done = 0  # set when Ralph fanout fires (any tier)
+    followup_nudges_used = 0  # cap follow-up fanout nudges per solve
+    critic_refinements_used = 0  # cap critic-driven refinements per solve
+    # track turns where the orchestrator emitted commands but the
+    # patch didn't change (pure cat/grep/ls exploration). Used to fire the
+    # parallel-nudge BEFORE the model commits to a full sequential pass.
+    exploration_only_streak = 0
+    _prev_patch_for_streak = ""
+    # Budget-pressure tracking. Old gate (`patch is empty`) was disabled by
+    # any incidental 1-line edit early in the solve — fresh-04 made one
+    # sed -i delete at step 3, then paginated for 17 more steps with the
+    # pressure gate silently False. Track the change-line count instead so
+    # we can detect "patch exists but is trivial" and stalls.
+    _prev_patch_change_lines = 0
+    _no_growth_streak = 0
+    # B5: count re-emit nudges when the model attempted PE markup that
+    # couldn't be parsed. Cap at 1 per solve so a model that genuinely
+    # can't produce the canonical syntax still terminates.
+    pe_reemit_nudges_used = 0
+    # B6: pagination-loop detection — consecutive `cat`/`sed -n`/`head`/
+    # `tail`/`less`/`more` commands targeting the same file. fresh-04
+    # spent 17 steps slicing through a 2300-line Rust file in 100-200
+    # line chunks before WALL_CLOCK with zero substantive writes.
+    pagination_same_file_streak = 0
+    last_paginated_path: Optional[str] = None
+    pagination_nudges_used = 0
+    # per-solve cat cache. Key = relative path. Value = sha256
+    # of file content at most-recent observed read. On a repeat cat of the
+    # same path with unchanged content, return an abbreviated observation
+    # instead of dumping the full file again.
+    cat_cache: Dict[str, Any] = {}  # {rel_path: {'count': int, 'hash': str|None}}
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,8 +4826,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
-        patch = get_patch(repo)
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, parallel_nudges_used, parallel_edits_fanouts_done, exploration_only_streak, _prev_patch_for_streak, followup_nudges_used
+        patch = get_patch(repo, issue=issue)
 
         if must_edit_after_gap:
             if patch != must_edit_patch:
@@ -3203,6 +4918,89 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
+        # parallel-nudge. Fires in TWO situations:
+        # (A) In-progress sequential editing — patch already has ≥3 files,
+        # Ralph never fired, more work pending. Switch the remainder
+        # to parallel.
+        # (B) Exploration-spree — ≥4 consecutive turns with no patch change,
+        # ≥3 acceptance criteria, Ralph never fired. Catches the mode where
+        # the model cats forever and never edits, runs out of wall-clock.
+        # Update the exploration-streak counter first (depends on whether
+        # the patch changed since last call).
+        if patch == _prev_patch_for_streak:
+            exploration_only_streak += 1
+        else:
+            exploration_only_streak = 0
+        _prev_patch_for_streak = patch
+
+        if parallel_nudges_used < MAX_PARALLEL_NUDGES:
+            changed_now = _patch_changed_files(patch)
+            uncovered = _uncovered_required_paths(patch, issue)
+            unaddressed_criteria = _unaddressed_criteria(patch, issue)
+            criteria = _extract_acceptance_criteria(issue)
+            more_work_needed = bool(uncovered) or bool(unaddressed_criteria)
+
+            trigger_inprogress = (
+                len(changed_now) >= 3
+                and more_work_needed
+            )
+            trigger_exploration_spree = (
+                exploration_only_streak >= 4
+                and len(criteria) >= 3
+            )
+
+            if (
+                (trigger_inprogress or trigger_exploration_spree)
+                and parallel_edits_fanouts_done == 0
+                and time_remaining() > (_RALPH_MIN_BUDGET + WALL_CLOCK_RESERVE_SECONDS + 20)
+            ):
+                parallel_nudges_used += 1
+                total_refinement_turns_used += 1
+                # Build the "todo" list for the prompt: prefer specific
+                # uncovered paths; fall back to criteria summary.
+                todo = uncovered if uncovered else [
+                    "see issue acceptance criteria — files not yet identified"
+                ]
+                trigger_label = (
+                    "inprogress" if trigger_inprogress else "exploration_spree"
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_parallel_nudge_prompt(sorted(changed_now), todo, issue),
+                    f"PARALLEL_NUDGE_QUEUED ({trigger_label}):\n  "
+                    f"changed={len(changed_now)} explore_streak={exploration_only_streak} "
+                    f"uncovered={len(uncovered)} criteria_open={len(unaddressed_criteria)} "
+                    f"criteria_total={len(criteria)}",
+                )
+                return True
+
+        # Post-fanout follow-up nudge. Fires AFTER a Ralph fanout finished if
+        # uncovered criteria remain and there's budget for another fanout.
+        # Catches the failure mode where the model treats one fanout as "done"
+        # and falls into wall-clock-eating sequential exploration.
+        if followup_nudges_used < MAX_FOLLOWUP_NUDGES and parallel_edits_fanouts_done >= 1:
+            changed_now = _patch_changed_files(patch)
+            uncovered = _uncovered_required_paths(patch, issue)
+            unaddressed_criteria = _unaddressed_criteria(patch, issue)
+            if (
+                (bool(uncovered) or bool(unaddressed_criteria))
+                and time_remaining() > (_RALPH_MIN_BUDGET + WALL_CLOCK_RESERVE_SECONDS + 20)
+            ):
+                followup_nudges_used += 1
+                total_refinement_turns_used += 1
+                todo = uncovered if uncovered else [
+                    "see issue acceptance criteria — files not yet identified"
+                ]
+                queue_refinement_turn(
+                    assistant_text,
+                    build_parallel_nudge_prompt(sorted(changed_now), todo, issue),
+                    f"FOLLOWUP_NUDGE_QUEUED:\n  "
+                    f"fanouts_done={parallel_edits_fanouts_done} "
+                    f"changed={len(changed_now)} uncovered={len(uncovered)} "
+                    f"criteria_open={len(unaddressed_criteria)}",
+                )
+                return True
+
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
         # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
@@ -3222,10 +5020,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            # king_analysis P1: issue says "move/relocate/rebuild as separate"
-            # but the patch contains no `new file mode` header — the model
-            # only edited the old-path file. Fire the same single-shot
-            # coverage nudge with a relocation-specific hint at the top.
+            # B13: issue says "move/relocate/rebuild as separate" but patch
+            # has no `new file mode` header — fire coverage nudge with a
+            # relocation-specific hint. Ported from king PR #1298.
             relocation_gap = (
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
@@ -3235,8 +5032,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
-                if relocation_gap:
-                    logs.append("FIRE: relocation_gap_detected")
                 marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
@@ -3244,9 +5039,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
-                    ),
+                    build_coverage_nudge_prompt(missing, issue, relocation_gap=relocation_gap),
                     marker,
                 )
                 return True
@@ -3299,7 +5092,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
-                modified_files = _patch_changed_files(get_patch(repo))
+                modified_files = _patch_changed_files(get_patch(repo, issue=issue))
                 stripped = _strip_preloaded_section(
                     original_initial,
                     preloaded_files,
@@ -3352,7 +5145,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 # and return that patch rather than wiping everything because
                 # the proxy hiccuped. Empty patches score 0; partial patches
                 # can still earn cursor-similarity credit.
-                if get_patch(repo).strip():
+                if get_patch(repo, issue=issue).strip():
                     logs.append(
                         "MODEL_ERROR_RECOVER:\nReturning best partial patch "
                         "after persistent model errors."
@@ -3371,6 +5164,138 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             consecutive_model_errors = 0
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
+            # If the model emitted <parallel_edits>, run the 3-phase Ralph
+            # protocol: prompt-gen briefs (parallel), Ralph loops (parallel,
+            # each owns its subprocess shell), then summarize results into
+            # response_text. Sub-agents already executed their edits — no
+            # <command> blocks get spliced back.
+            parallel_edit_specs = _extract_parallel_edits(response_text)
+            # PE-must-parallelize gate: suppress single-file PE. The Ralph
+            # dispatch overhead (separate LLM call per sub-agent, brief
+            # assembly, batch wall-clock coordination) is only worth it
+            # when at least 2 files run concurrently. Single-file PE is
+            # all overhead, no parallelism — sequential is strictly better.
+            # Observed degenerate cases: fresh-04 v9o PE x1 on main.rs
+            # (wrong file, sub-agent failed); bench-pr1 v9o PE x1 to
+            # create JwtAuthenticationFilter.java (the malformed-bracket
+            # case that triggered B1).
+            if parallel_edit_specs and len(parallel_edit_specs) < 2:
+                logs.append(
+                    f"\nPE_SUPPRESSED_NO_PARALLELISM:\n"
+                    f"  PE block has {len(parallel_edit_specs)} file — "
+                    "no parallelism benefit, stripping for sequential edit."
+                )
+                only_file = parallel_edit_specs[0][0]
+                summary = (
+                    f"[parallel_edits_suppressed] PE with a single file "
+                    f"({only_file}) is pure overhead. Edit it via a regular "
+                    "`<command>` block (sed -i or python3 heredoc) in your "
+                    "next response."
+                )
+                response_text = _PARALLEL_EDITS_BLOCK_RE.sub(
+                    lambda _m: summary, response_text, count=1,
+                )
+                response_text = _PARALLEL_EDITS_BLOCK_RE.sub(
+                    lambda _m: "", response_text,
+                )
+                parallel_edit_specs = []
+            if parallel_edit_specs:
+                budget_for_ralph = int(time_remaining() - WALL_CLOCK_RESERVE_SECONDS - 5)
+                if budget_for_ralph < _RALPH_MIN_BUDGET:
+                    logs.append(
+                        f"\nRALPH_SKIPPED: only {budget_for_ralph}s remaining; "
+                        f"agent should handle the {len(parallel_edit_specs)} edits "
+                        f"sequentially via regular <command> blocks."
+                    )
+                    response_text = _PARALLEL_EDITS_BLOCK_RE.sub(lambda _m: "", response_text)
+                # Plan validation. Cheap deterministic check first; critic
+                # LLM fires only when findings exist. If the critic refines,
+                # push back to the orchestrator and skip this fanout.
+                elif critic_refinements_used < MAX_CRITIC_REFINEMENTS:
+                    findings = _parse_and_validate_edits(parallel_edit_specs, repo, issue)
+                    if findings:
+                        pe_block_m = _PARALLEL_EDITS_BLOCK_RE.search(response_text)
+                        pe_block_text = pe_block_m.group(0) if pe_block_m else ""
+                        critique = _critique_findings(
+                            findings, pe_block_text, issue,
+                            model_name, api_base, api_key,
+                        )
+                        if critique.get("verdict") == "refine" and critique.get("message"):
+                            critic_refinements_used += 1
+                            logs.append(
+                                f"\nPLAN_CRITIC_REFINEMENT: {len(findings)} findings "
+                                f"→ critic suggests refine"
+                            )
+                            for f in findings[:6]:
+                                logs.append(
+                                    f"  finding: {f.get('file', '?')} :: "
+                                    f"{f.get('issue', '?')}"
+                                )
+                            # Keep the orchestrator's previous response in the
+                            # transcript and push the critic's message as a
+                            # user turn. Skip fanout on this iteration; next
+                            # turn the orchestrator emits a revised plan.
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({"role": "user", "content": critique["message"]})
+                            continue
+                        logs.append(
+                            f"\nPLAN_CRITIC_PROCEED: {len(findings)} findings "
+                            f"→ critic says proceed ({critique.get('reason', critique.get('verdict', '?'))})"
+                        )
+                    # No findings, or critic said proceed → fall through to fanout
+                    pass
+
+                if parallel_edit_specs and budget_for_ralph >= _RALPH_MIN_BUDGET:
+                    actual_wall_cap = min(_RALPH_BATCH_WALL_CAP, budget_for_ralph)
+                    ralph_t0 = time.monotonic()
+                    ralph_results = _run_ralph_parallel(
+                        parallel_edit_specs,
+                        issue=issue, repo=repo,
+                        model=model_name, api_base=api_base, api_key=api_key,
+                        batch_wall_cap=actual_wall_cap,
+                    )
+                    ralph_elapsed = time.monotonic() - ralph_t0
+                    done_n = sum(1 for r in ralph_results if r["status"] == "DONE_VERIFIED")
+                    blocked_n = sum(1 for r in ralph_results if r["status"] == "BLOCKED")
+                    wc_n = sum(1 for r in ralph_results if r["status"] == "WALL_CLOCK")
+                    other_n = len(ralph_results) - done_n - blocked_n - wc_n
+                    parallel_edits_fanouts_done += 1
+                    logs.append(
+                        f"\nRALPH_PARALLEL_FANOUT: {len(parallel_edit_specs)} edits requested, "
+                        f"{done_n} DONE_VERIFIED, {blocked_n} BLOCKED, {wc_n} WALL_CLOCK, "
+                        f"{other_n} other, elapsed={ralph_elapsed:.1f}s (cap={actual_wall_cap}s)"
+                    )
+                    for r in ralph_results:
+                        logs.append(
+                            f"  - {r['file_path']} :: {r['status']} ({r['iters']}i) :: "
+                            f"{(r.get('summary') or '')[:160]}"
+                        )
+                        bh = r.get("brief_head")
+                        if bh:
+                            logs.append(f"      BRIEF_HEAD:")
+                            for line in bh.splitlines()[:25]:
+                                logs.append(f"        {line[:200]}")
+                        for line in (r.get("trace") or [])[:40]:
+                            logs.append(f"      {line}")
+                    dropped = [
+                        fp for fp, _ in parallel_edit_specs[_RALPH_MAX_PER_BATCH:]
+                    ]
+                    if dropped:
+                        logs.append(
+                            f"\nPARALLEL_EDITS_OVERFLOW: {len(dropped)} files "
+                            f"exceeded per-batch cap and will be surfaced to the "
+                            f"model for retry on next turn: "
+                            + ", ".join(dropped[:8])
+                        )
+                    response_text = _replace_parallel_edits_with_summary(
+                        response_text, ralph_results, dropped_paths=dropped,
+                    )
+
+            # Defense-in-depth: strip HTML comments before extract_commands
+            # so any stray <!-- ... <command> ... --> in the response can't be
+            # parsed as a real command block.
+            response_text = _strip_html_comments(response_text)
+
             commands = extract_commands(response_text)
             final = extract_final(response_text)
 
@@ -3382,7 +5307,35 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     success = True
                     break
                 consecutive_no_command += 1
-                patch = get_patch(repo)
+                patch = get_patch(repo, issue=issue)
+                # B5: model emitted PE-like markup that couldn't be parsed
+                # (e.g. mismatched brackets, missing closing tag). Give it
+                # one chance to re-emit canonically instead of declaring
+                # success on a patch missing the attempted edits. bench-pr1
+                # lost JwtAuthenticationFilter.java because PATCH_READY
+                # fired in this exact situation.
+                if (
+                    patch.strip()
+                    and pe_reemit_nudges_used < 1
+                    and _looks_like_attempted_pe(response_text)
+                ):
+                    pe_reemit_nudges_used += 1
+                    consecutive_no_command = 0  # nudge is not a "no command" event
+                    logs.append(
+                        "\nPE_REEMIT_NUDGE:\nresponse looked like attempted parallel_edits "
+                        "markup but couldn't be parsed; asking model to re-emit canonically."
+                    )
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append({"role": "user", "content": (
+                        "Your last response contained `parallel_edits` or `<edit file=...>` "
+                        "markup that could not be parsed. Re-emit using exactly this syntax:\n\n"
+                        "<parallel_edits>\n"
+                        "  <edit file=\"path/to/file\">your instruction here</edit>\n"
+                        "</parallel_edits>\n\n"
+                        "Both opening AND closing tags must use angle brackets (`<` and `>`), "
+                        "not square brackets. Every `<edit>` must have a matching `</edit>`."
+                    )})
+                    continue
                 if patch.strip():
                     if maybe_queue_refinement(response_text):
                         continue
@@ -3402,13 +5355,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                # cat-cache short-circuit for repeated reads
+                # of unchanged files. Returns None on miss (run normally)
+                # or a synthetic CommandResult on hit.
+                cached = _maybe_cat_short_circuit(command, repo, cat_cache)
+                if cached is not None:
+                    result = cached
+                else:
+                    result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
                 if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
+                    patch = get_patch(repo, issue=issue)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
@@ -3437,7 +5397,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "Continue with one command at a time if more work remains."
                 )
 
-            if final is not None and get_patch(repo).strip():
+            if final is not None and get_patch(repo, issue=issue).strip():
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
@@ -3450,7 +5410,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                if not success and get_patch(repo, issue=issue).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
@@ -3470,10 +5430,83 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if success:
                 break
 
-            if not get_patch(repo).strip() and step in {2, 4}:
+            # Fire budget-pressure on every other step while the patch is
+            # either trivially small OR has stopped growing. The previous
+            # gate (`not patch.strip()`) was disabled by any single 1-line
+            # incidental edit — fresh-04 made a sed -i delete at step 3 and
+            # then paginated through a 2300-line file for 17 more steps
+            # with the gate silently False. Tracking change-lines plus a
+            # no-growth streak catches both shapes of the same problem.
+            _current_change_lines = _patch_change_lines(get_patch(repo, issue=issue))
+            if _current_change_lines > _prev_patch_change_lines:
+                _no_growth_streak = 0
+            else:
+                _no_growth_streak += 1
+            _prev_patch_change_lines = _current_change_lines
+            if step in {2, 4, 6, 8, 10, 12, 14, 16} and (
+                _current_change_lines < 3 or _no_growth_streak >= 2
+            ):
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
-        patch = get_patch(repo)
+            # B6: pagination-loop detector. If this step issued exactly
+            # one command and it was a pure read on the same file as the
+            # previous step, count it. After 4 consecutive same-file
+            # reads, inject a hard nudge telling the model to stop
+            # paginating and emit `<parallel_edits>` for that file.
+            # fresh-04 needed this — model spent 17 sed -n slices on the
+            # same Rust file before WALL_CLOCK.
+            if len(command_batch) == 1:
+                _read_target = _extract_read_target(command_batch[0])
+            else:
+                _read_target = None
+            if _read_target and _read_target == last_paginated_path:
+                pagination_same_file_streak += 1
+            elif _read_target:
+                pagination_same_file_streak = 1
+                last_paginated_path = _read_target
+            else:
+                pagination_same_file_streak = 0
+                last_paginated_path = None
+            if (
+                pagination_same_file_streak >= 4
+                and pagination_nudges_used < 1
+                and last_paginated_path
+            ):
+                pagination_nudges_used += 1
+                logs.append(
+                    f"\nPAGINATION_NUDGE: {pagination_same_file_streak} consecutive "
+                    f"reads of {last_paginated_path} — pushing model to write."
+                )
+                messages.append({"role": "user", "content": (
+                    f"STOP PAGINATING. You have read `{last_paginated_path}` "
+                    f"{pagination_same_file_streak} times in a row without writing "
+                    "anything. Further reads will not produce new information.\n\n"
+                    "Your next response MUST be a `<parallel_edits>` block that "
+                    f"INCLUDES `{last_paginated_path}` as an `<edit>` target — "
+                    "that is the file you have been reading; it IS the work. "
+                    "You may include additional related files but you MUST include "
+                    f"`{last_paginated_path}`. Use relative paths (no `/work/repo/` "
+                    "prefix). Format:\n\n"
+                    "<parallel_edits>\n"
+                    f"  <edit file=\"{last_paginated_path}\">specific change to make</edit>\n"
+                    "  <edit file=\"other/related/file.ext\">specific change to make</edit>\n"
+                    "</parallel_edits>\n\n"
+                    "Commit to writes based on what you already know from the "
+                    "issue and the preloaded snippets. A best-effort edit is "
+                    "better than another slice."
+                )})
+                # Reset so we don't double-fire on the same streak
+                pagination_same_file_streak = 0
+
+        # Remove docker-mount permission artifacts BEFORE collecting the
+        # patch: tau computes the score from the working tree state, so
+        # leaving phantom mode-flips in place pollutes the score with
+        # changes the agent never made.
+        try:
+            _revert_docker_mount_mode_artifacts(repo)
+        except Exception as exc:
+            logs.append(f"\nMODE_REVERT_ERROR:\n{exc!r}")
+        patch = _strip_mode_only_hunks(get_patch(repo, issue=issue))
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3491,7 +5524,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         patch = ""
         if repo is not None:
             try:
-                patch = get_patch(repo)
+                patch = _strip_mode_only_hunks(get_patch(repo, issue=issue))
             except Exception:
                 pass
 
