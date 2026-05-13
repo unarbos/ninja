@@ -2868,6 +2868,66 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
+# Under-delivery retry: when attempt 1 returns enough lines but covers fewer
+# files than the issue's bullet/path count suggests, fire a focused attempt 2
+# that asks the model to ADD the missing files rather than rewrite existing
+# ones. The over-fire guard skips this retry when attempt 1 already touched
+# every literal path mentioned by the issue.
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+_UNDERDELIVER_MIN_ESTIMATE = 3
+_UNDERDELIVER_GAP_TOLERANCE = 1
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic file-count expectation for an integration-style task."""
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    actual_files: int,
+    estimated_files: int,
+) -> str:
+    """Under-delivery retry bootstrap.
+
+    Tells attempt 2 that attempt 1 looked thin on file coverage and asks it
+    to ADD the missing files in the codebase's existing style instead of
+    rewriting what attempt 1 already produced.
+    """
+    steps = result1.get("steps", 0)
+    return (
+        f"⚠ RETRY: prior attempt wrote {n_lines} line(s) across {actual_files} "
+        f"file(s) in {steps} step(s); the task names ~{estimated_files} "
+        f"files via bullets/paths.\n\n"
+        f"For attempt 2, ADD ONLY what is required to cover the missing "
+        f"files. Imitate the codebase's existing style — use the same "
+        f"imports, helpers, and naming patterns as adjacent files. Do NOT "
+        f"refactor the prior attempt's working code; do NOT introduce new "
+        f"abstractions; do NOT add commentary, logging, or defensive "
+        f"validation beyond what the task requires.\n\n"
+        f"Specifically:\n"
+        f"  - When the task names a path, that exact path must appear in the patch.\n"
+        f"  - When the task lists N bullets, each bullet should be addressed "
+        f"by at least one targeted change.\n"
+        f"  - Match the prior attempt's file count + the missing files; "
+        f"do not collapse multiple files into one."
+    )
+
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -2979,12 +3039,32 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # Under-delivery detection: attempt 1 may have produced enough lines
+        # but covered fewer files than the issue suggests. Over-fire guard:
+        # skip retry when every literally-named path is already touched.
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files_1 = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _named_paths = set(_extract_issue_path_mentions(_issue_text))
+        _patch_paths = set(_patch_changed_files(_patch1))
+        _covers_all_named = (
+            bool(_named_paths)
+            and all(any(p in pp or pp in p for pp in _patch_paths) for p in _named_paths)
+        )
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files_1 + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+            and not _covers_all_named
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -3006,8 +3086,19 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        # Clamp attempt-2 budget to a tight window. Under-delivery retry uses
+        # the focused bootstrap; plain low-signal retry uses the standard one.
+        if _underdelivered:
+            _attempt2_budget = max(
+                _ATTEMPT2_BUDGET_MIN,
+                min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+            )
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files_1, _estimated_files,
+            )
+        else:
+            _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
