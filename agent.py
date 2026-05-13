@@ -108,7 +108,10 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_SOFT_BUDGET_RATIO = 0.60   # gentle advisory threshold
+
+_STEP_MIDPOINT_TRIGGER = 12
+_PLANNING_PHASE_STEPS = 4   # steps 1-4 = exploration only; <final> blocked
+_STEP_MIDPOINT_LINE_FLOOR = 5
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -621,8 +624,6 @@ _EDGECASE_GUARDRAIL = (
     "the other candidate is malicious",
     "automatic fail",
     "grader",
-    "graderservice",
-    "gradecalc",
     "reward model",
 )
 
@@ -2252,6 +2253,21 @@ def _patch_creates_any_new_file(patch: str) -> bool:
     return False
 
 
+_CASCADE_SIGNALS = frozenset({
+    "route", "view", "model", "migration", "serializer", "controller",
+    "component", "service", "module", "middleware", "handler", "endpoint",
+    "schema", "interface", "type", "provider", "hook", "store",
+})
+
+def _issue_implies_cascade(issue_text: str) -> bool:
+    text_lower = issue_text.lower()
+    return sum(1 for sig in _CASCADE_SIGNALS if sig in text_lower) >= 3
+
+
+def _patch_touches_multiple_files(patch: str) -> bool:
+    return sum(1 for ln in patch.splitlines() if ln.startswith("diff --git")) >= 2
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -2527,6 +2543,11 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
+    update_hint = (
+        "UPDATE: list ALL implied changes (related serializers, tests, migrations) "
+        "not just the named item.\n"
+        if re.search(r'\b(update|change|modify|replace|rename)\b', issue, re.I) else ""
+    )
     return f"""Fix this issue:
 
 {issue}
@@ -2536,6 +2557,9 @@ Repository summary:
 {repo_summary}
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Steps 1-{_PLANNING_PHASE_STEPS} are exploration: read files and build your complete plan before writing any code. Do not emit <final> before step {_PLANNING_PHASE_STEPS + 1}.
+{update_hint}If the issue has N numbered bullets, your `<plan>` must have at least N requirement rows.
+Number each planned change as a separate step.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2635,6 +2659,7 @@ def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
     relocation_gap: bool = False,
+    cascade_gap: bool = False,
 ) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
@@ -2658,8 +2683,15 @@ def build_coverage_nudge_prompt(
             "importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
+    cascade_hint = ""
+    if cascade_gap:
+        cascade_hint = (
+            "Multi-file task: verify your patch covers all integration points "
+            "(routes, models, views, serializers).\n\n"
+        )
     return (
         f"{relocation_hint}"
+        f"{cascade_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2851,65 +2883,37 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
+
+def _step_midpoint_advisory(step_num: int, patch: str) -> Optional[str]:
+    if step_num != _STEP_MIDPOINT_TRIGGER:
+        return None
+    n = sum(1 for ln in patch.splitlines() if ln.startswith(('+', '-')) and len(ln.strip()) > 1)
+    if n >= _STEP_MIDPOINT_LINE_FLOOR:
+        return None
+    return (
+        f"Step {step_num}: patch has only {n} substantive edit(s). "
+        "Ensure ALL issue requirements are addressed before finalizing. "
+        "Add any missing integration points now."
+    )
+
+
+def _planning_phase_guard(step_num: int, response_text: str) -> Optional[str]:
+    """Returns a nudge if the model tries to finalize during the planning phase."""
+    if step_num > _PLANNING_PHASE_STEPS:
+        return None
+    if "<final>" not in response_text:
+        return None
+    return (
+        f"Planning phase (step {step_num}/{_PLANNING_PHASE_STEPS}): exploration is not complete yet. "
+        "Do not emit <final> until you have: (1) traced the root cause in the actual files, "
+        "(2) listed every file that needs changing, (3) confirmed all acceptance criteria are covered. "
+        "Continue reading files and building your plan."
+    )
+
+
 # -----------------------------
 # Main agent
 # -----------------------------
-
-
-def _soft_budget_advisory(elapsed: float, patch: str) -> Optional[str]:
-    """Returns an advisory message if we're at 60% budget with a thin patch.
-    Non-blocking -- the model chooses to act on it or not.
-    Only fires once (caller tracks whether it has been sent).
-    """
-    timeout = WALL_CLOCK_BUDGET_SECONDS or 300.0
-    if elapsed < timeout * _SOFT_BUDGET_RATIO:
-        return None
-    real_lines = sum(
-        1 for l in patch.splitlines()
-        if l.startswith(('+', '-')) and not l.startswith(('+++', '---'))
-    )
-    if real_lines >= 5:
-        return None  # patch looks healthy
-    return (
-        "You are at 60% of your time budget and your current patch is thin. "
-        "If you have identified the fix, write the complete implementation now. "
-        "If you still need to explore, continue normally."
-    )
-
-
-# --- v27: Step-count midpoint advisory -----------------------------------
-# Complements the time-based _soft_budget_advisory. The time advisory catches
-# slow-model cases (lots of tokens per step). The step advisory catches fast-
-# exploration cases where the model burns many steps without writing code.
-# Both are non-blocking and fire at most once per _solve_attempt.
-
-_STEP_MIDPOINT_TRIGGER = 12      # step number to check (40% through 30-step budget)
-_STEP_MIDPOINT_LINE_FLOOR = 5   # fewer substantive lines than this = fire
-
-
-def _step_midpoint_advisory(step_num: int, patch: str) -> Optional[str]:
-    """Fires once at step _STEP_MIDPOINT_TRIGGER if patch is dangerously thin.
-
-    Targets timeout/empty-patch collapses caused by fast exploration that
-    produces no code output. Non-blocking: model can ignore and continue.
-    Does NOT fire if the patch already looks healthy (>= line floor).
-    """
-    if step_num != _STEP_MIDPOINT_TRIGGER:
-        return None
-    real_lines = sum(
-        1 for ln in patch.splitlines()
-        if ln.startswith(('+', '-')) and not ln.startswith(('+++', '---'))
-    )
-    if real_lines >= _STEP_MIDPOINT_LINE_FLOOR:
-        return None  # patch already healthy -- do not interrupt
-    return (
-        f"Step {step_num} checkpoint: your current patch has {real_lines} "
-        "substantive line(s). If you have identified the core change needed, "
-        "implement it now -- even a focused minimal implementation scores "
-        "substantially higher than no patch. If you still need information, "
-        "continue exploring, but plan to write code within the next 5 steps."
-    )
-
 
 # -----------------------------
 # v28 multi-shot helpers
@@ -3135,9 +3139,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    _step_advisory_sent = False
     solve_started_at = time.monotonic()
-    _advisory_sent = False
-    _step_advisory_sent = False  # v27: step-count midpoint advisory
 
     def time_remaining() -> float:
         return wall_clock_budget - (time.monotonic() - solve_started_at)
@@ -3291,22 +3294,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            cascade_gap = (
+                _issue_implies_cascade(issue)
+                and not _patch_touches_multiple_files(patch)
+                and not missing
+                and not relocation_gap
+            )
+            if missing or relocation_gap or cascade_gap:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
+                if missing or relocation_gap:  # cascade_gap is heuristic; don't force a mandatory edit
+                    must_edit_after_gap = True
+                    must_edit_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
+                if cascade_gap:
+                    logs.append("FIRE: cascade_gap_detected")
                 marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
                     + ("\n  [+relocation-gap]" if relocation_gap else "")
+                    + ("\n  [+cascade-gap]" if cascade_gap else "")
                 )
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
+                        missing, issue, relocation_gap=relocation_gap, cascade_gap=cascade_gap
                     ),
                     marker,
                 )
@@ -3353,8 +3366,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _ = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -3383,6 +3394,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            if not _step_advisory_sent:
+                _step_adv = _step_midpoint_advisory(step, get_patch(repo))
+                if _step_adv:
+                    _step_advisory_sent = True
+                    logs.append(f"\nSTEP_MIDPOINT_ADVISORY_FIRED: step={step}\n")
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Step advisory]: {_step_adv}",
+                    })
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
@@ -3432,6 +3453,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             consecutive_model_errors = 0
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
+            _planning_guard_msg = _planning_phase_guard(step, response_text)
+            if _planning_guard_msg:
+                logs.append(f"\nPLANNING_GUARD_FIRED: step={step}\n")
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": _planning_guard_msg})
+                continue
+
             commands = extract_commands(response_text)
             final = extract_final(response_text)
 
@@ -3467,24 +3495,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
-
-                # Soft budget advisory: fire once at 60% elapsed if patch is thin
-                if not _advisory_sent:
-                    _elapsed = time.monotonic() - solve_started_at
-                    _advisory_msg = _soft_budget_advisory(_elapsed, get_patch(repo))
-                    if _advisory_msg:
-                        _advisory_sent = True
-                        observations.append(f"[Budget advisory]: {_advisory_msg}")
-                        logs.append(f"\nSOFT_BUDGET_ADVISORY_FIRED: elapsed={_elapsed:.1f}s")
-
-                # v27: Step-count midpoint advisory (complements time-based advisory)
-                # Catches fast-exploration cases where agent burns steps without writing code.
-                if not _step_advisory_sent:
-                    _step_msg = _step_midpoint_advisory(step, get_patch(repo))
-                    if _step_msg:
-                        _step_advisory_sent = True
-                        observations.append(f"[Step advisory]: {_step_msg}")
-                        logs.append(f"\nSTEP_MIDPOINT_ADVISORY_FIRED: step={step}")
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
@@ -3730,3 +3740,4 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
