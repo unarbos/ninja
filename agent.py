@@ -120,6 +120,8 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_LITERAL_NUDGES = 1     # enforce exact quoted strings/constants/endpoints from the issue
+MAX_TEST_REQUIREMENT_NUDGES = 1  # enforce explicit add/update-test requirements
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -154,6 +156,7 @@ DANGEROUS_PATTERNS = [
     r"\bnft\b",
     r"\bchown\s+-R\s+/",
     r"\bchmod\s+-R\s+777\s+/",
+    r"\bchmod\b",
     r"\bcurl\b",
     r"\bwget\b",
     r"\bscp\b",
@@ -630,6 +633,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -714,6 +718,28 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         kept.append(block)
 
     result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Remove old/new mode metadata from mixed content diffs.
+
+    The benchmark feedback repeatedly penalizes otherwise-correct patches for
+    unrelated chmod/file-mode churn. `_strip_mode_only_file_diffs` drops pure
+    mode-only blocks; this follow-up removes mode metadata that was bundled
+    with a real content hunk so the submitted patch stays focused on code.
+    """
+    if not diff_output.strip():
+        return diff_output
+
+    kept: List[str] = []
+    for line in diff_output.splitlines():
+        if line.startswith("old mode ") or line.startswith("new mode "):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
@@ -2168,6 +2194,120 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 
 
 # -----------------------------
+# Exact-literal and explicit-test requirement gates
+# -----------------------------
+#
+# A recurring loss pattern in duel feedback is "close but not reference-like":
+# the issue quotes an exact label, endpoint, env var, output header, command,
+# or format string, but the patch substitutes a nearby constant/name or invents
+# a slightly different phrase. Hidden tests and LLM judges often key on those
+# literals. These helpers extract high-signal quoted literals from the issue
+# and nudge the model when none of the post-patch repo files contain them.
+
+_LITERAL_RE = re.compile(r"`([^`\n]{2,160})`|\"([^\"\n]{2,160})\"|'([^'\n]{2,160})'")
+_LITERAL_IGNORE = {
+    "true", "false", "null", "none", "yes", "no", "ok", "error",
+    "success", "failed", "pass", "fail", "id", "name", "title",
+}
+
+
+def _looks_like_file_literal(value: str) -> bool:
+    """True for path-like literals that coverage/path gates already handle."""
+    stripped = value.strip()
+    if not stripped or stripped.startswith("/"):
+        return False  # API routes like /api/foo are high-value literals.
+    return bool(re.search(r"(?:^|/)[\w.-]+\.(?:py|js|jsx|ts|tsx|go|rs|rb|php|java|kt|swift|dart|json|ya?ml|toml|css|scss|html|md)$", stripped, re.I))
+
+
+def _extract_issue_literals(issue_text: str, max_literals: int = 8) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for match in _LITERAL_RE.finditer(issue_text):
+        literal = next((g for g in match.groups() if g is not None), "").strip()
+        if not literal or literal.lower() in _LITERAL_IGNORE:
+            continue
+        if _looks_like_file_literal(literal):
+            continue
+        if len(literal) < 2 or len(literal) > 120:
+            continue
+        # Ignore very small plain identifiers; keep constants, endpoints,
+        # commands, labels, headers, env vars, and exact human-visible text.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", literal) and len(literal) < 8:
+            continue
+        # Skip literals explicitly described as removal targets; deletion gate
+        # handles those and we should not require them to remain in the repo.
+        idx = issue_text.lower().find(literal.lower())
+        if idx >= 0 and _DELETION_VERB_RE.search(issue_text[max(0, idx - 80):idx]):
+            continue
+        key = literal.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(literal)
+        if len(out) >= max_literals:
+            break
+    return out
+
+
+def _literal_exists_in_repo(repo: Path, literal: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "grep", "-F", "-q", "--", literal],
+            cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=4,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _missing_issue_literals(repo: Path, patch: str, issue_text: str) -> List[str]:
+    if not patch.strip():
+        return []
+    missing: List[str] = []
+    added_lower = _patch_added_text(patch)
+    for literal in _extract_issue_literals(issue_text):
+        low = literal.lower()
+        if low in added_lower:
+            continue
+        if _literal_exists_in_repo(repo, literal):
+            continue
+        missing.append(literal)
+    return missing
+
+
+_TEST_REQUIREMENT_RE = re.compile(
+    r"\b(?:add|adds|added|create|creates|created|write|writes|written|update|updates|updated|include|includes|including)\b"
+    r"(?:\W+\w+){0,6}?\W+\b(?:test|tests|spec|specs|coverage)\b|"
+    r"\bregression\s+tests?\b|\btest\s+coverage\b",
+    re.IGNORECASE,
+)
+
+
+def _issue_requires_test_change(issue_text: str) -> bool:
+    return bool(_TEST_REQUIREMENT_RE.search(issue_text))
+
+
+def _patch_touches_test_file(patch: str) -> bool:
+    for relative_path in _patch_changed_files(patch):
+        lower = relative_path.lower()
+        name = Path(lower).name
+        if (
+            "/test" in lower
+            or "/tests/" in lower
+            or "/spec" in lower
+            or name.startswith("test_")
+            or name.endswith("_test.py")
+            or ".test." in name
+            or ".spec." in name
+            or name.endswith("_test.go")
+            or name.endswith("_spec.rb")
+        ):
+            return True
+    return False
+
+
+# -----------------------------
 # Deletion-gap detection
 # -----------------------------
 #
@@ -2389,7 +2529,11 @@ Never emit `<final>` before a required code change has been made and verificatio
 ISSUE CONTRACT
 ====================================================================
 
-Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
+Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, exact quoted strings, endpoints, labels, constants, error messages, output formats, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
+
+Exact quoted text in the issue is usually intentional. If the task quotes a route like `/api/x`, a label like `Coming soon`, an env var, an output header, or a literal constant/string, use that exact spelling unless existing code proves it is only an old value being removed. Do not replace quoted task literals with near synonyms or project constants when the issue gives a concrete literal.
+
+For feature tasks, complete the whole vertical slice: data model/schema/defaults, service/helper, route/controller/API endpoint, frontend caller/UI wiring, navigation/tab/menu entry, release/docs note if explicitly requested, and a nearby test when the issue asks for one. A handler without registration, a frontend call without a backend route, or a new command group not registered under the CLI root is incomplete.
 
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
@@ -2487,6 +2631,7 @@ SCOPE DISCIPLINE
 ====================================================================
 
 Do NOT change:
+- File permissions or executable bits. Never run chmod; mode churn is penalized even when the code is correct.
 - Whitespace-only, comment-only, or blank-line-only hunks
 - Imports not needed by your fix
 - Type annotations not already present in the changed function
@@ -2735,6 +2880,38 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "needed to satisfy it, then end with <final>summary</final>.\n\n"
         "Do NOT add scope the task did not ask for. Do NOT rewrite working "
         "code. Add only what is required to cover the listed criteria.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_literal_nudge_prompt(missing_literals: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {lit}" for lit in missing_literals[:8]) or "(none)"
+    return (
+        "Exact-literal gap — the task quotes specific strings/constants/endpoints "
+        "that are not present in the current repo after your patch:\n"
+        f"  {bullets}\n\n"
+        "These are often expected labels, output headers, API routes, env-var "
+        "names, format strings, or constants. Use the exact quoted text from "
+        "the task unless nearby existing code proves a different spelling is "
+        "required. Do not invent synonyms.\n\n"
+        "Make the smallest edit needed to include the missing exact literal(s), "
+        "or if the literal is intentionally not supposed to appear because the "
+        "task asked to remove it, respond with <final>summary</final> and explain.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_test_requirement_nudge_prompt(issue_text: str) -> str:
+    return (
+        "Test-coverage gap — the task explicitly asks to add/update tests or "
+        "regression coverage, but your current patch does not touch any obvious "
+        "test/spec file.\n\n"
+        "Find the nearest existing test file for the changed behavior, add the "
+        "smallest regression test that matches existing fixtures/imports/types, "
+        "and run that test if a runner is available. Do not create speculative "
+        "tests with fake imports or mismatched types.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -3076,6 +3253,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    literal_nudges_used = 0
+    test_requirement_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3111,7 +3290,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, literal_nudges_used, test_requirement_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3200,6 +3379,39 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_deletion_nudge_prompt(issue),
                     "DELETION_NUDGE_QUEUED: issue requires removal but patch has no deletion lines",
+                )
+                return True
+
+        # Exact literal gap: issue quotes a route/label/constant/output format
+        # but the current repo after patch does not contain it. This catches
+        # common "nearby synonym" losses (wrong CTA text, wrong endpoint name,
+        # wrong env var, wrong quoted ad-unit constant, wrong summary header).
+        if literal_nudges_used < MAX_LITERAL_NUDGES:
+            missing_literals = _missing_issue_literals(repo, patch, issue)
+            if missing_literals:
+                literal_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_literal_nudge_prompt(missing_literals, issue),
+                    "LITERAL_NUDGE_QUEUED:\n  " + " | ".join(missing_literals[:4]),
+                )
+                return True
+
+        # Explicit test requirement: if the issue itself asks for tests, a
+        # source-only patch is incomplete even when the behavior looks fixed.
+        if test_requirement_nudges_used < MAX_TEST_REQUIREMENT_NUDGES:
+            if _issue_requires_test_change(issue) and not _patch_touches_test_file(patch):
+                test_requirement_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_requirement_nudge_prompt(issue),
+                    "TEST_REQUIREMENT_NUDGE_QUEUED: issue asks for tests but patch touches no test file",
                 )
                 return True
 
