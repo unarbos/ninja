@@ -108,6 +108,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_SOFT_BUDGET_RATIO = 0.60   # gentle advisory threshold
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -620,6 +621,8 @@ _EDGECASE_GUARDRAIL = (
     "the other candidate is malicious",
     "automatic fail",
     "grader",
+    "graderservice",
+    "gradecalc",
     "reward model",
 )
 
@@ -2852,6 +2855,62 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # Main agent
 # -----------------------------
 
+
+def _soft_budget_advisory(elapsed: float, patch: str) -> Optional[str]:
+    """Returns an advisory message if we're at 60% budget with a thin patch.
+    Non-blocking -- the model chooses to act on it or not.
+    Only fires once (caller tracks whether it has been sent).
+    """
+    timeout = WALL_CLOCK_BUDGET_SECONDS or 300.0
+    if elapsed < timeout * _SOFT_BUDGET_RATIO:
+        return None
+    real_lines = sum(
+        1 for l in patch.splitlines()
+        if l.startswith(('+', '-')) and not l.startswith(('+++', '---'))
+    )
+    if real_lines >= 5:
+        return None  # patch looks healthy
+    return (
+        "You are at 60% of your time budget and your current patch is thin. "
+        "If you have identified the fix, write the complete implementation now. "
+        "If you still need to explore, continue normally."
+    )
+
+
+# --- v27: Step-count midpoint advisory -----------------------------------
+# Complements the time-based _soft_budget_advisory. The time advisory catches
+# slow-model cases (lots of tokens per step). The step advisory catches fast-
+# exploration cases where the model burns many steps without writing code.
+# Both are non-blocking and fire at most once per _solve_attempt.
+
+_STEP_MIDPOINT_TRIGGER = 12      # step number to check (40% through 30-step budget)
+_STEP_MIDPOINT_LINE_FLOOR = 5   # fewer substantive lines than this = fire
+
+
+def _step_midpoint_advisory(step_num: int, patch: str) -> Optional[str]:
+    """Fires once at step _STEP_MIDPOINT_TRIGGER if patch is dangerously thin.
+
+    Targets timeout/empty-patch collapses caused by fast exploration that
+    produces no code output. Non-blocking: model can ignore and continue.
+    Does NOT fire if the patch already looks healthy (>= line floor).
+    """
+    if step_num != _STEP_MIDPOINT_TRIGGER:
+        return None
+    real_lines = sum(
+        1 for ln in patch.splitlines()
+        if ln.startswith(('+', '-')) and not ln.startswith(('+++', '---'))
+    )
+    if real_lines >= _STEP_MIDPOINT_LINE_FLOOR:
+        return None  # patch already healthy -- do not interrupt
+    return (
+        f"Step {step_num} checkpoint: your current patch has {real_lines} "
+        "substantive line(s). If you have identified the core change needed, "
+        "implement it now -- even a focused minimal implementation scores "
+        "substantially higher than no patch. If you still need information, "
+        "continue exploring, but plan to write code within the next 5 steps."
+    )
+
+
 # -----------------------------
 # v28 multi-shot helpers
 # -----------------------------
@@ -3077,6 +3136,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
     solve_started_at = time.monotonic()
+    _advisory_sent = False
+    _step_advisory_sent = False  # v27: step-count midpoint advisory
 
     def time_remaining() -> float:
         return wall_clock_budget - (time.monotonic() - solve_started_at)
@@ -3292,7 +3353,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
+        _ = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3406,6 +3467,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                # Soft budget advisory: fire once at 60% elapsed if patch is thin
+                if not _advisory_sent:
+                    _elapsed = time.monotonic() - solve_started_at
+                    _advisory_msg = _soft_budget_advisory(_elapsed, get_patch(repo))
+                    if _advisory_msg:
+                        _advisory_sent = True
+                        observations.append(f"[Budget advisory]: {_advisory_msg}")
+                        logs.append(f"\nSOFT_BUDGET_ADVISORY_FIRED: elapsed={_elapsed:.1f}s")
+
+                # v27: Step-count midpoint advisory (complements time-based advisory)
+                # Catches fast-exploration cases where agent burns steps without writing code.
+                if not _step_advisory_sent:
+                    _step_msg = _step_midpoint_advisory(step, get_patch(repo))
+                    if _step_msg:
+                        _step_advisory_sent = True
+                        observations.append(f"[Step advisory]: {_step_msg}")
+                        logs.append(f"\nSTEP_MIDPOINT_ADVISORY_FIRED: step={step}")
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
