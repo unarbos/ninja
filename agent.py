@@ -1019,8 +1019,13 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
+    # Symbol-centered windowing: when files are large, reading from line 0
+    # often misses the actual buggy region. Use issue-derived symbols to
+    # locate the first hit in each file and center the excerpt there.
+    preload_symbols = _extract_issue_symbols(issue) + _issue_terms(issue)
+
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        snippet = _read_context_file_centered(repo, relative_path, per_file_budget, preload_symbols)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1369,6 +1374,74 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
+
+
+_GREP_FIRST_LINE_RE = re.compile(r"^(\d+):")
+
+
+def _git_first_line_hitting_symbol(repo: Path, relative_path: str, symbols: List[str]) -> Optional[int]:
+    """Return 1-based line number of first symbol hit in file, or None.
+
+    SWE-Edit / context-learning work: centering excerpts on identifier matches
+    surfaces the buggy region inside large files instead of only the file head.
+    """
+    for sym in symbols[:8]:
+        if not sym or not sym.strip():
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-m", "1", "-F", "--", sym, "--", relative_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0 or not proc.stdout:
+            continue
+        first = proc.stdout.splitlines()[0]
+        m = _GREP_FIRST_LINE_RE.match(first)
+        if not m:
+            continue
+        try:
+            return int(m.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _read_context_file_centered(repo: Path, relative_path: str, max_chars: int, symbols: List[str]) -> str:
+    """Like `_read_context_file` but windows around the first issue-symbol hit."""
+    line_1 = _git_first_line_hitting_symbol(repo, relative_path, symbols)
+    if line_1 is None:
+        return _read_context_file(repo, relative_path, max_chars)
+    path = (repo / relative_path).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError:
+        return _read_context_file(repo, relative_path, max_chars)
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    if b"\0" in data[:4096]:
+        return _read_context_file(repo, relative_path, max_chars)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    idx = max(0, min(len(lines) - 1, line_1 - 1))
+    line_budget = max(24, max_chars // 90)
+    half = line_budget // 2
+    start = max(0, idx - half)
+    end = min(len(lines), start + line_budget)
+    if end - start < line_budget:
+        start = max(0, end - line_budget)
+    header = f"(excerpt lines {start + 1}-{end} of {len(lines)}, near issue symbol match)\n"
+    excerpt = "\n".join(lines[start:end])
+    return _truncate(header + excerpt, max_chars)
 
 
 # -----------------------------
