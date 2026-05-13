@@ -59,11 +59,14 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+# -----------------------------
+# Config
+# -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
@@ -103,7 +106,7 @@ MAX_STEP_RETRIES = 2
 # Inner solve wall: keep below the multishot outer budget so a second
 # attempt has comparable time. Tau docker_solver enforces a hard wall of
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
-WALL_CLOCK_BUDGET_SECONDS = 240.0
+WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -627,6 +630,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -714,6 +718,29 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode <N>` and `new mode <N>` lines from any file
+    block that survived `_strip_mode_only_file_diffs`.
+
+    Belt-and-suspenders with the `git config core.fileMode false` setting
+    applied at solve startup: that setting prevents the lines from being
+    generated in the first place, but if it fails to take effect (older
+    git version, sandbox config quirk, alternate diff backend) the lines
+    can still appear. This strip is purely text-level — it removes only
+    metadata lines, never content `+`/`-` lines or hunk headers, so the
+    patch remains structurally valid for the validator's diff applier.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -954,7 +981,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     Returns `(context_text, included_files)` so late solve steps can drop the
     bulky snippets while keeping a file-name breadcrumb.
 
-    Four improvements over a vanilla rank-and-read loop:
+    Three improvements over a vanilla rank-and-read loop:
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -971,16 +998,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          migrations, UI entry points, package/build files) are appended after
          the direct hits. This improves file targeting on feature tasks without
          displacing the primary target files.
-
-      4. Path-level issue-term matches use document-frequency downweighting
-         (SweRank-style) so tokens that appear in many paths do not dominate.
-         For top-ranked files with symbol hits, preloaded snippets can be
-         excerpt-centered on the first in-file symbol match (SWE-Edit-style
-         focused view) instead of only the file head.
     """
-    files, top_score, symbol_hits = _rank_context_files(repo, issue)
+    files, top_score = _rank_context_files(repo, issue)
     tracked_set = set(_tracked_files(repo))
-    preload_symbols = _extract_issue_symbols(issue)
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
@@ -1005,10 +1025,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    n_files = min(len(files), MAX_PRELOADED_FILES)
-    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
-    total_weight = sum(weights) or 1.0
-    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
+    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1026,18 +1043,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
-        budget_for_file = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
-        use_center = (
-            file_idx < 3
-            and relative_path in symbol_hits
-            and symbol_hits[relative_path] > 0
-            and bool(preload_symbols)
-        )
-        if use_center:
-            snippet = _read_context_file_centered(repo, relative_path, budget_for_file, preload_symbols)
-        else:
-            snippet = _read_context_file(repo, relative_path, budget_for_file)
+    for relative_path in files[:MAX_PRELOADED_FILES]:
+        snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1069,18 +1076,15 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
-def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[str, int]]:
-    """Returns (ranked_paths, top_score, symbol_hit_counts).
-
-    top_score is the highest computed score in the scoring pass; callers use
-    it to detect "weak ranking" rounds where no path/identifier signal hit, so
-    the top file is functionally random and the rescue-ranker fallback should
-    fire. symbol_hit_counts maps path -> distinct symbol grep hit count for
-    preload excerpt centering.
+def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
+    """Returns (ranked_paths, top_score). top_score is the highest computed
+    score in the scoring pass; callers use it to detect "weak ranking"
+    rounds where no path/identifier signal hit, so the top file is
+    functionally random and the rescue-ranker fallback should fire.
     """
     tracked = _tracked_files(repo)
     if not tracked:
-        return [], 0, {}
+        return [], 0
 
     issue_lower = issue.lower()
     path_mentions = _extract_issue_path_mentions(issue)
@@ -1108,10 +1112,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[st
                     seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
-    allowed_paths = [p for p in tracked if _context_file_allowed(p)]
-    n_allowed = len(allowed_paths)
-    term_df = _path_term_df(allowed_paths, terms) if terms and allowed_paths else {}
-
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -1127,19 +1127,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[st
             score += 35
         if name_lower and name_lower in issue_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 5 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        for term in terms:
-            if term not in path_lower:
-                continue
-            df = term_df.get(term, 0)
-            score += _idf_path_term_points(df, n_allowed, 3, 1)
+        score += sum(3 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
-            for term in terms:
-                if term not in path_lower:
-                    continue
-                df = term_df.get(term, 0)
-                score += _idf_path_term_points(df, n_allowed, 2, 1)
+            score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
@@ -1159,7 +1151,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int, Dict[st
         # Explicit path or backtick-ident match: ranking is strong even if
         # the scored list is empty (mentioned files bypass the score loop).
         top_score = max(top_score, 100)
-    return ranked, top_score, symbol_hits
+    return ranked, top_score
 
 
 # Threshold below which _rank_context_files is treated as "weak signal" and
@@ -1190,8 +1182,8 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
     terms = [t for t in _issue_terms(issue_text) if len(t) >= _RESCUE_RANKER_MIN_TERM_LEN][:_RESCUE_RANKER_MAX_TERMS]
     if not terms:
         return []
-
-    def _grep_term(term: str) -> List[str]:
+    hits: Dict[str, int] = {}
+    for term in terms:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-i", "-F", "--", term],
@@ -1202,21 +1194,13 @@ def _broad_grep_fallback(repo: Path, issue_text: str, tracked: set) -> List[str]
                 timeout=3,
             )
         except Exception:
-            return []
+            continue
         if proc.returncode not in (0, 1):
-            return []
-        return [
-            line.strip() for line in proc.stdout.splitlines()
-            if line.strip() and line.strip() in tracked
-        ]
-
-    hits: Dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=min(len(terms), 6)) as pool:
-        futures = {pool.submit(_grep_term, t): t for t in terms}
-        for future in as_completed(futures):
-            for path in future.result():
-                hits[path] = hits.get(path, 0) + 1
-
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if relative_path and relative_path in tracked:
+                hits[relative_path] = hits.get(relative_path, 0) + 1
     candidates = [(count, path) for path, count in hits.items() if count >= 2]
     candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [path for _count, path in candidates[:_RESCUE_RANKER_MAX_FALLBACK_FILES]]
@@ -1295,12 +1279,9 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             score += 6
         if parts and parts[0] in anchor_top_dirs:
             score += 3
-        path_words = _split_path_tokens(relative_path)
-        def _token_in_path(tok: str) -> bool:
-            return tok in path_words if len(tok) < 5 else tok in path_lower
-        score += min(8, 2 * sum(1 for token in issue_tokens if _token_in_path(token)))
-        score += min(8, 3 * sum(1 for token in issue_symbols if _token_in_path(token)))
-        score += min(6, 2 * sum(1 for token in signal_tokens if _token_in_path(token)))
+        score += min(8, 2 * sum(1 for token in issue_tokens if token in path_lower))
+        score += min(8, 3 * sum(1 for token in issue_symbols if token in path_lower))
+        score += min(6, 2 * sum(1 for token in signal_tokens if token in path_lower))
         if path.name in _INTEGRATION_ROOT_FILES and root_file_wanted:
             score += 5
         if "test" in path_lower or "spec" in path_lower:
@@ -1412,99 +1393,6 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     return _truncate(text, max_chars)
-
-
-_GREP_FIRST_LINE_RE = re.compile(r"^[^:]+:(\d+):")
-
-
-def _git_first_line_hitting_symbol(repo: Path, relative_path: str, symbols: List[str]) -> Optional[int]:
-    """Return 1-based line number of first symbol hit in file, or None.
-
-    SWE-Edit / context-learning work: centering excerpts on identifier matches
-    surfaces the buggy region inside large files instead of only the file head.
-    """
-    for sym in symbols[:8]:
-        if not sym or not sym.strip():
-            continue
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-n", "-m", "1", "-F", "--", sym, "--", relative_path],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=2,
-            )
-        except Exception:
-            continue
-        if proc.returncode != 0 or not proc.stdout:
-            continue
-        first = proc.stdout.splitlines()[0]
-        m = _GREP_FIRST_LINE_RE.match(first)
-        if not m:
-            continue
-        try:
-            return int(m.group(1))
-        except ValueError:
-            continue
-    return None
-
-
-def _read_context_file_centered(repo: Path, relative_path: str, max_chars: int, symbols: List[str]) -> str:
-    """Like `_read_context_file` but windows around the first issue-symbol hit."""
-    line_1 = _git_first_line_hitting_symbol(repo, relative_path, symbols)
-    if line_1 is None:
-        return _read_context_file(repo, relative_path, max_chars)
-    path = (repo / relative_path).resolve()
-    try:
-        path.relative_to(repo.resolve())
-    except ValueError:
-        return _read_context_file(repo, relative_path, max_chars)
-    try:
-        data = path.read_bytes()
-    except Exception:
-        return ""
-    if b"\0" in data[:4096]:
-        return _read_context_file(repo, relative_path, max_chars)
-    text = data.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    if not lines:
-        return ""
-    idx = max(0, min(len(lines) - 1, line_1 - 1))
-    line_budget = max(24, max_chars // 90)
-    half = line_budget // 2
-    start = max(0, idx - half)
-    end = min(len(lines), start + line_budget)
-    if end - start < line_budget:
-        start = max(0, end - line_budget)
-    header = f"(excerpt lines {start + 1}-{end} of {len(lines)}, near issue symbol match)\n"
-    excerpt = "\n".join(lines[start:end])
-    return _truncate(header + excerpt, max_chars)
-
-
-def _path_term_df(allowed_paths: List[str], terms: List[str]) -> Dict[str, int]:
-    """Document frequency: how many paths contain each issue term (substring).
-
-    SweRank-style signal: downweight terms that hit most of the tree so
-    `utils`/`index` do not drown out discriminative tokens.
-    """
-    out: Dict[str, int] = {}
-    for term in terms:
-        tl = term.lower()
-        out[term] = sum(1 for p in allowed_paths if tl in p.lower())
-    return out
-
-
-def _idf_path_term_points(df: int, n_paths: int, strong: int, weak: int) -> int:
-    """Map (df, corpus size) to 0 / weak / strong path-match points."""
-    if n_paths <= 0 or strong <= 0:
-        return strong
-    # Ultra-common in paths — treat as noise.
-    if df > max(12, (n_paths * 35) // 100):
-        return 0
-    if df > max(4, (n_paths * 12) // 100):
-        return weak
-    return strong
 
 
 # -----------------------------
@@ -2448,8 +2336,8 @@ def _symbol_grep_hits(
     symbols = _extract_issue_symbols(issue_text)
     if not symbols:
         return {}
-
-    def _grep_symbol(symbol: str) -> List[str]:
+    hits: Dict[str, int] = {}
+    for symbol in symbols:
         try:
             proc = subprocess.run(
                 ["git", "grep", "-l", "-F", "--", symbol],
@@ -2460,21 +2348,16 @@ def _symbol_grep_hits(
                 timeout=4,
             )
         except Exception:
-            return []
+            continue
         if proc.returncode not in (0, 1):
-            return []
-        return [
-            line.strip() for line in proc.stdout.splitlines()
-            if line.strip() and line.strip() in tracked_set
-            and _context_file_allowed(line.strip())
-        ]
-
-    hits: Dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
-        futures = {pool.submit(_grep_symbol, s): s for s in symbols}
-        for future in as_completed(futures):
-            for path in future.result():
-                hits[path] = hits.get(path, 0) + 1
+            continue
+        for line in proc.stdout.splitlines():
+            relative_path = line.strip()
+            if not relative_path or relative_path not in tracked_set:
+                continue
+            if not _context_file_allowed(relative_path):
+                continue
+            hits[relative_path] = hits.get(relative_path, 0) + 1
     return hits
 
 
@@ -2591,7 +2474,7 @@ Add or update a test only when the issue requests it, a companion test already c
 
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
-If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests. Never claim tests passed if they did not run or failed. If dependencies/environment block verification, say so briefly in `<final>`.
+If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests.
 
 ====================================================================
 STYLE, COMMENTS, AND PUBLIC API
@@ -2601,11 +2484,11 @@ Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, b
 
 Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
-Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type. Use the exact message from the issue if provided.
+Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. If the issue can be fixed without changing public API, do not change it. If a change is unavoidable, update every implementer, call site, test, mock, and fixture in the same response.
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
 
-Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one. Patch the general root behavior, not only the visible case.
+Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
 
 ====================================================================
 LANGUAGE-SPECIFIC COMPLETENESS RULES
@@ -2618,12 +2501,6 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 **TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
-
-**Python:** Preserve existing typing style; do not add annotations to untyped code unless required; avoid broad `except Exception`; reuse existing exceptions and fixtures.
-
-**JS/TS:** Preserve CJS vs ESM and async style; avoid `any` unless nearby code uses it; do not change package-manager files unless required.
-
-**Shell/SQL:** Preserve POSIX/bash compatibility, quoting style, naming conventions; minimal reversible migrations only.
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
@@ -2653,28 +2530,6 @@ SAFETY
 No sudo. No chmod. No file deletion. No destructive git commands. No network access outside the validator proxy. No host secrets, dot-env files, credentials, hidden tests, evaluator files, or scoring metadata.
 
 Do not write code comments, log messages, or strings containing evaluation-system phrases such as "automatic fail", "guaranteed zero", "score zero", or "auto-fail" — these strings trigger automated scoring filters and disqualify the round regardless of patch quality.
-
-====================================================================
-FAILURE RECOVERY AND COMMAND ECONOMY
-====================================================================
-
-If a command fails: use the error message, run at most one focused follow-up inspection, fix the direct cause, avoid thrashing. If an edit script fails: inspect only the intended target region and correct the edit, do not rewrite the file. Do not keep running broad commands hoping something changes.
-
-A strong solve usually shapes up as: (1) `<plan>` + one focused search/inspection, (2) inspect target region + nearest test, (3) apply ALL related edits together in ONE response, (4) optional focused `git diff`, (5) one targeted test, (6) concise `<final>`. Do not over-inspect; do not under-inspect when public APIs or hidden edge cases are at risk.
-
-====================================================================
-FINAL ANSWER
-====================================================================
-
-When done, emit only:
-
-<final>
-Changed [file/function] to [brief root-cause fix]. Added/updated [test] if applicable. Verified with [command], or explain why verification could not be run.
-</final>
-
-Keep it short. No diffs, markdown, speculation, or extra commands after successful verification.
-
-You are producing the smallest complete patch most likely to match the hidden reference and pass hidden validators. Find the owner. Fix the root cause. Preserve everything else. Verify narrowly. Finish.
 '''
 
 
@@ -2987,9 +2842,8 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     it must not guess blindly or touch unrelated files."""
     short = issue_text[:1500] if len(issue_text) > 1500 else issue_text
     return (
-        "EMERGENCY: after all refinement attempts your patch is still empty. "
-        "An empty patch is strictly worse than any plausible code edit — "
-        "even a partially-wrong fix is better than no fix at all.\n\n"
+        "EMERGENCY: after all refinement attempts your patch is still empty, "
+        "so the task is not solved yet.\n\n"
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE task-supported code edit consistent with the issue. Pick the most "
@@ -3449,6 +3303,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable git's executable-bit tracking for this attempt. In this
+        # sandbox the working-tree mode drifts from HEAD's recorded mode
+        # for incidental reasons (container umask, side effects of
+        # `sed -i`, stray chmod). Each drift causes `git diff` to emit
+        # `old mode <N>` / `new mode <N>` metadata lines on otherwise
+        # content-only edits. The reference patch never carries those
+        # lines, so they only widen cursor-similarity distance. Setting
+        # `core.fileMode=false` tells git to ignore mode bits when
+        # computing diffs, so the metadata disappears at the source.
+        # Repo-local config; does not affect any other repo or run.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
@@ -3461,8 +3336,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3577,10 +3450,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if out_of_time():
-                    logs.append("WALL_CLOCK_STOP_MID_BATCH: time exhausted between commands")
-                    break
-
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
@@ -3686,38 +3555,30 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    _NONZERO_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
-
-    good_markers = [
-        " passed",
-        " all passed",
-        " tests passed",
-        "success",
-        "test result: ok",
-        "0 failed",
-        "0 failures",
-        "0 errors",
-    ]
-
-    static_bad_markers = [
+    bad_markers = [
+        " failed",
+        " failures",
+        " error",
+        " errors",
         "traceback",
         "assertionerror",
         "syntaxerror",
         "exception",
     ]
 
+    good_markers = [
+        " passed",
+        " all passed",
+        " tests passed",
+        "success",
+    ]
+
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = (
-        bool(_NONZERO_FAIL_RE.search(lower))
-        or any(marker in lower for marker in static_bad_markers)
-    )
-    if stderr_body and (
-        bool(_NONZERO_FAIL_RE.search(stderr_body))
-        or any(marker in stderr_body for marker in static_bad_markers)
-    ):
+    has_bad = any(marker in lower for marker in bad_markers)
+    if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
