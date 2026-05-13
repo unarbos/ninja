@@ -49,6 +49,7 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -68,7 +69,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "14"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -87,7 +88,7 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "7000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
@@ -104,10 +105,14 @@ HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
 # Inner solve wall: keep below the multishot outer budget so a second
-# attempt has comparable time. Tau docker_solver enforces a hard wall of
-# max(per-task-timeout, 300s) from exec start — see multishot constants below.
-WALL_CLOCK_BUDGET_SECONDS = 248.0
-WALL_CLOCK_RESERVE_SECONDS = 20.0
+# attempt has comparable time. Duel-data observation: validator-side wall
+# is ~150s (artifacts from duel #4619 show exit_reason=time_limit_exceeded
+# at elapsed=127-153s). The previous 248s budget was unreachable — agent
+# never saw out_of_time() and was killed mid-call by the validator with no
+# graceful exit. 130s + 25s reserve = self-exit at 105s elapsed, leaves
+# ~45s margin to the validator wall for cleanup + return.
+WALL_CLOCK_BUDGET_SECONDS = 130.0
+WALL_CLOCK_RESERVE_SECONDS = 25.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -120,6 +125,9 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_DUPLICATE_SYMBOL_NUDGES = 1  # catch added function/class whose name already exists in the same file
+MAX_STRUCTURAL_INTEGRITY_NUDGES = 1  # catch missing Python imports / JS calls / broken HTML structure post-edit
+MAX_DEV_HOST_NUDGES = 1  # catch hardcoded localhost / dev ports in non-test code (round 064697)
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -630,6 +638,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_change_lines_in_mixed_blocks(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -665,6 +674,40 @@ def _sanitize_patch(diff_output: str) -> str:
         cleaned = rebuilt
 
     return cleaned
+
+
+def _strip_mode_change_lines_in_mixed_blocks(diff_output: str) -> str:
+    """Drop `old mode`/`new mode` lines from blocks that also contain real hunks.
+
+    When the model touches a file's content AND its mode, the previous mode-only
+    stripper leaves the mode lines in place because there are @@ hunks present.
+    The judge still sees the mode churn and penalises it. Strip the mode lines
+    while preserving the content edit.
+    """
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if "\n@@ " not in block:
+            out.append(block)
+            continue
+        if "\nold mode " not in block and "\nnew mode " not in block:
+            out.append(block)
+            continue
+        kept_lines = [
+            line for line in block.splitlines(keepends=True)
+            if not (line.startswith("old mode ") or line.startswith("new mode "))
+        ]
+        out.append("".join(kept_lines))
+
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _diff_block_path(block: str) -> str:
@@ -2177,7 +2220,18 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
 # mismatch cheaply and surfaces a targeted nudge before <final>.
 
 _DELETION_VERB_RE = re.compile(
-    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b",
+    r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|"
+    r"disable|deactivate|rename|migrate|consolidate|unify|swap|retire|sunset)\b",
+    re.IGNORECASE,
+)
+
+# Phrases that imply the new code REPLACES existing code, even without a verb
+# like "remove" being present. Round 064628 lost because the issue said
+# "support multi-file upload" — no removal verb — but the model kept the old
+# single-file handler alongside the new one, producing a duplicate function.
+_REPLACES_OLD_RE = re.compile(
+    r"\b(instead of|rather than|replacing the|in place of|supersed[a-z]+|"
+    r"superceded|formerly|previously used|legacy|old (?:way|method|function|handler|component|page))\b",
     re.IGNORECASE,
 )
 
@@ -2218,8 +2272,468 @@ def _patch_has_deletions(patch: str) -> bool:
 
 
 def _issue_requires_deletion(issue_text: str) -> bool:
-    """True if the issue contains explicit removal/replacement verbs."""
-    return bool(_DELETION_VERB_RE.search(issue_text))
+    """True if the issue contains removal verbs OR replacement-implying phrases."""
+    if _DELETION_VERB_RE.search(issue_text):
+        return True
+    return bool(_REPLACES_OLD_RE.search(issue_text))
+
+
+# -----------------------------
+# Duplicate-symbol detection
+# -----------------------------
+#
+# Round 064628 lost because the patch ADDED a new `handleFotoUpload` without
+# removing the existing one — two functions with the same name in the same
+# Vue/TS file cause a compile error. Same family of bug: 064805 (Kotlin
+# rename left stale references), 064644 (writing harness duplicate exports).
+# This gate runs after syntax fixes (because if the file doesn't parse, the
+# regex won't match the right lines) and before test (a duplicate-symbol
+# compile error makes the test gate useless).
+
+_SYMBOL_DEF_PATTERNS = [
+    # Python
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*[:(]"),
+    # JavaScript / TypeScript function declarations
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("),
+    # JS/TS const/let assignments of arrow functions or function expressions
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s*)?(?:\(|function\b)"),
+    # Go
+    re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\("),
+    # Rust
+    re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*[<(]"),
+    # Kotlin / Swift
+    re.compile(r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+|fileprivate\s+|open\s+)?fun\s+([A-Za-z_]\w*)\s*\("),
+    re.compile(r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+|fileprivate\s+)?func\s+([A-Za-z_]\w*)\s*\("),
+]
+
+
+def _line_defines_symbol(line: str) -> Optional[str]:
+    """Return the symbol name this line defines, or None."""
+    for pat in _SYMBOL_DEF_PATTERNS:
+        m = pat.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _patch_added_symbol_definitions(patch: str) -> Dict[str, set]:
+    """Map each modified file to the set of symbol names added by `+` lines."""
+    result: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        name = _line_defines_symbol(line[1:])
+        if name and current_file:
+            result.setdefault(current_file, set()).add(name)
+    return result
+
+
+def _file_duplicate_symbols(repo: Path, file_path: str, candidate_names: set) -> List[str]:
+    """Return names that have 2+ matching definitions in the post-patch file."""
+    abs_path = repo / file_path
+    if not abs_path.is_file():
+        return []
+    try:
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    counts: Dict[str, int] = {name: 0 for name in candidate_names}
+    for line in text.splitlines():
+        name = _line_defines_symbol(line)
+        if name in counts:
+            counts[name] += 1
+    return sorted(n for n, c in counts.items() if c >= 2)
+
+
+def _find_duplicate_symbols(repo: Path, patch: str) -> Dict[str, List[str]]:
+    """Top-level: returns {file: [dup_names]} for symbols defined more than once."""
+    out: Dict[str, List[str]] = {}
+    added = _patch_added_symbol_definitions(patch)
+    for path, names in added.items():
+        dups = _file_duplicate_symbols(repo, path, names)
+        if dups:
+            out[path] = dups
+    return out
+
+
+# -----------------------------
+# Structural integrity checks
+# -----------------------------
+#
+# Duel data: round 065055 lost because the patch used `timezone.utc` without
+# importing it (NameError at runtime). Round 064624 lost because the patch
+# left stray `<tr>` rows after `</html>` (malformed DOM). These are cheap
+# post-edit checks that catch a class of common runtime/structural bugs the
+# syntax gate misses (Python parses fine without imports; HTML parsers are
+# lenient about stray content).
+
+_PYTHON_NEEDS_IMPORT = {
+    "timezone", "datetime", "timedelta", "date",
+    "Path", "PurePath",
+    "Optional", "Dict", "List", "Tuple", "Set", "Union", "Callable", "Any",
+    "Iterable", "Iterator", "Sequence", "Mapping", "TypedDict", "Literal",
+    "Counter", "defaultdict", "OrderedDict", "deque", "namedtuple",
+}
+
+
+def _extract_python_imports(source: str) -> set:
+    """Return the set of names this Python file makes available via imports."""
+    names: set = set()
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^from\s+[\w.]+\s+import\s+(.+?)(\s*#.*)?$", line)
+        if m:
+            tokens = m.group(1).replace("(", " ").replace(")", " ").strip().rstrip(",")
+            for tok in tokens.split(","):
+                tok = tok.strip().rstrip(",")
+                if not tok or tok == "*":
+                    continue
+                if " as " in tok:
+                    _, alias = tok.split(" as ", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok)
+            continue
+        m = re.match(r"^import\s+(.+?)(\s*#.*)?$", line)
+        if m:
+            for tok in m.group(1).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if " as " in tok:
+                    _, alias = tok.split(" as ", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok.split(".")[0])
+    return names
+
+
+def _check_missing_imports(repo: Path, patch: str) -> Dict[str, List[str]]:
+    """Return {file: [symbols used in added lines but not imported]} for .py files."""
+    file_usages: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not current_file.endswith(".py"):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        content = line[1:]
+        stripped = content.strip()
+        if stripped.startswith(("import ", "from ", "#")):
+            continue
+        for sym in _PYTHON_NEEDS_IMPORT:
+            # Match symbol not preceded by . or word char, followed by ( [ or .
+            if re.search(rf"(?<![.\w]){re.escape(sym)}(?=[\(\[\.\s,:])", content):
+                file_usages.setdefault(current_file, set()).add(sym)
+
+    out: Dict[str, List[str]] = {}
+    for path, syms in file_usages.items():
+        abs_path = repo / path
+        if not abs_path.is_file():
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        imported = _extract_python_imports(text)
+        missing = sorted(s for s in syms if s not in imported)
+        if missing:
+            out[path] = missing
+    return out
+
+
+def _check_html_structure(repo: Path, patch: str) -> Dict[str, str]:
+    """Return {file: stray_content_preview} for HTML files with content after </html>."""
+    files_touched: set = set()
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            if current_file.lower().endswith((".html", ".htm")):
+                files_touched.add(current_file)
+
+    out: Dict[str, str] = {}
+    for path in files_touched:
+        abs_path = repo / path
+        if not abs_path.is_file():
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        m = re.search(r"</\s*html\s*>", text, re.IGNORECASE)
+        if not m:
+            continue
+        after = text[m.end():]
+        # Strip HTML comments and pure whitespace
+        after_clean = re.sub(r"<!--.*?-->", "", after, flags=re.DOTALL).strip()
+        if after_clean:
+            preview = after_clean[:120].replace("\n", " ⏎ ")
+            out[path] = preview
+    return out
+
+
+# -----------------------------
+# P3a — JS/TS internal-symbol reachability gate
+# -----------------------------
+#
+# Duel evidence (round 064786): the patch added `await deleteCourseFromPath(...)`
+# in a .ts file without adding the corresponding import. The judge wrote: "its
+# deletion change is materially flawed because it calls deleteCourseFromPath
+# without adding the required import, which would break compilation". The
+# Python missing-imports gate doesn't help here because JS has its own scoping
+# rules. This gate scans added lines for identifier calls and verifies each
+# is either imported, locally defined (post-patch), or a well-known global.
+
+_JS_BUILTIN_GLOBALS = frozenset({
+    # Built-in objects / functions
+    "console", "window", "document", "global", "globalThis", "process", "self",
+    "JSON", "Math", "Object", "Array", "Number", "String", "Boolean",
+    "Date", "Promise", "Symbol", "Reflect", "RegExp", "Set", "Map",
+    "WeakMap", "WeakSet", "Function", "Error", "TypeError", "ReferenceError",
+    "SyntaxError", "RangeError", "URIError", "EvalError", "Proxy",
+    "fetch", "parseInt", "parseFloat", "isNaN", "isFinite",
+    "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
+    "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "queueMicrotask", "structuredClone", "atob", "btoa",
+    "URL", "URLSearchParams", "Blob", "File", "FileReader", "FormData",
+    "Headers", "Request", "Response", "AbortController", "AbortSignal",
+    "TextEncoder", "TextDecoder", "DOMException",
+    "Uint8Array", "Uint16Array", "Uint32Array", "Int8Array", "Int16Array",
+    "Int32Array", "Float32Array", "Float64Array", "ArrayBuffer", "DataView",
+    "BigInt", "BigInt64Array", "BigUint64Array",
+    "Buffer", "require", "module", "exports", "__dirname", "__filename",
+    "alert", "confirm", "prompt", "navigator", "location", "history",
+    "sessionStorage", "localStorage", "indexedDB",
+    # React / common framework primitives
+    "React", "ReactDOM", "createElement", "cloneElement", "createContext",
+    "createRef", "forwardRef", "memo", "lazy", "Suspense", "Fragment",
+    "StrictMode", "render", "createRoot", "hydrateRoot",
+    "useState", "useEffect", "useMemo", "useCallback", "useRef", "useContext",
+    "useReducer", "useLayoutEffect", "useImperativeHandle", "useDebugValue",
+    "useId", "useTransition", "useDeferredValue", "useSyncExternalStore",
+    # Common test functions (jest/vitest)
+    "describe", "it", "test", "expect", "beforeEach", "afterEach",
+    "beforeAll", "afterAll", "vi", "jest", "mock", "spyOn",
+})
+
+_JS_KEYWORDS = frozenset({
+    "if", "else", "for", "while", "do", "switch", "case", "default",
+    "return", "function", "class", "async", "await", "throw", "try",
+    "catch", "finally", "new", "delete", "typeof", "instanceof", "in",
+    "of", "var", "let", "const", "this", "super", "void", "yield",
+    "true", "false", "null", "undefined", "break", "continue", "extends",
+    "import", "export", "from", "as", "static", "public", "private",
+    "protected", "interface", "type", "enum", "namespace", "module",
+    "declare", "abstract", "implements", "readonly", "with", "debugger",
+    "satisfies", "keyof", "infer", "is",
+})
+
+
+def _extract_js_imports(source: str) -> set:
+    """Extract imported and require-d names from a JS/TS file."""
+    names: set = set()
+    for raw in source.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", "*")):
+            continue
+        # `import { a, b as c } from 'mod'` (named)
+        m = re.match(r"^import\s*(?:type\s+)?\{([^}]+)\}\s*from\s*['\"]", line)
+        if m:
+            for tok in m.group(1).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if " as " in tok:
+                    _, alias = tok.split(" as ", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok)
+        # `import * as Foo from 'mod'`
+        m = re.match(r"^import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['\"]", line)
+        if m:
+            names.add(m.group(1))
+        # `import Foo from 'mod'` or `import Foo, { x } from 'mod'`
+        m = re.match(r"^import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,\s*\{([^}]+)\})?\s+from\s*['\"]", line)
+        if m:
+            names.add(m.group(1))
+            if m.group(2):
+                for tok in m.group(2).split(","):
+                    tok = tok.strip()
+                    if not tok:
+                        continue
+                    if " as " in tok:
+                        _, alias = tok.split(" as ", 1)
+                        names.add(alias.strip())
+                    else:
+                        names.add(tok)
+        # `const { a, b: alias } = require('mod')`
+        m = re.match(r"^(?:const|let|var)\s*\{([^}]+)\}\s*=\s*require\s*\(", line)
+        if m:
+            for tok in m.group(1).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if ":" in tok:
+                    _, alias = tok.split(":", 1)
+                    names.add(alias.strip())
+                else:
+                    names.add(tok)
+        # `const Foo = require('mod')`
+        m = re.match(r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(", line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _extract_js_definitions(source: str) -> set:
+    """Extract names defined at any scope in a JS/TS file."""
+    names: set = set()
+    patterns = [
+        re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]"),
+        re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"),
+        re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]"),
+        re.compile(r"^\s*(?:export\s+)?(?:type|interface|enum)\s+([A-Za-z_$][\w$]*)"),
+    ]
+    for line in source.splitlines():
+        for pat in patterns:
+            m = pat.match(line)
+            if m:
+                names.add(m.group(1))
+                break
+    return names
+
+
+def _check_missing_js_symbols(repo: Path, patch: str) -> Dict[str, List[str]]:
+    """Return {file: [identifiers called but not imported/defined]} for JS/TS files.
+
+    Conservative heuristic — only flags when the called name has NO non-call
+    occurrences anywhere in the post-patch file (it's not a local var, param,
+    destructured key, or anything else accessible). Caps at 6 names per file
+    to avoid spamming the model when a file is broadly broken.
+    """
+    JS_EXTS = (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs")
+    file_added_calls: Dict[str, set] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not current_file.lower().endswith(JS_EXTS):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        content = line[1:]
+        stripped = content.strip()
+        if not stripped or stripped.startswith(("//", "/*", "*", "*/")):
+            continue
+        # Skip import/export/type lines — those have their own syntax that the
+        # call regex would mis-match.
+        if re.match(r"^\s*(?:import|export|from|type|interface|enum)\b", content):
+            continue
+        # Identifier-call pattern: NAME( where NAME isn't preceded by . or word char
+        for m in re.finditer(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", content):
+            name = m.group(1)
+            if name in _JS_KEYWORDS or name in _JS_BUILTIN_GLOBALS:
+                continue
+            file_added_calls.setdefault(current_file, set()).add(name)
+
+    out: Dict[str, List[str]] = {}
+    for path, calls in file_added_calls.items():
+        abs_path = repo / path
+        if not abs_path.is_file():
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        imported = _extract_js_imports(text)
+        defined = _extract_js_definitions(text)
+        unresolved: List[str] = []
+        for name in sorted(calls):
+            if name in imported or name in defined:
+                continue
+            # If the name appears anywhere in the file as something OTHER than a
+            # call, it's likely a local var, param, destructure target, or
+            # method — skip to stay conservative. Only flag names that exist
+            # purely as unresolved-looking calls.
+            occurrences = list(re.finditer(rf"\b{re.escape(name)}\b\s*(\()?", text))
+            if not occurrences:
+                continue
+            non_call_occurrences = [o for o in occurrences if not o.group(1)]
+            if not non_call_occurrences:
+                unresolved.append(name)
+        if unresolved:
+            out[path] = unresolved[:6]
+    return out
+
+
+# -----------------------------
+# P4 — Hardcoded dev-host / port gate
+# -----------------------------
+#
+# Duel evidence (round 064697): the patch hardcoded a localhost function URL
+# and omitted auth headers; judge wrote: "hardcodes a localhost function URL
+# without auth ... misses a key acceptance criterion". The model defaults to
+# localhost when the codebase uses an env-driven config helper. Surface it.
+
+_HARDCODED_HOST_PATTERNS = [
+    re.compile(r"(?<![\w.])(localhost)(?::\d+)?", re.IGNORECASE),
+    re.compile(r"(?<![\w.])(127\.0\.0\.1)(?::\d+)?"),
+    re.compile(r"(?<![\w.])(0\.0\.0\.0)(?::\d+)?"),
+    re.compile(r"://([^/\s'\"]+):(3000|3001|4000|5000|5173|8000|8080|8888|9000)\b"),
+]
+
+_HOST_FILE_EXEMPT = (
+    "/tests/", "/test/", "/__tests__/", "/spec/",
+    ".test.", ".spec.", ".example.", "example.",
+    "/docs/", "/doc/",
+    "docker-compose", "/.devcontainer/", "/scripts/",
+)
+
+
+def _check_hardcoded_dev_hosts(patch: str) -> Dict[str, List[str]]:
+    """Return {file: [matched_host_strings_with_line_preview]} for non-test files."""
+    out: Dict[str, List[str]] = {}
+    current_file = ""
+    for line in patch.splitlines():
+        head = re.match(r"^\+\+\+\s+b/(.+)$", line)
+        if head:
+            current_file = head.group(1)
+            continue
+        if not current_file:
+            continue
+        if any(seg in current_file.lower() for seg in _HOST_FILE_EXEMPT):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        content = line[1:]
+        stripped = content.strip()
+        if not stripped or stripped.startswith(("//", "#", "/*", "*", "*/")):
+            continue
+        for pat in _HARDCODED_HOST_PATTERNS:
+            if pat.search(content):
+                preview = stripped[:90]
+                out.setdefault(current_file, []).append(preview)
+                break
+    # Cap entries per file
+    for path in out:
+        out[path] = out[path][:4]
+    return out
 
 
 def _issue_implies_relocation(issue_text: str) -> bool:
@@ -2482,6 +2996,12 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
+**React / JSX / Vue:** Hooks (useState, useEffect, useMemo, useCallback, useRef) MUST be called at the component top level only — never inside useMemo bodies, conditionals, loops, nested helper functions, or callbacks. Always audit useEffect dependency arrays: if state `X` appears in the deps AND you call `setX(...)` inside the effect with no guard, you have an infinite render loop. For typewriter/animation effects, drive the index with a ref or raw counter, never with the displayed-state value as both the dep and the setter target.
+
+**Async / await:** When you call an async function, explicitly `await` it unless it is intentionally fire-and-forget with error handling. `Promise<T>[]` is NOT `T[]` — if you build an array from `.save()`, `.toJSON()`, `fetch()`, or any other async-returning call, you must `await Promise.all(arr)` before treating the elements as bytes, strings, or objects. Missing awaits in Blob/Uint8Array/file-download paths silently break the feature at runtime.
+
+**Math / edge cases:** Before calling `Math.log(x)`, `Math.sqrt(x)`, `/x`, or `Math.pow(x, y)` with non-integer y, guard against the input being ≤0, NaN, or undefined. Statistical and financial code (Calmar ratio, profit factor, Sharpe ratio) almost always has an edge case for empty inputs, all-zero inputs, and all-losers/all-winners — handle them explicitly with the value the reference patch uses (often 0, NaN, or a sentinel), never let the formula divide by zero silently.
+
 ====================================================================
 SCOPE DISCIPLINE
 ====================================================================
@@ -2496,6 +3016,14 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
+- Existing database indexes, schema columns, or migrations that the issue did not mention
+- Lockfiles, package manifests, generated files (bun.lock, pnpm-lock.yaml, package-lock.json) unless the dependency change is the task itself
+- Existing CSS/SCSS rules adjacent to your fix when only logic changes are required
+- AppShell, layout, navbar, or sidebar files when the task is scoped to a feature page
+
+If the issue scopes the change to a single file, page, route, or feature, your patch MUST stay scoped there. Resist the urge to clean up adjacent code, remove "unused" exports, or improve nearby styling. Every line you touch outside the requested scope is a penalty during reference comparison. When in doubt, ask: "Did the issue mention this file?" — if no, do not edit it.
+
+**Convention discovery — reuse existing identifier names.** Before introducing a NEW field, function, variable, action, or state-key name, grep the codebase for analogous existing names and reuse them. Examples that lost rounds in past duels: a patch added `flashMsg` while the codebase already used `flash` (the validator's reference patch used `flash`); a patch named a new function `handleFotoUpload` while a sibling component already exported `handleFileUpload`. Run `grep -rn 'flash\\|notify\\|toast' .` (or the analogous family) before naming. Match the codebase's casing convention (camelCase vs snake_case vs kebab-case), the verb prefix family (handle/on/do/get), and the noun vocabulary already in use. Inconsistent naming is treated as scope drift by reference-comparison scoring.
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
@@ -2779,6 +3307,132 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_duplicate_symbol_nudge_prompt(dups_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it added a function/class whose name already exists in the file.
+
+    Duel data (round 064628): the patch added a new `handleFotoUpload` while
+    leaving the existing one in place — two definitions with the same name in
+    one Vue/TS file is a compile error. Same failure mode is common in Python,
+    Go, Rust, Kotlin: the model writes new code without removing the old code
+    it was meant to replace.
+    """
+    bullet_lines: List[str] = []
+    for path, names in dups_by_file.items():
+        for name in names:
+            bullet_lines.append(f"  - {path}: `{name}` is defined 2+ times in the file now")
+    return (
+        "Duplicate symbol — your patch added a function/class whose name already "
+        "exists in the same file. Two definitions with the same name will break "
+        "compilation (Python/Go/Rust/Kotlin) or cause runtime shadowing (JS/TS).\n\n"
+        "Affected definitions:\n"
+        + "\n".join(bullet_lines)
+        + "\n\nVerify with `grep -n 'def NAME\\|function NAME\\|class NAME\\|fn NAME' "
+        "path/to/file`, then delete the OBSOLETE definition (the one your new code "
+        "is meant to replace) and emit <final>summary</final>.\n"
+    )
+
+
+def build_missing_imports_nudge_prompt(missing_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it used Python symbols without importing them.
+
+    Duel data (round 065055): patch used `timezone.utc` but never imported
+    `timezone` (or `datetime`) — runtime NameError. Python parses fine without
+    imports, so syntax_fix won't catch this; only an explicit symbol/import
+    audit will.
+    """
+    bullets: List[str] = []
+    for path, syms in missing_by_file.items():
+        bullets.append(f"  - {path}: missing import for {', '.join('`' + s + '`' for s in syms)}")
+    return (
+        "Missing import — your patch uses Python symbols that are not imported "
+        "in the file. The code will fail at runtime with NameError, even though "
+        "the syntax parses cleanly.\n\n"
+        "Affected files:\n"
+        + "\n".join(bullets)
+        + "\n\nAdd the necessary imports at the top of each file. Common patterns:\n"
+        "  - `from datetime import datetime, timezone, timedelta`\n"
+        "  - `from pathlib import Path`\n"
+        "  - `from typing import Optional, Dict, List, Tuple, Any, Callable`\n"
+        "  - `from collections import Counter, defaultdict, deque`\n\n"
+        "Then emit <final>summary</final>.\n"
+    )
+
+
+def build_html_structure_nudge_prompt(stray_by_file: Dict[str, str]) -> str:
+    """Tell the model its HTML file has content after the closing </html> tag.
+
+    Duel data (round 064624): wishlist.html had stray `<tr>` rows after `</html>`,
+    breaking DOM structure. Most browsers tolerate it visually, but the judge
+    penalises the structural break.
+    """
+    bullets: List[str] = []
+    for path, preview in stray_by_file.items():
+        bullets.append(f"  - {path}: stray content after </html>: {preview}")
+    return (
+        "Broken HTML structure — one or more files have content sitting AFTER the "
+        "closing `</html>` tag. This is malformed DOM and will be flagged.\n\n"
+        "Affected files:\n"
+        + "\n".join(bullets)
+        + "\n\nEither delete the stray content (if it was leftover from a previous edit) "
+        "or move it inside the `<body>` block where it belongs. Verify the file ends "
+        "cleanly with `</html>` followed only by whitespace, then emit <final>summary</final>.\n"
+    )
+
+
+def build_missing_js_symbols_nudge_prompt(missing_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it called a JS/TS identifier that isn't imported or defined.
+
+    Duel data (round 064786): the patch added `await deleteCourseFromPath(courseId)`
+    in the deletion handler without adding the corresponding import. Judge
+    penalised it as "would break compilation". JS scoping isn't covered by the
+    Python missing-imports gate.
+    """
+    bullets: List[str] = []
+    for path, names in missing_by_file.items():
+        bullets.append(f"  - {path}: undefined call(s) to {', '.join('`' + n + '`' for n in names)}")
+    return (
+        "Missing import or definition (JS/TS) — your patch calls one or more "
+        "identifiers that aren't imported, locally defined, or available as a "
+        "known global. The code will fail at compile/runtime with ReferenceError "
+        "(or TypeScript will reject it).\n\n"
+        "Affected files:\n"
+        + "\n".join(bullets)
+        + "\n\nFor each undefined name, EITHER:\n"
+        "  - Add the missing import: `import { name } from 'module-path'`\n"
+        "  - Define it locally if you meant to introduce a new helper\n"
+        "  - Remove the call if it was added by mistake\n\n"
+        "Use `grep -rn 'export.*name' .` to find which existing module exports "
+        "the symbol. Then emit <final>summary</final>.\n"
+    )
+
+
+def build_hardcoded_dev_hosts_nudge_prompt(hosts_by_file: Dict[str, List[str]]) -> str:
+    """Tell the model it hardcoded localhost / dev ports in production code.
+
+    Duel data (round 064697): patch hardcoded a localhost function URL and
+    omitted auth headers; judge wrote "hardcodes a localhost function URL
+    without auth ... misses a key acceptance criterion". The codebase almost
+    always has an env-driven config helper or a runtime base URL — find and
+    use it instead of literal localhost.
+    """
+    bullets: List[str] = []
+    for path, lines in hosts_by_file.items():
+        for preview in lines:
+            bullets.append(f"  - {path}: `{preview}`")
+    return (
+        "Hardcoded development host or port — your patch contains literal "
+        "`localhost`, `127.0.0.1`, or a dev port (3000/5173/8000/8080/etc.) "
+        "in non-test code. Production deployments will silently break or hit "
+        "the wrong endpoint, and the judge penalises the missing config wiring.\n\n"
+        "Offending lines:\n"
+        + "\n".join(bullets)
+        + "\n\nReplace the literal host with the codebase's existing config or env "
+        "lookup (look for `process.env.X`, `import.meta.env.X`, or a "
+        "config/url helper module). Auth headers and base URLs are usually "
+        "attached at the same place. Then emit <final>summary</final>.\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -2857,16 +3511,18 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
 # -----------------------------
 
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
-# Tau docker_solver hard wall is max(per-task-timeout, 300s) from exec start.
-# A 580s outer budget invited "retry" starts with only seconds left, then the
-# process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
-# failure mode observed in duel #4544). Keep outer budget under ~300s.
-_MULTISHOT_TOTAL_BUDGET = 278.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
+# Duel #4619 artifact data shows validator-side wall is ~150s (not 300s as
+# previously assumed). The earlier 278s outer budget was a fantasy — every
+# losing attempt got killed at 127-153s. Keep outer budget under the real
+# wall with a small safety margin so the wrapper can return on time.
+# Multishot is rarely triggered now (winners finish in ~70s, losers can't
+# leave 50s headroom), but the structure remains for the lucky-quick case.
+_MULTISHOT_TOTAL_BUDGET = 145.0
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 50.0
 # If attempt 1 already consumed this much wall clock, skip attempt 2 even when
-# attempt 1 was low-signal — otherwise the process often dies before the retry
-# finishes, which is worse than shipping the first (possibly thin) patch.
-_MULTISHOT_MAX_FIRST_ELAPSED = 132.0
+# attempt 1 was low-signal — otherwise the process dies before the retry can
+# finish, which is strictly worse than shipping attempt 1's thin patch.
+_MULTISHOT_MAX_FIRST_ELAPSED = 70.0
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -3076,6 +3732,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    duplicate_symbol_nudges_used = 0
+    structural_integrity_nudges_used = 0
+    dev_host_nudges_used = 0
+    # P2: track patch hash at last queued refinement; if a turn ran and the
+    # patch is unchanged, the model rejected the nudge. Two consecutive
+    # no-ops = abort all remaining refinement to reclaim ~15-30s of budget
+    # (per duel #4619 artifacts, this is the difference between a salvageable
+    # exit and a validator-killed empty return).
+    prev_queued_patch_hash: Optional[str] = None
+    consecutive_refinement_noops = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3089,10 +3755,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         prompt_text: str,
         marker: str,
     ) -> None:
-        """Append assistant + corrective user message and journal it."""
+        """Append assistant + corrective user message and journal it.
+
+        P2 no-op tracking: capture the patch hash at queue time. The next
+        maybe_queue_refinement call compares this to the post-LLM patch hash
+        to detect when the model rejected the nudge (refinement was a no-op).
+        Two consecutive no-ops abort refinement to reclaim validator budget.
+        """
+        nonlocal prev_queued_patch_hash
         logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
+        try:
+            captured = get_patch(repo) if repo is not None else ""
+        except Exception:
+            captured = ""
+        prev_queued_patch_hash = hashlib.sha1((captured or "").encode("utf-8")).hexdigest()
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
@@ -3111,8 +3789,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, duplicate_symbol_nudges_used, structural_integrity_nudges_used, dev_host_nudges_used, prev_queued_patch_hash, consecutive_refinement_noops
         patch = get_patch(repo)
+
+        # P2 no-op detection: if the previous call queued a refinement turn,
+        # the LLM should have produced a new patch by now. If the hash is the
+        # same as when we queued, the model rejected the nudge. Two consecutive
+        # no-ops = stop chaining; the model is stuck and further turns just
+        # burn validator wall-clock.
+        current_patch_hash = hashlib.sha1((patch or "").encode("utf-8")).hexdigest()
+        if prev_queued_patch_hash is not None:
+            if current_patch_hash == prev_queued_patch_hash:
+                consecutive_refinement_noops += 1
+                if consecutive_refinement_noops >= 2:
+                    logs.append("REFINEMENT_ABORT_NOOP: 2 consecutive turns left patch unchanged")
+                    prev_queued_patch_hash = None
+                    return False
+            else:
+                consecutive_refinement_noops = 0
+        prev_queued_patch_hash = None  # will be set again below if any gate queues
 
         if must_edit_after_gap:
             if patch != must_edit_patch:
@@ -3162,6 +3857,100 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Duplicate-symbol gate: a function/class with the same name defined twice
+        # in one file = compile error (round 064628). Runs after syntax (so the
+        # regex matches valid code) and before test (a duplicate-symbol compile
+        # error makes the test gate's slow runner useless).
+        if duplicate_symbol_nudges_used < MAX_DUPLICATE_SYMBOL_NUDGES:
+            dups = _find_duplicate_symbols(repo, patch)
+            if dups:
+                duplicate_symbol_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_duplicate_symbol_nudge_prompt(dups),
+                    "DUPLICATE_SYMBOL_QUEUED:\n  " + "; ".join(
+                        f"{path}: {', '.join(names)}" for path, names in dups.items()
+                    ),
+                )
+                return True
+
+        # Structural integrity gate: missing Python imports (round 065055) and
+        # broken HTML structure (round 064624). Two cheap post-edit checks
+        # sharing one refinement-budget slot — only the first detected issue
+        # fires, the other waits for the next cycle.
+        if structural_integrity_nudges_used < MAX_STRUCTURAL_INTEGRITY_NUDGES:
+            missing_imports = _check_missing_imports(repo, patch)
+            if missing_imports:
+                structural_integrity_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_imports_nudge_prompt(missing_imports),
+                    "MISSING_IMPORTS_QUEUED:\n  " + "; ".join(
+                        f"{path}: {', '.join(syms)}" for path, syms in missing_imports.items()
+                    ),
+                )
+                return True
+            # P3a: JS/TS internal-symbol reachability — round 064786 lost
+            # because the patch called deleteCourseFromPath() without adding
+            # the import. Same family as Python missing-imports but JS scoping
+            # rules require their own check.
+            missing_js = _check_missing_js_symbols(repo, patch)
+            if missing_js:
+                structural_integrity_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_missing_js_symbols_nudge_prompt(missing_js),
+                    "MISSING_JS_SYMBOLS_QUEUED:\n  " + "; ".join(
+                        f"{path}: {', '.join(syms)}" for path, syms in missing_js.items()
+                    ),
+                )
+                return True
+            html_breaks = _check_html_structure(repo, patch)
+            if html_breaks:
+                structural_integrity_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_html_structure_nudge_prompt(html_breaks),
+                    "HTML_STRUCTURE_QUEUED:\n  " + "; ".join(
+                        f"{path}: {preview[:60]}" for path, preview in html_breaks.items()
+                    ),
+                )
+                return True
+
+        # P4 — Hardcoded dev-host gate. Round 064697 lost because the patch
+        # hardcoded a localhost function URL without auth. The judge flagged
+        # the missing config-driven base URL as "misses a key acceptance
+        # criterion". Fires AFTER structural gates (compile errors take
+        # priority) and BEFORE deletion/criteria/coverage (a hardcoded host
+        # is concrete acceptance failure, not a heuristic gap).
+        if dev_host_nudges_used < MAX_DEV_HOST_NUDGES:
+            hosts = _check_hardcoded_dev_hosts(patch)
+            if hosts:
+                dev_host_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hardcoded_dev_hosts_nudge_prompt(hosts),
+                    "DEV_HOST_QUEUED:\n  " + "; ".join(
+                        f"{path}: {len(lines)} hit(s)" for path, lines in hosts.items()
+                    ),
                 )
                 return True
 
