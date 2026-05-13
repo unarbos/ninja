@@ -31,6 +31,12 @@ Design goals:
     - Validator owns repo, tests, sandbox, scoring, hidden tasks.
     - Miners only patch this file.
 
+Thorn (this fork):
+    Post-cherry hardening: broader relocation phrasing, multishot winner uses a
+    touched-file tie-break when substantive +line counts tie, and attempt-2
+    bootstrap lists which paths attempt-1 actually edited so the retry diverges
+    instead of repeating the same blind alley.
+
 Miner editing guide:
     You are expected to improve this file. Good areas to edit include prompting,
     context gathering, command selection, tool/result parsing, stopping logic,
@@ -2203,6 +2209,12 @@ _RELOCATION_PHRASE_RE = re.compile(
     r"(?:location|path|directory|folder|module|file)"
     r"|"
     r"(?:rebuild|reorganize|restructure)\s+(?:\S+\s+){0,6}?as\s+separate"
+    r"|"
+    r"(?:belongs?|belonging)\s+(?:in|under|inside)\s+(?:the\s+)?(?:new\s+)?"
+    r"(?:path|directory|folder|module|location)"
+    r"|"
+    r"(?:split|break)\s+(?:\S+\s+){0,4}?into\s+(?:its\s+own\s+)?(?:a\s+)?"
+    r"(?:new\s+)?(?:file|module|component|package)"
     r")",
     re.IGNORECASE,
 )
@@ -2779,7 +2791,31 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
-def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
+def _multishot_paths_from_patch(patch: str, *, max_paths: int = 20) -> List[str]:
+    """Paths appearing as `b/` targets in diff headers (deduped, stable order)."""
+    paths: List[str] = []
+    seen: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        m = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
+        if not m:
+            continue
+        b_side = m.group(2).strip()
+        if b_side and b_side not in seen:
+            seen.add(b_side)
+            paths.append(b_side)
+        if len(paths) >= max_paths:
+            break
+    return paths
+
+
+def build_attempt2_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    *,
+    prior_patch: str = "",
+) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
     Attempt 2 is blind to what attempt 1 tried — it starts a fresh conversation
@@ -2801,9 +2837,27 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         reasons.append(f"produced only {n_lines} substantive line(s)")
     reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
 
+    prior_paths = _multishot_paths_from_patch(prior_patch)
+    path_hint = ""
+    if prior_paths:
+        bullets = "\n  ".join(f"- {p}" for p in prior_paths)
+        path_hint = (
+            "The prior attempt's unified diff touched ONLY these paths — if the "
+            "issue implies a different owner file, new path, or multi-file "
+            "integration, do NOT anchor solely here:\n  "
+            f"{bullets}\n\n"
+        )
+    elif (prior_patch or "").strip():
+        path_hint = (
+            "The prior attempt produced a non-empty patch but no `diff --git` "
+            "headers were parsed — treat the first attempt as unreliable and "
+            "re-locate the real fix from the issue + repo.\n\n"
+        )
+
     return (
         f"⚠ RETRY ATTEMPT: A prior attempt at this task {reason_str} "
         f"({steps} steps). Do NOT repeat the same approach.\n"
+        f"{path_hint}"
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
@@ -2883,6 +2937,10 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_count_touched_files(patch: str) -> int:
+    return len(_multishot_paths_from_patch(patch))
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -3007,14 +3065,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _bootstrap = build_attempt2_bootstrap(_result1, _n1, prior_patch=_patch1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _f1 = _multishot_count_touched_files(_patch1)
+        _f2 = _multishot_count_touched_files(_patch2)
 
-        if _n2 >= _n1:
+        if _n2 > _n1 or (_n2 == _n1 and _f2 > _f1):
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
+            if _n2 == _n1 and _f2 > _f1:
+                _result2["multishot_tiebreak"] = "more_files"
             return _result2
 
         if _multishot_repo_obj is not None:
