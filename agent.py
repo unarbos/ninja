@@ -2963,6 +2963,64 @@ def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
     return max(0, base + covers - syntax_penalty)
 
 
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+
+# v2 production-tuned constants for under-delivery retry.
+# Live duel #4625 showed 12 of 42 challenger rounds hit time_limit_exceeded,
+# largely because retries kicked in on borderline cases AND inherited too
+# much budget. v2 makes the trigger STRICTER (severe gap only) and caps
+# attempt-2 budget tightly so a slow attempt 1 cannot cascade a timeout.
+_UNDERDELIVER_MIN_ESTIMATE = 5
+_UNDERDELIVER_RATIO_FACTOR = 3   # require actual * 3 <= estimated (e.g. 1 of 5)
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic file-count expectation for an integration-style task.
+
+    Counts acceptance-criteria-style bullets and explicit path mentions. Used
+    only by the v2 under-delivery retry gate; the heuristic is intentionally
+    crude so it cannot consistently mis-fire toward firing extra retries.
+    """
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any], n_lines: int, actual_files: int, estimated_files: int
+) -> str:
+    """Bootstrap variant for the severe under-delivery case.
+
+    Used only when attempt 1 has enough lines (>= signal threshold) but the
+    file count is at most 1/3 of the task's estimated file count AND attempt
+    1 finished well within budget. Surfaces the file-count gap explicitly so
+    attempt 2 adds missing files rather than rewriting existing files.
+    """
+    steps = result1.get("steps", 0)
+    return (
+        f"⚠ RETRY ATTEMPT: A prior attempt wrote {n_lines} substantive line(s) "
+        f"across {actual_files} file(s) in {steps} step(s), but the task "
+        f"appears to require ~{estimated_files} files based on its acceptance "
+        f"criteria. Re-read the task and ensure EACH bullet or required path "
+        f"corresponds to a concrete file in your patch. Common omissions: "
+        f"separate test files per module, config files, new route/controller "
+        f"files, mock modules. Do not re-edit files the prior attempt already "
+        f"covered; add the MISSING files first.\n\n"
+    )
+
+
 def _multishot_capture_head(repo: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -3057,35 +3115,59 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # v2 severe under-delivery detection: attempt 1 wrote enough lines but
+        # touched only ~1/3 or fewer of the files the task implies AND finished
+        # well inside the budget so attempt 2 has clean headroom. The strict
+        # ratio (actual * 3 <= estimated) and the elapsed cap together prevent
+        # the v1 failure mode where retries kicked in on borderline cases and
+        # cascaded into time_limit_exceeded (12 of 42 rounds in duel #4625).
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _underdelivered_severe = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files * _UNDERDELIVER_RATIO_FACTOR <= _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered_severe:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
-        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
-            # Attempt 1 already burned the outer budget — starting attempt 2
-            # invites a docker_solver kill (hard wall ~300s from exec start),
-            # which is strictly worse than shipping attempt 1's thin patch.
+        # v2: empty attempt 1 (n1 == 0) bypasses the max-first-elapsed check
+        # because shipping an empty patch is the worst outcome — attempt 2 with
+        # a tight budget is strictly better than 0.000 similarity.
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED and _n1 > 0:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
             return _result1
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
+        # v2 attempt-2 budget cap: clamp at 45-90s window. The prior code let
+        # attempt 2 inherit remaining-reserve which could be ~150s if attempt 1
+        # finished fast, but minimax/highspeed on 80K-token prompts has been
+        # observed to consume the full per-step budget on hard tasks and
+        # cascade to timeout. A 90s cap forces a tighter, more focused retry.
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _attempt2_budget = max(
+            _ATTEMPT2_BUDGET_MIN,
+            min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+        )
+        if _underdelivered_severe:
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files, _estimated_files
+            )
+        else:
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
