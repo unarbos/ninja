@@ -1955,6 +1955,100 @@ def _check_jsx_imports_one(repo: Path, relative_path: str) -> Optional[str]:
     )
 
 
+def _check_php_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Lint PHP via `php -l` when the interpreter is available; otherwise
+    fall back to a sentinel check for stray-comma-after-array-close bugs,
+    the dominant locale/config hand-edit failure mode.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    if _has_executable("php"):
+        proc_result = run_command(
+            f"php -l {_shell_quote(relative_path)}",
+            repo,
+            timeout=_SYNTAX_TIMEOUT,
+        )
+        if proc_result.exit_code == 0:
+            return None
+        msg_lines = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()
+        msg = msg_lines[-1] if msg_lines else "php -l failed"
+        return f"{relative_path}: {msg}"
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    # A bare `,` on its own line just before a closing `]` breaks PHP
+    # array literals (`[..., ,]` is a syntax error). Frequent locale-file
+    # hand-edit failure mode.
+    if re.search(r",\s*\n\s*,\s*\n\s*\]", source):
+        return (
+            f"{relative_path}: stray ',' on its own line just before `]` "
+            "— PHP arrays cannot contain an empty comma-separated element; "
+            "remove the bare comma line."
+        )
+    return None
+
+
+# Compose/Android leaves whose missing import is the most common Kotlin
+# compile-break under hand-edit. Kept narrow to keep false positives near
+# zero — every entry here is something whose presence in source code
+# strongly implies the corresponding androidx package must be imported.
+_KOTLIN_IMPORT_HINTS = {
+    "drawBehind": "androidx.compose.ui.draw.drawBehind",
+    "drawWithContent": "androidx.compose.ui.draw.drawWithContent",
+    "Offset": "androidx.compose.ui.geometry.Offset",
+    "Size": "androidx.compose.ui.geometry.Size",
+    "Brush": "androidx.compose.ui.graphics.Brush",
+    "PathEffect": "androidx.compose.ui.graphics.PathEffect",
+}
+
+
+def _check_kotlin_imports_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag Compose/Android identifiers used without a matching `import`.
+
+    Mirrors `_check_jsx_imports_one` for the Kotlin/Compose stack. Naive
+    brace-balance is disabled for Kotlin (char-literal collision with the
+    quote parser), so missing-import is the cheapest compile-break signal
+    we have on patches that touch `.kt` files.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    # Wildcard imports can bring anything in; skip enforcement.
+    if re.search(r"^\s*import\s+[\w.]+\.\*\s*$", source, re.MULTILINE):
+        return None
+    imported_leaves = {
+        m.group(1).rsplit(".", 1)[-1]
+        for m in re.finditer(r"^\s*import\s+([\w.]+)", source, re.MULTILINE)
+    }
+    body = re.sub(r"^\s*import\s+.*$", "", source, flags=re.MULTILINE)
+    missing = [
+        f"{ident} (expected `import {pkg}`)"
+        for ident, pkg in _KOTLIN_IMPORT_HINTS.items()
+        if ident not in imported_leaves
+        and re.search(r"\b" + re.escape(ident) + r"\b", body)
+    ]
+    if not missing:
+        return None
+    return (
+        f"{relative_path}: Kotlin/Compose identifier(s) used without import: "
+        + ", ".join(missing[:5])
+    )
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1975,6 +2069,10 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        elif suffix == ".php":
+            result = _check_php_syntax_one(repo, relative_path)
+        elif suffix in {".kt", ".kts"}:
+            result = _check_kotlin_imports_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
             if result is None and suffix in {".tsx", ".jsx"}:
@@ -2734,6 +2832,10 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
+**DB schema changes:** When the task says ADD COLUMN, persist, store, track, record, or include a new attribute on an existing entity, enumerate (1) the `CREATE TABLE` / schema definition, (2) every `INSERT` / `UPDATE` statement that writes the entity, (3) the row → dict / serializer / DTO layer that exposes the value, (4) the API request handler that accepts it AND the response builder that returns it, and (5) a migration script (`ALTER TABLE` or framework-specific migration file) when the issue mentions existing databases, deployed installations, "existing rows", or "ensure column". A patch that only edits the `CREATE TABLE` is incomplete by definition; reviewers reliably catch this. After patching, mentally check `git diff --stat` for at least one file matching each row above.
+
+**Multi-page / nav features:** When the task says ADD or RENAME a tab / page / screen / route, enumerate (1) the nav link / menu entry where the user reaches it, (2) the route or path registration, (3) the page / component file itself (use `cat > NEW_PATH <<\'EOF\'` if it does not exist), (4) the API endpoint / server action / store action it calls, (5) the empty-state / loading-state UI when the feature consumes dynamic data, and (6) release notes / version bump / CHANGELOG when the repo has a visible version file (`package.json` `"version"`, `__init__.py` `__version__`, `Cargo.toml` `version`, `pyproject.toml` `version`). Missing the nav link or the route registration is the most common partial-implementation loss; an inaccessible new page scores zero on completeness. After patching, mentally check `git diff --stat` for one file per row above.
+
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
 ====================================================================
@@ -2767,6 +2869,79 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
+_LITERAL_BACKTICK_RE = re.compile(r"`([^`\n]{2,80})`")
+_LITERAL_DQUOTE_RE = re.compile(r'"([^"\n]{3,80})"')
+_LITERAL_SQUOTE_RE = re.compile(r"'([^'\n]{3,80})'")
+_LITERAL_URL_RE = re.compile(r"https?://[^\s<>'\"`)\]]{4,120}")
+_LITERAL_VERSION_RE = re.compile(
+    r"(?<![\w.])(?:\^|~|>=|<=)?\d+\.\d+(?:\.\d+){0,2}(?:-[a-zA-Z0-9.]+)?(?![\w.])"
+)
+_LITERAL_ALLCAPS_RE = re.compile(
+    r"\b[A-Z][A-Z0-9]{2,}(?:[ _\-/]+[A-Z][A-Z0-9]+){1,6}\b"
+)
+# Tokens that look like literals but are too generic to enforce verbatim.
+_LITERAL_DROP = {
+    "true", "false", "null", "none", "yes", "no", "ok", "todo", "fixme",
+    "example", "foo", "bar", "baz", "lorem", "ipsum",
+}
+
+
+def _extract_literal_spans(issue_text: str, *, max_spans: int = 24) -> List[str]:
+    """Pull issue-literal strings the patch must preserve character-for-character.
+
+    Captures backtick/quoted spans, URLs, semver pins, and ALLCAPS_LIKE_THIS
+    runs. Order-preserving dedup; capped so the prompt block stays compact.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+
+    def _try_add(span: str) -> bool:
+        span = span.strip()
+        if not span or len(span) < 2 or len(span) > 80:
+            return False
+        if span.lower() in _LITERAL_DROP:
+            return False
+        if span in seen:
+            return False
+        seen.add(span)
+        out.append(span)
+        return len(out) >= max_spans
+
+    for pattern in (_LITERAL_BACKTICK_RE, _LITERAL_DQUOTE_RE, _LITERAL_SQUOTE_RE):
+        for m in pattern.finditer(issue_text):
+            if _try_add(m.group(1)):
+                return out
+    for m in _LITERAL_URL_RE.finditer(issue_text):
+        if _try_add(m.group(0).rstrip(".,;:)")):
+            return out
+    for m in _LITERAL_VERSION_RE.finditer(issue_text):
+        span = m.group(0)
+        # Skip bare integers (handled poorly by the regex via line numbers etc.)
+        if "." in span and not span.replace(".", "").replace("^", "").replace("~", "").isdigit() is False:
+            if _try_add(span):
+                return out
+    for m in _LITERAL_ALLCAPS_RE.finditer(issue_text):
+        if _try_add(m.group(0)):
+            return out
+    return out
+
+
+def _format_literal_block(literals: List[str]) -> str:
+    if not literals:
+        return ""
+    bullets = "\n".join(f"  - `{s}`" for s in literals)
+    return (
+        "\n\nLITERAL_STRINGS_TO_PRESERVE_VERBATIM:\n"
+        "The issue contains these exact strings. Your patch's `+` lines MUST "
+        "contain each one character-for-character (matching case, punctuation, "
+        "spacing) wherever the issue says to use it. Do NOT paraphrase, abbreviate, "
+        "expand, line-break, or substitute synonyms:\n\n"
+        f"{bullets}\n"
+    )
+
+
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
@@ -2778,10 +2953,12 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
+    literals_section = _format_literal_block(_extract_literal_spans(issue))
+
     return f"""Fix this issue:
 
 {issue}
-
+{literals_section}
 Repository summary:
 
 {repo_summary}
@@ -2963,6 +3140,18 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+    literals = _extract_literal_spans(issue_text)
+    literal_bullet = ""
+    if literals:
+        joined = ", ".join(f"`{s}`" for s in literals[:12])
+        literal_bullet = (
+            "  - LITERAL FIDELITY: the issue contains these exact strings — "
+            f"{joined}. For each one, grep your patch's `+` lines: does the "
+            "string appear character-for-character (case, punctuation, "
+            "spacing) wherever the issue says to use it? Paraphrases, "
+            "abbreviations, line-breaks inside the string, and synonym "
+            "substitutions all lose points.\n"
+        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
@@ -2972,6 +3161,7 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - For every new/modified function signature: does each call site pass the right args? "
         "Forms calling server actions: do their FormData fields match the new signature?\n"
         "  - For every enum/typed field in the schema: does the patch use the enum/constant, not a plain string?\n"
+        f"{literal_bullet}"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
@@ -3151,13 +3341,7 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 # process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
 # failure mode observed in duel #4544). Keep outer budget under ~300s.
 _MULTISHOT_TOTAL_BUDGET = 278.0
-# Doubles as (a) precondition: skip attempt 2 if less than this is left, and
-# (b) cleanup buffer: subtracted from remaining wall-clock when sizing the
-# attempt-2 budget. Sized so attempt 2 either gets a meaningful slice or
-# doesn't run — a 30 s retry can't complete an LLM round trip + patch apply,
-# and wasting that 30 s is strictly worse than shipping attempt 1 as-is.
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 80.0
-_MULTISHOT_ATTEMPT2_MIN_BUDGET = 60.0
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # If attempt 1 already consumed this much wall clock, skip attempt 2 even when
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
@@ -3333,7 +3517,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(_MULTISHOT_ATTEMPT2_MIN_BUDGET, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         if _underdelivered:
             _bootstrap = (
                 "⚠ RETRY ATTEMPT (under-delivery): The prior attempt only touched "
