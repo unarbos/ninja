@@ -122,6 +122,7 @@ MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty 
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
 MAX_LITERAL_NUDGES = 1     # enforce exact quoted strings/constants/endpoints from the issue
 MAX_TEST_REQUIREMENT_NUDGES = 1  # enforce explicit add/update-test requirements
+MAX_STATIC_GUARD_NUDGES = 1     # catch dependency/entrypoint/type-only/static-js/schema risks
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -2289,22 +2290,358 @@ def _issue_requires_test_change(issue_text: str) -> bool:
 
 
 def _patch_touches_test_file(patch: str) -> bool:
-    for relative_path in _patch_changed_files(patch):
-        lower = relative_path.lower()
-        name = Path(lower).name
-        if (
-            "/test" in lower
-            or "/tests/" in lower
-            or "/spec" in lower
-            or name.startswith("test_")
-            or name.endswith("_test.py")
-            or ".test." in name
-            or ".spec." in name
-            or name.endswith("_test.go")
-            or name.endswith("_spec.rb")
-        ):
-            return True
-    return False
+    return bool(_patch_touched_test_files(patch))
+
+
+def _is_test_file_path(relative_path: str) -> bool:
+    lower = relative_path.lower()
+    name = Path(lower).name
+    return (
+        "/test" in lower
+        or "/tests/" in lower
+        or "/spec" in lower
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or ".test." in name
+        or ".spec." in name
+        or name.endswith("_test.go")
+        or name.endswith("_spec.rb")
+    )
+
+
+def _patch_touched_test_files(patch: str) -> List[str]:
+    return [path for path in _patch_changed_files(patch) if _is_test_file_path(path)]
+
+
+def _diff_blocks(patch: str) -> Dict[str, str]:
+    blocks: Dict[str, str] = {}
+    for block in re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE):
+        if not block.startswith("diff --git "):
+            continue
+        path = _diff_block_path(block)
+        if path:
+            blocks[path] = block
+    return blocks
+
+
+def _patch_block_for_path(patch: str, relative_path: str) -> str:
+    return _diff_blocks(patch).get(relative_path, "")
+
+
+def _run_changed_test_file(repo: Path, test_path: str, timeout_seconds: int = 10) -> Optional[str]:
+    """Run or syntax-check a test file that the patch itself modified.
+
+    The old gate only ran companion tests for edited source files. That missed
+    a repeated loss pattern where the model *adds bad tests* with fake imports,
+    wrong structs, or syntax errors. Keep this best-effort and cheap: Python and
+    Go get real targeted runners; JS gets parse-only; other languages are
+    skipped rather than burning the wall clock.
+    """
+    full = repo / test_path
+    if not full.exists() or not full.is_file():
+        return None
+    suffix = Path(test_path).suffix.lower()
+    if suffix == ".py":
+        return _run_companion_test(repo, test_path, timeout_seconds=timeout_seconds)
+    if suffix == ".go" and _has_executable("go"):
+        test_dir = str(Path(test_path).parent)
+        if test_dir in {"", "."}:
+            test_dir = "."
+        try:
+            proc = subprocess.run(
+                ["go", "test", "./" + test_dir if test_dir != "." else "."],
+                cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=timeout_seconds, env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Changed Go test `{test_path}` timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+    if suffix in {".js", ".mjs", ".cjs"}:
+        return _check_node_syntax_one(repo, test_path)
+    return None
+
+
+def _select_changed_test_failure(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    for test_path in _patch_touched_test_files(patch)[:4]:
+        output = _run_changed_test_file(repo, test_path)
+        if output:
+            return (test_path, output)
+    return None
+
+
+def _select_test_or_companion_failure(repo: Path, patch: str) -> Optional[Tuple[str, str]]:
+    # Modified tests first: bad test churn is a direct LLM-judge penalty and
+    # often worse than no tests at all.
+    failure = _select_changed_test_failure(repo, patch)
+    if failure is not None:
+        return failure
+    return _select_companion_test_failure(repo, patch)
+
+
+# -----------------------------
+# Static guard checks for repeated duel-loss patterns
+# -----------------------------
+
+_JS_NODE_BUILTINS = {
+    "assert", "buffer", "child_process", "crypto", "events", "fs", "http",
+    "https", "net", "os", "path", "process", "stream", "timers", "url",
+    "util", "zlib", "readline", "querystring", "module", "worker_threads",
+}
+
+
+def _git_show_text(repo: Path, relative_path: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"HEAD:{relative_path}"], cwd=str(repo),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            return proc.stdout
+    except Exception:
+        pass
+    return ""
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def _package_dependency_sections(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    keys = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+    return {k: data.get(k) or {} for k in keys}
+
+
+def _package_dependency_changed(repo: Path) -> bool:
+    current = _read_json_file(repo / "package.json")
+    old_raw = _git_show_text(repo, "package.json")
+    if not current or not old_raw:
+        return False
+    try:
+        old = json.loads(old_raw)
+    except Exception:
+        return False
+    return _package_dependency_sections(current) != _package_dependency_sections(old)
+
+
+def _nearest_package_json(repo: Path, relative_path: str) -> Optional[Path]:
+    current = (repo / relative_path).resolve().parent
+    root = repo.resolve()
+    try:
+        current.relative_to(root)
+    except ValueError:
+        return None
+    while True:
+        candidate = current / "package.json"
+        if candidate.exists():
+            return candidate
+        if current == root:
+            break
+        current = current.parent
+    return None
+
+
+def _package_name_from_import(spec: str) -> str:
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else spec
+    return spec.split("/")[0]
+
+
+def _added_external_js_imports(patch: str) -> List[Tuple[str, str]]:
+    imports: List[Tuple[str, str]] = []
+    import_re = re.compile(r"(?:from\s+['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\)|import\(\s*['\"]([^'\"]+)['\"]\s*\))")
+    for path, block in _diff_blocks(patch).items():
+        if Path(path).suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            continue
+        for line in block.splitlines():
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            m = import_re.search(line[1:])
+            if not m:
+                continue
+            spec = next((g for g in m.groups() if g), "")
+            if not spec or spec.startswith((".", "/", "@/", "~/")):
+                continue
+            pkg = _package_name_from_import(spec)
+            if pkg in _JS_NODE_BUILTINS:
+                continue
+            imports.append((path, pkg))
+    return imports
+
+
+def _dependency_consistency_findings(repo: Path, patch: str) -> List[str]:
+    changed = set(_patch_changed_files(patch))
+    findings: List[str] = []
+
+    if "package.json" in changed and _package_dependency_changed(repo):
+        lockfiles = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb"]
+        existing_locks = [lf for lf in lockfiles if (repo / lf).exists()]
+        touched_locks = [lf for lf in existing_locks if lf in changed]
+        if existing_locks and not touched_locks:
+            findings.append(
+                "package.json dependency changes but existing lockfile was not updated: "
+                + ", ".join(existing_locks[:3])
+            )
+
+    if "Cargo.toml" in changed and (repo / "Cargo.lock").exists() and "Cargo.lock" not in changed:
+        block = _patch_block_for_path(patch, "Cargo.toml")
+        if re.search(r"^[+-].*(\[dependencies|\[dev-dependencies|\[build-dependencies|version\s*=)", block, re.M):
+            findings.append("Cargo.toml dependency/version change but Cargo.lock was not updated")
+
+    if "pubspec.yaml" in changed and (repo / "pubspec.lock").exists() and "pubspec.lock" not in changed:
+        block = _patch_block_for_path(patch, "pubspec.yaml")
+        if re.search(r"^[+-]\s{2,}[A-Za-z0-9_\-]+\s*:", block, re.M):
+            findings.append("pubspec.yaml dependency change but pubspec.lock was not updated")
+
+    missing: List[str] = []
+    seen_missing: set[Tuple[str, str]] = set()
+    for path, pkg in _added_external_js_imports(patch):
+        pkg_json_path = _nearest_package_json(repo, path)
+        if not pkg_json_path:
+            continue
+        data = _read_json_file(pkg_json_path)
+        deps = {}
+        for section in _package_dependency_sections(data).values():
+            if isinstance(section, dict):
+                deps.update(section)
+        if pkg not in deps and (path, pkg) not in seen_missing:
+            seen_missing.add((path, pkg))
+            missing.append(f"{path} imports `{pkg}` but nearest package.json does not declare it")
+    findings.extend(missing[:4])
+    return findings
+
+
+def _static_js_module_export_findings(patch: str, issue_text: str) -> List[str]:
+    if re.search(r"\b(module|esm|export|import\s+syntax)\b", issue_text, re.I):
+        return []
+    findings: List[str] = []
+    for path, block in _diff_blocks(patch).items():
+        lower = path.lower()
+        if not ("static/js/" in lower or "public/js/" in lower or lower.startswith("static/js/") or lower.startswith("public/js/")):
+            continue
+        for line in block.splitlines():
+            if re.match(r"^\+\s*export\s+(?:async\s+)?(?:function|const|let|var|class|default|\{)", line):
+                findings.append(f"{path} adds ES module `export` inside static/public JS; check script tags are type=module before using exports")
+                break
+    return findings
+
+
+_RUNTIME_ISSUE_RE = re.compile(
+    r"\b(handle|implement|wire|route|endpoint|api|cli|command|subcommand|button|click|submit|open|login|logout|delete|create|update|save|load|fetch|display|render|flow|workflow|modal|tab|screen|page|nav|sidebar|menu|start|cancel|confirm|upload|download|stream|sse)\b",
+    re.I,
+)
+_RUNTIME_PATH_MARKERS = {
+    "api", "app", "bin", "cli", "client", "command", "commands", "component",
+    "components", "controller", "controllers", "handler", "handlers", "main",
+    "page", "pages", "route", "routes", "router", "screen", "screens",
+    "service", "services", "static", "store", "stores", "ui", "view", "views",
+}
+_NON_RUNTIME_SUFFIXES = {".md", ".json", ".lock", ".toml", ".yaml", ".yml", ".sql", ".css", ".scss"}
+
+
+def _path_tokens(relative_path: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", relative_path.lower()) if t}
+
+
+def _is_runtime_source_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    suffix = path.suffix.lower()
+    if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".php", ".java", ".kt", ".swift", ".dart", ".svelte", ".vue", ".zig", ".cs", ".c", ".cc", ".cpp", ".h", ".hpp"}:
+        return False
+    if _is_test_file_path(relative_path):
+        return False
+    tokens = _path_tokens(relative_path)
+    # Pure type/schema files are not enough for behavioral issues unless they
+    # sit in a runtime surface path.
+    if tokens & {"types", "type", "schema", "schemas", "dto", "model", "models", "migration", "migrations"}:
+        return bool(tokens & _RUNTIME_PATH_MARKERS)
+    return True
+
+
+def _runtime_behavior_findings(patch: str, issue_text: str) -> List[str]:
+    if not _RUNTIME_ISSUE_RE.search(issue_text):
+        return []
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+    if any(_is_runtime_source_path(p) for p in changed):
+        return []
+    if any(Path(p).suffix.lower() not in _NON_RUNTIME_SUFFIXES for p in changed):
+        return []
+    return [
+        "Patch appears to change only docs/config/schema/types/tests, but the issue asks for runtime behavior; add the owner implementation/wiring file too"
+    ]
+
+
+def _wiring_surface_findings(patch: str, issue_text: str) -> List[str]:
+    changed = _patch_changed_files(patch)
+    if not changed:
+        return []
+    lower_issue = issue_text.lower()
+    joined_paths = "\n".join(changed).lower()
+    findings: List[str] = []
+
+    def has_any(words: Tuple[str, ...]) -> bool:
+        return any(re.search(r"\b" + re.escape(w) + r"\b", lower_issue) for w in words)
+
+    if has_any(("cli", "command", "subcommand", "configure", "setup")):
+        if not re.search(r"(cli|command|commands|main\.py|index\.(js|ts)|bin/|package\.json|pyproject\.toml|setup\.py)", joined_paths):
+            findings.append("CLI/command task but patch does not touch an obvious command registration or entrypoint file")
+
+    if has_any(("endpoint", "route", "api", "controller", "server action", "rpc")):
+        if not re.search(r"(api|route|routes|router|controller|controllers|server|action|actions|app\.|main\.|index\.)", joined_paths):
+            findings.append("API/route task but patch does not touch an obvious router/controller/action/entrypoint file")
+
+    if has_any(("tab", "nav", "menu", "sidebar", "screen", "page", "modal", "button", "footer", "header")):
+        if not re.search(r"(component|components|page|pages|screen|screens|view|views|nav|menu|sidebar|layout|app/|static/js|public/js|ui)", joined_paths):
+            findings.append("UI/navigation task but patch does not touch an obvious UI/nav/page/component wiring file")
+
+    if re.search(r"\b(readme|docs?|documentation|release notes?|changelog|version)\b", lower_issue):
+        if not any(re.search(r"(readme|docs?/|changelog|release|notes|package\.json|pubspec\.yaml|cargo\.toml)", p.lower()) for p in changed):
+            findings.append("Task mentions docs/release/version updates but patch does not touch a docs/release/version file")
+
+    return findings[:4]
+
+
+def _schema_churn_findings(patch: str, issue_text: str) -> List[str]:
+    if re.search(r"\b(unique|constraint|index|indexes|indices)\b", issue_text, re.I):
+        return []
+    findings: List[str] = []
+    for path, block in _diff_blocks(patch).items():
+        if Path(path).suffix.lower() not in {".sql", ".prisma"} and "migration" not in path.lower():
+            continue
+        if re.search(r"^\+.*\bUNIQUE\b", block, re.M | re.I):
+            findings.append(f"{path} adds UNIQUE/index-like schema constraints not requested by the issue; verify this is not harmful churn")
+        if re.search(r"^-.*\b(CREATE\s+INDEX|INDEX|KEY)\b", block, re.M | re.I):
+            findings.append(f"{path} removes existing index/key lines; avoid schema/index churn unless explicitly required")
+    return findings[:3]
+
+
+def _static_guard_findings(repo: Path, patch: str, issue_text: str) -> List[str]:
+    findings: List[str] = []
+    findings.extend(_dependency_consistency_findings(repo, patch))
+    findings.extend(_static_js_module_export_findings(patch, issue_text))
+    findings.extend(_runtime_behavior_findings(patch, issue_text))
+    findings.extend(_wiring_surface_findings(patch, issue_text))
+    findings.extend(_schema_churn_findings(patch, issue_text))
+    # De-duplicate while preserving order.
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in findings:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out[:6]
 
 
 # -----------------------------
@@ -2627,6 +2964,18 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
 ====================================================================
+REFERENCE-SHAPE COMPLETENESS CHECKS
+====================================================================
+
+Before finalizing, check whether your patch is a complete vertical slice, not just a local edit:
+- CLI/subcommand tasks: command function + parser/registration + help/tests/docs when requested. A standalone command group not attached to main is a failure.
+- API/route/server-action tasks: schema/types + service/helper + controller/route/action + caller/UI integration + imports.
+- UI tab/page/nav/menu tasks: component/page + nav/menu/tab registration + script/module loading compatibility + state flow. Do not add `export` to static non-module scripts unless the loader uses modules.
+- Dependency changes: update the appropriate lockfile when the repo already tracks one. Do not import a new package without declaring it.
+- Tests: only add tests using existing fixtures/types/imports, then run the nearest targeted test. Bad/uncompilable tests are worse than no tests unless tests are explicitly required.
+- Data/model/schema changes: update constructor/defaults/migrations/serialization/initial-data rows/callers together; do not add extra UNIQUE/index/schema churn unless the issue asks for it.
+
+====================================================================
 SCOPE DISCIPLINE
 ====================================================================
 
@@ -2912,6 +3261,32 @@ def build_test_requirement_nudge_prompt(issue_text: str) -> str:
         "smallest regression test that matches existing fixtures/imports/types, "
         "and run that test if a runner is available. Do not create speculative "
         "tests with fake imports or mismatched types.\n\n"
+        "Task (for reference):\n"
+        f"{issue_text[:1500]}\n"
+    )
+
+
+def build_static_guard_prompt(findings: List[str], issue_text: str) -> str:
+    bullets = "\n  ".join(f"- {f}" for f in findings[:8]) or "(none)"
+    return (
+        "Static integration guard — your current patch matches a repeated "
+        "duel-loss pattern that often scores lower than a simpler but fully "
+        "wired reference patch:\n"
+        f"  {bullets}\n\n"
+        "Fix only the real issue-supported gaps. High-value checks before "
+        "finalizing:\n"
+        "  - If you added an import/require, ensure the dependency already exists "
+        "or update the manifest and lockfile together.\n"
+        "  - If you added a CLI command, route, tab, page, or API helper, wire it "
+        "into the existing entrypoint/router/nav/script loading path.\n"
+        "  - If you added or changed tests, run the nearest test and fix fake "
+        "imports/types instead of shipping uncompilable tests.\n"
+        "  - Do not add ES module exports to non-module static scripts unless the "
+        "HTML/script loader is also updated.\n"
+        "  - Avoid unrelated schema/index/lock/version churn.\n\n"
+        "If a finding is a false positive, respond with <final>summary</final> "
+        "and briefly say why; otherwise make the smallest corrective edit and "
+        "run one targeted verification command.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -3255,6 +3630,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     deletion_nudges_used = 0
     literal_nudges_used = 0
     test_requirement_nudges_used = 0
+    static_guard_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3290,7 +3666,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, literal_nudges_used, test_requirement_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, literal_nudges_used, test_requirement_nudges_used, static_guard_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3354,7 +3730,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_test_or_companion_failure(repo, patch)
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
@@ -3363,6 +3739,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_test_fix_prompt(test_path, output),
                     f"TEST_FIX_QUEUED:\n  {test_path}",
+                )
+                return True
+
+        # Static integration guard: catches repeated duel losses where the
+        # local edit is plausible but the feature is not wired, dependencies/
+        # locks are inconsistent, tests are uncompilable, or static scripts are
+        # broken by module exports. One combined nudge avoids burning several
+        # refinement turns.
+        if static_guard_nudges_used < MAX_STATIC_GUARD_NUDGES:
+            findings = _static_guard_findings(repo, patch, issue)
+            if findings:
+                static_guard_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_static_guard_prompt(findings, issue),
+                    "STATIC_GUARD_NUDGE_QUEUED:\n  " + " | ".join(f[:80] for f in findings[:4]),
                 )
                 return True
 
