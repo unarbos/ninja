@@ -50,6 +50,7 @@ Miner editing guide:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -108,9 +109,14 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-# If we already have a patch after the early solve window, prefer returning it
-# over risking the validator killing the process during another model/tool turn.
-PATCH_SOFT_RETURN_SECONDS = 92.0
+# Preserve good partial patches only late enough that normal solve/refinement
+# depth still has room. Duel data showed 92s avoided timeouts but cut too much
+# quality; these thresholds are a late salvage guard, not an early stop.
+PATCH_SALVAGE_STRONG_SECONDS = 145.0
+PATCH_SALVAGE_MIN_SECONDS = 168.0
+PATCH_SALVAGE_STRONG_SUBSTANTIVE_LINES = 80
+PATCH_SALVAGE_MIN_SUBSTANTIVE_LINES = 12
+PATCH_SALVAGE_STRONG_CHANGED_FILES = 4
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -1004,7 +1010,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files_taken = min(len(files), MAX_PRELOADED_FILES)
+    if n_files_taken > 0:
+        budget_curve = [
+            2.4 if i < 2 else 1.7 if i < 4 else 1.2 if i < 8 else 0.7
+            for i in range(n_files_taken)
+        ]
+        curve_total = sum(budget_curve) or 1.0
+        file_budgets = [
+            max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * weight / curve_total))
+            for weight in budget_curve
+        ]
+    else:
+        file_budgets = []
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1022,8 +1040,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+    for index, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        budget_for_file = file_budgets[index] if index < len(file_budgets) else 1500
+        snippet = _read_context_file(repo, relative_path, budget_for_file)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1053,6 +1072,40 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+_TERM_RARITY_BASE = 3
+_TERM_RARITY_CAP = 8
+_DOC_FREQUENCY_TERM_CAP = 12
+_DOC_FREQUENCY_GREP_TIMEOUT = 3.0
+_DOC_FREQUENCY_MIN_TERM_LEN = 3
+
+
+def _doc_frequency(repo: Path, terms: List[str]) -> Dict[str, int]:
+    df: Dict[str, int] = {}
+    for term in terms[:_DOC_FREQUENCY_TERM_CAP]:
+        if not term or len(term) < _DOC_FREQUENCY_MIN_TERM_LEN:
+            df[term] = 0
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "-i", "-I", "--", term],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+                check=False,
+            )
+            df[term] = proc.stdout.count("\n") if proc.returncode == 0 else 0
+        except Exception:
+            df[term] = 0
+    return df
+
+
+def _term_bonus(term: str, df: Dict[str, int]) -> int:
+    hits = df.get(term)
+    if hits is None or hits <= 0:
+        return _TERM_RARITY_BASE
+    bonus = 6.0 / math.log(2 + hits)
+    return max(_TERM_RARITY_BASE, min(_TERM_RARITY_CAP, int(round(bonus))))
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
@@ -1092,6 +1145,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    term_df = _doc_frequency(repo, terms)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1108,7 +1162,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -2872,11 +2926,24 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
 
-def _patch_soft_return_due(patch: str, solve_started_at: float, *, now: Optional[float] = None) -> bool:
+def _patch_late_salvage_due(patch: str, solve_started_at: float, *, now: Optional[float] = None) -> bool:
     if not patch.strip():
         return False
     current = time.monotonic() if now is None else now
-    return (current - solve_started_at) >= PATCH_SOFT_RETURN_SECONDS
+    elapsed = current - solve_started_at
+    substantive = _multishot_count_substantive(patch)
+    changed_files = len(_patch_changed_files(patch))
+    if substantive < PATCH_SALVAGE_MIN_SUBSTANTIVE_LINES:
+        return False
+    if (
+        elapsed >= PATCH_SALVAGE_STRONG_SECONDS
+        and (
+            substantive >= PATCH_SALVAGE_STRONG_SUBSTANTIVE_LINES
+            or changed_files >= PATCH_SALVAGE_STRONG_CHANGED_FILES
+        )
+    ):
+        return True
+    return elapsed >= PATCH_SALVAGE_MIN_SECONDS
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -2893,6 +2960,60 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_score(repo: Optional[Path], patch: str, issue_text: str) -> int:
+    base = _multishot_count_substantive(patch)
+    if not patch.strip():
+        return base
+    covers = 4 if _patch_covers_required_paths(patch, issue_text) else 0
+    syntax_penalty = 0
+    if repo is not None:
+        try:
+            syntax_penalty = 3 * len(_check_syntax(repo, patch))
+        except Exception:
+            syntax_penalty = 0
+    return max(0, base + covers - syntax_penalty)
+
+
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+_UNDERDELIVER_MIN_ESTIMATE = 3
+_UNDERDELIVER_GAP_TOLERANCE = 1
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    actual_files: int,
+    estimated_files: int,
+) -> str:
+    steps = result1.get("steps", 0)
+    return (
+        f"RETRY ATTEMPT: A prior attempt wrote {n_lines} substantive line(s) "
+        f"across {actual_files} file(s) in {steps} step(s), but the task "
+        f"appears to require about {estimated_files} files based on its paths "
+        f"and acceptance criteria. Add the missing files first: tests, routes, "
+        f"controllers, config, assets, or registration/wiring files named or "
+        f"implied by the task. Keep existing correct edits and avoid unrelated churn.\n\n"
+    )
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -2989,18 +3110,28 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
             return _result1
 
-        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
+        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED and _n1 > 0:
             # Attempt 1 already burned the outer budget — starting attempt 2
             # invites a docker_solver kill (hard wall ~300s from exec start),
             # which is strictly worse than shipping attempt 1's thin patch.
@@ -3016,13 +3147,23 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _attempt2_budget = max(
+            _ATTEMPT2_BUDGET_MIN,
+            min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+        )
+        if _underdelivered:
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files, _estimated_files
+            )
+        else:
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _n2 >= _n1:
+        _s1 = _multishot_score(_multishot_repo_obj, _patch1, _issue_text)
+        _s2 = _multishot_score(_multishot_repo_obj, _patch2, _issue_text)
+        if _s2 > _s1:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3308,9 +3449,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append(f"\n\n===== STEP {step} =====\n")
             patch_at_step_start = get_patch(repo)
 
-            if _patch_soft_return_due(patch_at_step_start, solve_started_at):
+            if _patch_late_salvage_due(patch_at_step_start, solve_started_at):
                 logs.append(
-                    "PATCH_SOFT_RETURN:\n"
+                    "PATCH_LATE_SALVAGE:\n"
                     "Returning current patch before starting another model/tool turn."
                 )
                 success = True
@@ -3428,10 +3569,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
-                    if _patch_soft_return_due(patch, solve_started_at):
+                    if _patch_late_salvage_due(patch, solve_started_at):
                         logs.append(
-                            "\nPATCH_SOFT_RETURN:\n"
-                            "Returning current patch after command execution before external timeout."
+                            "\nPATCH_LATE_SALVAGE:\n"
+                            "Returning current patch after command execution before a risky late turn."
                         )
                         success = True
                         break
@@ -3530,6 +3671,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict()
 
 
+_NONZERO_TEST_FAIL_RE = re.compile(r"\b[1-9]\d*\s+(failed|failures|errors?)\b")
+
+
 def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
@@ -3538,11 +3682,7 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if not _looks_like_verification_command(command):
         return False
 
-    bad_markers = [
-        " failed",
-        " failures",
-        " error",
-        " errors",
+    always_bad_markers = [
         "traceback",
         "assertionerror",
         "syntaxerror",
@@ -3554,14 +3694,30 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " all passed",
         " tests passed",
         "success",
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "failed: 0",
+        "failures: 0",
+        "errors: 0",
+        "0 tests failed",
+        "build succeeded",
+        "ran 0 tests",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
-    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+    has_bad = (
+        bool(_NONZERO_TEST_FAIL_RE.search(lower))
+        or any(marker in lower for marker in always_bad_markers)
+    )
+    if stderr_body and (
+        bool(_NONZERO_TEST_FAIL_RE.search(stderr_body))
+        or any(marker in stderr_body for marker in always_bad_markers)
+    ):
         has_bad = True
 
     if exit_code == 0 and not has_bad:
