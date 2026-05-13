@@ -1530,6 +1530,64 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+def _drop_files_with_mode_churn(repo: Path, patch: str, issue_text: str) -> List[str]:
+    """Revert any file whose diff contains stray mode-change metadata.
+
+    `git diff` emits `old mode <X>` / `new mode <Y>` lines whenever a file's
+    permission bits flipped versus HEAD. In this sandbox those flips happen
+    incidentally — different container umask than the validator's reference,
+    side effects of `sed -i` or `chmod` the model ran for unrelated reasons.
+    The reference patch never asks for chmod, so any file carrying mode-
+    change metadata is almost certainly scope creep (and its accompanying
+    content edit usually is too). Revert the entire file via
+    `git checkout -- <path>`. Exception: if the issue explicitly names the
+    file's path, keep it (a legitimately-edited file with an accidental
+    mode flip).
+
+    Returns the list of dropped file paths. The caller should re-run
+    `get_patch(repo)` to obtain the cleaned-up diff.
+    """
+    if not patch.strip():
+        return []
+    mentioned_paths = set(_extract_issue_path_mentions(issue_text))
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    dropped: List[str] = []
+    for block in blocks:
+        if not block.strip():
+            continue
+        first = block.splitlines()[0]
+        match = re.match(r"diff --git a/(.+?) b/(.+?)$", first)
+        if not match:
+            continue
+        file_path = match.group(2)
+        has_mode_churn = (
+            "\nold mode " in block
+            or "\nnew mode " in block
+            or block.startswith("old mode ")
+            or block.startswith("new mode ")
+        )
+        if not has_mode_churn:
+            continue
+        basename = Path(file_path).name
+        if file_path in mentioned_paths or basename in mentioned_paths:
+            continue  # issue explicitly named this file — keep it
+        try:
+            proc = subprocess.run(
+                ["git", "checkout", "--", file_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0:
+                dropped.append(file_path)
+        except Exception:
+            continue
+    return dropped
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -3292,8 +3350,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -3474,6 +3530,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        # Pre-submit scope tightening. Revert any file whose diff carries
+        # `old mode` / `new mode` metadata that the issue didn't ask for.
+        # Mode flips happen incidentally in this sandbox; the reference
+        # patch never has them; the accompanying content edits on those
+        # files are usually unrelated scope creep. Exempts files the
+        # issue explicitly names by path.
+        if patch.strip() and repo is not None:
+            dropped = _drop_files_with_mode_churn(repo, patch, issue)
+            if dropped:
+                logs.append(
+                    "DROPPED_MODE_CHURN_FILES: "
+                    + ", ".join(dropped)
+                )
+                patch = get_patch(repo)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
