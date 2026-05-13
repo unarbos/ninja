@@ -1885,6 +1885,76 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+_JSX_TAG_OPEN_RE = re.compile(r"<([A-Z][A-Za-z0-9_]{2,})(?=[\s/>])")
+_IMPORT_DEFAULT_RE = re.compile(
+    r"^\s*import\s+([A-Za-z_]\w*)(?:\s*,\s*(?:\{[^}]*\}|\*\s+as\s+\w+))?\s+from\s+",
+    re.MULTILINE,
+)
+_IMPORT_NAMED_RE = re.compile(
+    r"^\s*import\s+(?:\w+\s*,\s*)?\{([^}]+)\}\s+from\s+", re.MULTILINE
+)
+_IMPORT_NAMESPACE_RE = re.compile(
+    r"^\s*import\s+\*\s+as\s+(\w+)\s+from\s+", re.MULTILINE
+)
+_LOCAL_VALUE_DECL_RE = re.compile(
+    r"\b(?:function|class|const|let|var)\s+([A-Z]\w*)"
+)
+
+
+def _check_jsx_imports_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag PascalCase JSX tags with no matching import or local binding.
+
+    `node --check` and the brace-balance pass both accept files that use a
+    component identifier without binding it (the JSX parser treats it as a
+    free reference, syntactically fine), but the actual build fails. The
+    canonical example is swapping `<img>` → `<Image>` without adding
+    `import Image from "next/image"`. Restricted to 3+ char names so TS
+    single-letter generics (`<T,>`) don't false-positive.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    used = {m.group(1) for m in _JSX_TAG_OPEN_RE.finditer(source)}
+    if not used:
+        return None
+
+    bound: set = set()
+    for m in _IMPORT_DEFAULT_RE.finditer(source):
+        bound.add(m.group(1))
+    for m in _IMPORT_NAMED_RE.finditer(source):
+        for spec in m.group(1).split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            name = spec.split(" as ")[-1].strip() if " as " in spec else spec
+            name = name.lstrip("type ").strip()
+            if name:
+                bound.add(name)
+    for m in _IMPORT_NAMESPACE_RE.finditer(source):
+        bound.add(m.group(1))
+    for m in _LOCAL_VALUE_DECL_RE.finditer(source):
+        bound.add(m.group(1))
+    if "React" in bound or re.search(r"from\s+['\"]react['\"]", source):
+        bound.update({"React", "Fragment"})
+
+    missing = sorted(used - bound)
+    if not missing:
+        return None
+    return (
+        f"{relative_path}: JSX component(s) used without import or local "
+        f"declaration: {', '.join(missing[:5])}"
+    )
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1907,6 +1977,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
+            if result is None and suffix in {".tsx", ".jsx"}:
+                result = _check_jsx_imports_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
@@ -3079,7 +3151,13 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 # process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
 # failure mode observed in duel #4544). Keep outer budget under ~300s.
 _MULTISHOT_TOTAL_BUDGET = 278.0
-_MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
+# Doubles as (a) precondition: skip attempt 2 if less than this is left, and
+# (b) cleanup buffer: subtracted from remaining wall-clock when sizing the
+# attempt-2 budget. Sized so attempt 2 either gets a meaningful slice or
+# doesn't run — a 30 s retry can't complete an LLM round trip + patch apply,
+# and wasting that 30 s is strictly worse than shipping attempt 1 as-is.
+_MULTISHOT_MIN_ATTEMPT_RESERVE = 80.0
+_MULTISHOT_ATTEMPT2_MIN_BUDGET = 60.0
 # If attempt 1 already consumed this much wall clock, skip attempt 2 even when
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
@@ -3151,6 +3229,25 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
+
+def _emit_refinement_timing(
+    logs: List[str],
+    timeline: List[Tuple[str, float]],
+    solve_started_at: float,
+) -> None:
+    """Append a single REFINEMENT_TURN_TIMING summary line to logs.
+
+    Records each refinement marker with its elapsed seconds since solve start
+    plus the total solve wall-clock. Lets us tell, post-mortem, whether
+    timeout rounds blew the budget on initial exploration vs refinement.
+    """
+    total = time.monotonic() - solve_started_at
+    if timeline:
+        turns = "; ".join(f"{m}@{t:.1f}s" for m, t in timeline)
+    else:
+        turns = "(no refinement turns queued)"
+    logs.append(f"\nREFINEMENT_TURN_TIMING: total={total:.1f}s; {turns}")
+
 
 # MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
 # signature as upstream, but the body runs the inner attempt twice with
@@ -3236,7 +3333,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+        _attempt2_budget = max(_MULTISHOT_ATTEMPT2_MIN_BUDGET, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         if _underdelivered:
             _bootstrap = (
                 "⚠ RETRY ATTEMPT (under-delivery): The prior attempt only touched "
@@ -3344,6 +3441,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    _refinement_timeline: List[Tuple[str, float]] = []
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3358,6 +3456,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         marker: str,
     ) -> None:
         """Append assistant + corrective user message and journal it."""
+        _refinement_timeline.append((marker, time.monotonic() - solve_started_at))
         logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
@@ -3766,6 +3865,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
+        _emit_refinement_timing(logs, _refinement_timeline, solve_started_at)
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
@@ -3784,6 +3884,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        _emit_refinement_timing(logs, _refinement_timeline, solve_started_at)
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
