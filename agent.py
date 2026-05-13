@@ -108,6 +108,7 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+_REFINEMENT_WALL_CLOCK_FLOOR_SECONDS = 55.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -719,21 +720,152 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+_ISSUE_FILE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_/])"
+    r"((?:src|app|lib|components|pages|tests?|specs?|server|client|"
+    r"api|utils|services|store|stores|models|routes|controllers|views|"
+    r"templates|styles|features|modules|core|shared|domain)/"
+    r"[A-Za-z0-9_./-]+"
+    r"\.(?:tsx?|jsx?|py|go|rs|java|kt|cs|cpp|cc|h|hpp|css|scss|html|"
+    r"vue|svelte))"
+    r"(?![A-Za-z0-9_/])"
+)
+_NEW_FILE_HEADER_RE = re.compile(
+    r"^diff --git a/(\S+) b/\1\s*\nnew file mode", re.MULTILINE,
+)
+_PATCH_TOUCHED_FILE_RE = re.compile(
+    r"^diff --git a/(\S+) b/\S+", re.MULTILINE,
+)
+
+
+def _check_target_file_fidelity(issue_text: str, patch: str) -> List[str]:
+    """If the issue names an existing-file path and the patch creates a new file
+    at a different path while leaving the named file untouched, surface that as a
+    likely target-fidelity miss. Pure-functional; fail-safe."""
+    try:
+        if not isinstance(issue_text, str) or not isinstance(patch, str):
+            return []
+        if not issue_text.strip() or not patch.strip():
+            return []
+        named = list(dict.fromkeys(
+            m.group(1) for m in _ISSUE_FILE_PATH_RE.finditer(issue_text)))
+        if not named:
+            return []
+        touched = set(m.group(1) for m in _PATCH_TOUCHED_FILE_RE.finditer(patch))
+        if not touched:
+            return []
+        new_files = set(m.group(1) for m in _NEW_FILE_HEADER_RE.finditer(patch))
+        for path in named[:5]:
+            if path in touched:
+                return []
+            try:
+                base = path.rsplit("/", 1)[-1]
+                if not base:
+                    continue
+                stem = base.rsplit(".", 1)[0]
+                if len(stem) < 4:
+                    continue
+                similar_new = [n for n in new_files if stem.lower() in n.lower()]
+            except Exception:
+                similar_new = []
+            if similar_new:
+                return [
+                    "TARGET_FIDELITY: issue names existing file "
+                    f"`{path}` but the patch creates `{similar_new[0]}` "
+                    "instead. The acceptance test most likely checks "
+                    "for changes in the named file — edit it in place, "
+                    "do not create a new file at a different path."
+                ]
+        return []
+    except Exception:
+        return []
+
+
+_MANIFEST_IMPORT_PATTERNS = (
+    re.compile(
+        r"^\+\s*(?:const|let|var)\s+\S+\s*=\s*require\("
+        r"\s*['\"]([^'\"./][^'\"]*)['\"]\s*\)",
+        re.MULTILINE,
+    ),
+    re.compile(
+        r"^\+\s*import\s+(?:\S+\s+from\s+)?['\"]([^'\"./][^'\"]*)['\"]",
+        re.MULTILINE,
+    ),
+    re.compile(r"^\+\s*import\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE),
+    re.compile(r"^\+\s*from\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE),
+)
+_PYTHON_STDLIB_HINT = frozenset({
+    "os", "sys", "re", "json", "math", "time", "datetime", "pathlib",
+    "subprocess", "typing", "collections", "itertools", "functools",
+    "logging", "io", "shutil", "tempfile", "argparse", "ast", "csv",
+    "asyncio", "contextlib", "dataclasses", "enum", "hashlib", "random",
+    "string", "struct", "threading", "unittest", "urllib", "warnings",
+    "abc", "copy", "uuid", "base64", "pickle", "socket", "ssl", "xml",
+    "decimal", "fractions", "secrets", "errno", "signal", "select",
+    "queue", "concurrent", "multiprocessing", "platform", "textwrap",
+})
+
+
+def _check_dependency_manifest_sync(patch: str) -> List[str]:
+    """Detect new non-relative/non-stdlib imports whose package manifest was not
+    also touched. Pure-functional. Returns at most one observation string."""
+    try:
+        if not isinstance(patch, str) or not patch.strip():
+            return []
+        new_pkgs: set = set()
+        for pat in _MANIFEST_IMPORT_PATTERNS:
+            for m in pat.finditer(patch):
+                name = m.group(1)
+                if not name or name in _PYTHON_STDLIB_HINT:
+                    continue
+                if name.startswith("_"):
+                    continue
+                new_pkgs.add(name)
+        if not new_pkgs:
+            return []
+        manifest_touched = any(
+            tok in patch for tok in (
+                "package.json", "requirements.txt", "Cargo.toml",
+                "go.mod", "Pipfile", "pyproject.toml", "Gemfile",
+            )
+        )
+        if manifest_touched:
+            return []
+        findings = sorted(new_pkgs)[:3]
+        return [
+            "MANIFEST_SYNC: patch adds these non-relative imports without "
+            "touching any package manifest: "
+            + ", ".join(findings)
+            + ". If any are runtime dependencies not already declared, "
+            "add them to package.json / requirements.txt / Cargo.toml / "
+            "go.mod in this same patch."
+        ]
+    except Exception:
+        return []
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        ".tox",
         "node_modules",
         "coverage",
         "dist",
         "build",
         "target",
         ".git",
+        ".idea",
+        ".vscode",
+        ".next",
+        ".turbo",
     }
     generated_suffixes = {
         ".class",
@@ -951,6 +1083,46 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+_ISSUE_PATH_ANCHOR_RE = re.compile(
+    r"(?<![\w/])"
+    r"((?:src|app|lib|components|pages|public|tests?|specs?|backend|"
+    r"frontend|server|client|api|utils|hooks|helpers|services|store|"
+    r"stores|models|schemas|migrations|routes|controllers|views|"
+    r"templates|styles|assets|config|cmd|pkg|internal|gen|types|"
+    r"interfaces|features|modules|core|shared|domain|infra)"
+    r"/[A-Za-z0-9_.\-/]+"
+    r"\.(?:tsx?|jsx?|py|go|rs|java|kt|cs|cpp|cc|h|hpp|css|scss|sass|"
+    r"html|vue|svelte|md|sql|sh|yaml|yml|json|toml|gradle|kts|swift|"
+    r"m|mm|rb|php|dart|ex|exs))"
+    r"(?![\w/])"
+)
+
+
+def _issue_path_anchors(issue_text: str, tracked_set: set) -> List[str]:
+    """Return tracked file paths that the issue text explicitly names.
+
+    Pure-functional: no filesystem access beyond the membership test in
+    tracked_set. Caps at 4 to avoid displacing the symbol-grep ranker
+    entirely. Fail-safe: any exception returns []."""
+    try:
+        if not isinstance(issue_text, str) or not issue_text.strip():
+            return []
+        anchors: List[str] = []
+        seen: set = set()
+        for m in _ISSUE_PATH_ANCHOR_RE.finditer(issue_text):
+            path = m.group(1)
+            if path in seen:
+                continue
+            seen.add(path)
+            if path in tracked_set:
+                anchors.append(path)
+                if len(anchors) >= 4:
+                    break
+        return anchors
+    except Exception:
+        return []
+
+
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """Preload the highest-ranked tracked files plus their companion tests.
 
@@ -997,6 +1169,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
+
+    try:
+        _anchors = _issue_path_anchors(issue, tracked_set)
+    except Exception:
+        _anchors = []
+    if _anchors:
+        _anchor_set = set(_anchors)
+        files = _anchors + [f for f in files if f not in _anchor_set]
 
     parts: List[str] = []
     included: List[str] = []
@@ -1638,6 +1818,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".php",
 }
 
 
@@ -2500,6 +2683,47 @@ Do NOT change:
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
 ====================================================================
+WIRING AND REGISTRATION CHECKS
+====================================================================
+
+When you ADD a new entry-point, command, route, handler, or state
+machine, you must ALSO wire it into the place that invokes it.
+Scaffolding without wiring is the most frequent loss mode. Before
+emitting <final>, mentally walk each pair that applies:
+
+- CLI subcommand: if you defined a Click/Typer group or command,
+  verify the parent file calls `cli.add_command(group)` /
+  `app.add_typer(group, name=...)`. A `@click.group` definition that
+  is never registered is unreachable.
+- Web route + security: if you added a controller method or route
+  handler for a public endpoint, verify the security config also
+  permits that path (`.requestMatchers(...).permitAll()` for Spring,
+  `app.use(cors())` and the allow-list for Express).
+- State / phase transitions: if you added a new state enum value or
+  phase, verify SOMETHING actually transitions INTO it at runtime, the
+  UI/HUD/localization renders the new state, and any cancellation path
+  returns OUT of it. New enum values alone never affect runtime.
+- DI refactor cascade: when you remove a global singleton and switch
+  some handlers to dependency injection, audit EVERY remaining handler
+  that referenced the singleton. One unconverted handler panics at
+  runtime on its endpoint.
+- Service separation of concerns: when the task adds a new domain
+  resource (Category, Comment, etc.) with its own routes, create a
+  separate Controller / Service rather than mixing the new logic into
+  an existing Service. Mixing concerns is judged as poorer design even
+  when functionality is correct.
+- Gate-before-action ordering: when the task requires a gate (contact
+  form, intake modal, confirmation, approval) before an action (first
+  chat send, delete, post), enforce the gate FIRST. Do not dispatch
+  the action and follow up with a `[System]` placeholder; store the
+  user input locally and resume only after the gate is satisfied.
+- Test-fixture struct fidelity: before writing a test that constructs
+  a struct / object / record literal, read the actual type definition
+  in the codebase. Field names and types in fixtures must match the
+  real type; guessed shapes cause compile failures that fail the whole
+  patch.
+
+====================================================================
 SAFETY
 ====================================================================
 
@@ -3148,6 +3372,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
+        # Wall-clock circuit breaker: when time is short and the patch is already
+        # substantive, skip remaining refinement so the emit completes before the
+        # docker hard wall converts a good patch into an empty SIGTERM result.
+        try:
+            _wall_remaining = time_remaining()
+            _patch_substantive_count = _multishot_count_substantive(patch)
+        except Exception:
+            _wall_remaining = 999.0
+            _patch_substantive_count = 0
+        if _wall_remaining < _REFINEMENT_WALL_CLOCK_FLOOR_SECONDS and \
+                _patch_substantive_count >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+            logs.append(
+                f"REFINEMENT_SKIPPED_WALL_CLOCK: wall_remaining={_wall_remaining:.1f}s "
+                f"floor={_REFINEMENT_WALL_CLOCK_FLOOR_SECONDS:.1f}s "
+                f"patch_substantive={_patch_substantive_count} -- "
+                f"declining further refinement to ship the current patch."
+            )
+            return False
+
         # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
@@ -3253,23 +3496,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if polish_turns_used < MAX_POLISH_TURNS:
             junk = _diff_low_signal_summary(patch)
-            if junk:
+            try:
+                _fidelity_findings = _check_target_file_fidelity(issue, patch)
+            except Exception:
+                _fidelity_findings = []
+            if junk or _fidelity_findings:
                 polish_turns_used += 1
                 total_refinement_turns_used += 1
+                _polish_prompt = build_polish_prompt(junk or "")
+                if _fidelity_findings:
+                    _polish_prompt = "\n".join(_fidelity_findings) + "\n\n" + _polish_prompt
                 queue_refinement_turn(
                     assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
+                    _polish_prompt,
+                    f"POLISH_TURN_QUEUED:\n  {junk or '(target-fidelity)'}",
                 )
                 return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
+            try:
+                _manifest_findings = _check_dependency_manifest_sync(patch)
+            except Exception:
+                _manifest_findings = []
+            _self_check_prompt = build_self_check_prompt(patch, issue)
+            if _manifest_findings:
+                _self_check_prompt = "\n".join(_manifest_findings) + "\n\n" + _self_check_prompt
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
-                "SELF_CHECK_QUEUED",
+                _self_check_prompt,
+                "SELF_CHECK_QUEUED" + (" (manifest-gap)" if _manifest_findings else ""),
             )
             return True
 
