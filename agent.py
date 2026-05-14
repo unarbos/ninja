@@ -2209,6 +2209,42 @@ def _check_cpp_include_order_one(repo: Path, relative_path: str) -> Optional[str
     return f"{relative_path}: " + "; ".join(findings[:3])
 
 
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)\s*$")
+
+
+def _check_patch_binary_blobs(patch: str) -> List[str]:
+    """Flag binary-format diff blobs committed in the patch.
+
+    `git diff` emits `GIT binary patch` or `Binary files ... differ` when a
+    binary file changes. Compiled artifacts (`.wasm`, `.so`, `.pyc`, build
+    outputs) committed by mistake hurt similarity scoring and may not apply
+    cleanly. Returns one error per offending path so the existing syntax-fix
+    prompt can surface them as separate bullets.
+    """
+    if not patch:
+        return []
+    binary_paths: List[str] = []
+    current_path: Optional[str] = None
+    for line in patch.splitlines():
+        m = _DIFF_GIT_HEADER_RE.match(line)
+        if m:
+            current_path = m.group(2)
+            continue
+        if current_path and (
+            line.startswith("GIT binary patch")
+            or line.startswith("Binary files ")
+        ):
+            if current_path not in binary_paths:
+                binary_paths.append(current_path)
+            current_path = None
+    return [
+        f"{path}: patch contains a binary diff blob; revert with "
+        f"`git restore --staged --worktree -- {path}` and edit only the "
+        "text source files that produce this artifact."
+        for path in binary_paths[:5]
+    ]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -2216,7 +2252,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     know how to check parsed; languages we can't check (Go, Rust, etc.) are
     silently passed through.
     """
-    errors: List[str] = []
+    errors: List[str] = list(_check_patch_binary_blobs(patch))
     for relative_path in _patch_changed_files(patch):
         suffix = Path(relative_path).suffix.lower()
         result: Optional[str] = None
@@ -3398,7 +3434,8 @@ def build_self_check_prompt(
             f"  {bullets}\n"
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
-	
+        )
+
     literals = _extract_literal_spans(issue_text)
     literal_bullet = ""
     if literals:
@@ -3561,7 +3598,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+def _recently_observed_paths(logs: List[str], window: int = 80) -> List[str]:
     """Extract file paths recently read by the model from the last `window` log entries.
 
     Scans for paths surfaced via read_file/cat observations so the mid-loop
