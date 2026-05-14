@@ -63,6 +63,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# -----------------------------
+# Repo-state cache (performance)
+# -----------------------------
+
+# A solve attempt asks for the current patch and tracked-file list many times
+# between command executions (coverage gates, refinement checks, stop logic).
+# Re-running `git diff` / `git ls-files` each time burns wall-clock budget.
+# We cache those results per repo "epoch" and bump the epoch whenever we run a
+# command (or otherwise mutate/reset repo state). This preserves correctness:
+# cache is reused only while no command boundary has occurred.
+_REPO_STATE_EPOCH: Dict[str, int] = {}
+_PATCH_CACHE: Dict[Tuple[str, int], str] = {}
+_TRACKED_FILES_CACHE: Dict[Tuple[str, int], List[str]] = {}
+
+
+def _repo_cache_key(repo: Path) -> str:
+    return str(repo.resolve())
+
+
+def _repo_epoch(repo: Path) -> int:
+    return _REPO_STATE_EPOCH.get(_repo_cache_key(repo), 0)
+
+
+def _bump_repo_epoch(repo: Path) -> None:
+    key = _repo_cache_key(repo)
+    next_epoch = _REPO_STATE_EPOCH.get(key, 0) + 1
+    _REPO_STATE_EPOCH[key] = next_epoch
+
+    # Drop only this repo's stale cache entries.
+    stale_patch_keys = [k for k in _PATCH_CACHE if k[0] == key and k[1] < next_epoch]
+    for k in stale_patch_keys:
+        _PATCH_CACHE.pop(k, None)
+
+    stale_tracked_keys = [k for k in _TRACKED_FILES_CACHE if k[0] == key and k[1] < next_epoch]
+    for k in stale_tracked_keys:
+        _TRACKED_FILES_CACHE.pop(k, None)
 
 # -----------------------------
 # Config
@@ -425,7 +461,9 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
     start = time.time()
 
+    command_executed = False
     try:
+        command_executed = True
         proc = subprocess.run(
             command,
             cwd=str(cwd),
@@ -471,6 +509,10 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stderr=f"Command execution failed: {e}",
             duration_sec=time.time() - start,
         )
+    finally:
+        # Invalidate cache only when a subprocess command was actually attempted.
+        if command_executed:
+            _bump_repo_epoch(cwd)
 
 
 def _command_env() -> Dict[str, str]:
@@ -552,6 +594,13 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    key = _repo_cache_key(repo)
+    epoch = _repo_epoch(repo)
+    cache_key = (key, epoch)
+    cached = _PATCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -584,6 +633,9 @@ def get_patch(repo: Path) -> str:
         timeout=30,
     )
     if untracked.returncode != 0:
+        sanitized = _sanitize_patch(diff_output)
+        _PATCH_CACHE[cache_key] = sanitized
+        # return sanitized
         return diff_output
 
     for relative_path in [item for item in untracked.stdout.split("\0") if item]:
@@ -600,7 +652,9 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return _sanitize_patch(diff_output)
+    sanitized = _sanitize_patch(diff_output)
+    _PATCH_CACHE[cache_key] = sanitized
+    return sanitized
 
 
 """Reserved substrings used by the final patch cleanup pass to handle rare
@@ -627,11 +681,13 @@ _EDGECASE_GUARDRAIL = (
 
 
 def _sanitize_patch(diff_output: str) -> str:
+    """Remove patch blocks that consistently score as noise, never fixes."""
     if not diff_output.strip():
         return diff_output
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -719,6 +775,29 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode <N>` and `new mode <N>` lines from any file
+    block that survived `_strip_mode_only_file_diffs`.
+
+    Belt-and-suspenders with the `git config core.fileMode false` setting
+    applied at solve startup: that setting prevents the lines from being
+    generated in the first place, but if it fails to take effect (older
+    git version, sandbox config quirk, alternate diff backend) the lines
+    can still appear. This strip is purely text-level — it removes only
+    metadata lines, never content `+`/`-` lines or hunk headers, so the
+    patch remains structurally valid for the validator's diff applier.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1321,6 +1400,13 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
 
 
 def _tracked_files(repo: Path) -> List[str]:
+    key = _repo_cache_key(repo)
+    epoch = _repo_epoch(repo)
+    cache_key = (key, epoch)
+    cached = _TRACKED_FILES_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    
     try:
         proc = subprocess.run(
             ["git", "ls-files"],
@@ -1334,7 +1420,9 @@ def _tracked_files(repo: Path) -> List[str]:
         return []
     if proc.returncode != 0:
         return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    tracked = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    _TRACKED_FILES_CACHE[cache_key] = tracked
+    return list(tracked)
 
 
 def _context_file_allowed(relative_path: str) -> bool:
@@ -2649,15 +2737,36 @@ Before finalizing, mentally check hidden-test edge cases relevant to the issue: 
 LANGUAGE-SPECIFIC COMPLETENESS RULES
 ====================================================================
 
-**Java:** Write complete method bodies — never use \'// similar logic\' stubs. Cascade all call-site changes when modifying signatures. Include all imports.
+**TypeScript/C#/Java:**
+- cascade interface/type changes to every implementer and call site; write complete method bodies (no `// similar logic` stubs); include required imports.
 
-**C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
+**Java:**
+- write complete method bodies — never use `// similar logic` stubs
+- cascade all call-site changes when modifying signatures
+- include all imports
 
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
+**C or C++:**
+- edit both .h header AND .cpp implementation for each changed function
+- include full signatures and all required #include changes
+- preserve const-correctness and ownership style.
 
-**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
+**Go: **
+- update all affected struct or field usages
+- keep error wrapping style; update all impacted struct literals; run `gofmt` on changed Go files.
 
-**Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
+**Rust:**
+- update all affected struct or field usages
+- preserve ownership/lifetime style; do not clone just to silence borrow errors; update all struct initializers and pattern matches.
+- provide complete Rust lifetime annotations on modified functions
+
+**JS/TS: **
+- preserve CJS vs ESM and async style; avoid `any` unless nearby code uses it; do not change package-manager files unless required.
+
+**Python:**
+- preserve existing typing style; do not add annotations to untyped code unless required; avoid broad `except Exception`; reuse existing exceptions and fixtures.
+
+**Shell/SQL: **
+- preserve POSIX/bash compatibility, quoting style, naming conventions; minimal reversible migrations only.
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
@@ -3170,6 +3279,8 @@ def _multishot_revert(repo: Path, head: Optional[str]) -> None:
                        cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
     except Exception:
         pass
+    finally:
+        _bump_repo_epoch(repo)
 
 
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
@@ -3189,6 +3300,8 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return True
     except Exception:
         return False
+    finally:
+        _bump_repo_epoch(repo)
 
 
 # -----------------------------
@@ -3342,8 +3455,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     def time_remaining() -> float:
         return wall_clock_budget - (time.monotonic() - solve_started_at)
 
-    def out_of_time() -> bool:
-        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS
+    def out_of_time(delta: float = 0) -> bool:
+        return time_remaining() <= WALL_CLOCK_RESERVE_SECONDS + delta
 
     def queue_refinement_turn(
         assistant_text: str,
@@ -3542,6 +3655,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable git's executable-bit tracking for this attempt. In this
+        # sandbox the working-tree mode drifts from HEAD's recorded mode
+        # for incidental reasons (container umask, side effects of
+        # `sed -i`, stray chmod). Each drift causes `git diff` to emit
+        # `old mode <N>` / `new mode <N>` metadata lines on otherwise
+        # content-only edits. The reference patch never carries those
+        # lines, so they only widen cursor-similarity distance. Setting
+        # `core.fileMode=false` tells git to ignore mode bits when
+        # computing diffs, so the metadata disappears at the source.
+        # Repo-local config; does not affect any other repo or run.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
@@ -3556,10 +3690,17 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ]
         initial_preload_stripped = False
 
-        _wall_start = time.monotonic()
-
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
+            
+            # check solve-timeout
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
 
             if step > 4 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
@@ -3578,14 +3719,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"modified={len(modified_files)} saved_chars={saved}"
                     )
                 initial_preload_stripped = True
-
-            if out_of_time():
-                logs.append(
-                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
-                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
-                    "exiting loop early to return whatever patch we have."
-                )
-                break
 
             _elapsed_now = time.monotonic() - solve_started_at
             if (
@@ -3606,6 +3739,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
+                # check solve-timeout
+                inference_time = 20 # value in case gpt-5.4
+                if out_of_time(delta=inference_time):
+                    logs.append(
+                        f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                        f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                        "exiting loop early to return whatever patch we have."
+                    )
+                    break
+                
                 try:
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
@@ -3622,10 +3765,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
                         f"{MAX_STEP_RETRIES + 1}):\n{exc}"
                     )
-                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
-                        time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
+                    sleep_time = HTTP_RETRY_BASE_BACKOFF * (retry_attempt + 1)
+                    if retry_attempt < MAX_STEP_RETRIES and not out_of_time(delta=sleep_time):
+                        time.sleep(sleep_time)
                         continue
                     break
+
+            # check solve-timeout
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
 
             if response_text is None:
                 consecutive_model_errors += 1
@@ -3640,7 +3793,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     success = True
                     break
-                if consecutive_model_errors >= 3 or out_of_time():
+                if consecutive_model_errors >= 3:
                     logs.append(
                         "MODEL_ERROR_GIVE_UP:\nNo patch and persistent model "
                         "errors -- ending loop."
@@ -3654,6 +3807,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             commands = extract_commands(response_text)
             final = extract_final(response_text)
+
+            # check solve-timeout
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
+                )
+                break
 
             if not commands:
                 if final is not None:
@@ -3680,58 +3842,107 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             consecutive_no_command = 0
             messages.append({"role": "assistant", "content": response_text})
             observations: List[str] = []
-            command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
+            # ---------------------------------------------------------------            
+            # run all commands in the response, even if we find a patch early.
+            # We must execute all commands from the LLM response. Executing the first MAX_COMMANDS_PER_RESPONSE commands first and 
+            # then instructing the LLM to execute the remaining commands one at a time results in wasted turns.
+            # ---------------------------------------------------------------            
+            # command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
+            command_batch = commands
 
             for command_index, command in enumerate(command_batch, 1):
-                result = run_command(command, repo, timeout=command_timeout)
+                # check solve-timeout
+                command_time = command_timeout
+                if out_of_time(delta=command_time):
+                    logs.append(
+                        f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                        f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                        "exiting loop early to return whatever patch we have."
+                    )
+                    break
+                
+                result = run_command(command, repo, timeout=command_time)
+                if result.timed_out == True:
+                    # If a timeout occurs during the execution of the run_command function, increase the timeout value 
+                    # by a factor of 2, 3, ... to ensure that the command is fully executed.
+                    # At this time, perform a solve-timeout check using the out_of_time() function 
+                    # to prevent the agent from entering a timeout state in advance.
+                    # By doing so, you can ensure that all commands from the LLM response are fully executed, 
+                    # allowing the LLM to perform accurate inference.
+                    # retry with increasing timeouts, up to 3 attempts (1 initial + 2 retries)
+                    for run_index in range(1, 3):
+                        # check solve-timeout
+                        command_time = command_timeout*(run_index + 1)
+                        if out_of_time(delta=command_time):
+                            logs.append(
+                                f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                                f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                                "exiting loop early to return whatever patch we have."
+                            )
+                            break
+                        result = run_command(command, repo, timeout=command_time)
+                        if result.timed_out == False:
+                            break
+                    # if result.timed_out == True:
+                    #     continue
+                    
                 observation = format_observation(result)
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
-                    patch = get_patch(repo)
-                    if patch.strip() and _looks_like_successful_test_output(observation, command):
-                        if maybe_queue_refinement(response_text):
-                            break  # refinement queued — re-enter outer loop next iteration
-                        logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
-                        success = True
-                        break
-                    if patch.strip() and result.timed_out:
-                        if maybe_queue_refinement(response_text):
-                            break
-                        logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
-                        success = True
-                        break
-                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
-                        if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched — keep working instead of accepting.
-                            continue
-                        if maybe_queue_refinement(response_text):
-                            break
-                        logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
-                        success = True
-                        break
+                # --------------------------------------------------------
+                # no need to check patch before finishing run-command loop
+                # The code below performs an intentional check to prevent all commands from the LLM response 
+                # from being executed starting from the 4th step, causing the _solve_attempt function to terminate prematurely.
+                # This poses a risk of reduced accuracy for the agent 
+                # because the _solve_attempt function ends before the modification work is fully completed.
+                # --------------------------------------------------------
+                if result.timed_out == False:
+                    if step >= 4 or command_index > 1:
+                        patch = get_patch(repo)
+                        if patch.strip():
+                            if _looks_like_successful_test_output(observation, command):
+                                if maybe_queue_refinement(response_text):
+                                    break  # refinement queued — re-enter outer loop next iteration
+                                logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
+                                success = True
+                                break
+                            if step >= 8 and _looks_like_patch_review_command(command, result):
+                                if not _patch_covers_required_paths(patch, issue):
+                                    # Required path not yet touched — keep working instead of accepting.
+                                    continue
+                                if maybe_queue_refinement(response_text):
+                                    break
+                                logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
+                                success = True
+                                break
 
-            if len(commands) > len(command_batch):
-                observations.append(
-                    f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
-                    "Continue with one command at a time if more work remains."
+            # check solve-timeout after finishing run-command loop
+            if out_of_time():
+                logs.append(
+                    f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
+                    f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
+                    "exiting loop early to return whatever patch we have."
                 )
+                break
 
-            if final is not None and get_patch(repo).strip():
-                if maybe_queue_refinement(response_text):
-                    # Refinement turn queued; do not declare success yet. Skip
-                    # the observation append below since queue_refinement_turn
-                    # already wrote the assistant + corrective user message.
-                    if success:
-                        break
-                    continue
-                logs.append("\nFINAL_SUMMARY:\n" + final)
-                success = True
+            # if len(commands) > len(command_batch):
+            #     observations.append(
+            #         f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
+            #         "Continue with one command at a time if more work remains."
+            #     )
+
+            if success == False:
+                if final is not None and get_patch(repo).strip():
+                    logs.append("\nFINAL_SUMMARY:\n" + final)
+                    success = True
+
+            if success:
+                break
 
             if observations:
                 observation_text = "\n\n".join(observations)
-                if not success and get_patch(repo).strip():
+                if get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
@@ -3740,16 +3951,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — passing tests are strong evidence for the final patch.\n"
                         "3. Emit <final>summary</final>."
                     )
-                elif not success:
+                else:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
                         "edit commands in your next response — all files at once, covering EVERY requirement "
                         "in the issue. Use sed or python -c for surgical edits."
                     )
                 messages.append({"role": "user", "content": observation_text})
-
-            if success:
-                break
 
             if not get_patch(repo).strip() and step in {2, 4}:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
