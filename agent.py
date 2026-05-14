@@ -1712,6 +1712,177 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
+# senoo v2.t1.5 — In-place edit advisory.
+#
+# Surface a high-leverage failure mode: the model creates a new file at
+# `src/utils/payment.ts` while the existing `src/lib/payment.ts` (same
+# basename) was never edited. King PR #1450 has a single-source check
+# (`--- /dev/null`) and a global relocation-trigger suppress that fires on
+# any whole-document occurrence of "rename"/"move"/etc.
+#
+# Our improvements:
+#   1. Two-source new-file detection: the `--- /dev/null\n+++ b/<path>` form
+#      AND the more reliable `^new file mode 100\d{3}` line that git emits
+#      for newly created files. The first form alone misses patches where
+#      git formats the index header before the `---` marker.
+#   2. Three-tier matching:
+#        Tier A (basename equal)        → "same name elsewhere, untouched"
+#        Tier B (stem equal, ext diff)  → "same concept, different ext"
+#      King has only Tier A.
+#   3. Sentence-scoped relocation-trigger suppression: we scan only the
+#      sentence(s) that mention the new file's basename or stem for a
+#      relocation verb, instead of suppressing whenever any relocation
+#      verb appears anywhere in the issue (king's behavior, which lets
+#      false-positives through whenever the issue mentions "Rename" for an
+#      unrelated thing).
+
+# Two patterns that mark a file as new in a unified diff:
+#   • the canonical `--- /dev/null\n+++ b/<path>`
+#   • the git-extended `new file mode 100\d{3}\n` followed by the diff header
+_INPLACE_NEW_FILE_REGEXES = (
+    re.compile(r"^--- /dev/null\n\+\+\+ b/(?P<path>.+?)$", re.MULTILINE),
+    re.compile(
+        r"^diff --git a/(?P<path_a>.+?) b/(?P<path>.+?)\n"
+        r"new file mode \d+\n",
+        re.MULTILINE,
+    ),
+)
+
+# Verbs/phrases that legitimately indicate the issue WANTS a new file at a new
+# location. When one of these appears in the same sentence as the new file's
+# basename, we suppress the advisory. Slightly broader than king's catalog.
+_INPLACE_RELOC_TRIGGERS_RE = re.compile(
+    r"\b(?:rename|renamed|move|moved|relocate|relocated|extract|extracted|"
+    r"split|splitting|factor|refactor(?:ed)?\s+into|"
+    r"belongs?\s+(?:in|under|inside)|"
+    r"new\s+location|new\s+module|new\s+file\b|create\s+(?:a\s+)?new|"
+    r"convert\s+to|migrate(?:d)?\s+(?:to|into))\b",
+    re.IGNORECASE,
+)
+
+# Heuristic sentence splitter — handles ., !, ?, newlines without overdoing it.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _patch_newly_created_paths(patch: str) -> List[str]:
+    """Return paths newly-created by the patch (de-duped, both diff forms)."""
+    if not patch:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for regex in _INPLACE_NEW_FILE_REGEXES:
+        for m in regex.finditer(patch):
+            path = m.group("path")
+            if path and path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
+def _sentences_mentioning(text: str, needles: List[str]) -> List[str]:
+    """Return sentences that contain ANY of the given lowercase needles."""
+    if not text or not needles:
+        return []
+    needles_low = [n.lower() for n in needles if n]
+    if not needles_low:
+        return []
+    sentences = _SENTENCE_SPLIT_RE.split(text)
+    out: List[str] = []
+    for s in sentences:
+        s_low = s.lower()
+        if any(n in s_low for n in needles_low):
+            out.append(s)
+    return out
+
+
+def _inplace_relocation_suppressed_for(
+    new_path: str, issue_text: str
+) -> bool:
+    """True iff the issue clearly authorises creating new_path at a new location.
+
+    Sentence-scoped: we only suppress if the relocation trigger appears in a
+    sentence that ALSO references the new file's basename or stem. Falls back
+    to the whole-document check when the path is too generic (≤3 chars stem)
+    to be confident about sentence scoping.
+    """
+    if not issue_text:
+        return False
+    p = Path(new_path)
+    name_low = p.name.lower()
+    stem_low = p.stem.lower()
+    needles: List[str] = []
+    if name_low:
+        needles.append(name_low)
+    if stem_low and len(stem_low) >= 4 and stem_low != name_low:
+        needles.append(stem_low)
+    if not needles:
+        # No discriminating token → fall back to whole-document scan
+        return bool(_INPLACE_RELOC_TRIGGERS_RE.search(issue_text))
+    relevant = _sentences_mentioning(issue_text, needles)
+    if not relevant:
+        return False
+    return any(_INPLACE_RELOC_TRIGGERS_RE.search(s) for s in relevant)
+
+
+def _inplace_intent_advisories(
+    patch: str,
+    issue_text: str,
+    tracked_set: set,
+    cap: int = 4,
+) -> List[str]:
+    """Return human-readable advisories about new-file-when-existing collisions.
+
+    Each advisory is a compact one-liner the LLM can cite in its self-check.
+    """
+    if not patch:
+        return []
+    try:
+        new_paths = _patch_newly_created_paths(patch)
+        if not new_paths:
+            return []
+        changed = set(_patch_changed_files(patch))
+        out: List[str] = []
+        for new_path in new_paths[: cap + 2]:
+            if _inplace_relocation_suppressed_for(new_path, issue_text):
+                continue
+            new_p = Path(new_path)
+            new_basename = new_p.name
+            new_stem = new_p.stem
+            # Tier A — exact same basename, untouched, somewhere else
+            tier_a: List[str] = []
+            tier_b: List[str] = []
+            for existing in tracked_set:
+                if existing == new_path or existing in changed:
+                    continue
+                ep = Path(existing)
+                if ep.name == new_basename:
+                    tier_a.append(existing)
+                elif (
+                    ep.stem == new_stem
+                    and len(new_stem) >= 4
+                    and ep.suffix != new_p.suffix
+                ):
+                    tier_b.append(existing)
+            if tier_a:
+                others = ", ".join(repr(x) for x in tier_a[:2])
+                more = f" (+{len(tier_a) - 2} more)" if len(tier_a) > 2 else ""
+                out.append(
+                    f"new file {new_path!r} created, but same-name "
+                    f"existing file(s) untouched: {others}{more}"
+                )
+            elif tier_b:
+                others = ", ".join(repr(x) for x in tier_b[:2])
+                out.append(
+                    f"new file {new_path!r} created with same stem "
+                    f"({new_stem!r}) as untouched existing: {others}"
+                )
+            if len(out) >= cap:
+                break
+        return out
+    except Exception:
+        return []
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -3098,16 +3269,39 @@ def build_coverage_nudge_prompt(
     )
 
 
-def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+def build_self_check_prompt(
+    patch: str,
+    issue_text: str,
+    inplace_advisories: Optional[List[str]] = None,
+) -> str:
+    """Show the model its own draft and ask for a focused self-review.
+
+    When `inplace_advisories` is non-empty (Tier-1.5 — a new file was
+    created at a path that has a same-basename or same-stem peer that was
+    not edited), we surface those bullets at the top so the model is forced
+    to justify the new file vs. an in-place edit before locking the patch.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+    advisory_block = ""
+    if inplace_advisories:
+        bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
+        advisory_block = (
+            "\nIN-PLACE EDIT WARNINGS (verify before locking the patch):\n"
+            f"  {bullets}\n"
+            "For each warning above, choose ONE of:\n"
+            "  (a) Edit the existing file in-place and remove the new file, OR\n"
+            "  (b) Justify why a new file is REQUIRED (the issue mandates a new "
+            "location, the existing peer is unrelated, etc.).\n"
+            "Do not silently leave a duplicate-name pair.\n"
+        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
+        f"{advisory_block}"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
@@ -3818,6 +4012,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 (_issue_implies_relocation(issue) or _issue_implies_creation(issue))
                 and not _patch_creates_any_new_file(patch)
             )
+            # senoo v2.t1.5 — keep self-check turn for unresolved in-place
+            # collisions (new file with same-basename peer untouched).
+            try:
+                _tracked_for_gate = set(_tracked_files(repo))
+            except Exception:
+                _tracked_for_gate = set()
+            fresh_inplace_collision = bool(
+                _inplace_intent_advisories(patch, issue, _tracked_for_gate)
+            )
             if not (
                 fresh_syntax_errors
                 or fresh_missing
@@ -3825,6 +4028,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 or fresh_junk
                 or fresh_deletion_gap
                 or fresh_creation_gap
+                or fresh_inplace_collision
             ):
                 logs.append(
                     "CONFIDENT_EARLY_EXIT: structural gates clean "
@@ -3836,9 +4040,26 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
+            # senoo v2.t1.5 — compute in-place edit advisories before launching
+            # self-check so the model sees concrete same-name/same-stem peers
+            # it should justify or fold back into.
+            try:
+                _tracked_for_inplace = set(_tracked_files(repo))
+            except Exception:
+                _tracked_for_inplace = set()
+            _inplace_adv = _inplace_intent_advisories(
+                patch, issue, _tracked_for_inplace
+            )
+            if _inplace_adv:
+                logs.append(
+                    f"INPLACE_ADVISORY: {len(_inplace_adv)} warning(s) "
+                    f"injected into self-check"
+                )
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue),
+                build_self_check_prompt(
+                    patch, issue, inplace_advisories=_inplace_adv
+                ),
                 "SELF_CHECK_QUEUED",
             )
             return True
