@@ -1689,8 +1689,7 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     """Required paths from the issue that the patch doesn't touch yet.
 
     Used by the coverage-nudge refinement turn to tell the model concretely
-    which files the task says to edit but that haven't been touched. The
-    LLM judge frequently dings king for "missing/lacks/omits" — surfacing
+    which files the task says to edit but that haven't been touched. Surfacing
     the gap to the model directly is the cheapest way to close it.
     """
     required = _extract_issue_path_mentions(issue_text)
@@ -1797,10 +1796,9 @@ _BRACE_BALANCE_SUFFIXES = {
 def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     """Cheap brace/paren/bracket balance check for languages without a parser.
 
-    The LLM judge frequently dings patches for "extra closing braces" or
-    "duplicate brace" — issues a real compiler would catch. This naive
-    counter ignores braces inside string and comment context (best-effort)
-    and reports an imbalance with file + count delta.
+    Catches "extra closing braces" or obvious imbalance a real compiler would
+    flag. This naive counter ignores braces inside string and comment context
+    (best-effort) and reports an imbalance with file + count delta.
     """
     full = (repo / relative_path).resolve()
     try:
@@ -1892,7 +1890,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
-        # Other suffixes: trust the model; the LLM judge catches gross errors.
+        # Other suffixes: trust the model; downstream checks catch gross errors.
         if result:
             errors.append(result)
     return errors
@@ -1924,8 +1922,8 @@ def _shell_quote(value: str) -> str:
 # -----------------------------
 #
 # When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
-# repo, running that test before <final> catches a class of regressions the
-# scope/judge gates can't see. Cursor's baseline diffs almost always update
+# repo, running that test before <final> catches a class of regressions
+# file-path gates alone won't flag. Cursor's baseline diffs almost always update
 # tests in lockstep with source edits, and a fast pytest -k catches "I broke
 # the test I was supposed to fix."
 
@@ -2300,8 +2298,7 @@ def _patch_added_text(patch: str) -> str:
 
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
-    lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
+    lines. Surfacing the gap lets the model close it before <final>."""
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
@@ -2544,7 +2541,7 @@ def _symbol_grep_hits(
                 text=True,
                 timeout=4,
             )
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             continue
         if proc.returncode not in (0, 1):
             continue
@@ -2594,7 +2591,6 @@ First response format:
 - Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
-- Acceptance / tests: if you will add or change tests, list each distinct observable the issue names (e.g. subtotal, tax, total, side effects) and ensure the test plan asserts every one — not only a single summary field.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2612,8 +2608,6 @@ ISSUE CONTRACT
 ====================================================================
 
 Treat the issue as a contract. Extract every requirement before editing — main task, bullet points, acceptance criteria, error messages, edge cases, and backwards-compat constraints. Treat clauses with "and / also / ensure / should / must / when / unless / only / both / all / regression / edge case / preserve" as distinct requirements. Hidden tests usually target the secondary clauses.
-
-When the issue names URLs, REST paths, RPC names, or CLI flags, the patch must use the exact identifiers the codebase and tests already expect — do not invent parallel routes or renamed actions (wrong paths fail even when UI logic looks right).
 
 If the issue is ambiguous, do not ask for clarification — infer intent from nearby code, tests, and existing patterns, and pick the smallest plausible maintainer fix that preserves unrelated behavior.
 
@@ -2636,8 +2630,6 @@ Patch the owner of the behavior, not a downstream symptom. Parser rejects valid 
 Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
 
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
-
-When the issue involves algorithms, multi-step transforms, routing, funding or crypto math, ML-style ranking, or cross-module behaviour, trace the full pipeline implied by the issue: every file that must participate, every call site, and the canonical API or module entry point the repo already uses. Prefer extending that path over introducing a new architecture or a duplicate helper with a different name or URL.
 
 When the issue or codebase implies a specific approach — an existing constant, a library already present in imports or package.json/requirements.txt, a utility already used in adjacent code, a pattern already established in the file — use exactly that. Do NOT invent a custom equivalent. The reference patch almost always takes the most direct implementation the codebase already supports: use the named constant, not a hardcoded string; use the existing helper, not a reimplementation; use the library the project already imports, not a hand-rolled substitute.
 
@@ -2674,8 +2666,6 @@ TESTS AND VERIFICATION
 
 Add or update a test only when the issue requests it, a companion test already covers the area, the source fix breaks an existing nearby test, or a small regression test is the obvious lock-down. Place new tests next to the closest similar test, reuse fixtures, match naming, assert public behaviour. Never weaken, skip, delete, or loosen existing tests to pass.
 
-When the issue or acceptance criteria name several distinct outputs (e.g. subtotal, tax, total; or multiple fields / stages / error cases), tests must assert each named outcome where a test is appropriate — asserting only one aggregate value often loses to hidden tests that check the rest.
-
 After patching, run the most targeted meaningful verification available — one test case, one test file, or one module. Examples: `pytest tests/test_parser.py::test_x -q`, `pytest tests/test_x.py -x -q`, `go test ./pkg/foo`, `cargo test specific_test`, `npm test -- file -t "name"`, `mvn -q -Dtest=FooTest test`. Do not rely only on syntax checks when real targeted tests exist. Run broad suites only if the repo is small or no targeted tests exist.
 
 If verification fails: read the failure, decide whether your patch caused it or it is pre-existing/environmental, fix the root cause if yours, rerun the same targeted command. Do not broaden the patch randomly. Do not mask failures by weakening tests.
@@ -2686,7 +2676,7 @@ STYLE, COMMENTS, AND PUBLIC API
 
 Match adjacent code exactly: indentation, quotes, semicolons, trailing commas, brace placement, blank-line rhythm, naming, import grouping, error/assertion/test naming style. If nearby code style is imperfect, follow it anyway. Consistency beats personal preference.
 
-Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human and LLM judges. If a comment becomes false because of your fix, update it minimally; do not delete it.
+Preserve EVERY meaningful comment around changed code — section headers, TODO/FIXME, compatibility notes, public-API docs, test labels, region markers. Section-grouping comments are high-signal to human reviewers. If a comment becomes false because of your fix, update it minimally; do not delete it.
 
 Error messages are often tested exactly. When changing one, match capitalization, punctuation, quotes, and the existing error class/type.
 
@@ -2702,21 +2692,13 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **C/C++:** Edit both .h header AND .cpp implementation for each changed function. Include full signatures and all required #include changes.
 
-**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one = lower score.
-
-**React / JSX (.tsx/.jsx):** Keep default vs named imports consistent with how the exporting file and neighbours import the symbol — mismatched `import X` vs `{ X }` breaks the build. Every hook you call (`useEffect`, `useMemo`, `useCallback`, `useRef`, etc.) must be imported from `react` or the correct package. Match props to the component\'s existing interface; do not rename unrelated state/props (IDs, order keys, etc.) when the issue only needs a local UI or behaviour fix.
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing classes, components, and function parameters. Missing one breaks typechecked builds.
 
 **Go/Rust:** Update every struct field usage. Provide complete Rust lifetime annotations on modified functions.
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
-
-====================================================================
-COMPILE, IMPORT, AND RUNTIME SAFETY
-====================================================================
-
-Before `<final>`, sanity-check your diff for common scorer-killers: undefined variables, missing imports, wrong call arity, broken relative imports, malformed JSX (unclosed tags, bad fragments), and TypeScript/JavaScript shape mismatches on changed components. When the repo exposes a cheap check (for example `npx tsc --noEmit`, `npm run typecheck`, `npm test -- <one file>`), prefer the narrowest command that validates your touch over guessing. Do not add dependencies or change lockfiles unless the issue explicitly requires it.
 
 ====================================================================
 SCOPE DISCIPLINE
@@ -2768,17 +2750,15 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
-
-Wall clock is finite — after a handful of inspection commands without a patch, prioritize emitting the smallest plausible edit over further exploration. Timeouts and empty diffs score worse than a best-effort minimal fix.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. If the issue lists multiple acceptance outcomes, your verification should exercise each (or explain why one is N/A). Then finish with <final>...</final>.
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
 
 
@@ -2918,72 +2898,6 @@ def build_coverage_nudge_prompt(
     )
 
 
-def _self_check_type_cue(issue_text: str) -> str:
-    """Return a 1-line type-specific cue prepended to the self-check prompt.
-
-    Heuristic keyword scan over the issue text. Empty when no strong type signal lands
-    (the prompt then degrades to the generic boilerplate). Cheap and stateless.
-    """
-    text = issue_text.lower()
-    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
-        return (
-            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
-            "caller, import, and reference of the removed name is also updated; "
-            "leftover dangling references will fail the completeness check.\n\n"
-        )
-    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
-        return (
-            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
-            "Verify the patch explicitly handles the boundary case named in the issue "
-            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
-            "happy path.\n\n"
-        )
-    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
-        return (
-            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
-            "companion test was updated (or added) and that asserted values match "
-            "the new behaviour exactly.\n\n"
-        )
-    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
-        return (
-            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
-            "and caller now points at the NEW location and the OLD location no "
-            "longer holds the moved code.\n\n"
-        )
-    if any(tok in text for tok in (
-        "typescript", "tsc", "eslint", "webpack", "vite", "cannot find module",
-        "build error", "compilation", "compile error", "type error", "tsx",
-    )):
-        return (
-            "TYPE-AWARE CUE: this issue involves build/TS/module tooling. Verify "
-            "imports resolve, exported types match call sites, and props/interfaces "
-            "align after your edit — ship no edit that would obviously fail `tsc` "
-            "or the project\'s usual typecheck.\n\n"
-        )
-    if re.search(
-        r"\b(subtotal|line\s+items?|checkout|billing|invoice|sales\s+tax|vat\s+rate|"
-        r"normalize|funding|allocation|priority\s+queues?|shortest\s+paths?|"
-        r"route\s+planning|dijkstra)\b",
-        text,
-    ):
-        return (
-            "TYPE-AWARE CUE: multi-output business or numeric logic. Verify every "
-            "distinct value the issue names is computed correctly, and that any "
-            "tests assert each named output — not only one summary field.\n\n"
-        )
-    if any(tok in text for tok in (
-        "traceback", "exception", "raises", "raise ", "raised", " error ",
-        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
-        "runtimeerror", "stack trace", "throws", "thrown",
-    )):
-        return (
-            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
-            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
-            "and that the exception type/message matches what the issue expects.\n\n"
-        )
-    return ""
-
-
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -3004,24 +2918,19 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
-    type_cue = _self_check_type_cue(issue_text)
     return (
-        f"{type_cue}"
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        "Self-check pass. Re-read your diff against the issue and the repo's "
+        "conventions before you finalize.\n\n"
+        "CORRECTNESS:\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
+        "COMPLETENESS:\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - If the task names several observable outputs (subtotal/tax/total, multi-step results, etc.), "
-        "do tests assert each distinct output, not only one aggregate?\n"
-        "  - For React/JSX: default vs named imports match exports? Every hook used is imported?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE (minimal diff):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
@@ -3068,8 +2977,6 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "needed to satisfy it, then end with <final>summary</final>.\n\n"
         "Do NOT add scope the task did not ask for. Do NOT rewrite working "
         "code. Add only what is required to cover the listed criteria.\n\n"
-        "When a criterion implies several measurable quantities, tests (if you touch tests) "
-        "should assert each quantity the issue names, not a single catch-all assertion.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n"
     )
@@ -3598,8 +3505,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge — addressing them is higher-value
-        # than covering additional file paths.
+        # are easy to skip in multi-requirement issues — nudge them before path coverage.
         if criteria_nudges_used < MAX_CRITERIA_NUDGES:
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
