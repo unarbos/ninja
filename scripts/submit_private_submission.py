@@ -18,6 +18,7 @@ from typing import Any
 
 
 DEFAULT_API_URL = "https://ninja66.ai/api/submissions"
+USER_AGENT = "ninja66-private-submission/1.0"
 MAX_AGENT_BYTES = 5_000_000
 PRIVATE_SUBMISSION_RE = re.compile(r"^private-submission:[A-Za-z0-9_.-]{1,128}:[0-9a-f]{64}$")
 
@@ -152,7 +153,11 @@ def post_submission(
     request = urllib.request.Request(
         api_url,
         data=body,
-        headers={"Content-Type": content_type, "Accept": "application/json"},
+        headers={
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "User-Agent": USER_AGENT,
+        },
         method="POST",
     )
     try:
@@ -201,7 +206,10 @@ def encode_multipart_form(
 def decode_json_response(body: bytes) -> dict[str, Any]:
     if not body:
         return {}
-    payload = json.loads(body.decode("utf-8"))
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("submission API returned non-JSON response") from exc
     if not isinstance(payload, dict):
         raise ValueError("submission API returned non-object JSON")
     return payload
