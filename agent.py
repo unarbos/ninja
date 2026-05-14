@@ -1063,7 +1063,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     for relative_path in files[:MAX_PRELOADED_FILES]:
         # senoo v2.t2.11 — pass the issue text so large files get region-
         # selected (relevance-scored) instead of head-truncated.
-        snippet = _read_context_file(repo, relative_path, per_file_budget, issue)
+        snippet = _read_context_file(
+            repo, relative_path, per_file_budget, issue_text=issue
+        )
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1543,7 +1545,7 @@ def _read_context_file(
     repo: Path,
     relative_path: str,
     max_chars: int,
-    issue: str = "",
+    issue_text: str = "",
 ) -> str:
     path = (repo / relative_path).resolve()
     try:
@@ -1561,8 +1563,8 @@ def _read_context_file(
     # exceeds the per-file budget, head-of-file truncation throws away the
     # interesting parts. Replace with relevance-scored region selection so the
     # model sees the lines that actually match issue anchors.
-    if issue and len(text) > max_chars * _REGION_PRELOAD_RATIO:
-        regions = _select_relevant_regions(text, issue, relative_path, max_chars)
+    if issue_text and len(text) > max_chars * _REGION_PRELOAD_RATIO:
+        regions = _select_relevant_regions(text, issue_text, relative_path, max_chars)
         if regions:
             return regions
     return _truncate(text, max_chars)
@@ -1589,7 +1591,7 @@ _REGION_MAX_REGIONS = 5
 
 def _select_relevant_regions(
     text: str,
-    issue: str,
+    issue_text: str,
     relative_path: str,
     max_chars: int,
 ) -> str:
@@ -1616,8 +1618,8 @@ def _select_relevant_regions(
         if n_lines == 0:
             return ""
         # Build anchors. Extracted identifiers come from Tier-1.3.
-        identifiers_raw = _extract_issue_identifiers(issue) if issue else []
-        terms = _issue_terms(issue) if issue else []
+        identifiers_raw = _extract_issue_identifiers(issue_text) if issue_text else []
+        terms = _issue_terms(issue_text) if issue_text else []
         # Add path basename and stem as low-weight anchors so files indexed
         # explicitly in the issue still self-reinforce.
         try:
