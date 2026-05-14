@@ -120,6 +120,7 @@ MAX_SOFT_NUDGE_TURNS = 1
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_COMPILE_SANITY_TURNS = 1  # Dart Consumer base, broken imports, Next.js use-client, Vue ref-wrap, SQL DROP
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -1940,6 +1941,278 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+_DART_REF_USE_RE = re.compile(r"\bref\.(?:watch|read|listen)\b")
+_DART_CLASS_RE = re.compile(r"^\s*class\s+(\w+)\s+extends\s+(\w+(?:<[^>]+>)?)", re.MULTILINE)
+_DART_NON_CONSUMER_BASES = ("StatelessWidget", "StatefulWidget", "State")
+
+
+def _check_dart_consumer_bases(repo: Path, relative_path: str) -> List[str]:
+    """Flag .dart classes that use `ref.watch/read/listen` while extending
+    StatelessWidget/StatefulWidget/State<X> instead of ConsumerWidget /
+    ConsumerStatefulWidget / ConsumerState. The most common Riverpod silent
+    compile-break observed across duels 004696-004700.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    findings: List[str] = []
+    matches = list(_DART_CLASS_RE.finditer(source))
+    for idx, m in enumerate(matches):
+        class_name = m.group(1)
+        base_full = m.group(2)
+        base_root = base_full.split("<", 1)[0]
+        if base_root not in _DART_NON_CONSUMER_BASES:
+            continue
+        body_start = m.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(source)
+        if not _DART_REF_USE_RE.search(source[body_start:body_end]):
+            continue
+        line_no = source.count("\n", 0, m.start()) + 1
+        suggested = {
+            "StatelessWidget": "ConsumerWidget",
+            "StatefulWidget": "ConsumerStatefulWidget",
+            "State": "ConsumerState",
+        }[base_root]
+        findings.append(
+            f"{relative_path}:{line_no}: class {class_name} extends {base_root} "
+            f"uses ref.watch/read/listen — change base to {suggested}"
+        )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+_TS_IMPORT_RE = re.compile(
+    r"""^\s*import\s+(?:[^'";\n]*?\s+from\s+)?["']([^"']+)["']""",
+    re.MULTILINE,
+)
+_TS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts")
+
+
+def _check_relative_import_paths(
+    repo: Path, relative_path: str, created_files: set
+) -> List[str]:
+    """Flag relative imports whose target file is not in the repo and not
+    created by this patch. Catches `import {X} from "./components/foo"` when
+    foo doesn't exist — guaranteed build failure.
+    """
+    full = (repo / relative_path).resolve()
+    repo_resolved = repo.resolve()
+    try:
+        full.relative_to(repo_resolved)
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    findings: List[str] = []
+    file_dir = full.parent
+    for m in _TS_IMPORT_RE.finditer(source):
+        spec = m.group(1).strip()
+        if not (spec.startswith("./") or spec.startswith("../")):
+            continue
+        target = (file_dir / spec).resolve()
+        candidates: List[Path] = []
+        if Path(spec).suffix:
+            candidates.append(target)
+        else:
+            for ext in _TS_RESOLVE_EXTS:
+                candidates.append(Path(str(target) + ext))
+            for ext in _TS_RESOLVE_EXTS:
+                candidates.append(target / f"index{ext}")
+        if any(c.exists() for c in candidates):
+            continue
+        created_hit = False
+        for c in candidates:
+            try:
+                rel = str(c.relative_to(repo_resolved))
+            except ValueError:
+                continue
+            if rel in created_files:
+                created_hit = True
+                break
+        if created_hit:
+            continue
+        line_no = source.count("\n", 0, m.start()) + 1
+        findings.append(
+            f"{relative_path}:{line_no}: import '{spec}' — target file not found "
+            "in repo and not created by this patch"
+        )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+_NEXT_CLIENT_PATH_RE = re.compile(r"(?:^|/)(?:app|src/app|components|src/components)/")
+_NEXT_HOOK_RE = re.compile(
+    r"\b(?:useState|useEffect|useRef|useMemo|useCallback|useReducer|useContext|"
+    r"useLayoutEffect|useImperativeHandle|useTransition|useDeferredValue|"
+    r"useSyncExternalStore|useFormStatus|useFormState|useActionState|useOptimistic)\s*\("
+)
+_NEXT_EVENT_HANDLER_RE = re.compile(
+    r"\b(?:onClick|onChange|onSubmit|onBlur|onFocus|onInput|onKeyDown|onKeyUp|"
+    r"onMouseEnter|onMouseLeave|onMouseDown|onMouseUp|onTouchStart|onTouchEnd|"
+    r"onDrag|onDrop|onScroll)\s*="
+)
+_NEXT_USE_CLIENT_RE = re.compile(r'^\s*[\'"]use client[\'"]\s*;?\s*$', re.MULTILINE)
+
+
+def _check_nextjs_use_client(repo: Path, relative_path: str) -> List[str]:
+    """Flag .tsx/.jsx files under app-router-style trees that use React hooks
+    or inline event handlers but are missing the `"use client"` directive.
+
+    Pattern from duel 004723 (round 065002): challenger removed `'use client'`
+    while WaitlistForm still used `useState` + `onSubmit`, breaking Next.js
+    app-router build.
+    """
+    if not _NEXT_CLIENT_PATH_RE.search(f"/{relative_path}"):
+        return []
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in {".tsx", ".jsx", ".ts", ".js"}:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    if _NEXT_USE_CLIENT_RE.search(source):
+        return []
+    hook_hit = _NEXT_HOOK_RE.search(source)
+    handler_hit = _NEXT_EVENT_HANDLER_RE.search(source)
+    if not hook_hit and not handler_hit:
+        return []
+    triggers: List[str] = []
+    if hook_hit:
+        triggers.append(hook_hit.group(0).split("(", 1)[0])
+    if handler_hit:
+        triggers.append(handler_hit.group(0).split("=", 1)[0])
+    return [
+        f"{relative_path}: missing `\"use client\"` directive but file uses "
+        f"{', '.join(triggers[:2])} — add `\"use client\"` as the first line "
+        "(Next.js app-router requirement)"
+    ]
+
+
+_VUE_REF_WRAP_RE = re.compile(
+    r"\bref\(\s*(?:state|store|props|stateStore|\w+Store)\.\w+(?:\.\w+)*\s*\)"
+)
+
+
+def _check_vue_ref_snapshot(repo: Path, relative_path: str) -> List[str]:
+    """Flag `ref(state.xxx)` / `ref(store.xxx)` patterns in Vue/Pinia code that
+    wrap already-reactive state into a non-reactive snapshot.
+
+    Pattern from duel 004723 (round 065040): challenger returned
+    `{ activeReservation: ref(state.activeReservation), ... }` from a
+    composable, breaking reactive updates downstream.
+    """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix not in {".ts", ".js", ".vue"}:
+        return []
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    findings: List[str] = []
+    for m in _VUE_REF_WRAP_RE.finditer(source):
+        line_no = source.count("\n", 0, m.start()) + 1
+        findings.append(
+            f"{relative_path}:{line_no}: `{m.group(0)}` wraps reactive state in "
+            "a snapshot ref — use `storeToRefs(store)` or `computed(() => ...)` instead"
+        )
+        if len(findings) >= 3:
+            break
+    return findings
+
+
+_SQL_DROP_RE = re.compile(
+    r"^\+\s*(?:DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE(?:\s+TABLE)?)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _check_sql_destructive(patch: str, issue_text: str) -> List[str]:
+    """Flag added `DROP TABLE` / `TRUNCATE` / `DROP DATABASE` lines in any SQL
+    file inside the patch when the issue did not explicitly ask for a drop.
+
+    Pattern from duel 004723 (round 065038): challenger added 10+ `DROP TABLE
+    IF EXISTS` lines on a task that only asked to add new columns/indexes/data.
+    """
+    issue_lower = issue_text.lower()
+    if any(tok in issue_lower for tok in ("drop table", "drop the table", "truncate", "wipe ", "reset the schema")):
+        return []
+    findings: List[str] = []
+    sections = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    for section in sections:
+        first_line = section.splitlines()[0] if section else ""
+        m = re.match(r"diff --git a/.+? b/(.+)$", first_line)
+        if not m:
+            continue
+        path = m.group(1)
+        if not path.lower().endswith((".sql", ".pgsql", ".mysql")):
+            continue
+        for hit in _SQL_DROP_RE.finditer(section):
+            stmt = hit.group(0).lstrip("+").strip()
+            findings.append(
+                f"{path}: destructive SQL statement added (`{stmt[:60]}`) — "
+                "remove it unless the task explicitly asked to drop/truncate"
+            )
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+_COMPILE_SANITY_JS_LIKE = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+
+
+def _check_compile_sanity(repo: Path, patch: str, issue_text: str = "") -> List[str]:
+    """Cheap deterministic compile-correctness + destructive-churn checks
+    beyond what _check_syntax can catch. Each finding fires the dedicated
+    fixer prompt for one refinement turn.
+    """
+    errors: List[str] = []
+    created = set(_patch_newly_created_files(patch))
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".dart":
+            errors.extend(_check_dart_consumer_bases(repo, relative_path))
+        elif suffix in _COMPILE_SANITY_JS_LIKE:
+            errors.extend(_check_relative_import_paths(repo, relative_path, created))
+            errors.extend(_check_nextjs_use_client(repo, relative_path))
+            errors.extend(_check_vue_ref_snapshot(repo, relative_path))
+        elif suffix == ".vue":
+            errors.extend(_check_vue_ref_snapshot(repo, relative_path))
+        if len(errors) >= 6:
+            break
+    if len(errors) < 6:
+        errors.extend(_check_sql_destructive(patch, issue_text))
+    return errors[:6]
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2743,7 +3016,23 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
+**Dart/Riverpod compile gate:** Any class that calls `ref.watch`, `ref.read`, or `ref.listen` MUST extend `ConsumerWidget` (with `build(BuildContext, WidgetRef ref)`) or `ConsumerStatefulWidget` (with `ConsumerState<...>`). Editing `StatelessWidget`/`StatefulWidget` to use `ref` without changing the base class WILL NOT COMPILE — a common silent loss mode. Before `<final>`, scan every `+` line containing `ref.` and confirm its enclosing class extends a Consumer base.
+
+**Next.js app-router compile gate:** Any `.tsx`/`.jsx` file under `app/`, `src/app/`, or `components/` that uses ANY of `useState`, `useEffect`, `useRef`, `useMemo`, `useCallback`, `useReducer`, `useContext`, or an inline `onClick=`/`onChange=`/`onSubmit=`/`onBlur=`/`onFocus=` handler MUST have a `"use client"` directive on the first line. Removing or omitting `"use client"` while the file still uses hooks/handlers is a guaranteed build failure ("You're importing a component that needs `useState`..."). If you must rewrite a client component, KEEP the `"use client"` line on top.
+
+**Vue/Pinia reactivity gate:** When exposing reactive store state from a composable or `setup()`, NEVER wrap it as `ref(state.foo)` / `ref(store.foo)` — that captures a snapshot value, the resulting `Ref` is NOT reactive to store mutations, and consumers will see stale data. Use `storeToRefs(store)` for Pinia stores, `computed(() => state.foo)` for derived getters, or return the reactive state object directly. The most common bad pattern: returning `{ activeReservation: ref(state.activeReservation), temperature: ref(state.temperature) }` from a composable — this breaks live updates entirely.
+
+**JS/TS state-lifting gate:** When you move a `useState` declaration up to a parent and pass setters down, EVERY old reference (`chainId`, `setChainId`, etc.) in the child must be either replaced with the prop / context value or removed. Leaving `value={chainId}` in a child after the state was lifted gives "chainId is not defined" at compile time.
+
+**Import-path reality check:** Every new `import` you add MUST point to a path that either already exists in the repo OR is being created in this same patch. `import { X } from "./components/foo"` where `./components/foo` does not exist and is not added is a guaranteed compile failure. Avoid `require("./x")` in TypeScript/ESM source — use a top-level `import` statement.
+
+**SQL/migration discipline:** Inside a `.sql` migration / dump, do NOT emit `DROP TABLE` / `DROP DATABASE` / `TRUNCATE` lines unless the task explicitly asks to drop the table. Even with `IF EXISTS`, destructive drops in a patch that was only supposed to add columns/indexes/seed data are flagged as "destructive churn" and tank the LLM score. Restrict additions to `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN`, indexes, and inserts.
+
+**Action coverage (success + error paths):** When the task says "on logout / on save / on submit, also do X" (clear cookies, refresh list, navigate back, fire toast), wire that action on BOTH the success path AND the error path that still completes the user-visible operation. Adding the cleanup only inside the catch block is a common loss mode — the success path is the one users actually take.
+
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
+
+**Helper-without-integration anti-pattern:** If the task names multiple consumers (routes, pages, components, dashboards) of a new shared helper/utility, adding ONLY the helper file scores near zero. After creating the helper, import and call it from every named consumer in the SAME patch — otherwise the LLM judge treats the integration as missing.
 
 ====================================================================
 SCOPE DISCIPLINE
@@ -2761,6 +3050,12 @@ Do NOT change:
 - File permissions or mode bits (chmod is forbidden)
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
+
+**Narrow-tweak anti-rewrite rule:** When the task asks for a localized change inside a file (e.g., "update the formatting of the total line", "tweak the styling of the header", "fix the validation in createUser"), edit ONLY the named region. Do NOT rewrite adjacent functions, restyle unrelated sections, or refactor the rest of the file even if it would look cleaner — the LLM judge penalises "unrelated rewrites" as heavily as missed requirements, and large rewrites also raise the chance of introducing compile errors elsewhere in the file.
+
+**Explicit cleanup recognition:** Phrases like "remove the old X", "delete App.css", "drop the legacy Y", "no longer needed" require an actual deletion in the patch (`rm path`, `git rm`, or `--- /dev/null` rename). Adding the new code without removing the old leaves the cleanup undone.
+
+**Secondary-requirement coverage:** Most tasks list a primary headline change PLUS smaller sub-requirements ("also add a spinner", "also show a success banner", "also clear cookies on logout"). Missing one secondary item is the cheapest way to lose a close round. Re-read the task before `<final>`, list every "also / and / additionally / also include / on success" clause, and confirm each one shows up in your diff.
 
 ====================================================================
 SAFETY
@@ -2795,9 +3090,20 @@ Repository summary:
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions. Pay special attention to "also / and / additionally / on success / on submit" clauses — missing one secondary item is the cheapest way to lose a close round.
 
-Scope discipline: only modify files the task explicitly names plus the minimum cross-file edits needed to keep them compiling. Do not rewrite working code in adjacent files even if a refactor would improve it; the judge penalises unrelated rewrites as heavily as missed requirements.
+Scope discipline: only modify files the task explicitly names plus the minimum cross-file edits needed to keep them compiling. Do not rewrite working code in adjacent files even if a refactor would improve it; the judge penalises unrelated rewrites as heavily as missed requirements. When the task asks for a NARROW change inside a file, edit ONLY that region — do not rewrite adjacent functions.
+
+Integration completeness: if the task names multiple consumers of a shared utility (routes, pages, components), wire the utility into EACH of them in the same patch. Adding just the helper file without integration scores near zero on the LLM judge.
+
+Compile-sanity self-check before <final>:
+- Every added `import` path resolves to a file that exists in the repo or is created in this patch.
+- Dart: any class using `ref.watch/read/listen` extends `ConsumerWidget`/`ConsumerStatefulWidget`.
+- Next.js (app-router .tsx/.jsx under app/, src/app/, or components/): any file using `useState`/`useEffect`/`useRef`/`useMemo`/`useCallback`/`useReducer`/`useContext` or inline event handlers starts with `"use client"`.
+- Vue/Pinia composables: reactive store state is exposed via `storeToRefs(store)` or `computed(() => ...)`, NOT wrapped in plain `ref(state.x)` (snapshot, non-reactive).
+- After lifting JS/TS state to a parent, no child still references the old local names.
+- SQL migrations only contain DROP/TRUNCATE if the task explicitly requested them.
+Silent compile breaks and destructive churn are the two most common loss modes.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2885,7 +3191,13 @@ def build_polish_prompt(junk_summary: str) -> str:
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
-        "  - Cosmetic refactors not asked for by the task\n\n"
+        "  - Cosmetic refactors not asked for by the task\n"
+        "  - Wholesale rewrites of files / functions the task did not name "
+        "(judges flag these as \"unrelated rewrites\" and they tank the LLM score)\n"
+        "  - Destructive SQL such as `DROP TABLE`/`TRUNCATE` in migrations or dumps "
+        "when the task did not request a drop\n"
+        "  - Deletions of files (typography.md, README sections, etc.) the task did not "
+        "ask to remove\n\n"
         "Keep substantive code changes. After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
@@ -3014,14 +3326,34 @@ def build_self_check_prompt(
     return (
         f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
+        "with the reference — review your patch against all four:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "COMPILE SANITY (highest-leverage gate — silent failures here halve the LLM score):\n"
+        "  - Every added `import` path points to a file that EXISTS in the repo or is "
+        "being CREATED in this patch. No `./components/foo` imports for paths that don't exist.\n"
+        "  - Dart files: any class using `ref.watch`/`ref.read`/`ref.listen` extends "
+        "`ConsumerWidget` or `ConsumerStatefulWidget` (NOT `StatelessWidget`/`StatefulWidget`).\n"
+        "  - Next.js (.tsx/.jsx under app/, src/app/, components/): files using "
+        "`useState`/`useEffect`/`useRef`/`useMemo`/`useCallback`/`useReducer`/`useContext` or "
+        "inline event handlers start with `\"use client\"` on the first line.\n"
+        "  - Vue/Pinia: composables expose store state via `storeToRefs(store)` or "
+        "`computed(() => state.x)`, NEVER `ref(state.x)` (that captures a snapshot).\n"
+        "  - State lifted to parent: child has no remaining references to the old local names.\n"
+        "  - SQL migrations: no `DROP TABLE` / `TRUNCATE` unless the task explicitly asked for it.\n"
+        "  - Brackets/braces/parens balance in every added block; no truncated functions.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
+        "  - Every `also`/`and`/`additionally`/`on success`/`on submit` clause has a "
+        "matching change in the diff — secondary items are the most common loss vector.\n"
+        "  - If a new helper/util file was added, every consumer named or implied by the "
+        "task imports and uses it (helper-without-integration scores near zero).\n"
+        "  - Cleanup actions (clear cookies, refresh list, navigate back, fire toast) are "
+        "wired on the SUCCESS path, not only the error/catch path.\n"
+        "  - If the task says `remove`/`delete`/`drop`, the patch contains a real deletion.\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
@@ -3038,6 +3370,34 @@ def build_self_check_prompt(
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+    )
+
+
+def build_compile_sanity_fix_prompt(errors: List[str]) -> str:
+    """Surface deterministic compile-break / destructive-churn findings from
+    _check_compile_sanity. Each class of finding has a mechanical fix, so the
+    prompt nails it down per finding and forbids unrelated edits."""
+    bullets = "\n  ".join(errors[:6]) or "(none)"
+    return (
+        f"Compile-sanity check found likely build breakers / destructive churn introduced by your patch:\n"
+        f"  {bullets}\n\n"
+        "These are NOT style nits — each one will fail at build time or be flagged by "
+        "the LLM judge as broken. Fix each one now with the SMALLEST possible edit:\n"
+        "  - Dart `class X extends StatelessWidget` using `ref.*` -> change base to "
+        "`ConsumerWidget` (and `build(BuildContext, WidgetRef ref)`).\n"
+        "  - Dart `class X extends StatefulWidget` paired with `State<X>` using `ref.*` -> "
+        "change to `ConsumerStatefulWidget` and `ConsumerState<X>`.\n"
+        "  - Missing relative-import target -> create the file in this patch, fix the path, "
+        "or remove the unused import.\n"
+        "  - Next.js file missing `\"use client\"` while using hooks/handlers -> add "
+        "`\"use client\"` as the FIRST line of the file (before any imports/comments).\n"
+        "  - Vue `ref(state.x)` / `ref(store.x)` -> replace with `storeToRefs(store)` for "
+        "Pinia state or `computed(() => state.x)` for a single getter.\n"
+        "  - Destructive SQL (`DROP TABLE`, `TRUNCATE`) not requested by the task -> "
+        "delete those lines; keep only `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD` / "
+        "indexes / inserts.\n\n"
+        "Do NOT add unrelated edits. Do NOT rewrite working code. Issue the corrective "
+        "<command> blocks now, then end with <final>summary</final>."
     )
 
 
@@ -3476,6 +3836,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    compile_sanity_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3523,7 +3884,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, compile_sanity_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3574,6 +3935,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Compile-sanity gate: deterministic checks beyond what _check_syntax
+        # can catch — Dart Consumer-base mismatch, broken relative imports,
+        # missing Next.js `"use client"`, Vue ref-wrap snapshots, destructive
+        # SQL drops. All repeat loss patterns observed across duels
+        # 004696-004723.
+        if compile_sanity_turns_used < MAX_COMPILE_SANITY_TURNS:
+            compile_errors = _check_compile_sanity(repo, patch, issue)
+            if compile_errors:
+                compile_sanity_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_compile_sanity_fix_prompt(compile_errors),
+                    "COMPILE_SANITY_QUEUED:\n  " + "\n  ".join(compile_errors),
                 )
                 return True
 
