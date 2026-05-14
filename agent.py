@@ -106,7 +106,7 @@ MAX_STEP_RETRIES = 2
 # Inner solve wall: keep below the multishot outer budget so a second
 # attempt has comparable time. Tau docker_solver enforces a hard wall of
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
-WALL_CLOCK_BUDGET_SECONDS = 248.0
+WALL_CLOCK_BUDGET_SECONDS = 270.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 _MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
@@ -632,6 +632,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -719,6 +720,20 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual old/new-mode metadata lines that survived _strip_mode_only_file_diffs."""
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1004,7 +1019,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    n_files = min(len(files), MAX_PRELOADED_FILES)
+    weights = [2.0 if i < 3 else 1.0 if i < 8 else 0.6 for i in range(n_files)]
+    total_weight = sum(weights) or 1.0
+    file_budgets = [max(1500, int(MAX_PRELOADED_CONTEXT_CHARS * w / total_weight)) for w in weights]
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1022,7 +1040,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
+    for file_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        per_file_budget = file_budgets[file_idx] if file_idx < len(file_budgets) else 1500
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
@@ -2382,6 +2401,24 @@ def _patch_creates_any_new_file(patch: str) -> bool:
     return False
 
 
+_CASCADE_SIGNALS = frozenset({
+    "route", "view", "model", "migration", "serializer", "controller",
+    "component", "service", "module", "middleware", "handler", "endpoint",
+    "schema", "interface", "type", "provider", "hook", "store",
+})
+
+
+def _issue_implies_cascade(issue_text: str) -> bool:
+    """True if the issue text implies multiple related files need changing (cascade pattern)."""
+    text_lower = issue_text.lower()
+    return sum(1 for sig in _CASCADE_SIGNALS if sig in text_lower) >= 3
+
+
+def _patch_touches_multiple_files(patch: str) -> bool:
+    """True if the patch modifies at least two distinct files."""
+    return sum(1 for ln in patch.splitlines() if ln.startswith("diff --git")) >= 2
+
+
 # -----------------------------
 # Issue-symbol grep ranking
 # -----------------------------
@@ -3002,6 +3039,16 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         reasons.append("produced an empty patch")
     elif n_lines < 3:
         reasons.append(f"produced only {n_lines} substantive line(s)")
+    # DGM pattern: inject which files attempt 1 already edited so attempt 2 explores different paths
+    patch1 = result1.get("patch", "") or result1.get("diff", "") or ""
+    if patch1:
+        changed = []
+        for line in patch1.splitlines():
+            if line.startswith("+++ b/"):
+                changed.append(line[6:].strip())
+        if changed:
+            changed_str = ", ".join(changed[:5])
+            reasons.append(f"attempt 1 edited: {changed_str}")
     reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
 
     return (
@@ -3010,6 +3057,72 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
+    )
+
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    """Heuristic file-count expectation for an integration-style task.
+
+    Counts bullet points and literal path mentions to estimate how many files
+    the issue expects to be touched. Used to detect under-delivery from attempt 1.
+    """
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    actual_files: int,
+    estimated_files: int,
+) -> str:
+    """Under-delivery retry bootstrap.
+
+    Tells attempt 2 that attempt 1 looked thin on file coverage and asks it
+    to ADD the missing files in the codebase's existing style instead of
+    rewriting what attempt 1 already produced.
+    DGM pattern: injects which files attempt 1 already edited so attempt 2
+    targets genuinely different (missing) files.
+    """
+    steps = result1.get("steps", 0)
+    # DGM history: extract files attempt 1 already edited
+    patch1 = result1.get("patch", "") or result1.get("diff", "") or ""
+    already_edited: List[str] = []
+    if patch1:
+        for line in patch1.splitlines():
+            if line.startswith("+++ b/"):
+                already_edited.append(line[6:].strip())
+    history_str = ""
+    if already_edited:
+        history_str = (
+            f"\n\nAttempt 1 already edited: {', '.join(already_edited[:5])}. "
+            f"Do NOT re-edit these files — focus only on the missing ones."
+        )
+    return (
+        f"⚠ RETRY: prior attempt wrote {n_lines} line(s) across {actual_files} "
+        f"file(s) in {steps} step(s); the task names ~{estimated_files} "
+        f"files via bullets/paths.{history_str}\n\n"
+        f"For attempt 2, ADD ONLY what is required to cover the missing "
+        f"files. Imitate the codebase's existing style — use the same "
+        f"imports, helpers, and naming patterns as adjacent files. Do NOT "
+        f"refactor the prior attempt's working code; do NOT introduce new "
+        f"abstractions; do NOT add commentary, logging, or defensive "
+        f"validation beyond what the task requires.\n\n"
+        f"Specifically:\n"
+        f"  - When the task names a path, that exact path must appear in the patch.\n"
+        f"  - When the task lists N bullets, each bullet should be addressed "
+        f"by at least one targeted change.\n"
+        f"  - Match the prior attempt's file count + the missing files; "
+        f"do not collapse multiple files into one."
     )
 
 
@@ -3128,6 +3241,18 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
 
+# Under-delivery retry: when attempt 1 produces enough lines but fewer files
+# than the issue expects, fire a focused retry targeting the missing files.
+# Over-fire guard: skip when attempt 1 already covers every literally-named path.
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+_UNDERDELIVER_MIN_ESTIMATE = 3
+_UNDERDELIVER_GAP_TOLERANCE = 1
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+
 
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
@@ -3239,12 +3364,31 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        # Under-delivery detection: attempt 1 may have produced enough lines
+        # but covered fewer files than the issue suggests.
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files_1 = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _named_paths = set(_extract_issue_path_mentions(_issue_text))
+        _patch_paths = set(_patch_changed_files(_patch1))
+        _covers_all_named = (
+            bool(_named_paths)
+            and all(any(p in pp or pp in p for pp in _patch_paths) for p in _named_paths)
+        )
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files_1 + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+            and not _covers_all_named
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -3266,13 +3410,34 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        # Clamp attempt-2 budget. Under-delivery retry uses a focused bootstrap.
+        if _underdelivered:
+            _attempt2_budget = max(
+                _ATTEMPT2_BUDGET_MIN,
+                min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+            )
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files_1, _estimated_files,
+            )
+        else:
+            _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _files2 = len(set(
+            line[6:].strip() for line in _patch2.splitlines()
+            if line.startswith("+++ b/")
+        ))
 
-        if _n2 >= _n1:
+        # M2 fix: for under-delivery path use file-count comparison (not line-count).
+        # A correct 8-line fix adding the missing 3rd file beats a 20-line attempt
+        # that still only covers 2 files.
+        _attempt2_wins = (
+            (_underdelivered and _files2 > _actual_files_1 and _n2 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD)
+            or (not _underdelivered and _n2 >= _n1)
+        )
+        if _attempt2_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3491,17 +3656,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            cascade_gap = (
+                _issue_implies_cascade(issue)
+                and not _patch_touches_multiple_files(patch)
+                and not missing
+                and not relocation_gap
+            )
+            if missing or relocation_gap or cascade_gap:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
+                if missing or relocation_gap:  # cascade_gap is heuristic; don't force a mandatory edit
+                    must_edit_after_gap = True
+                    must_edit_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
+                if cascade_gap:
+                    logs.append("FIRE: cascade_gap_detected")
                 marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
                     + ("\n  [+relocation-gap]" if relocation_gap else "")
+                    + ("\n  [+cascade-gap]" if cascade_gap else "")
                 )
                 queue_refinement_turn(
                     assistant_text,
@@ -3555,8 +3730,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
