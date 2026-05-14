@@ -1055,8 +1055,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        # senoo v2.t2.11 — pass the issue text so large files get region-
-        # selected (relevance-scored) instead of head-truncated.
+        # Pass the issue text so large files get region-selected
+        # (relevance-scored) instead of head-truncated.
         snippet = _read_context_file(
             repo, relative_path, per_file_budget, issue_text=issue
         )
@@ -1128,9 +1128,9 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
-    # senoo v2.t1.3 — score boost for paths matching identifier-shaped tokens
-    # extracted from the issue (CamelCase / hookPattern / snake_case /
-    # kebab-case / dotted). Tiered weights: parent-dir > basename > ancestor.
+    # Score boost for paths matching identifier-shaped tokens extracted from
+    # the issue (CamelCase / hookPattern / snake_case / kebab-case / dotted).
+    # Tiered weights: parent-dir > basename > ancestor.
     id_scores = _score_paths_by_issue_identifiers(issue, list(tracked))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
@@ -1154,9 +1154,9 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
-        # senoo v2.t1.3 — boost files whose path/name matches identifier-shaped
-        # tokens from the issue. Capped at +120 so it can't overwhelm explicit
-        # path mentions (which still score +100) but is large enough to lift a
+        # Boost files whose path/name matches identifier-shaped tokens from
+        # the issue. Capped at +120 so it can't overwhelm explicit path
+        # mentions (which still score +100) but is large enough to lift a
         # path-matched candidate above generic term-matched noise.
         if relative_path in id_scores:
             score += min(120, id_scores[relative_path])
@@ -1249,9 +1249,9 @@ def _looks_like_integration_surface(relative_path: str) -> bool:
     return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
 
 
-# senoo v2.t1.2 — same-directory companion files. Many duel losses stem from
-# the model finding the right "main" file but missing a sibling that needs to
-# be co-edited (e.g. fixing a layout but skipping the page that imports it,
+# Same-directory companion files. Many duel losses stem from the model
+# finding the right "main" file but missing a sibling that needs to be
+# co-edited (e.g. fixing a layout but skipping the page that imports it,
 # editing a Python module without updating its `__init__.py` exports, or
 # changing a Rust struct without touching its `mod.rs`). King PR #1450 added a
 # similar mechanism but limited it to the Next.js / web-stack basename catalog;
@@ -1553,10 +1553,10 @@ def _read_context_file(
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
-    # senoo v2.t2.11 — selective region preload. When the file substantially
-    # exceeds the per-file budget, head-of-file truncation throws away the
-    # interesting parts. Replace with relevance-scored region selection so the
-    # model sees the lines that actually match issue anchors.
+    # Selective region preload. When the file substantially exceeds the
+    # per-file budget, head-of-file truncation throws away the interesting
+    # parts. Replace with relevance-scored region selection so the model
+    # sees the lines that actually match issue anchors.
     if issue_text and len(text) > max_chars * _REGION_PRELOAD_RATIO:
         regions = _select_relevant_regions(text, issue_text, relative_path, max_chars)
         if regions:
@@ -1593,7 +1593,7 @@ def _select_relevant_regions(
 
     Strategy:
       1. Build the anchor set: issue identifiers (high-weight) + issue terms
-         (low-weight). Identifiers are reused from Tier-1.3's extractor.
+         (low-weight). Identifiers are reused from the path-boost extractor.
       2. Score every line by sum of anchor weights it contains.
       3. Find lines exceeding _REGION_MIN_SCORE and grow each into a region of
          ±context lines.
@@ -1611,7 +1611,8 @@ def _select_relevant_regions(
         n_lines = len(lines)
         if n_lines == 0:
             return ""
-        # Build anchors. Extracted identifiers come from Tier-1.3.
+        # Build anchors. Extracted identifiers come from the path-boost
+        # extractor (`_extract_issue_identifiers`).
         identifiers_raw = _extract_issue_identifiers(issue_text) if issue_text else []
         terms = _issue_terms(issue_text) if issue_text else []
         # Add path basename and stem as low-weight anchors so files indexed
@@ -1859,7 +1860,7 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
-# senoo v2.t1.5 — In-place edit advisory.
+# In-place edit advisory.
 #
 # Surface a high-leverage failure mode: the model creates a new file at
 # `src/utils/payment.ts` while the existing `src/lib/payment.ts` (same
@@ -2030,7 +2031,7 @@ def _inplace_intent_advisories(
         return []
 
 
-# senoo v2.t1.6 — Caller audit on removed definitions.
+# Caller audit on removed definitions.
 #
 # When a patch removes a public function/class/method/struct, the LLM judge
 # almost always penalises the patch unless EVERY caller was updated. King
@@ -2456,7 +2457,7 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# senoo v2.t2.10 — Compile-clean preflight (import resolution).
+# Compile-clean preflight (import resolution).
 #
 # After the model produces a patch, scan the touched files for newly added
 # imports and flag any that don't resolve to a tracked module / directory /
@@ -3273,7 +3274,7 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
-# senoo v2.t1.3 — Issue-identifier path boost.
+# Issue-identifier path boost.
 #
 # Patches frequently miss the right file because `_rank_context_files` matches
 # only literal-path / term substrings. When the issue says "fix `useDebounced
@@ -3854,11 +3855,11 @@ def build_self_check_prompt(
 ) -> str:
     """Show the model its own draft and ask for a focused self-review.
 
-    When `inplace_advisories` is non-empty (Tier-1.5), surface the
-    same-basename/same-stem collision so the model justifies or folds back.
-    When `caller_audit_advisories` is non-empty (Tier-1.6), surface the
-    list of removed/renamed top-level symbols so the model verifies every
-    caller has been updated.
+    When `inplace_advisories` is non-empty, surface the same-basename /
+    same-stem collision so the model justifies or folds back. When
+    `caller_audit_advisories` is non-empty, surface the list of
+    removed/renamed top-level symbols so the model verifies every caller
+    has been updated.
     """
     truncated = (
         patch
@@ -4402,7 +4403,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
-    mid_loop_rescue_turns_used = 0  # senoo v2: dual-pass mid-loop rescue when patch is empty mid-flight
+    mid_loop_rescue_turns_used = 0  # dual-pass mid-loop rescue when patch is empty mid-flight
     mid_loop_rescue_pass_done = {"early": False, "late": False}
     solve_started_at = time.monotonic()
 
@@ -4591,7 +4592,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # P3-β: confident early-exit. The self-check below fires UNCONDITIONALLY
+        # Confident early-exit. The self-check below fires UNCONDITIONALLY
         # while budget remains, even when the patch is already structurally
         # clean. On a strong first draft this round-trips the entire diff back
         # through the model (~30K tokens) and frequently introduces noise on
@@ -4622,8 +4623,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 (_issue_implies_relocation(issue) or _issue_implies_creation(issue))
                 and not _patch_creates_any_new_file(patch)
             )
-            # senoo v2.t1.5 — keep self-check turn for unresolved in-place
-            # collisions (new file with same-basename peer untouched).
+            # Keep self-check turn for unresolved in-place collisions
+            # (new file with same-basename peer untouched).
             try:
                 _tracked_for_gate = set(_tracked_files(repo))
             except Exception:
@@ -4631,8 +4632,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             fresh_inplace_collision = bool(
                 _inplace_intent_advisories(patch, issue, _tracked_for_gate)
             )
-            # senoo v2.t1.6 — keep self-check turn when removed/renamed
-            # symbols haven't yet been audited against their callers.
+            # Keep self-check turn when removed/renamed symbols haven't yet
+            # been audited against their callers.
             fresh_caller_audit_pending = bool(_caller_audit_advisories(patch))
             if not (
                 fresh_syntax_errors
@@ -4654,9 +4655,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
-            # senoo v2.t1.5 — compute in-place edit advisories before launching
-            # self-check so the model sees concrete same-name/same-stem peers
-            # it should justify or fold back into.
+            # Compute in-place edit advisories before launching self-check
+            # so the model sees concrete same-name / same-stem peers it
+            # should justify or fold back into.
             try:
                 _tracked_for_inplace = set(_tracked_files(repo))
             except Exception:
@@ -4669,14 +4670,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"INPLACE_ADVISORY: {len(_inplace_adv)} warning(s) "
                     f"injected into self-check"
                 )
-            # senoo v2.t1.6 — caller audit on removed/renamed top-level symbols.
+            # Caller audit on removed/renamed top-level symbols.
             _caller_adv = _caller_audit_advisories(patch)
             if _caller_adv:
                 logs.append(
                     f"CALLER_AUDIT: {len(_caller_adv)} removed/renamed "
                     f"symbol(s) flagged for caller verification"
                 )
-            # senoo v2.t2.10 — compile-clean preflight (import resolution).
+            # Compile-clean preflight (import resolution).
             _import_adv = _check_imports_resolve(repo, patch)
             if _import_adv:
                 logs.append(
@@ -4745,11 +4746,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 break
 
-            # senoo v2 — dual-pass mid-loop rescue. When the model is still
-            # reading files at ~55% of wall-clock with NO edits applied yet,
-            # surface inspected paths + already-edited paths and demand an
-            # edit in the next response. A second pass fires at ~78% if the
-            # patch is still empty, so a single stuck step isn't fatal.
+            # Dual-pass mid-loop rescue. When the model is still reading
+            # files at ~55% of wall-clock with NO edits applied yet, surface
+            # inspected paths + already-edited paths and demand an edit in
+            # the next response. A second pass fires at ~78% if the patch
+            # is still empty, so a single stuck step isn't fatal.
             if mid_loop_rescue_turns_used < MAX_MID_LOOP_RESCUE_TURNS:
                 _elapsed_now = time.monotonic() - solve_started_at
                 _patch_now = get_patch(repo)
