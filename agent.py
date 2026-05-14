@@ -109,6 +109,7 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 _MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_THIN_PATCH_BUDGET_FRACTION = 0.40
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -117,8 +118,9 @@ MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_TS_COMPILE_TURNS = 1   # repair TypeScript type/import errors via tsc --noEmit
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_COVERAGE_NUDGES = 2    # tell model which issue-mentioned paths are still untouched; 2nd only if patch unchanged
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
@@ -515,7 +517,40 @@ FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_commands(model_text: str) -> List[str]:
-    return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    raw = [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+    return [_maybe_rewrite_sed_to_python(cmd) for cmd in raw]
+
+
+def _maybe_rewrite_sed_to_python(cmd: str) -> str:
+    if "sed" not in cmd or "python" in cmd:
+        return cmd
+    if "-i" not in cmd:
+        return cmd
+    sed_e_count = cmd.count(" -e ")
+    has_newline_in_replacement = "\\\\n" in cmd or "\\n" in cmd
+    if sed_e_count < 2 and not has_newline_in_replacement:
+        return cmd
+    m = re.search(r"sed -i\s+(?:'([^']+)')?\s+(.+)", cmd)
+    if not m:
+        return cmd
+    target = m.group(2).strip().rstrip(";")
+    fm = re.search(r'"([^"]+)"', target)
+    if fm:
+        filepath = fm.group(1)
+    else:
+        fm2 = re.match(r"([^\s;]+)", target)
+        filepath = fm2.group(1) if fm2 else target
+    old = m.group(1) if m.group(1) else ""
+    if not old:
+        return cmd
+    sep = old[0] if old and old[0] in ("/", "#", "|", "@", "!") else "/"
+    parts = old.split(sep)
+    if len(parts) >= 3:
+        search = parts[1]
+        replace = parts[2]
+        py_cmd = f"python3 -c \"from pathlib import Path; p=Path('{filepath}'); s=p.read_text(); s=s.replace({repr(search)},{repr(replace)},1); p.write_text(s)\""
+        return py_cmd
+    return cmd
 
 
 def extract_command(model_text: str) -> Optional[str]:
@@ -632,6 +667,8 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
+    cleaned = _strip_lockfile_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -721,9 +758,49 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     return result
 
 
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+    kept: List[str] = []
+    for line in diff_output.splitlines(True):
+        stripped = line.strip()
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+_LOCKFILE_SUFFIXES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-lock.yml",
+    "composer.lock", "Gemfile.lock", "cargo.lock", "poetry.lock",
+    "Pipfile.lock", "pubspec.lock", "mix.lock", "go.sum",
+})
+
+
+def _strip_lockfile_diffs(patch: str) -> str:
+    if not patch.strip():
+        return patch
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        first_line = block.splitlines()[0] if block else ""
+        match = re.match(r"diff --git a/.+? b/(.+)$", first_line)
+        if match and Path(match.group(1)).name in _LOCKFILE_SUFFIXES:
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if patch.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     if path.suffix in {".pyc", ".pyo"}:
+        return True
+    if path.suffix == ".map" or path.name.lower().endswith((".js.map", ".css.map", ".ts.map", ".d.ts.map")):
         return True
     generated_parts = {
         "__pycache__",
@@ -736,6 +813,9 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".next", ".nuxt", ".turbo", ".svelte-kit",
+        ".cache", ".parcel-cache", ".vite",
+        ".astro", ".angular", ".docusaurus",
     }
     generated_suffixes = {
         ".class",
@@ -1022,7 +1102,15 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
+    mentioned_paths = {m.strip("./") for m in _extract_issue_path_mentions(issue)}
     for relative_path in files[:MAX_PRELOADED_FILES]:
+        if relative_path not in mentioned_paths:
+            try:
+                fsize = (repo / relative_path).stat().st_size
+                if fsize > 50000:
+                    continue
+            except Exception:
+                pass
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
@@ -1212,14 +1300,25 @@ _DIRECTORY_SIBLING_BASENAMES = {
     "constants", "schema",
 }
 
+_LANG_SIBLING_BASENAMES: Dict[str, set] = {
+    ".py": {"__init__", "conftest", "models", "views", "serializers", "urls", "admin", "signals", "tasks"},
+    ".tsx": {"index", "page", "layout", "loading", "error", "head", "template", "metadata"},
+    ".ts": {"index", "types", "utils", "helpers", "constants", "config", "routes"},
+    ".jsx": {"index", "page", "layout", "App"},
+    ".go": {"doc", "test", "model", "handler", "service", "repository"},
+    ".java": {"Test", "Model", "Service", "Controller", "Repository"},
+    ".kt": {"Test", "ViewModel", "Repository", "UseCase"},
+    ".vue": {"index", "router", "store", "types"},
+    ".rb": {"test", "spec", "helper", "concern"},
+}
+
 
 def _augment_with_directory_siblings(
     files: List[str], tracked_set: set, limit: int = 3
 ) -> List[str]:
     """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
 
-    Targets high-leverage basenames (layout, index, schema, etc.) that commonly
-    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
+    Two-pass: language-specific basenames first (high priority), then generic.
     """
     try:
         if not files:
@@ -1229,9 +1328,21 @@ def _augment_with_directory_siblings(
         if top_dir in {"", "."}:
             return files
         seen = set(files)
+        top_suffix = Path(top).suffix.lower()
+        lang_basenames = _LANG_SIBLING_BASENAMES.get(top_suffix, set())
         siblings: List[str] = []
         for candidate in tracked_set:
             if candidate in seen:
+                continue
+            cpath = Path(candidate)
+            if str(cpath.parent).replace("\\", "/") != top_dir:
+                continue
+            if cpath.stem.lower() in lang_basenames:
+                siblings.append(candidate)
+            if len(siblings) >= limit:
+                break
+        for candidate in tracked_set:
+            if candidate in seen or candidate in siblings:
                 continue
             cpath = Path(candidate)
             if str(cpath.parent).replace("\\", "/") != top_dir:
@@ -1660,9 +1771,80 @@ def _patch_removed_definitions(patch: str, cap: int = 8) -> List[str]:
         return []
 
 
+_HARDCODED_PATTERNS = [
+    re.compile(r"\bcurDay\s*=\s*[0-9]"),
+    re.compile(r"\bdaysInMonth\s*=\s*[0-9]"),
+    re.compile(r"\bAPI[_-]?KEY\s*=\s*['\"]"),
+    re.compile(r"\bSECRET[_-]?KEY\s*=\s*['\"]"),
+    re.compile(r"\bPASSWORD\s*=\s*['\"]"),
+    re.compile(r"\bTOKEN\s*=\s*['\"]"),
+    re.compile(r"\bDB_PASSWORD\s*=\s*['\"]"),
+    re.compile(r"\bMONGO_URI\s*=\s*['\"]"),
+    re.compile(r"\bDATABASE_URL\s*=\s*['\"]"),
+    re.compile(r"\bJWT_SECRET\s*=\s*['\"]"),
+    re.compile(r"\bREDIS_URL\s*=\s*['\"]"),
+    re.compile(r"\bAWS_SECRET_ACCESS_KEY\s*=\s*['\"]"),
+    re.compile(r"\bSTRIPE_SECRET_KEY\s*=\s*['\"]"),
+]
+
+_SECRET_IN_CLIENT_PATTERNS = [
+    re.compile(r"\bsk-[A-Za-z0-9]{10,}"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{20,}"),
+    re.compile(r"\bghp_[A-Za-z0-9]{30,}"),
+    re.compile(r"\bgho_[A-Za-z0-9]{30,}"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bxox[bpras]-[A-Za-z0-9-]{20,}"),
+    re.compile(r"\bhooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}"),
+]
+
+
+def _check_hardcoded_advisories(patch: str) -> List[str]:
+    added_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:])
+    if not added_lines:
+        return []
+    findings: List[str] = []
+    for pat in _HARDCODED_PATTERNS:
+        for line in added_lines:
+            if pat.search(line) and len(findings) < 6:
+                snippet = line.strip()[:80]
+                findings.append(f"Hardcoded credential/sentinel: `{snippet}`")
+    for pat in _SECRET_IN_CLIENT_PATTERNS:
+        for line in added_lines:
+            if pat.search(line) and len(findings) < 6:
+                snippet = line.strip()[:80]
+                findings.append(f"Secret token in client code: `{snippet}`")
+    return findings
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
+
+
+_FUNCTIONAL_AREA_CHECKS = [
+    ("CI / GitHub Actions",
+     re.compile(r"\bgithub\s+actions?\b|\bworkflow[s]?\.(ya?ml|yaml)\b|\bci\s+pipeline\b", re.I),
+     (".github/", "workflows/", ".github/workflows/")),
+    ("Dockerfile / deploy",
+     re.compile(r"\bdockerfile\b|\bdocker-?compose\b|\bkubernetes\b|\bk8s\b|\bdeploy\b", re.I),
+     ("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "deploy/", "k8s/")),
+]
+
+
+def _missing_functional_areas(patch: str, issue_text: str) -> List[str]:
+    changed = set(_patch_changed_files(patch))
+    missing: List[str] = []
+    issue_lower = issue_text.lower()
+    for name, pattern, hints in _FUNCTIONAL_AREA_CHECKS:
+        if not pattern.search(issue_lower):
+            continue
+        if any(hint in changed_path for changed_path in changed for hint in hints):
+            continue
+        missing.append(name)
+    return missing
 
 
 def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
@@ -1848,6 +2030,42 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     if diffs:
         return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
     return None
+
+
+def _check_ts_compilation(repo: Path, patch: str, timeout: int = 15) -> List[str]:
+    changed = _patch_changed_files(patch)
+    ts_changed = [p for p in changed if p.endswith((".ts", ".tsx"))]
+    if not ts_changed:
+        return []
+    tsc_bin = repo / "node_modules" / ".bin" / "tsc"
+    if not tsc_bin.exists():
+        tsc_bin = None
+    tsc_cmd = [str(tsc_bin)] if tsc_bin else ["tsc"]
+    ts_changed_args = []
+    for p in ts_changed:
+        full = repo / p
+        if full.exists():
+            ts_changed_args.extend(["--pretty", "false", str(full)])
+    if not ts_changed_args:
+        return []
+    proc = subprocess.run(
+        tsc_cmd + ["--noEmit", "--strict", "false"] + ts_changed_args,
+        cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, timeout=timeout,
+    )
+    if proc.returncode == 0:
+        return []
+    errors: List[str] = []
+    changed_set = set(ts_changed)
+    for line in proc.stdout.splitlines():
+        if "error TS" in line:
+            for f in ts_changed:
+                if f in line and line not in errors:
+                    errors.append(line.strip()[:200])
+                    break
+            if len(errors) >= 8:
+                break
+    return errors
 
 
 def _check_syntax(repo: Path, patch: str) -> List[str]:
@@ -2615,7 +2833,7 @@ if old not in s:
 p.write_text(s.replace(old, new, 1))
 PY
 
-Use `sed -i \'s/exact old/exact new/\' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
+Use `sed -i \'s/exact old/exact new/\' path/to/file` ONLY for single-line substitutions where the old string is a unique literal with no regex metacharacters (no /, &, #, |, (, ), [, ], {, }, ., *, +, ?, ^, $). For ANY edit touching 3+ consecutive lines, always use the python heredoc pattern above. sed fails silently on multi-line contexts and whitespace-sensitive matches — python exact-block matching never does.
 
 When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
 
@@ -2719,6 +2937,8 @@ If the preloaded snippets show the target code, edit them directly — do not re
 
 When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
 
+For edits spanning 3+ lines, use the python heredoc pattern (python - <<'PY' ... PY) with exact old/new block matching. Avoid sed for multi-line or whitespace-sensitive changes — it silently fails on such contexts.
+
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
 
@@ -2812,6 +3032,7 @@ def build_coverage_nudge_prompt(
     issue_text: str,
     relocation_gap: bool = False,
     removed_names: Optional[List[str]] = None,
+    missing_areas: Optional[List[str]] = None,
 ) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
@@ -2821,6 +3042,16 @@ def build_coverage_nudge_prompt(
     set, also instruct the model to CREATE a new file at the implied path
     (king_analysis P1 fix: don't just edit the old-path file).
     """
+    area_hint = ""
+    if missing_areas:
+        area_items = "\n  ".join(f"- {a}" for a in missing_areas)
+        area_hint = (
+            "FUNCTIONAL AREA GAP — the task mentions these infrastructure areas "
+            "but your patch doesn't touch any files in those directories:\n"
+            f"  {area_items}\n"
+            "Run discovery commands like `find . -name '*.yml'` or `ls .github/workflows/` "
+            "to locate the relevant files, then edit them.\n\n"
+        )
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     relocation_hint = ""
     if relocation_gap:
@@ -2844,6 +3075,7 @@ def build_coverage_nudge_prompt(
             "Run `git grep` for each before <final> if uncertain.\n\n"
         )
     return (
+        f"{area_hint}"
         f"{relocation_hint}"
         f"{removed_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
@@ -2879,9 +3111,28 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    hardcoded = _check_hardcoded_advisories(patch)
+    hardcoded_block = ""
+    if hardcoded:
+        items = "\n  ".join(f"- {h}" for h in hardcoded[:4])
+        hardcoded_block = (
+            "\nSECURITY/SECRECY WARNING (must fix before finalizing):\n"
+            f"  {items}\n"
+            "Remove hardcoded credentials/secrets from the patch. Use environment variables "
+            "or config files instead.\n"
+        )
+    criteria = _extract_acceptance_criteria(issue_text)
+    criteria_block = ""
+    if criteria:
+        items = "\n  ".join(f"- [ ] {c}" for c in criteria[:6])
+        criteria_block = (
+            "\nACCEPTANCE CRITERIA CHECKLIST (from task — verify each):\n"
+            f"  {items}\n"
+        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
+        f"{criteria_block}\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
@@ -2896,7 +3147,8 @@ def build_self_check_prompt(
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n"
-        f"{advisory_block}\n"
+        f"{advisory_block}"
+        f"{hardcoded_block}\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -3326,8 +3578,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    ts_compile_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
+    coverage_nudge_last_patch = ""
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
@@ -3337,6 +3591,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    _consecutive_read_only_steps = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3372,7 +3627,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, ts_compile_turns_used, test_fix_turns_used, coverage_nudges_used, coverage_nudge_last_patch, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3409,7 +3664,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Gate order: syntax → tsc → test → deletion → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -3423,6 +3678,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        if ts_compile_turns_used < MAX_TS_COMPILE_TURNS:
+            ts_errors = _check_ts_compilation(repo, patch)
+            if ts_errors:
+                ts_compile_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(ts_errors),
+                    "TS_COMPILE_QUEUED:\n  " + "\n  ".join(ts_errors),
                 )
                 return True
 
@@ -3483,16 +3750,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         if coverage_nudges_used < MAX_COVERAGE_NUDGES:
             missing = _uncovered_required_paths(patch, issue)
-            # king_analysis P1: issue says "move/relocate/rebuild as separate"
-            # but the patch contains no `new file mode` header — the model
-            # only edited the old-path file. Fire the same single-shot
-            # coverage nudge with a relocation-specific hint at the top.
+            missing_areas = _missing_functional_areas(patch, issue)
             relocation_gap = (
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            should_fire = bool(missing or relocation_gap or missing_areas)
+            if should_fire and coverage_nudges_used >= 1:
+                if patch == coverage_nudge_last_patch:
+                    pass  # patch unchanged since first nudge — re-fire
+                elif missing or relocation_gap:
+                    pass  # patch changed but new gap appeared — still fire
+                else:
+                    should_fire = False
+            if should_fire:
                 coverage_nudges_used += 1
+                coverage_nudge_last_patch = patch
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
@@ -3508,6 +3781,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     build_coverage_nudge_prompt(
                         missing, issue, relocation_gap=relocation_gap,
                         removed_names=_patch_removed_definitions(patch),
+                        missing_areas=missing_areas,
                     ),
                     marker,
                 )
@@ -3542,6 +3816,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        subprocess.run(["git", "config", "core.fileMode", "false"],
+                       cwd=str(repo), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
@@ -3561,7 +3837,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
-            if step > 4 and not initial_preload_stripped and len(messages) >= 2:
+            if step > 3 and not initial_preload_stripped and len(messages) >= 2:
                 original_initial = messages[1].get("content") or ""
                 modified_files = _patch_changed_files(get_patch(repo))
                 stripped = _strip_preloaded_section(
@@ -3588,6 +3864,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            _thin_patch_nudged = False
+            current_patch = get_patch(repo)
+            if (
+                not _thin_patch_nudged
+                and _elapsed_now >= _THIN_PATCH_BUDGET_FRACTION * wall_clock_budget
+                and current_patch.strip()
+                and mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
+                and _consecutive_read_only_steps >= 3
+            ):
+                sub_lines = [l for l in current_patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+                sub_lines = [l for l in sub_lines if l.strip() and not l.strip().startswith(("#", "//", "import ", "from "))]
+                if len(sub_lines) < 3:
+                    _thin_patch_nudged = True
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "BUDGET WARNING: You've used 40% of your time budget but your patch has "
+                            f"only {len(sub_lines)} substantive edit line(s). Stop exploring and "
+                            "focus on making the actual code changes now. Use the python heredoc "
+                            "pattern for multi-line edits. Emit all remaining edits in your next "
+                            "response, then <final>."
+                        ),
+                    })
+                    logs.append("THIN_PATCH_NUDGE_FIRED")
+                    continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
@@ -3678,6 +3980,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 continue
 
             consecutive_no_command = 0
+            _is_edit_command = any(
+                _looks_like_edit_command(c) for c in commands[:MAX_COMMANDS_PER_RESPONSE]
+            )
+            if _is_edit_command:
+                _consecutive_read_only_steps = 0
+            else:
+                _consecutive_read_only_steps += 1
             messages.append({"role": "assistant", "content": response_text})
             observations: List[str] = []
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
@@ -3685,6 +3994,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             for command_index, command in enumerate(command_batch, 1):
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
+                if "sed" in command and result.exit_code != 0:
+                    _sed_err_patterns = ["no such file", "command not found", "unterminated", "no match", "extra characters", "unknown option"]
+                    if any(p in observation.lower() for p in _sed_err_patterns):
+                        observation += "\nNOTE: sed replacement failed. Use python -c with exact block matching instead:\npython -c \"from pathlib import Path; p=Path('file'); s=p.read_text(); s=s.replace('old','new',1); p.write_text(s)\""
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
@@ -3823,6 +4136,12 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         return True
 
     return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
+def _looks_like_edit_command(command: str) -> bool:
+    lower = command.strip().lower()
+    edit_indicators = ("sed -i", "python -c", "python - <<", "cat >", "tee ", "echo >", "awk -i", "perl -i")
+    return any(ind in lower for ind in edit_indicators)
 
 
 def _looks_like_verification_command(command: str) -> bool:
