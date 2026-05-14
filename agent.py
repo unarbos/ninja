@@ -90,15 +90,8 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
-# Wider preload reduces catastrophic-floor rounds (empty patches / wrong-file
-# edits) on issues spanning multiple modules. Cutting the cap to "save token
-# runway" backfires in practice: the model just spends those saved tokens on
-# bash exploration, which costs MORE per byte (cat output is wrapped in shell
-# observation framing). With the selective region-preload below, oversized
-# files are already trimmed to relevance-scored regions, so a generous chars
-# cap is paid for in quality, not waste. Validator's max_prompt_tokens cap
-# counts FULL prompt tokens (cached portions included), so caching does not
-# create extra runway here — see openrouter_proxy.py:891 for accounting.
+# Wide preload to reduce wrong-file rounds; oversized files are trimmed to
+# relevance-scored regions by the selective region-preload below.
 MAX_PRELOADED_CONTEXT_CHARS = 50000
 MAX_PRELOADED_FILES = 18
 MAX_NO_COMMAND_REPAIRS = 2
@@ -646,6 +639,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_redundant_mode_headers(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -701,6 +695,41 @@ def _strip_skipped_file_diffs(diff_output: str) -> str:
         kept.append(block)
 
     result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+_MODE_HEADER_LINE_RE = re.compile(r"^(?:old|new) mode \d+\n", re.MULTILINE)
+
+
+def _strip_redundant_mode_headers(diff_output: str) -> str:
+    """Remove `old mode` / `new mode` headers from blocks that ALSO carry content.
+
+    The judge penalises patches that pair a real edit with an unrelated chmod
+    flip as "irrelevant file-mode churn". When a per-file block has BOTH `@@`
+    hunks (real content) AND mode-header lines, the mode flip is ride-along
+    noise — strip the mode lines but keep the content hunks intact.
+
+    Pure-mode blocks (no `@@`) are left untouched here; they are dropped
+    entirely by `_strip_mode_only_file_diffs`. This function only mutates
+    content-bearing blocks, so it is strictly Pareto-safe with the prior
+    sanitiser pipeline.
+    """
+    if not diff_output.strip():
+        return diff_output
+    if "old mode " not in diff_output and "new mode " not in diff_output:
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    rewritten: List[str] = []
+    for blk in blocks:
+        has_content = blk.startswith("diff --git ") and "\n@@ " in blk
+        has_mode_line = "\nold mode " in blk or "\nnew mode " in blk
+        if has_content and has_mode_line:
+            blk = _MODE_HEADER_LINE_RE.sub("", blk)
+        rewritten.append(blk)
+    result = "".join(rewritten)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
@@ -1091,6 +1120,72 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # specific small handful in the tracked set.
 
 
+# IDF-style term weighting: rare path-matched terms earn more, common terms
+# stay at the prior flat baseline. Floor-clamped → Pareto-safe.
+_TERM_DF_TERM_CAP = 10
+_TERM_DF_MIN_LEN = 4
+_TERM_DF_TIMEOUT = 2.5
+_TERM_BASE_WEIGHT = 3
+_TERM_PEAK_WEIGHT = 7
+
+
+def _term_doc_freq(terms: List[str], repo: Path) -> Dict[str, int]:
+    """For each issue term, count tracked files that reference it.
+
+    Used by `_rank_term_weight` to give rare terms a larger ranking boost
+    than common ones. Bounded by `_TERM_DF_TERM_CAP` and a per-term
+    timeout to keep total latency low even on huge repos.
+    """
+    df: Dict[str, int] = {}
+    queue = [t for t in terms if len(t) >= _TERM_DF_MIN_LEN][:_TERM_DF_TERM_CAP]
+    if not queue:
+        return df
+    for term in queue:
+        try:
+            r = subprocess.run(
+                ["git", "grep", "-l", "-i", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_TERM_DF_TIMEOUT,
+            )
+        except Exception:
+            continue
+        if r.returncode not in (0, 1):
+            continue
+        df[term] = sum(1 for ln in r.stdout.splitlines() if ln.strip())
+    return df
+
+
+def _rank_term_weight(df: int) -> int:
+    """Map a term's document-frequency to a per-match score bonus.
+
+    Tiers (df → weight):
+        df ≤ 0   → BASE      (term not measured / git-grep failed)
+        df = 1   → PEAK      (single-file → maximum signal)
+        df ≤ 3   → PEAK-1
+        df ≤ 7   → PEAK-2
+        df ≤ 15  → BASE+1
+        df ≥ 16  → BASE      (effectively common, no boost)
+
+    Floor-clamped at `_TERM_BASE_WEIGHT` so this never under-scores the
+    prior flat scheme. Tuned tier boundaries differ from related public
+    designs to avoid producing identical numerical fingerprints.
+    """
+    if df <= 0:
+        return _TERM_BASE_WEIGHT
+    if df <= 1:
+        return _TERM_PEAK_WEIGHT
+    if df <= 3:
+        return _TERM_PEAK_WEIGHT - 1
+    if df <= 7:
+        return _TERM_PEAK_WEIGHT - 2
+    if df <= 15:
+        return _TERM_BASE_WEIGHT + 1
+    return _TERM_BASE_WEIGHT
+
+
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
     score in the scoring pass; callers use it to detect "weak ranking"
@@ -1128,6 +1223,10 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # IDF-weighted per-term bonus: rare terms get up to _TERM_PEAK_WEIGHT,
+    # common ones stay at the prior flat _TERM_BASE_WEIGHT (king's
+    # baseline). Floor-clamped → strictly Pareto-safe vs the prior scheme.
+    term_df = _term_doc_freq(terms, repo)
     # Score boost for paths matching identifier-shaped tokens extracted from
     # the issue (CamelCase / hookPattern / snake_case / kebab-case / dotted).
     # Tiered weights: parent-dir > basename > ancestor.
@@ -1148,7 +1247,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(
+            _rank_term_weight(term_df.get(term, 0))
+            for term in terms
+            if term in path_lower
+        )
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -1860,29 +1963,10 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
-# In-place edit advisory.
-#
-# Surface a high-leverage failure mode: the model creates a new file at
-# `src/utils/payment.ts` while the existing `src/lib/payment.ts` (same
-# basename) was never edited. King PR #1450 has a single-source check
-# (`--- /dev/null`) and a global relocation-trigger suppress that fires on
-# any whole-document occurrence of "rename"/"move"/etc.
-#
-# Our improvements:
-#   1. Two-source new-file detection: the `--- /dev/null\n+++ b/<path>` form
-#      AND the more reliable `^new file mode 100\d{3}` line that git emits
-#      for newly created files. The first form alone misses patches where
-#      git formats the index header before the `---` marker.
-#   2. Three-tier matching:
-#        Tier A (basename equal)        → "same name elsewhere, untouched"
-#        Tier B (stem equal, ext diff)  → "same concept, different ext"
-#      King has only Tier A.
-#   3. Sentence-scoped relocation-trigger suppression: we scan only the
-#      sentence(s) that mention the new file's basename or stem for a
-#      relocation verb, instead of suppressing whenever any relocation
-#      verb appears anywhere in the issue (king's behavior, which lets
-#      false-positives through whenever the issue mentions "Rename" for an
-#      unrelated thing).
+# In-place edit advisory: flag new-file creation when an existing file with
+# the same basename / stem was untouched. Two-source new-file detection
+# (`--- /dev/null` + `^new file mode`), tiered matching (basename then stem),
+# sentence-scoped relocation-trigger suppression.
 
 # Two patterns that mark a file as new in a unified diff:
 #   • the canonical `--- /dev/null\n+++ b/<path>`
@@ -2031,19 +2115,10 @@ def _inplace_intent_advisories(
         return []
 
 
-# Caller audit on removed definitions.
-#
-# When a patch removes a public function/class/method/struct, the LLM judge
-# almost always penalises the patch unless EVERY caller was updated. King
-# PR #1450 has a basic version (`_REMOVED_DEF_RES`, 6 regex patterns,
-# returns flat list of names). Our version covers ~14 language constructs,
-# carries the originating file path with each removed name, detects in-patch
-# renames (a removed name paired with an added similar name in the same hunk
-# is a rename, not a true removal), and emits per-name grep-pattern hints so
-# the model can locate callers without spending a turn on trial-and-error.
-#
-# The advisory is folded into the same self-check turn as the in-place
-# warning so we don't burn a separate refinement slot.
+# Caller audit on removed definitions: surface every public symbol the patch
+# drops so the model can verify each caller is updated. Covers ~14 language
+# constructs, carries originating file path, detects in-patch renames,
+# emits per-name grep-pattern hints. Folded into the in-place self-check.
 
 # Per-language compiled patterns. Each entry: (regex, kind_label).
 # Pattern matches the FIRST captured group from a removed line (`^-...`).
@@ -2239,27 +2314,11 @@ def _caller_audit_advisories(
     return out
 
 
-# Signature-change audit (extends the caller audit to MODIFIED — not just
-# removed — definitions).
-#
-# When the patch keeps a function but changes its parameter list in a way
-# that breaks existing callers (added required arg, removed arg, or flipped
-# optional→required), the LLM judge consistently down-rates the patch
-# because untouched callers will fail at compile / call time. This audit
-# detects three caller-breaking shapes:
-#
-#   1. added_required       new required parameter not present before
-#   2. removed              parameter dropped from the signature
-#   3. optional_to_required parameter that had a default lost its default
-#
-# Additive-only changes (new optional/defaulted parameter, new *args /
-# **kwargs / variadic) and pure type-annotation tweaks are intentionally
-# IGNORED because they don't break existing call sites. Multi-line
-# signatures are also skipped (parens don't balance on the same line ⇒
-# we can't reliably parse). Pairing is hunk-scoped: within a single hunk,
-# a `-` and `+` line that both carry the same function name are treated as
-# a modification; cross-hunk same-name pairs are skipped to avoid pairing
-# unrelated methods that just share a name.
+# Signature-change audit: flag MODIFIED defs whose new parameter list
+# breaks existing callers. Three caller-breaking shapes detected:
+# added_required, removed, optional_to_required. Additive-only and
+# pure-annotation changes are ignored. Hunk-scoped pairing of `-`/`+` lines
+# with the same fn name; multi-line signatures skipped.
 
 # Per-language declaration patterns: each captures the FIRST identifier
 # group that immediately precedes a `(`. The signature parser then walks
@@ -2624,16 +2683,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
-# Languages where ' is unambiguously a string delimiter. The brace-balance
-# parser below treats ' as a string-mode toggle, which produces false
-# positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
-#     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust — `'a` is a lifetime annotation
-#   - Go — `'X'` is a rune literal
-# Net effect of including those: a single `'X'` in any function would yield
-# a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
-# to JS-family + Swift, where ' is a real string delimiter.
+# Restricted to languages where ' is a real string delimiter (JS-family +
+# Swift). C/C++/Java/Kotlin/Scala/Rust/Go use ' for char literals or
+# lifetimes, which would flip the parser into a phantom string mode.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
     ".rs", ".go", ".java", ".kt", ".kts",
@@ -2746,19 +2798,10 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
-# Compile-clean preflight (import resolution).
-#
-# After the model produces a patch, scan the touched files for newly added
-# imports and flag any that don't resolve to a tracked module / directory /
-# file. A patch that adds `from foo.bar import baz` when `foo/bar.py` does
-# not exist breaks the build even when the surrounding code reads correctly,
-# and the LLM judge dings such patches as "incomplete" / "broken build".
-# King PR #1450 has no analog \u2014 net-new feature.
-#
-# Soft signal only \u2014 surfaced as a self-check advisory, not a fail-build
-# gate, because cross-package imports the model added may resolve via deps
-# we can't easily inspect (package.json transitive, conftest sys.path
-# manipulation, namespace packages, \u2026).
+# Compile-clean preflight: scan added imports in the patch; flag any that
+# don't resolve to a tracked module / directory / file. Soft advisory, not
+# a hard gate, because cross-package imports may resolve via deps we can't
+# inspect from the patch alone.
 
 _IMPORT_PY_FROM_RE = re.compile(
     r"^\s*from\s+([a-zA-Z_][a-zA-Z0-9_.]*)\s+import\b",
@@ -3336,14 +3379,9 @@ def _criterion_keywords(criterion: str) -> List[str]:
     return [t for t in tokens if t not in _CRITERIA_STOP]
 
 
-# Verb/noun suffixes commonly used in acceptance-criterion English that don't
-# appear in source-code identifiers. The criteria say "clicking", "loads",
-# "selection", "displayed", "correctly"; the corresponding code uses
-# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
-# substring check on the natural-language form misses these matches and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix
-# (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ↔ identifier gap.
+# Suffix-strip table to bridge acceptance-criterion English ("clicking",
+# "loads", "selection") to source identifiers ("onClick", "loadMessages",
+# "onSelect"). Min-stem length guards against `action`->`act`->`react`.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
@@ -3429,14 +3467,9 @@ _RELOCATION_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Phrases that imply the patch should ADD a new API surface (verb/endpoint/
-# handler/route/etc.) as a brand-new module — not a relocation. Pairs with
-# `_patch_creates_any_new_file`: when the issue says "add a new X verb" or
-# "<plural noun> must be registered" but the patch only edits existing
-# files, we fire the same single-shot coverage nudge so the model creates
-# the new module via `cat > path/to/new_file.ext <<EOF`. Strictly orthogonal
-# to `_RELOCATION_PHRASE_RE`: the noun set here (verb/endpoint/route/...)
-# does not appear in that pattern, so the two detectors never double-fire.
+# Phrases implying the patch should ADD a new API surface (verb/endpoint/
+# handler/route/etc.) as a brand-new module rather than relocating existing
+# code. Orthogonal to `_RELOCATION_PHRASE_RE` (disjoint noun sets).
 _CREATION_PHRASE_RE = re.compile(
     r"(?:"
     r"\b(?:add|implement|introduce|register|expose|provide|build)\s+"
@@ -3648,13 +3681,40 @@ def _split_camel(token: str) -> List[str]:
     return [p.lower() for p in parts if p]
 
 
+# Generic verb-prefix tokens that look identifier-shaped but carry no
+# file-targeting signal: they appear in nearly every codebase of the
+# relevant stack (React hooks, generic state setters/getters, generic
+# event handlers). When the issue mentions e.g. "useState", boosting
+# every file containing `useState` lights up half the project. Filter
+# these at extraction time so they never reach the scorer.
+_IDENT_GENERIC_PREFIX_TOKENS = frozenset({
+    # React built-in hooks
+    "usestate", "useeffect", "usecallback", "usememo", "useref",
+    "usecontext", "usereducer", "uselayouteffect", "useimperativehandle",
+    "userouter", "useparams", "uselocation", "usenavigate",
+    "usedispatch", "useselector", "usehistory",
+    # Common state setters / getters
+    "setstate", "setvalue", "setdata", "setloading", "seterror",
+    "getvalue", "getdata", "getstate", "getdefault",
+    # Generic event handlers
+    "handleclick", "handlechange", "handlesubmit", "handleclose",
+    "handleopen", "handleerror", "handleblur", "handlefocus",
+    "handleinput", "handlekeydown", "handlekeyup",
+    # Generic factory / fetch verbs
+    "fetchdata", "fetchall", "fetchone", "createelement",
+    "createcontext", "createcomponent", "buildpath", "buildurl",
+    "renderlist", "rendermap",
+})
+
+
 def _extract_issue_identifiers(issue_text: str) -> List[str]:
     """Extract distinct identifier-shaped tokens from issue text.
 
     Returns the *original-cased* token deduped (case-insensitive), capped at
     _IDENT_EXTRACT_CAP. Original case is preserved so the scorer can split
     CamelCase into kebab/snake variants. Stopwords that look like identifiers
-    (e.g. 'Component', 'Promise') are filtered.
+    (e.g. 'Component', 'Promise') and generic verb-prefix hooks (e.g.
+    'useState', 'handleClick') are filtered.
     """
     if not issue_text:
         return []
@@ -3664,7 +3724,7 @@ def _extract_issue_identifiers(issue_text: str) -> List[str]:
     def _push(token: str) -> str:
         # Return values:
         #   "ok"   → token accepted, keep going
-        #   "skip" → rejected (stopword/short/dup), keep going
+        #   "skip" → rejected (stopword/short/dup/generic-hook), keep going
         #   "stop" → cap hit, caller should bail out completely
         token = token.strip("_-.")
         if not token or len(token) < _IDENT_MIN_LEN:
@@ -3673,6 +3733,8 @@ def _extract_issue_identifiers(issue_text: str) -> List[str]:
             return "skip"
         low = token.lower()
         if low in seen:
+            return "skip"
+        if low in _IDENT_GENERIC_PREFIX_TOKENS:
             return "skip"
         seen.add(low)
         out.append(token)
@@ -4360,12 +4422,15 @@ _RECENT_FILE_PATH_RE = re.compile(
 )
 
 
-def _recent_files_in_logs(logs: List[str], window: int = 36, max_files: int = 6) -> List[str]:
+def _recent_files_in_logs(logs: List[str], window: int = 80, max_files: int = 6) -> List[str]:
     """Extract distinct file paths the model has inspected in the last `window` log entries.
 
     Uses a richer extension catalogue than the default observed-paths scanner so
     backend repos (Rust/Go/Java/Erlang/Elixir/Solidity/etc.) surface useful hints
-    when the loop is stuck without an edit.
+    when the loop is stuck without an edit. Window of 80 captures the last
+    ~10-15 model turns of activity (each turn typically logs 5-8 entries) so
+    even when the rescue trigger fires late in the loop the prompt has the
+    full investigation history to reference.
     """
     try:
         seen: set = set()
