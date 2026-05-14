@@ -2654,7 +2654,7 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 4. **Rust:** Read the module\'s `lib.rs` or `mod.rs` to understand the module hierarchy before touching any impl.
 These 2–4 read steps prevent structural mismatches that score near zero even when the logic is correct.
 
-**Reference-pattern reading (dedicated benchmarks and fuzz targets):** Before writing any new dedicated benchmark file or fuzz target file (not incidental unit tests inside a feature PR), find and read the most similar existing example in the codebase first: run `grep -rn "Benchmark" --include="*.go"`, `grep -rn "criterion" --include="*.rs"`, or the language equivalent to locate existing examples. Read one representative file, then mirror its exact harness structure, naming convention, and measurement pattern. Structural divergence from the repo\'s existing patterns is penalized even when logic is correct.
+**Reference-pattern reading (benchmarks, tests, algorithms):** Before writing any new benchmark function, fuzz target, test case, or standalone algorithm, find and read the most similar existing example in the codebase first: run `grep -rn "Benchmark" --include="*.go"`, `grep -rn "criterion" --include="*.rs"`, or the language equivalent to locate existing examples. Read one representative file, then mirror its exact harness structure, naming convention, and measurement/assertion pattern. Structural divergence from the repo\'s existing patterns is penalized even when logic is correct.
 
 ====================================================================
 SCOPE DISCIPLINE
@@ -2909,9 +2909,9 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - Every variable referenced in new code is provably in-scope — not from a closure or outer scope that may not exist at call time.\n"
         "  - Every method called on an object (`.delete()`, `.create()`, `.save()`, etc.) exists in the actual codebase — if uncertain, grep for the method name before finalizing.\n"
         "  - Route URL parameters (`:param`) match exactly what the controller reads (`req.params.param`). If they differ, fix the mismatch now.\n"
-        "  - If you wrote a new dedicated benchmark file or fuzz target file (not incidental tests inside a feature): "
-        "grep for existing examples in the repo (e.g. `grep -rn 'Benchmark' --include='*.go'`, `grep -rn 'criterion' --include='*.rs'`) "
-        "and confirm your new code matches the same harness structure, naming convention, and measurement pattern. Fix any mismatch before finalizing.\n\n"
+        "  - If you wrote a new benchmark, fuzz target, or standalone algorithm: grep for existing examples in the repo "
+        "(e.g. `grep -rn 'Benchmark' --include='*.go'`, `grep -rn 'criterion' --include='*.rs'`) and confirm your new code "
+        "matches the same harness structure, naming convention, and measurement/assertion pattern. Fix any structural mismatch before finalizing.\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
