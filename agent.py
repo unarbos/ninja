@@ -2643,6 +2643,19 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
 
+**Language identity check:** Before writing to any file, verify its extension. Java files (`.java`) must contain only Java syntax; Kotlin files (`.kt`) must contain only Kotlin. Never inject Kotlin syntax into a `.java` file — if a feature requires Kotlin in a Java Android project, create a new `.kt` file and call it from Java instead.
+
+**Route/controller consistency (feature tasks only):** When adding or updating a URL route parameter (e.g. `:userId`, `:staffCode`), immediately read the corresponding controller and verify the same name appears in `req.params.<name>`. When updating a controller, read its route file. Names MUST match exactly. Skip only when the task explicitly renames the parameter — then apply the new name consistently in both the route and controller.
+
+**Systems-language exploration (C/C++, Go, Rust):** Before writing any code in a `.c`, `.cpp`, `.h`, `.go`, or `.rs` file, complete these reads first:
+1. Read the build manifest (`Makefile`, `CMakeLists.txt`, `Cargo.toml`, or `go.mod`) to understand build structure and compilation flags.
+2. **C/C++:** Read BOTH the `.h` header AND the existing `.c`/`.cpp` implementation of every function you plan to change or call.
+3. **Go:** Read ALL `.go` files in the target package, not just the one the task names.
+4. **Rust:** Read the module\'s `lib.rs` or `mod.rs` to understand the module hierarchy before touching any impl.
+These 2–4 read steps prevent structural mismatches that score near zero even when the logic is correct.
+
+**Reference-pattern reading (dedicated benchmarks and fuzz targets):** Before writing any new dedicated benchmark file or fuzz target file (not incidental unit tests inside a feature PR), find and read the most similar existing example in the codebase first: run `grep -rn "Benchmark" --include="*.go"`, `grep -rn "criterion" --include="*.rs"`, or the language equivalent to locate existing examples. Read one representative file, then mirror its exact harness structure, naming convention, and measurement pattern. Structural divergence from the repo\'s existing patterns is penalized even when logic is correct.
+
 ====================================================================
 SCOPE DISCIPLINE
 ====================================================================
@@ -2657,6 +2670,8 @@ Do NOT change:
 - Test files unless required OR your change broke an existing test
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
+
+**New-file wiring check:** When you CREATE a new file (component, service, route handler, provider, screen, hook), before emitting `<final>` ask: "Where is this imported or mounted?" If there is no entry-point import or registration for the new file anywhere in the patch, add one. Common locations: `App.tsx`, `index.js`, `main.py`, the router file, the DI/service registry. Skip ONLY if the task says to create the file alone, or if another file you already edited in this patch explicitly imports the new file.
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
@@ -2889,6 +2904,14 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "    has a corresponding import statement (grep for the name if unsure).\n"
         "  - No adjacent JSX siblings without a wrapping fragment (<>...</>) or element.\n"
         "  - No TypeScript interface or type changed without updating all implementors.\n\n"
+        "RUNTIME SAFETY (prevents compile/runtime failures — high impact):\n"
+        "  - Every `await` expression is inside a function declared `async` (async def / async function).\n"
+        "  - Every variable referenced in new code is provably in-scope — not from a closure or outer scope that may not exist at call time.\n"
+        "  - Every method called on an object (`.delete()`, `.create()`, `.save()`, etc.) exists in the actual codebase — if uncertain, grep for the method name before finalizing.\n"
+        "  - Route URL parameters (`:param`) match exactly what the controller reads (`req.params.param`). If they differ, fix the mismatch now.\n"
+        "  - If you wrote a new dedicated benchmark file or fuzz target file (not incidental tests inside a feature): "
+        "grep for existing examples in the repo (e.g. `grep -rn 'Benchmark' --include='*.go'`, `grep -rn 'criterion' --include='*.rs'`) "
+        "and confirm your new code matches the same harness structure, naming convention, and measurement pattern. Fix any mismatch before finalizing.\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
@@ -3709,6 +3732,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "to verify correctness — passing tests are strong evidence for the final patch.\n"
                         "3. Emit <final>summary</final>."
                     )
+                    _tr = time_remaining()
+                    if _tr < 80:
+                        observation_text += (
+                            f"\n\nTIME BUDGET: only {_tr:.0f}s remaining. "
+                            "Do NOT expand scope or start new work. "
+                            "Correct partial work scores far higher than broken complete work — "
+                            "emit <final>summary</final> now if the core task is addressed."
+                        )
                 elif not success:
                     observation_text += (
                         "\n\nIf you have enough context to implement the fix, send the COMPLETE set of "
