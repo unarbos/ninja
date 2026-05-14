@@ -584,7 +584,7 @@ def get_patch(repo: Path) -> str:
         timeout=30,
     )
     if untracked.returncode != 0:
-        return diff_output
+        return _sanitize_patch(diff_output)
 
     for relative_path in [item for item in untracked.stdout.split("\0") if item]:
         if _should_skip_patch_path(relative_path):
@@ -633,6 +633,7 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
+    cleaned = _split_comment_import_concat(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
     # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
@@ -719,6 +720,64 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+_IMPORT_CONCAT_PATTERN = re.compile(r'[)};](?=import\s+[{*\w])')
+_HUNK_HEADER_RE = re.compile(r'^@@ -(\d+(?:,\d+)?) \+(\d+)(?:,(\d+))? @@(.*)$')
+
+
+def _split_comment_import_concat(diff_output: str) -> str:
+    """Repair '+' lines where a // comment ending and a JS/TS import statement
+    got concatenated onto one line (e.g. ')import {x}'). In JS/TS // extends to
+    end of line, so the concatenation silently turns the import into a comment
+    and breaks the file. Split at the boundary and bump the hunk's added-line
+    count. Narrow trigger: '//' must precede a close-bracket that is immediately
+    followed by 'import <brace-or-ident>' inside a '+' line."""
+    if not diff_output.strip() or '//' not in diff_output:
+        return diff_output
+    if not _IMPORT_CONCAT_PATTERN.search(diff_output):
+        return diff_output
+
+    lines = diff_output.splitlines(keepends=True)
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _HUNK_HEADER_RE.match(line.rstrip('\n'))
+        if not m:
+            out_lines.append(line)
+            i += 1
+            continue
+        old_part = m.group(1)
+        new_start = int(m.group(2))
+        new_count = int(m.group(3)) if m.group(3) else 1
+        tail = m.group(4)
+        j = i + 1
+        delta = 0
+        body: List[str] = []
+        while j < n and not lines[j].startswith('@@') and not lines[j].startswith('diff --git'):
+            bl = lines[j]
+            if bl.startswith('+') and not bl.startswith('+++') and '//' in bl:
+                ends_nl = bl.endswith('\n')
+                content = bl[1:].rstrip('\n')
+                mm = _IMPORT_CONCAT_PATTERN.search(content)
+                if mm and '//' in content[:mm.start()]:
+                    left = content[:mm.end()].rstrip()
+                    right = content[mm.end():].lstrip()
+                    if left and right:
+                        body.append('+' + left + '\n')
+                        body.append('+' + right + ('\n' if ends_nl else ''))
+                        delta += 1
+                        j += 1
+                        continue
+            body.append(bl)
+            j += 1
+        new_header = '@@ -%s +%d,%d @@%s\n' % (old_part, new_start, new_count + delta, tail)
+        out_lines.append(new_header)
+        out_lines.extend(body)
+        i = j
+    return ''.join(out_lines)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -2618,6 +2677,8 @@ PY
 Use `sed -i \'s/exact old/exact new/\' path/to/file` only when the substitution is uniquely scoped. Do not run broad regex replacements.
 
 When a change necessarily spans multiple files (interface, signature, type, header+impl, schema/serializer pair), update every required file in the same response. Do not leave related files inconsistent. Do not touch extra files just because they are nearby.
+
+Per-file minimality matters as much as per-repo minimality. When the issue requires editing a file, change only the regions, functions, components, or sections the issue actually touches. Leave unrelated functions/components/blocks inside that same file unchanged — do not rewrite the rest of the file to match new styling, do not reorder, do not refactor neighboring code that already works. The reference patch usually keeps the file mostly identical to its prior state outside the issue's stated surface area.
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
