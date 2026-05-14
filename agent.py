@@ -376,6 +376,10 @@ def chat_completion(
                 time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** attempt))
                 continue
             raise RuntimeError(f"Model returned non-JSON: {e}") from e
+        except MemoryError:
+            raise
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}") from e
 
@@ -384,8 +388,8 @@ def chat_completion(
 
     try:
         content = data["choices"][0]["message"]["content"] or ""
-    except Exception as e:
-        raise RuntimeError(f"Unexpected model response shape: {data}") from e
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Unexpected model response shape: {data!r}") from e
 
     usage = data.get("usage") or {}
     cost = 0.0 if usage else None
@@ -463,12 +467,28 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             timed_out=True,
         )
 
+    except (OSError, subprocess.SubprocessError) as e:
+        return CommandResult(
+            command=command,
+            exit_code=1,
+            stdout="",
+            stderr=_truncate(
+                f"Command failed ({type(e).__name__}): {e}",
+                MAX_OBSERVATION_CHARS,
+            ),
+            duration_sec=time.time() - start,
+        )
+
     except Exception as e:
         return CommandResult(
             command=command,
             exit_code=1,
             stdout="",
-            stderr=f"Command execution failed: {e}",
+            stderr=_truncate(
+                f"Unexpected command failure ({type(e).__name__}): {e}\n"
+                + traceback.format_exc(),
+                MAX_OBSERVATION_CHARS,
+            ),
             duration_sec=time.time() - start,
         )
 
@@ -3408,7 +3428,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             patch=salvaged or "",
             logs=(
                 f"FATAL_SAFETY_NET:\n{type(exc).__name__}: {str(exc)[:500]}\n"
-                f"Returning on-disk patch ({len(salvaged.splitlines())} lines)."
+                + _truncate(traceback.format_exc(), 4000)
+                + f"\nReturning on-disk patch ({len(salvaged.splitlines())} lines)."
             ),
             steps=0,
             cost=0.0,
@@ -3728,9 +3749,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         total_cost += cost
                     break
                 except Exception as exc:
+                    exc_head = "".join(
+                        traceback.format_exception_only(type(exc), exc)
+                    ).strip()
+                    cause = exc.__cause__ or exc.__context__
+                    cause_note = ""
+                    if cause is not None:
+                        cause_head = "".join(
+                            traceback.format_exception_only(type(cause), cause)
+                        ).strip()
+                        cause_note = f"\nCaused by: {cause_head}"
                     logs.append(
                         f"MODEL_ERROR (step {step}, attempt {retry_attempt + 1}/"
-                        f"{MAX_STEP_RETRIES + 1}):\n{exc}"
+                        f"{MAX_STEP_RETRIES + 1}):\n{exc_head}{cause_note}"
                     )
                     if retry_attempt < MAX_STEP_RETRIES and not out_of_time():
                         time.sleep(HTTP_RETRY_BASE_BACKOFF * (2 ** retry_attempt))
@@ -3882,14 +3913,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             success=success and bool(patch.strip()),
         ).to_dict()
 
-    except Exception:
-        logs.append("FATAL_ERROR:\n" + traceback.format_exc())
+    except Exception as exc:
+        logs.append(
+            "FATAL_ERROR:\n"
+            f"{type(exc).__name__}: {exc}\n"
+            + traceback.format_exc()
+        )
         patch = ""
         if repo is not None:
             try:
                 patch = get_patch(repo)
-            except Exception:
-                pass
+            except Exception as patch_exc:
+                logs.append(
+                    "PATCH_RECOVERY:\n"
+                    + "".join(traceback.format_exception_only(type(patch_exc), patch_exc)).strip()
+                )
 
         return AgentResult(
             patch=patch,
