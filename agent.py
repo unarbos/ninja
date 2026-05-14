@@ -2783,7 +2783,7 @@ Treat every plan row and issue bullet as binary: either shipped end-to-end or st
 - **State and persistence:** If you touch caches, denormalized fields, `lastUpdated`, or snapshots, update every read/write path so nothing serves stale data after the fix.
 - **Prioritization:** Ship must-have wiring first; polish only after the end-to-end path is demonstrably correct.
 
-If the first user message includes **EXTRACTED WORK ITEMS**, treat that numbered block as part of the contract — each line should map to observable code or test evidence before you emit `<final>`.
+If the first user message includes a **### EXTRACTED WORK ITEMS** block, treat that numbered list as part of the contract — each line should map to observable code or test evidence before you emit `<final>`.
 
 ====================================================================
 INSPECTION STRATEGY
@@ -2903,12 +2903,18 @@ _PRELOAD_BEGIN_MARKER = "<!-- preloaded-context-begin -->"
 _PRELOAD_END_MARKER = "<!-- preloaded-context-end -->"
 
 
-def build_initial_user_prompt(
-    issue: str,
-    repo_summary: str,
-    preloaded_context: str = "",
-    work_items: Optional[List[str]] = None,
-) -> str:
+def _format_work_items_standalone_prefix(work_items: List[str]) -> str:
+    """Issue checklist for the first user message (outside preload markers so strip preload keeps it)."""
+    if not work_items:
+        return ""
+    numbered = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(work_items[:18]))
+    return (
+        "### EXTRACTED WORK ITEMS (from issue text — treat each as mandatory)\n"
+        f"{numbered}\n\n"
+    )
+
+
+def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     context_section = ""
     if preloaded_context.strip():
         context_section = f"""
@@ -2919,15 +2925,6 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 {_PRELOAD_END_MARKER}
 """
 
-    work_block = ""
-    if work_items:
-        numbered = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(work_items[:18]))
-        work_block = f"""
-EXTRACTED WORK ITEMS (enumerated from the issue text — treat each as a binary deliverable; do not stop after partial coverage):
-{numbered}
-
-"""
-
     return f"""Fix this issue:
 
 {issue}
@@ -2935,7 +2932,8 @@ EXTRACTED WORK ITEMS (enumerated from the issue text — treat each as a binary 
 Repository summary:
 
 {repo_summary}
-{context_section}{work_block}Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+{context_section}
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -3850,9 +3848,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
-            + build_initial_user_prompt(
-                issue, repo_summary, preloaded_context, work_items=_issue_work_items_list
-            )
+            + _format_work_items_standalone_prefix(_issue_work_items_list)
+            + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
