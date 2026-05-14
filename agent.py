@@ -141,6 +141,19 @@ _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
 
+# Issue-text file-count estimation. Drives the under-delivery retry that
+# kicks in when attempt 1 touches far fewer files than the task describes.
+# A patch that edits 1 file when the task lists 5 paths is almost always
+# missing integration surface.
+_FILE_COUNT_ESTIMATE_MIN = 2
+_FILE_COUNT_ESTIMATE_MAX = 8
+_UNDERDELIVER_MIN_ESTIMATE = 4
+_UNDERDELIVER_GAP_TOLERANCE = 1
+_BULLET_PREFIXES = (
+    "- ", "* ", "• ",
+    "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.",
+)
+
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
