@@ -108,8 +108,11 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.50
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -584,7 +587,7 @@ def get_patch(repo: Path) -> str:
         timeout=30,
     )
     if untracked.returncode != 0:
-        return diff_output
+        return _sanitize_patch(diff_output)
 
     for relative_path in [item for item in untracked.stdout.split("\0") if item]:
         if _should_skip_patch_path(relative_path):
@@ -633,6 +636,7 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
+    cleaned = _split_comment_import_concat(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
     # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
@@ -719,6 +723,64 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+_IMPORT_CONCAT_PATTERN = re.compile(r'[)};](?=import\s+[{*\w])')
+_HUNK_HEADER_RE = re.compile(r'^@@ -(\d+(?:,\d+)?) \+(\d+)(?:,(\d+))? @@(.*)$')
+
+
+def _split_comment_import_concat(diff_output: str) -> str:
+    """Repair '+' lines where a // comment ending and a JS/TS import statement
+    got concatenated onto one line (e.g. ')import {x}'). In JS/TS // extends to
+    end of line, so the concatenation silently turns the import into a comment
+    and breaks the file. Split at the boundary and bump the hunk's added-line
+    count. Narrow trigger: '//' must precede a close-bracket that is immediately
+    followed by 'import <brace-or-ident>' inside a '+' line."""
+    if not diff_output.strip() or '//' not in diff_output:
+        return diff_output
+    if not _IMPORT_CONCAT_PATTERN.search(diff_output):
+        return diff_output
+
+    lines = diff_output.splitlines(keepends=True)
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _HUNK_HEADER_RE.match(line.rstrip('\n'))
+        if not m:
+            out_lines.append(line)
+            i += 1
+            continue
+        old_part = m.group(1)
+        new_start = int(m.group(2))
+        new_count = int(m.group(3)) if m.group(3) else 1
+        tail = m.group(4)
+        j = i + 1
+        delta = 0
+        body: List[str] = []
+        while j < n and not lines[j].startswith('@@') and not lines[j].startswith('diff --git'):
+            bl = lines[j]
+            if bl.startswith('+') and not bl.startswith('+++') and '//' in bl:
+                ends_nl = bl.endswith('\n')
+                content = bl[1:].rstrip('\n')
+                mm = _IMPORT_CONCAT_PATTERN.search(content)
+                if mm and '//' in content[:mm.start()]:
+                    left = content[:mm.end()].rstrip()
+                    right = content[mm.end():].lstrip()
+                    if left and right:
+                        body.append('+' + left + '\n')
+                        body.append('+' + right + ('\n' if ends_nl else ''))
+                        delta += 1
+                        j += 1
+                        continue
+            body.append(bl)
+            j += 1
+        new_header = '@@ -%s +%d,%d @@%s\n' % (old_part, new_start, new_count + delta, tail)
+        out_lines.append(new_header)
+        out_lines.extend(body)
+        i = j
+    return ''.join(out_lines)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -2436,6 +2498,25 @@ _IDENTIFIER_STOPWORDS = {
     "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
     "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
     "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
+    "Card", "Modal", "Form", "Button", "Input", "Label", "Image", "Menu",
+    "Header", "Footer", "Layout", "Page", "Section", "Container", "Wrapper",
+    "Element", "Component", "Service", "Manager", "Handler", "Provider",
+    "Context", "Status", "Value", "Field", "Item", "Result", "Response",
+    "Request", "Config", "Settings", "Options", "Properties", "Default",
+    "Module", "Class", "Object", "String", "Number", "Array", "Function",
+    "Method", "Action", "State", "Store", "Schema", "Model", "View",
+    "Index", "Route", "Router", "Render", "Update", "Create", "Delete",
+    "useState", "useEffect", "useCallback", "useMemo", "useRef", "useContext",
+    "useRouter", "setState", "setValue", "getValue", "getDefault",
+    "handleClick", "handleChange", "handleSubmit", "handleClose", "handleError",
+    "fetchData", "createElement", "createContext", "buildPath", "buildUrl",
+}
+
+_HOOK_GENERIC_PREFIXES_LOWER = {
+    "usestate", "useeffect", "usecallback", "usememo", "useref", "usecontext",
+    "userouter", "setstate", "setvalue", "getvalue", "getdefault",
+    "handleclick", "handlechange", "handlesubmit", "handleclose", "handleerror",
+    "fetchdata", "createelement", "createcontext", "buildpath", "buildurl",
 }
 
 _CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
@@ -2458,8 +2539,11 @@ def _issue_identifier_path_boost(
             if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
                 identifiers.add(tok.lower())
         for m in _HOOK_RE.finditer(issue_text):
+            hook_lower = m.group(0).lower()
+            if hook_lower in _HOOK_GENERIC_PREFIXES_LOWER:
+                continue
             if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
+                identifiers.add(hook_lower)
         for m in _SNAKE_RE.finditer(issue_text):
             if len(identifiers) < cap:
                 identifiers.add(m.group(1).lower())
@@ -2713,6 +2797,8 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
+Scope discipline: only modify files the task explicitly names plus the minimum cross-file edits needed to keep them compiling. Do not rewrite working code in adjacent files even if a refactor would improve it; the judge penalises unrelated rewrites as heavily as missed requirements.
+
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
@@ -2859,6 +2945,51 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    """Return a 1-line type-specific cue prepended to the self-check prompt.
+
+    Heuristic keyword scan over the issue text. Empty when no strong type signal lands
+    (the prompt then degrades to the generic boilerplate). Cheap and stateless.
+    """
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -2879,7 +3010,9 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    type_cue = _self_check_type_cue(issue_text)
     return (
+        f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
@@ -3013,7 +3146,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+def _recently_observed_paths(logs: List[str], window: int = 80) -> List[str]:
     """Extract file paths recently read by the model from the last `window` log entries.
 
     Scans for paths surfaced via read_file/cat observations so the mid-loop
@@ -3034,6 +3167,23 @@ def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
         return results
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    """Mild budget reminder fired once when the model has cycled several steps without committing.
+
+    Unlike build_mid_loop_hail_mary_prompt, this does NOT order the model to stop reading or
+    pick a file — it nudges toward commitment without derailing a legitimate plan. Empty when
+    the model already has a clear target and will edit naturally.
+    """
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_hail_mary_prompt(
@@ -3331,6 +3481,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
+    soft_nudge_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3588,6 +3739,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and not get_patch(repo).strip()
+                and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            ):
+                soft_nudge_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_soft_nudge_prompt(step, _elapsed_now),
+                })
+                logs.append(f"SOFT_NUDGE_FIRED: step={step} elapsed={_elapsed_now:.1f}s")
+                continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
