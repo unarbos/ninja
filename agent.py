@@ -2995,7 +2995,12 @@ def build_self_check_prompt(
     issue_text: str,
     inplace_advisories: Optional[List[str]] = None,
 ) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+    """Show the model its own draft and demand an adversarial self-review.
+
+    Reframed from "validate this patch" to "find the weakest link" — models
+    systematically rubber-stamp their own work when asked to confirm
+    correctness but surface real flaws when explicitly asked to attack it.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
@@ -3013,31 +3018,32 @@ def build_self_check_prompt(
     type_cue = _self_check_type_cue(issue_text)
     return (
         f"{type_cue}"
-        "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
-        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n"
-        f"{advisory_block}\n"
-        "Your patch:\n```diff\n"
-        f"{truncated}\n```\n\n"
+        "ADVERSARIAL REVIEW. The LLM judge compares your patch to a reference "
+        "solution and marks it WRONG if any requirement is missed or the root "
+        "cause isn't fixed. Assume the patch is wrong until proven otherwise. "
+        "Your job is to find the weakest link BEFORE submitting.\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+        "Your patch:\n```diff\n"
+        f"{truncated}\n```\n\n"
+        "Answer in order — be specific, name lines/symbols, do not give generic answers:\n"
+        "1. ROOT CAUSE: does the diff fix the underlying cause, or only suppress a "
+        "symptom (try/except, default fallback, early return, value coerce)?\n"
+        "2. COMPLETENESS: enumerate every concrete requirement in the task. Which "
+        "are NOT obviously addressed by the diff?\n"
+        "3. RUNTIME CHECK: would the most relevant test in this repo pass against "
+        "this patch? If you have NOT run one, run `pytest tests/test_<module>.py "
+        "-x -q` (or the language equivalent for the file you edited) NOW. A "
+        "passing test is the strongest correctness evidence.\n"
+        "4. SCOPE: any whitespace-only, comment-only, type-annotation-only, "
+        "renames, or unrelated refactors the grader will penalize as scope creep?\n"
+        f"{advisory_block}\n"
+        "If you find ANY weakness in 1-4, emit corrective <command> blocks IN THE "
+        "SAME RESPONSE (run missing tests, fix root cause, revert scope-creep), "
+        "then end with <final>summary</final>.\n"
+        "Only respond `<final>OK</final>` when you have run a relevant test, it "
+        "passed, AND you cannot identify a weakness above.\n"
+        "Do NOT add new features, destructive operations, or unrelated scope."
     )
 
 
