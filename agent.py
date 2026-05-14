@@ -1,6 +1,98 @@
 #!/usr/bin/env python3
 """
-Portable single-file SWE-style coding agent harness.
+Portable single-file SWE-style coding agent harness — variant 1450_4.
+
+Forked from 1450_3_agent.py with the api-contract drift gate de-risked.
+
+Background: of the seven new advisory gates introduced in 1450_2, the static
+A/B harness in duels_artifacts/king18_1298_UID247/_ab_summary.md found two
+gates with non-trivial false-positive risk for live runs:
+
+  - styling-fidelity (de-risked in 1450_3)
+  - api-contract drift (de-risked here in 1450_4)
+
+The api-contract gate had two distinct false-positive shapes:
+
+  1. Paraphrase fires (e.g. "issue says `images`, patch added `imageUrls`")
+     fired even when:
+       a) the issue documented a migration that mentioned BOTH names, so
+          the gate punished the rename the issue was actually asking for; or
+       b) the canonical name did not appear anywhere in the diff at all,
+          meaning the paraphrase add was coincidental and unrelated.
+  2. Missing-identifier fires (issue back-ticks `Foo`, added lines do not
+     mention `Foo`) fired even when `Foo` was already in the patch's
+     CONTEXT lines — i.e. the model was editing a function/component named
+     `Foo` and just didn't repeat the name in its added body.
+
+1450_4 narrows the api-contract gate so it only fires when:
+
+  - (paraphrase) BOTH directions for a pair are skipped if both members
+    appear in the issue text (migration shape); AND the canonical name
+    must appear somewhere in the patch's universe (added/removed/context)
+    before a paraphrase fire is emitted.
+  - (missing-identifier) the wanted name must be absent from the entire
+    patch universe, not just from added lines. If it is in context or
+    removed lines, the model is clearly already on it.
+  - length threshold for missing-identifier bumped from 5 to 6, dropping
+    incidental 5-char tokens like `index`, `value`, `param`.
+  - total firings per round capped at 3 (was 5).
+
+All other gates and behaviour are identical to 1450_3 (which itself is
+identical to 1450_2 except for the styling de-risk).
+
+Original 1450_3 description (still accurate):
+
+Forked from 1450_2_agent.py with the styling-fidelity gate de-risked.
+
+Background: the static A/B in
+duels_artifacts/king18_1298_UID247/_ab_summary.md showed that 6 of 1450_2's
+7 new advisory gates were dormant on the king-247 corpus, while the
+styling-fidelity gate carried the highest false-positive risk for live runs:
+its single-keyword trigger (`padding`, `className`, `py-4`, ...) would fire
+on every routine "tighten padding" task and tell the model to keep className
+strings byte-for-byte identical, which can make it under-edit a legitimate
+multi-class change.
+
+1450_3 narrows the styling gate to only fire when BOTH:
+  (a) the issue text contains a "redesign-shape" verb cue
+      (rewrite, redesign, rework, overhaul, refactor, restyle, revamp,
+       reimplement, rebuild, modernize, polish, recreate, reskin,
+       "match the design/mockup/figma/spec"); AND
+  (b) the patch's added lines actually touch >= 2 className= attributes
+      (the case where over-editing risk is real). Single-attribute
+      changes — exactly the case where the original advisory most often
+      misfired — now pass through unflagged.
+
+All other gates and behaviour are identical to 1450_2.
+
+Original 1450_2 description (still accurate):
+
+What 1450_2 adds on top of 1450 (no removed behaviour):
+
+  * Per-language hardening for .py, .mjs, .go, .tsx, .java, and (noext) files
+    (extra companion-test patterns, gofmt + char-aware Java brace check,
+    optional tsc parse, shebang-driven extensionless syntax check, richer
+    sibling basenames, broader noext basename allow-list).
+
+  * Anti quality-loss gates plumbed into the existing self-check refinement
+    turn:
+        - styling-fidelity advisory  (ui_styling_gap)
+        - api-contract drift advisory (api_contract_mismatch)
+        - hardcoded-sentinel advisory (curDay=1, daysInMonth=30, app/api IDs)
+        - exact-version pinning advisory (drops `^`/`~` when task says X.Y.Z)
+        - client-side secret advisory  (sk-, AIza, Bearer literals in .tsx etc)
+        - residual mode-only-hunk advisory
+
+  * Junk-path hardening:
+        - .map source maps, .next/.nuxt/.turbo/.svelte-kit caches added to the
+          unconditional skip list
+        - lockfiles (package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb,
+          Cargo.lock, Gemfile.lock, composer.lock, go.sum, poetry.lock,
+          uv.lock, pdm.lock) hard-stripped from the final returned patch
+          UNLESS the issue explicitly mentions the lockfile basename.
+
+All additions are additive: same `solve()` contract, same wall-clock budgets,
+same multishot machinery, same dangerous-pattern list, same SYSTEM_PROMPT.
 
 Contract:
     The validator imports this file and calls:
@@ -725,6 +817,13 @@ def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
     if path.suffix in {".pyc", ".pyo"}:
         return True
+    # 1450_2: source-map suffixes are essentially always generator output; judges
+    # ding patches that touch them. They never carry semantics the task cares about.
+    if path.suffix == ".map":
+        return True
+    name_lower = path.name.lower()
+    if name_lower.endswith((".js.map", ".css.map", ".ts.map", ".d.ts.map")):
+        return True
     generated_parts = {
         "__pycache__",
         ".pytest_cache",
@@ -736,6 +835,18 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        # 1450_2: framework caches that show up as scope-creep noise in TSX-heavy
+        # rounds. Stripping them is safe because they are regenerated on every build.
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".svelte-kit",
+        ".cache",
+        ".parcel-cache",
+        ".vite",
+        ".astro",
+        ".angular",
+        ".docusaurus",
     }
     generated_suffixes = {
         ".class",
@@ -811,6 +922,27 @@ TEXT_FILE_BASENAMES = {
     "Gemfile",
     "Makefile",
     "Podfile",
+    # 1450_2: extra extensionless basenames that show up in king-247 (noext) tasks
+    # (worst-rate extension at 21.1% king winrate across 71 rounds — see analysis v2 §5).
+    "Brewfile",
+    "Caddyfile",
+    "Containerfile",
+    "Earthfile",
+    "Justfile",
+    "Procfile",
+    "Rakefile",
+    "Tiltfile",
+    "Vagrantfile",
+    "BUILD",
+    "WORKSPACE",
+    "BUILD.bazel",
+    "WORKSPACE.bazel",
+    ".dockerignore",
+    ".gitattributes",
+    ".gitignore",
+    ".npmignore",
+    ".prettierignore",
+    ".eslintignore",
 }
 
 CONTEXT_SKIP_PARTS = {
@@ -1210,6 +1342,36 @@ _DIRECTORY_SIBLING_BASENAMES = {
     "layout", "index", "page", "route", "loading", "error", "metadata",
     "manifest", "head", "template", "_meta", "_root", "styles", "types",
     "constants", "schema",
+    # 1450_2: Python neighbours (548 .py rounds; 52% king winrate).
+    "__init__", "__main__", "conftest", "settings", "config", "models",
+    "serializers", "urls", "views", "forms", "admin", "apps", "signals",
+    # 1450_2: Go neighbours (142 .go rounds; 54% king winrate).
+    "doc", "errors", "interfaces", "common",
+    # 1450_2: TSX/Next.js extras (757 .tsx rounds — biggest bucket).
+    "default", "actions", "providers", "middleware", "auth", "client", "server",
+    "utils", "lib", "hooks", "store", "context",
+    # 1450_2: Java neighbours (146 .java rounds; 36% king winrate, 2nd worst).
+    "package-info", "module-info",
+}
+
+
+# 1450_2: Per-extension preferred sibling stems. When the top-ranked file matches
+# an extension here, we look for these companions in the same directory in
+# addition to the language-agnostic _DIRECTORY_SIBLING_BASENAMES set above.
+_LANG_SIBLING_BASENAMES: Dict[str, set] = {
+    ".py":  {"__init__", "__main__", "conftest", "settings", "models", "urls",
+             "views", "serializers", "schemas", "forms", "admin", "signals",
+             "apps", "tasks", "celery", "wsgi", "asgi"},
+    ".tsx": {"index", "layout", "page", "route", "loading", "error", "metadata",
+             "default", "template", "providers", "middleware"},
+    ".ts":  {"index", "types", "constants", "schema", "config", "client",
+             "server", "utils"},
+    ".jsx": {"index", "App", "main"},
+    ".js":  {"index", "config", "main"},
+    ".mjs": {"index", "config"},
+    ".go":  {"doc", "errors", "main", "client", "server"},
+    ".java":{"package-info", "module-info"},
+    ".kt":  {"package-info"},
 }
 
 
@@ -1220,6 +1382,11 @@ def _augment_with_directory_siblings(
 
     Targets high-leverage basenames (layout, index, schema, etc.) that commonly
     need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
+
+    1450_2: also consults `_LANG_SIBLING_BASENAMES` for language-specific
+    companions (e.g. `__init__.py` next to a .py file, `package-info.java` next
+    to a .java file). The language-specific set takes priority over the generic
+    one so a Python task gets `conftest.py` before `layout.tsx` in a polyglot repo.
     """
     try:
         if not files:
@@ -1228,19 +1395,30 @@ def _augment_with_directory_siblings(
         top_dir = str(Path(top).parent).replace("\\", "/")
         if top_dir in {"", "."}:
             return files
+        top_suffix = Path(top).suffix.lower()
+        lang_basenames = _LANG_SIBLING_BASENAMES.get(top_suffix, set())
         seen = set(files)
-        siblings: List[str] = []
+        # Two-pass: first fill from language-specific basenames (higher precedence),
+        # then top up from the generic set if there is room left in the budget.
+        lang_siblings: List[str] = []
+        generic_siblings: List[str] = []
         for candidate in tracked_set:
             if candidate in seen:
                 continue
             cpath = Path(candidate)
             if str(cpath.parent).replace("\\", "/") != top_dir:
                 continue
-            if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
-                siblings.append(candidate)
-            if len(siblings) >= limit:
+            stem_lower = cpath.stem.lower()
+            if lang_basenames and stem_lower in {b.lower() for b in lang_basenames}:
+                lang_siblings.append(candidate)
+            elif stem_lower in _DIRECTORY_SIBLING_BASENAMES:
+                generic_siblings.append(candidate)
+            if len(lang_siblings) >= limit:
                 break
-        return files + siblings[:limit]
+        picked = lang_siblings[:limit]
+        if len(picked) < limit:
+            picked.extend(generic_siblings[: limit - len(picked)])
+        return files + picked
     except Exception:
         return files
 
@@ -1593,6 +1771,563 @@ def _patch_newly_created_files(patch: str) -> List[str]:
         return []
 
 
+# ----------------------------------------------------------------------
+# 1450_2: quality-loss + concrete-fix advisory gates.
+#
+# Each gate returns a list of human-readable advisory strings. They are all
+# plumbed through the existing self-check refinement turn (no extra LLM round
+# trips). Pure diff-text + issue-text scans — no subprocess, no I/O.
+#
+# Targets from duels_artifacts/king18_1298_UID247/_analysis_v2.md:
+#   §7 quality losses: ui_styling_gap (303), api_contract_mismatch (174),
+#   mode_only_chmod_noise (188 — already partly handled by _strip_mode_only).
+#   §11 concrete fixes: hardcoded constants, exact-version pinning,
+#   client-side secrets, lockfile/junk hard-strip.
+# ----------------------------------------------------------------------
+
+# Words/phrases that signal a styling-shaped task. When the task uses any of
+# these AND the patch touches a UI-shaped extension, surface a styling advisory.
+_STYLING_ISSUE_RE = re.compile(
+    r"\b(padding|margin|className|class\s*name|tailwind|font|"
+    r"radius|shadow|border|gap|spacing|width|height|background|"
+    r"color|hover|focus|inline|flex|grid|rounded|opacity|"
+    r"text-(?:xs|sm|base|lg|xl|2xl|3xl)|"
+    r"py-\d|px-\d|mt-\d|mb-\d|ml-\d|mr-\d|p-\d|m-\d|"
+    r"w-\d|h-\d|gap-\d|space-(?:x|y)-\d)\b",
+    re.IGNORECASE,
+)
+# 1450_3: styling-fidelity gate only fires when the issue ALSO contains one of
+# these "redesign-shape" verb cues — otherwise simple "change padding to py-4"
+# tasks would receive an over-conservative nudge and the model would under-edit.
+# Verbs/phrases here all imply that MULTIPLE class changes are expected, which
+# is the regime where the advisory's "preserve other classes byte-for-byte"
+# instruction has positive value rather than causing under-editing.
+_STYLING_REDESIGN_VERB_RE = re.compile(
+    r"\b(rewrite|redesign|rework|overhaul|refactor|restyle|revamp|"
+    r"reimplement|rebuild|modernize|modernise|polish|recreate|reskin|"
+    r"redo (?:the )?(?:layout|styles?|styling|design|ui|component)|"
+    r"match (?:the )?(?:design|mockup|figma|spec)|"
+    r"as shown in (?:the )?(?:design|mockup|figma|screenshot)|"
+    r"according to (?:the )?(?:design|mockup|figma|spec))\b",
+    re.IGNORECASE,
+)
+# 1450_3: count of `className=` attribute occurrences in the patch's added
+# lines must reach this threshold for the gate to fire. Single-attribute
+# touches are exactly the case where the advisory most often over-corrects.
+_STYLING_CLASSNAME_MIN = 2
+_CLASSNAME_ATTR_RE = re.compile(r"\bclassName\s*=")
+_UI_FILE_EXTS = {".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".sass", ".less"}
+
+
+def _check_styling_fidelity(patch: str, issue_text: str) -> List[str]:
+    """Return advisories when the task is a styling REDESIGN that touches multiple className attrs.
+
+    Targets king-247 §7 quality losses where ui_styling_gap appears in 303 of
+    1,107 quality-loss rounds — judges flag patches that refactor className
+    strings or reorder utility classes when the task only asked for a focused
+    style change.
+
+    1450_3 narrows the trigger from 1450_2 by requiring BOTH:
+      - issue contains a redesign-shape verb (`_STYLING_REDESIGN_VERB_RE`),
+        not just a styling-shaped keyword; AND
+      - the patch's added lines touch at least `_STYLING_CLASSNAME_MIN`
+        className= attributes, so the advisory only ships when the model
+        is making multi-attribute UI changes (the regime where preserving
+        unrelated classes is genuinely valuable).
+    Either gate alone falsely flags routine "change padding to py-4" tasks.
+    """
+    try:
+        text = issue_text or ""
+        if not _STYLING_ISSUE_RE.search(text):
+            return []
+        # 1450_3 surgery #1: require a redesign-shape verb cue. This suppresses
+        # the gate on focused single-attribute tasks where the advisory was
+        # most likely to cause under-editing.
+        if not _STYLING_REDESIGN_VERB_RE.search(text):
+            return []
+        touched_ui = [
+            p for p in _patch_changed_files(patch)
+            if Path(p).suffix.lower() in _UI_FILE_EXTS
+        ]
+        if not touched_ui:
+            return []
+        # 1450_3 surgery #2: require multiple className= attribute touches.
+        # Single-attribute edits are exactly the case where the advisory most
+        # often over-corrects — the model has already made the one change the
+        # task asked for and shouldn't be nudged to "preserve everything else"
+        # when there is nothing else to preserve.
+        className_hits = sum(
+            len(_CLASSNAME_ATTR_RE.findall(line[1:]))
+            for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if className_hits < _STYLING_CLASSNAME_MIN:
+            return []
+        sample = ", ".join(touched_ui[:3])
+        return [
+            f"task is a styling REDESIGN and you touched {sample} across "
+            f"{className_hits} className attributes: preserve the existing "
+            "className strings byte-for-byte except for the specific "
+            "utility classes the task asked you to change; do not reorder, "
+            "alphabetise, or 'tidy' surrounding classes; do not switch between "
+            "tailwind and inline styles unless the task requested it."
+        ]
+    except Exception:
+        return []
+
+
+# Identifier-shaped tokens in the issue text that the patch is expected to
+# preserve verbatim. Captures back-ticked symbols and JSON-key-shaped strings.
+_BACKTICK_TOKEN_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,40})`")
+_JSON_KEY_RE       = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{2,40})"\s*:')
+
+# Common API-contract paraphrases that judges punish (king-247 §7 cites
+# `imageUrls` vs `images`, missing `createdAt`, etc.).
+_API_PARAPHRASE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("images",      "imageUrls"),
+    ("images",      "imageList"),
+    ("images",      "image_urls"),
+    ("createdAt",   "created_at"),
+    ("updatedAt",   "updated_at"),
+    ("deletedAt",   "deleted_at"),
+    ("userId",      "user_id"),
+    ("itemId",      "item_id"),
+    ("orderId",     "order_id"),
+    ("isActive",    "active"),
+    ("isEnabled",   "enabled"),
+    ("isDeleted",   "deleted"),
+    ("totalCount",  "total"),
+    ("pageSize",    "limit"),
+    ("pageNumber",  "page"),
+)
+
+# 1450_4: line prefixes that mark non-content (header/meta) diff lines we must
+# strip before scanning the patch for tokens. Note that '@@' hunk headers are
+# handled separately because their trailing 'function context' segment names
+# the symbol the model is editing — that text IS part of the universe.
+_PATCH_META_PREFIXES: Tuple[str, ...] = (
+    "diff ", "index ", "--- ", "+++ ", "Binary files",
+    "new file mode", "deleted file mode", "old mode", "new mode",
+    "rename from ", "rename to ", "similarity index", "dissimilarity index",
+    "copy from ", "copy to ", "GIT binary patch",
+)
+
+
+def _api_patch_universe(patch: str) -> str:
+    """Return all non-meta diff line bodies, joined with newlines.
+
+    Used by `_check_api_contract_drift` (1450_4) so a single regex scan can
+    answer 'does this token appear anywhere in the diff the model is editing
+    — added, removed, surrounding context, OR the function/class context
+    named in the @@ hunk header?'. This lets us suppress fires where the
+    model is already operating on the symbol the issue mentioned (most
+    common false-positive shape we observed in 1450_3 review).
+    """
+    out: List[str] = []
+    for line in patch.splitlines():
+        if not line:
+            continue
+        if line.startswith("@@"):
+            # Unified-diff hunk header: '@@ -a,b +c,d @@ <function context>'.
+            # The function context after the second '@@' is prime evidence of
+            # which symbol the model is editing — keep it in the universe.
+            parts = line.split("@@", 2)
+            if len(parts) >= 3:
+                fn_ctx = parts[2].strip()
+                if fn_ctx:
+                    out.append(fn_ctx)
+            continue
+        if line.startswith(_PATCH_META_PREFIXES):
+            continue
+        first = line[0]
+        if first in (" ", "+", "-"):
+            out.append(line[1:])
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _check_api_contract_drift(patch: str, issue_text: str) -> List[str]:
+    """Return advisories when the patch text drops or paraphrases names the issue specifies.
+
+    Targets king-247 §7 quality losses where api_contract_mismatch appears in
+    174 quality-loss rounds. Most concrete failure: judge asks for `images`,
+    king ships `imageUrls`; or judge asks for `createdAt`, king ships
+    `created_at`. We surface both directions so the model can re-align.
+
+    1450_4 narrows the trigger from 1450_3 with three suppressions:
+      A. migration shape — if BOTH members of a paraphrase pair appear in
+         the issue text, skip both directions for that pair (the issue is
+         documenting a transition, the gate would punish the rename).
+      B. paraphrase fires require the canonical name to appear somewhere
+         in the patch's universe (added/removed/context). A paraphrase
+         add to code that never touches the canonical is almost always
+         a coincidence, not contract drift.
+      C. missing-identifier fires require the wanted name to be absent
+         from the patch's entire universe, not just added lines. Names
+         in context or removed lines mean the model is editing them.
+      D. length threshold for missing-identifier bumped 5 → 6.
+      E. total firings per round capped at 3 (was 5).
+    """
+    try:
+        if not patch.strip():
+            return []
+        wanted: set = set()
+        for m in _BACKTICK_TOKEN_RE.finditer(issue_text or ""):
+            wanted.add(m.group(1))
+        for m in _JSON_KEY_RE.finditer(issue_text or ""):
+            wanted.add(m.group(1))
+        if not wanted:
+            return []
+        added_lines = "\n".join(
+            ln[1:] for ln in patch.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        )
+        if not added_lines:
+            return []
+        # 1450_4: full token surface of the patch (added + removed + context).
+        # Used to detect 'model is already on this symbol' so we don't nag.
+        universe = _api_patch_universe(patch)
+
+        def _in_universe(name: str) -> bool:
+            return bool(re.search(r"\b" + re.escape(name) + r"\b", universe))
+
+        advisories: List[str] = []
+        for canonical, paraphrase in _API_PARAPHRASE_PAIRS:
+            # 1450_4 surgery A: migration shape — issue mentions both names,
+            # so the gate would otherwise punish the rename the issue is
+            # asking the model to perform.
+            if canonical in wanted and paraphrase in wanted:
+                continue
+            # Direction A: issue says canonical, patch wrote paraphrase.
+            if canonical in wanted:
+                if (
+                    re.search(r"\b" + re.escape(paraphrase) + r"\b", added_lines)
+                    and not re.search(r"\b" + re.escape(canonical) + r"\b", added_lines)
+                    # 1450_4 surgery B: canonical must appear somewhere in
+                    # the patch (typically removed/context lines). Paraphrase
+                    # adds to unrelated code are coincidence, not drift.
+                    and _in_universe(canonical)
+                ):
+                    advisories.append(
+                        f"task names `{canonical}` but your patch added `{paraphrase}`: "
+                        "rename to match the contract literally."
+                    )
+            # Direction B: issue says paraphrase, patch wrote canonical.
+            if paraphrase in wanted:
+                if (
+                    re.search(r"\b" + re.escape(canonical) + r"\b", added_lines)
+                    and not re.search(r"\b" + re.escape(paraphrase) + r"\b", added_lines)
+                    and _in_universe(paraphrase)
+                ):
+                    advisories.append(
+                        f"task names `{paraphrase}` but your patch added `{canonical}`: "
+                        "rename to match the contract literally."
+                    )
+            if len(advisories) >= 3:
+                break
+        # Generic: a wanted identifier (long enough to be specific) is missing
+        # from added text entirely.
+        for name in wanted:
+            # 1450_4 surgery D: bumped 5 → 6; drops 5-char incidentals like
+            # `index`, `value`, `param` while keeping `images`, `userId`.
+            if len(name) < 6:
+                continue
+            # 1450_4 surgery C: name appears anywhere in the patch (added,
+            # removed, or context). The model is clearly editing it; the
+            # advisory would just be noise.
+            if _in_universe(name):
+                continue
+            advisories.append(
+                f"task names `{name}` but your patch's added lines do not mention it; "
+                "verify it was not dropped or renamed."
+            )
+            # 1450_4 surgery E: tighter overall cap (was 5).
+            if len(advisories) >= 3:
+                break
+        return advisories[:3]
+    except Exception:
+        return []
+
+
+# Hardcoded-sentinel patterns. Each entry is (regex, message-template, group_idx).
+_HARDCODED_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\b(curDay|currentDay|cur_day|current_day|currDay)\s*[=:]\s*1\b"),
+     "{name}=1 is a calendar sentinel — pass the current day or compute from new Date()/datetime.now()"),
+    (re.compile(r"\b(daysInMonth|days_in_month|monthDays|month_days)\s*[=:]\s*(28|29|30|31)\b"),
+     "{name}={value} is a calendar sentinel — compute days_in_month from year+month"),
+    (re.compile(r"\b(?:appId|app_id|application_id|applicationId|app-id)\s*[=:]\s*[\"']([A-Za-z0-9_-]{6,})[\"']"),
+     "hardcoded application ID `{value}` — read from env/config so it can vary per environment"),
+    (re.compile(r"\b(?:apiKey|api_key)\s*[=:]\s*[\"']([A-Za-z0-9_-]{12,})[\"']"),
+     "hardcoded apiKey literal `{value}` — read from env at request time, never commit a key"),
+    (re.compile(r"\bca-pub-(\d{10,})"),
+     "hardcoded AdSense publisher id `ca-pub-{value}` — promote to a constant fed from config"),
+    (re.compile(r"\bG-([A-Z0-9]{6,})\b"),
+     "hardcoded GA4 measurement id `G-{value}` — promote to a constant fed from env/config"),
+    (re.compile(r"\bUA-(\d{5,}-\d+)\b"),
+     "hardcoded Universal Analytics id `UA-{value}` — promote to a constant fed from env/config"),
+    (re.compile(r"\b(year)\s*[=:]\s*(20\d{2})\b"),
+     "hardcoded {name}={value} — derive from new Date()/datetime.now()"),
+    (re.compile(r"\bnew Date\(\s*(20\d{2})\s*[,)]"),
+     "hardcoded `new Date({value}, …)` — derive year from new Date() rather than literal"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+     "hardcoded `sk-…` literal — looks like an API secret; remove and source from env"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+     "hardcoded `AIza…` literal — looks like a Google API key; remove and source from env"),
+    (re.compile(r"\bpk_(?:test|live)_[A-Za-z0-9]{16,}\b"),
+     "hardcoded Stripe public key literal — promote to env constant"),
+    (re.compile(r"\bsk_(?:test|live)_[A-Za-z0-9]{16,}\b"),
+     "hardcoded Stripe SECRET key literal — must NOT live in source; remove and source from env"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+     "hardcoded Slack token literal — must NOT live in source; remove and source from env"),
+)
+
+
+def _check_hardcoded_sentinels(patch: str) -> List[str]:
+    """Return advisories for suspicious magic-number / API-id / secret literals in added lines.
+
+    Targets king-247 §11 concrete fix: 'Stop hardcoding constants
+    (curDay=1, daysInMonth=30, API keys, app IDs)'. Multiple losses cite this.
+
+    Pure diff-text scan — no subprocess, no I/O.
+    """
+    try:
+        if not patch.strip():
+            return []
+        added_lines = [
+            ln[1:] for ln in patch.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        ]
+        if not added_lines:
+            return []
+        advisories: List[str] = []
+        seen: set = set()
+        for line in added_lines:
+            for pattern, message_template in _HARDCODED_PATTERNS:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                groups = m.groups()
+                name = groups[0] if groups else ""
+                value = groups[1] if len(groups) > 1 else (groups[0] if groups else "")
+                msg = message_template.format(name=name, value=value)
+                if msg in seen:
+                    continue
+                seen.add(msg)
+                advisories.append(msg)
+                if len(advisories) >= 6:
+                    return advisories
+        return advisories
+    except Exception:
+        return []
+
+
+# Manifest files where exact-version pinning typically matters.
+_MANIFEST_BASENAMES = {
+    "package.json", "Cargo.toml", "pyproject.toml", "requirements.txt",
+    "requirements-dev.txt", "go.mod", "Gemfile", "composer.json", "pubspec.yaml",
+    "build.gradle", "build.gradle.kts", "pom.xml",
+}
+_VERSION_LITERAL_RE  = re.compile(r"\b(\d+\.\d+\.\d+(?:-[A-Za-z0-9.\-]+)?)\b")
+_PINNING_VERB_RE     = re.compile(
+    r"\b(pin|pinned|pin to|exactly|exact version|use version|set to version|"
+    r"upgrade to|downgrade to|bump to|use|to)\b\s*[`'\"]?\d+\.\d+\.\d+",
+    re.IGNORECASE,
+)
+_LOOSE_RANGE_RE      = re.compile(r"[\^~>]=?\s*\d+\.\d+\.\d+|\*|\bany\b")
+
+
+def _check_version_pinning(patch: str, issue_text: str) -> List[str]:
+    """Return advisories when the issue says 'exactly X.Y.Z' but the patch wrote `^X.Y.Z` etc.
+
+    Targets king-247 §11 concrete fix:
+    'Pin versions exactly when the task says 1.3.0, not ^1.3.0.'
+    Relevant duel: 004606 task `validate-20260509031332-064765`
+    (finch upgrade where reference pinned to 1.3.0 and king wrote ^1.3.0).
+    """
+    try:
+        if not patch.strip() or not issue_text:
+            return []
+        wanted_versions = {m.group(1) for m in _VERSION_LITERAL_RE.finditer(issue_text)}
+        if not wanted_versions:
+            return []
+        if not _PINNING_VERB_RE.search(issue_text):
+            return []
+        # Only inspect added lines in manifest files.
+        advisories: List[str] = []
+        cur_path: Optional[str] = None
+        in_manifest = False
+        for line in patch.splitlines():
+            if line.startswith("diff --git "):
+                m = re.match(r"diff --git a/.+? b/(.+)$", line)
+                cur_path = m.group(1) if m else None
+                in_manifest = bool(cur_path and Path(cur_path).name in _MANIFEST_BASENAMES)
+                continue
+            if not in_manifest or not line.startswith("+") or line.startswith("+++"):
+                continue
+            added = line[1:]
+            for v in wanted_versions:
+                if v in added and re.search(r"[\^~>]=?\s*" + re.escape(v), added):
+                    advisories.append(
+                        f"{cur_path}: task says exactly `{v}`, your patch wrote a "
+                        f"loose range — drop the `^`/`~`/`>=` so the spec is "
+                        f"literally `{v}`."
+                    )
+                    break
+            if len(advisories) >= 4:
+                break
+        return advisories
+    except Exception:
+        return []
+
+
+# Client-side file extensions where shipping a secret is a hard penalty.
+_CLIENT_EXTS = {".tsx", ".jsx", ".js", ".mjs", ".vue", ".svelte", ".html", ".htm"}
+_SECRET_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+     "OpenAI-style `sk-…` secret literal"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+     "Google `AIza…` API key literal"),
+    (re.compile(r"\bsk_(?:test|live)_[A-Za-z0-9]{16,}\b"),
+     "Stripe SECRET key literal"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+     "Slack token literal"),
+    (re.compile(r"\bghp_[A-Za-z0-9]{30,}\b"),
+     "GitHub personal access token literal"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+     "AWS access key literal"),
+    (re.compile(r"Authorization\s*:\s*['\"]\s*Bearer\s+[A-Za-z0-9_.\-]{20,}"),
+     "hardcoded `Authorization: Bearer …` literal"),
+    (re.compile(r"\b(?:apiKey|api_key|API_KEY|secret|SECRET)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]"),
+     "hardcoded apiKey/secret literal"),
+)
+
+
+def _check_client_side_secrets(patch: str) -> List[str]:
+    """Return advisories when added lines in client-side files carry secret-shaped literals.
+
+    Targets king-247 §11 concrete fix:
+    'Don't expose API keys or secrets in client code.'
+    Specifically called out in duel 004606 task validate-20260509031735-064790
+    where exposing an Anthropic key in a client component was a hard penalty.
+    """
+    try:
+        if not patch.strip():
+            return []
+        advisories: List[str] = []
+        seen: set = set()
+        cur_path: Optional[str] = None
+        in_client = False
+        for line in patch.splitlines():
+            if line.startswith("diff --git "):
+                m = re.match(r"diff --git a/.+? b/(.+)$", line)
+                cur_path = m.group(1) if m else None
+                in_client = bool(cur_path and Path(cur_path).suffix.lower() in _CLIENT_EXTS)
+                continue
+            if not in_client or not line.startswith("+") or line.startswith("+++"):
+                continue
+            added = line[1:]
+            for pattern, label in _SECRET_PATTERNS:
+                if pattern.search(added):
+                    msg = f"{cur_path}: {label} in client code — move to a server function/route handler and source from env at request time"
+                    if msg in seen:
+                        continue
+                    seen.add(msg)
+                    advisories.append(msg)
+                    if len(advisories) >= 4:
+                        return advisories
+        return advisories
+    except Exception:
+        return []
+
+
+# Lockfile basenames hard-stripped from the final patch unless the issue
+# explicitly mentions the basename. Targets king-247 §11 concrete fix.
+_LOCKFILE_BASENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum",
+    "poetry.lock", "uv.lock", "pdm.lock", "pubspec.lock",
+    "Pipfile.lock", "mix.lock",
+}
+
+
+def _strip_lockfile_diffs_unless_mentioned(patch: str, issue_text: str) -> str:
+    """Drop lockfile diff blocks when the issue does not mention the basename.
+
+    1450_2: lockfile churn shows up as scope-creep in many king-247 losses
+    (see analysis v2 §9 'red-flag losing diffs'). Manifest churn is fine; the
+    autogenerated lockfile shouldn't ride along unless the task explicitly
+    asks for it.
+    """
+    try:
+        if not patch.strip():
+            return patch
+        issue_lower = (issue_text or "").lower()
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        kept: List[str] = []
+        dropped: List[str] = []
+        for block in blocks:
+            if not block:
+                continue
+            path = _diff_block_path(block)
+            base = Path(path).name if path else ""
+            if base in _LOCKFILE_BASENAMES and base.lower() not in issue_lower:
+                dropped.append(path)
+                continue
+            kept.append(block)
+        result = "".join(kept)
+        if patch.endswith("\n") and result and not result.endswith("\n"):
+            result += "\n"
+        return result
+    except Exception:
+        return patch
+
+
+def _check_residual_mode_only_hunks(patch: str) -> List[str]:
+    """Return an advisory if any mode-only file blocks survived the sanitiser.
+
+    Belt-and-braces for king-247 §9 — duels 004628..004685 task `…064772`
+    consistently shipped 15+ mode-only chmod hunks despite the existing
+    _strip_mode_only_file_diffs sanitiser. This catches stragglers.
+    """
+    try:
+        if not patch.strip():
+            return []
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        offenders: List[str] = []
+        for block in blocks:
+            if not block.startswith("diff --git "):
+                continue
+            if (
+                "\nold mode " in block
+                and "\nnew mode " in block
+                and "\n@@ " not in block
+                and "\nGIT binary patch" not in block
+                and "\nBinary files " not in block
+                and "\nnew file mode " not in block
+                and "\ndeleted file mode " not in block
+            ):
+                p = _diff_block_path(block)
+                if p:
+                    offenders.append(p)
+                if len(offenders) >= 5:
+                    break
+        if not offenders:
+            return []
+        sample = ", ".join(offenders[:5])
+        return [
+            f"mode-only chmod hunks remain in your patch ({sample}); "
+            "drop those file blocks entirely — the task did not ask for permission changes."
+        ]
+    except Exception:
+        return []
+
+
+# ----------------------------------------------------------------------
+# end of 1450_2 advisory gates
+# ----------------------------------------------------------------------
+
+
 def _check_inplace_intent(
     patch: str, issue_text: str, tracked_set: set
 ) -> List[str]:
@@ -1850,6 +2585,238 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_go_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`gofmt -l <file>` parses-but-doesn't-format-check a Go source file.
+
+    1450_2: added because king-247 has 142 .go rounds at 54.2% winrate (65 losses)
+    and the original 1450 had no Go syntax check at all.
+    Skips silently if `gofmt` is not on PATH.
+    """
+    if not _has_executable("gofmt"):
+        return None
+    proc_result = run_command(
+        f"gofmt -l {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code != 0:
+        msg = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()
+        if msg:
+            return f"{relative_path}: {msg[-1]}"
+        return f"{relative_path}: gofmt parse failed"
+    return None
+
+
+def _check_tsc_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`tsc --noEmit` on a single .ts/.tsx file.
+
+    1450_2: added because king-247 has 757 .tsx rounds (biggest single bucket)
+    plus 146 .ts rounds and the original 1450 only ran `node --check` on those,
+    which catches syntax errors but not type/JSX-shape errors.
+    Skips silently if `tsc` is not on PATH (most task containers won't have it).
+    """
+    if not _has_executable("tsc"):
+        return None
+    proc_result = run_command(
+        f"tsc --noEmit --target es2020 --module esnext --moduleResolution node "
+        f"--jsx preserve --allowJs --skipLibCheck "
+        f"--esModuleInterop {_shell_quote(relative_path)}",
+        repo,
+        timeout=_SYNTAX_TIMEOUT,
+    )
+    if proc_result.exit_code != 0:
+        msg = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()
+        if msg:
+            # tsc prints many lines; keep the first error so the model has
+            # something concrete to fix.
+            for line in msg:
+                if ": error " in line.lower() or "error TS" in line:
+                    return f"{relative_path}: {line.strip()}"
+            return f"{relative_path}: {msg[-1].strip()}"
+        return f"{relative_path}: tsc parse failed"
+    return None
+
+
+def _check_java_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Java/Kotlin/C-family char-literal-aware brace balance.
+
+    1450_2: the generic `_check_brace_balance_one` treats `'` as a string
+    delimiter, which produces false positives on Java's char literals (`'X'`,
+    `'\\n'`, `'\\u00A0'`). The brace-balance constant in 1450 includes .java/.kt
+    despite its own comment warning against it. This Java-specific check
+    handles char literals and Java-style string literals correctly.
+
+    Targets: king-247 .java is the second-worst extension (146 rounds, 36.3%
+    winrate, 93 losses). The original 1450 has no Java syntax check at all;
+    this gives at least a cheap brace-count signal.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    counts = {"{": 0, "}": 0, "[": 0, "]": 0, "(": 0, ")": 0}
+    i = 0
+    n = len(source)
+    in_str: Optional[str] = None
+    in_text_block = False  # Java 13+ triple-quoted text block: """ ... """
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        nxt2 = source[i + 2] if i + 2 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_text_block:
+            if ch == '"' and nxt == '"' and nxt2 == '"':
+                in_text_block = False
+                i += 3
+                continue
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        # Java char literal: '<one logical char optionally escaped>'
+        if ch == "'":
+            j = i + 1
+            if j < n and source[j] == "\\":
+                # consume escape — single char, octal, or unicode \uXXXX
+                j += 1
+                if j < n and source[j] == "u":
+                    j += 5  # \uXXXX
+                else:
+                    j += 1
+            else:
+                j += 1
+            if j < n and source[j] == "'":
+                i = j + 1
+                continue
+            # malformed char literal — fall through, treat as no-op rather than
+            # flipping into permanent string mode.
+            i += 1
+            continue
+        # Java text block opener """
+        if ch == '"' and nxt == '"' and nxt2 == '"':
+            in_text_block = True
+            i += 3
+            continue
+        if ch == '"':
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+
+    diffs: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        delta = counts[opener] - counts[closer]
+        if delta != 0:
+            diffs.append(f"{opener}/{closer} delta={delta:+d}")
+    if diffs:
+        return f"{relative_path}: brace imbalance ({', '.join(diffs)})"
+    return None
+
+
+def _check_noext_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Shebang-driven syntax check for files without an extension.
+
+    1450_2: king-247's worst-rate extension is `(noext)` at 21.1% winrate across
+    71 rounds. Most extensionless code in those rounds is shell scripts checked
+    in without `.sh`. This routes them to `bash -n` (parse-only) when bash is
+    available, and to `python -m py_compile` when the shebang says python.
+    Dockerfile-family basenames get a basic `FROM`-required check.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    name = Path(relative_path).name
+    if name in {"Dockerfile", "Containerfile"} or name.endswith(".Dockerfile"):
+        # Light-touch: must contain at least one FROM instruction.
+        if not re.search(r"^\s*FROM\s+\S", source, re.IGNORECASE | re.MULTILINE):
+            return f"{relative_path}: Dockerfile missing required FROM instruction"
+        return None
+    if name == "Makefile":
+        # Tabs-vs-spaces is the classic Makefile bug. Recipes must start with TAB.
+        for ln_no, line in enumerate(source.splitlines()[:400], start=1):
+            if line.startswith("    ") and not line.startswith("\t") and ":" not in line[:80] and line.strip():
+                return f"{relative_path}:{ln_no}: Makefile recipe line uses spaces; needs leading TAB"
+        return None
+
+    first_line = source.splitlines()[0] if source else ""
+    if not first_line.startswith("#!"):
+        return None
+
+    if "python" in first_line:
+        try:
+            import ast as _ast
+            _ast.parse(source)
+            return None
+        except SyntaxError as exc:
+            return f"{relative_path}:{exc.lineno}: {exc.msg}"
+        except Exception as exc:
+            return f"{relative_path}: parse failure: {exc}"
+
+    if any(sh in first_line for sh in ("bash", "/sh", "zsh", "ksh")):
+        if not _has_executable("bash"):
+            return None
+        proc_result = run_command(
+            f"bash -n {_shell_quote(relative_path)}",
+            repo,
+            timeout=_SYNTAX_TIMEOUT,
+        )
+        if proc_result.exit_code != 0:
+            msg = (proc_result.stderr or proc_result.stdout or "").strip().splitlines()
+            if msg:
+                return f"{relative_path}: {msg[-1]}"
+            return f"{relative_path}: bash -n failed"
+    return None
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1870,6 +2837,27 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        # 1450_2: language-specific paths added BEFORE the generic brace check
+        # so that .java / .go / .ts / .tsx get the right tool when available.
+        elif suffix == ".go":
+            result = _check_go_syntax_one(repo, relative_path)
+            if result is None:
+                result = _check_brace_balance_one(repo, relative_path)
+        elif suffix in {".ts", ".tsx"}:
+            result = _check_tsc_one(repo, relative_path)
+            if result is None:
+                # Fall back to node --check parse (already supports TS/TSX) and
+                # then to brace balance.
+                result = _check_node_syntax_one(repo, relative_path)
+                if result is None:
+                    result = _check_brace_balance_one(repo, relative_path)
+        elif suffix == ".java":
+            result = _check_java_brace_balance_one(repo, relative_path)
+        elif suffix == ".kt":
+            # Kotlin shares Java's char-literal grammar.
+            result = _check_java_brace_balance_one(repo, relative_path)
+        elif suffix == "":
+            result = _check_noext_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
@@ -1919,6 +2907,10 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "test/{stem}_test.py"),
     ("{stem}.py", "test/test_{stem}.py"),
     ("{stem}.py", "{dir}/{stem}_test.py"),
+    # 1450_2: extra Python conventions seen in king-247 .py rounds (548 rounds, 52% winrate).
+    ("{stem}.py", "{dir}/tests/{stem}_test.py"),
+    ("{stem}.py", "tests/unit/test_{stem}.py"),
+    ("{stem}.py", "tests/integration/test_{stem}.py"),
     # TypeScript / JavaScript — Jest / Vitest conventions.
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
@@ -1931,10 +2923,31 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.js", "tests/{stem}.test.js"),
     ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
+    # 1450_2: extra TSX/JS shapes seen in king-247 (757 .tsx rounds, biggest single bucket).
+    ("{stem}.tsx", "tests/{stem}.test.tsx"),
+    ("{stem}.tsx", "test/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/{stem}.spec.tsx"),
+    ("{stem}.ts", "{dir}/{stem}.spec.ts"),
+    ("{stem}.js", "{dir}/{stem}.spec.js"),
+    ("{stem}.jsx", "{dir}/__tests__/{stem}.test.jsx"),
+    ("{stem}.jsx", "tests/{stem}.test.jsx"),
+    ("{stem}.mjs", "{dir}/{stem}.test.mjs"),
+    ("{stem}.mjs", "tests/{stem}.test.mjs"),
+    ("{stem}.mjs", "{dir}/__tests__/{stem}.test.mjs"),
     # Other languages — single canonical convention each.
     ("{stem}.go", "{dir}/{stem}_test.go"),
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    # 1450_2: Java — second-worst extension by losses (146 rounds, 36.3%, 93 losses).
+    # Cover both junit-classic and Maven/Gradle layouts.
+    ("{stem}.java", "{dir}/{stem}Test.java"),
+    ("{stem}.java", "{dir}/Test{stem}.java"),
+    ("{stem}.java", "{dir}/{stem}Tests.java"),
+    ("{stem}.java", "src/test/java/{stem}Test.java"),
+    ("{stem}.java", "src/test/java/Test{stem}.java"),
+    # 1450_2: Kotlin parallel.
+    ("{stem}.kt", "{dir}/{stem}Test.kt"),
+    ("{stem}.kt", "src/test/kotlin/{stem}Test.kt"),
 )
 
 
@@ -2863,22 +3876,75 @@ def build_self_check_prompt(
     patch: str,
     issue_text: str,
     inplace_advisories: Optional[List[str]] = None,
+    styling_advisories: Optional[List[str]] = None,
+    api_contract_advisories: Optional[List[str]] = None,
+    hardcoded_advisories: Optional[List[str]] = None,
+    version_pinning_advisories: Optional[List[str]] = None,
+    secret_advisories: Optional[List[str]] = None,
+    chmod_advisories: Optional[List[str]] = None,
 ) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+    """Show the model its own draft and ask for a focused self-review.
+
+    1450_2: extra advisory kwargs feed in the styling-fidelity, api-contract,
+    hardcoded-sentinel, version-pinning, client-side-secret, and residual
+    chmod-noise checks so the model sees concrete evidence instead of generic
+    'self-check' instructions.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+
+    def _render(label: str, items: Optional[List[str]], how_to_fix: str) -> str:
+        if not items:
+            return ""
+        bullets = "\n  ".join(f"- {a}" for a in items[:5])
+        return f"\n{label}:\n  {bullets}\n  → {how_to_fix}\n"
+
     advisory_block = ""
-    if inplace_advisories:
-        bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
-        advisory_block = (
-            "\nIN-PLACE EDIT WARNINGS (check before finalizing):\n"
-            f"  {bullets}\n"
-            "If the task is a refactor (not a new-file relocation), fix each by editing "
-            "the EXISTING file rather than creating a new one at a different path.\n"
-        )
+    advisory_block += _render(
+        "IN-PLACE EDIT WARNINGS",
+        inplace_advisories,
+        "If the task is a refactor (not a new-file relocation), fix each by "
+        "editing the EXISTING file rather than creating a new one at a different path.",
+    )
+    advisory_block += _render(
+        "RESIDUAL CHMOD/MODE-ONLY HUNKS",
+        chmod_advisories,
+        "Drop those file blocks entirely. The judge penalises diffs that ship "
+        "permission flips when the task did not request them.",
+    )
+    advisory_block += _render(
+        "STYLING FIDELITY",
+        styling_advisories,
+        "Re-emit the changed file with the original className strings restored "
+        "EXACTLY for every utility class the task did not request.",
+    )
+    advisory_block += _render(
+        "API CONTRACT DRIFT",
+        api_contract_advisories,
+        "Rename to match the literal names the task uses. The judge compares "
+        "field names character-for-character against the reference.",
+    )
+    advisory_block += _render(
+        "HARDCODED CONSTANTS",
+        hardcoded_advisories,
+        "Replace each literal with a value sourced from runtime context "
+        "(`new Date()`, `datetime.now()`, env, or a function parameter).",
+    )
+    advisory_block += _render(
+        "EXACT-VERSION PINNING",
+        version_pinning_advisories,
+        "Drop `^`/`~`/`>=` so the version spec is literally what the task says.",
+    )
+    advisory_block += _render(
+        "CLIENT-SIDE SECRET LEAK (HARD PENALTY)",
+        secret_advisories,
+        "Move the secret to a server function/route handler and source it from "
+        "env at request time. NEVER ship a long-lived secret literal in client "
+        "code — this is judged as a hard failure.",
+    )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
@@ -3528,11 +4594,43 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
-            _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
+            # 1450_2: compute every advisory once and pass them all in. Each
+            # gate is pure diff-text + issue-text scanning, so the cost is in
+            # microseconds and the model gets a single concrete self-check
+            # turn instead of multiple round-trips.
+            _inplace_adv  = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
+            _styling_adv  = _check_styling_fidelity(patch, issue)
+            _api_adv      = _check_api_contract_drift(patch, issue)
+            _hardcode_adv = _check_hardcoded_sentinels(patch)
+            _pin_adv      = _check_version_pinning(patch, issue)
+            _secret_adv   = _check_client_side_secrets(patch)
+            _chmod_adv    = _check_residual_mode_only_hunks(patch)
+            _adv_summary  = ",".join(
+                f"{name}={len(adv)}"
+                for name, adv in (
+                    ("inplace",  _inplace_adv),
+                    ("styling",  _styling_adv),
+                    ("api",      _api_adv),
+                    ("hardcode", _hardcode_adv),
+                    ("pin",      _pin_adv),
+                    ("secret",   _secret_adv),
+                    ("chmod",    _chmod_adv),
+                )
+                if adv
+            )
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
-                "SELF_CHECK_QUEUED",
+                build_self_check_prompt(
+                    patch, issue,
+                    inplace_advisories=_inplace_adv,
+                    styling_advisories=_styling_adv,
+                    api_contract_advisories=_api_adv,
+                    hardcoded_advisories=_hardcode_adv,
+                    version_pinning_advisories=_pin_adv,
+                    secret_advisories=_secret_adv,
+                    chmod_advisories=_chmod_adv,
+                ),
+                f"SELF_CHECK_QUEUED:{_adv_summary or 'no-advisories'}",
             )
             return True
 
@@ -3755,6 +4853,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        # 1450_2: lockfile hard-strip — drop autogenerated lockfile diff blocks
+        # unless the issue text explicitly mentions the lockfile basename.
+        # Targets king-247 §11 'Avoid touching lockfiles … unless the task requires it'.
+        try:
+            patch_pre = patch
+            patch = _strip_lockfile_diffs_unless_mentioned(patch, issue)
+            if patch != patch_pre:
+                logs.append(
+                    "LOCKFILE_STRIPPED: dropped autogenerated lockfile blocks "
+                    "(issue text did not mention the basename)."
+                )
+        except Exception:
+            pass
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
@@ -3773,6 +4884,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if repo is not None:
             try:
                 patch = get_patch(repo)
+                try:
+                    patch = _strip_lockfile_diffs_unless_mentioned(patch, issue)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
