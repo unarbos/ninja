@@ -41,7 +41,7 @@ Miner editing guide:
       public entry point.
     - Return a dict with patch, logs, steps, cost, and success.
     - Use only the validator-provided api_base/api_key for LLM calls.
-    - Do not hardcode another LLM endpoint, API key, model, wallet, scorer, test
+    - Do not hardcode another LLM endpoint, API key, model, scorer, test
       path, or validator secret.
     - Do not add third-party package requirements; this file must stay portable.
     - Do not read or exfiltrate host secrets, hidden tests, or evaluator data.
@@ -2152,7 +2152,7 @@ def _check_undefined_helpers(repo: Path, patch: str) -> List[str]:
     in the patch nor anywhere in the post-patch version of the file.
 
     This is the loss pattern from duel 4696 round task 064632: king's patch
-    added `buildWalletHistoryDiagnostics(query, env)` without defining the
+    added `buildHistoryDiagnostics(query, env)` without defining the
     helper anywhere — the call site was correct but the function did not
     exist, so the runtime fails immediately. King lost this task 17/17 times.
 
@@ -3323,7 +3323,7 @@ def build_undefined_helpers_fix_prompt(errors: List[str]) -> str:
     The loss pattern: model inserts `<verbHelperName>(...)` at a call site
     but forgets to add the helper definition. Runtime fails on the first
     call. King lost duel 4696 task 064632 17 / 17 times to this exact bug —
-    `buildWalletHistoryDiagnostics(query, env)` was called but never defined.
+    `buildHistoryDiagnostics(query, env)` was called but never defined.
     """
     bullets = "\n  ".join(errors[:6]) or "(none)"
     return (
@@ -3870,7 +3870,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         # Undefined-helper gate: catches the king-loss pattern from duel 4696
         # task 064632 (lost 17/17). The patch calls a custom helper like
-        # `buildWalletHistoryDiagnostics(...)` but never defines or imports
+        # `buildHistoryDiagnostics(...)` but never defines or imports
         # it, so the runtime fails on the first call. Conservative: only
         # flags >= 12-char identifiers with verb prefixes (build, parse,
         # create, …) that have no `.` before the call and no definition or
