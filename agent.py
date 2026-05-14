@@ -2460,6 +2460,227 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+# senoo v2.t2.10 — Compile-clean preflight (import resolution).
+#
+# After the model produces a patch, scan the touched files for newly added
+# imports and flag any that don't resolve to a tracked module / directory /
+# file. A patch that adds `from foo.bar import baz` when `foo/bar.py` does
+# not exist breaks the build even when the surrounding code reads correctly,
+# and the LLM judge dings such patches as "incomplete" / "broken build".
+# King PR #1450 has no analog \u2014 net-new feature.
+#
+# Soft signal only \u2014 surfaced as a self-check advisory, not a fail-build
+# gate, because cross-package imports the model added may resolve via deps
+# we can't easily inspect (package.json transitive, conftest sys.path
+# manipulation, namespace packages, \u2026).
+
+_IMPORT_PY_FROM_RE = re.compile(
+    r"^\s*from\s+([a-zA-Z_][a-zA-Z0-9_.]*)\s+import\b",
+    re.MULTILINE,
+)
+_IMPORT_PY_PLAIN_RE = re.compile(
+    r"^\s*import\s+([a-zA-Z_][a-zA-Z0-9_.]*)(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_.]*)*\b",
+    re.MULTILINE,
+)
+_IMPORT_JS_RE = re.compile(
+    r"""(?:^|\n)\s*import\s+(?:[^'"]*?\bfrom\s+)?['"]([^'"]+)['"]""",
+    re.MULTILINE,
+)
+_IMPORT_JS_REQUIRE_RE = re.compile(
+    r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)""",
+)
+
+# Stdlib module catalog. sys.stdlib_module_names lands in py 3.10+; for
+# older interpreters we fall back to a generous static list.
+try:
+    _PY_STDLIB = frozenset(sys.stdlib_module_names)  # type: ignore[attr-defined]
+except AttributeError:
+    _PY_STDLIB = frozenset({
+        "abc", "argparse", "ast", "asyncio", "base64", "binascii", "bisect",
+        "builtins", "bz2", "calendar", "collections", "concurrent", "contextlib",
+        "copy", "csv", "ctypes", "dataclasses", "datetime", "decimal",
+        "difflib", "dis", "doctest", "email", "enum", "errno", "fcntl",
+        "filecmp", "fileinput", "fnmatch", "fractions", "ftplib",
+        "functools", "gc", "getopt", "getpass", "gettext", "glob", "gzip",
+        "hashlib", "heapq", "hmac", "html", "http", "imaplib", "importlib",
+        "inspect", "io", "ipaddress", "itertools", "json", "keyword",
+        "linecache", "locale", "logging", "lzma", "math", "mimetypes",
+        "mmap", "multiprocessing", "netrc", "nntplib", "numbers", "operator",
+        "optparse", "os", "pathlib", "pdb", "pickle", "pkgutil", "platform",
+        "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
+        "pstats", "pty", "pwd", "queue", "quopri", "random", "re", "readline",
+        "reprlib", "resource", "rlcompleter", "runpy", "sched", "secrets",
+        "select", "selectors", "shelve", "shlex", "shutil", "signal",
+        "smtplib", "socket", "socketserver", "sqlite3", "ssl", "stat",
+        "statistics", "string", "stringprep", "struct", "subprocess",
+        "sunau", "symtable", "sys", "sysconfig", "syslog", "tabnanny",
+        "tarfile", "telnetlib", "tempfile", "termios", "textwrap", "threading",
+        "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace",
+        "traceback", "tracemalloc", "tty", "turtle", "types", "typing",
+        "unicodedata", "unittest", "urllib", "uu", "uuid", "venv",
+        "warnings", "wave", "weakref", "webbrowser", "wsgiref", "xdrlib",
+        "xml", "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib", "zoneinfo",
+    })
+
+# Common third-party packages we should treat as resolvable without checking
+# (very high false-positive rate otherwise — the validator's solver has these
+# installed in nearly every task repo).
+_PY_KNOWN_THIRD_PARTY = frozenset({
+    "pytest", "pytest_asyncio", "numpy", "pandas", "scipy", "sklearn", "torch",
+    "tensorflow", "matplotlib", "requests", "urllib3", "click", "flask",
+    "fastapi", "starlette", "pydantic", "sqlalchemy", "alembic", "django",
+    "rest_framework", "celery", "redis", "aiohttp", "httpx", "yaml", "toml",
+    "tomli", "tomlkit", "ruamel", "lxml", "bs4", "beautifulsoup4", "PIL",
+    "boto3", "botocore", "google", "openai", "anthropic", "tiktoken",
+    "langchain", "langgraph", "transformers", "datasets", "accelerate",
+    "peft", "trl", "wandb", "tqdm", "rich", "typer", "loguru", "structlog",
+    "websockets", "pymongo", "psycopg2", "psycopg", "asyncpg", "supabase",
+    "stripe", "twilio", "sendgrid", "discord", "telegram",
+    "scrapy", "selenium", "playwright", "tenacity", "more_itertools",
+    "attr", "attrs", "cattrs", "msgspec", "orjson", "ujson", "simplejson",
+    "marshmallow", "factory", "factory_boy", "freezegun", "responses",
+    "vcr", "mock", "moto", "hypothesis", "faker",
+    "bittensor", "substrateinterface", "scalecodec",
+    "gunicorn", "uvicorn", "hypercorn", "daphne",
+    "openrouter_client",  # tau-internal helper
+})
+
+
+def _module_in_repo(repo: Path, dotted: str) -> bool:
+    """True iff the EXACT dotted module path resolves under repo.
+
+    Does NOT fall back to shorter prefixes: when the model writes
+    `from src.nonexistent import foo`, we need to flag it even if `src` is
+    a valid package — the full chain must exist. For top-level `import X`
+    (no dots) the same rule applies: there must be `X.py`, `X/__init__.py`,
+    or a top-level `X/` directory.
+    """
+    parts = dotted.split(".")
+    if not parts or any(not p for p in parts):
+        return False
+    target = repo.joinpath(*parts)
+    if target.with_suffix(".py").is_file():
+        return True
+    if (target / "__init__.py").is_file():
+        return True
+    if target.is_dir():
+        return True
+    return False
+
+
+def _resolve_js_relative(repo: Path, source_file: str, spec: str) -> bool:
+    """Resolve a relative JS/TS import like './foo' from source_file."""
+    if not (spec.startswith("./") or spec.startswith("../") or spec.startswith("/")):
+        return False  # caller handles bare specifiers
+    try:
+        if spec.startswith("/"):
+            base_dir = repo
+            spec_rel = spec.lstrip("/")
+        else:
+            src_dir = (repo / source_file).parent
+            base_dir = src_dir
+            spec_rel = spec
+        target = (base_dir / spec_rel).resolve()
+        # Ensure target stays under repo.
+        target.relative_to(repo.resolve())
+    except (ValueError, OSError):
+        return False
+    candidates = [
+        target,
+        target.with_suffix(".ts"),
+        target.with_suffix(".tsx"),
+        target.with_suffix(".js"),
+        target.with_suffix(".jsx"),
+        target.with_suffix(".mjs"),
+        target.with_suffix(".cjs"),
+        target.with_suffix(".json"),
+        target / "index.ts",
+        target / "index.tsx",
+        target / "index.js",
+        target / "index.jsx",
+    ]
+    return any(c.is_file() for c in candidates)
+
+
+def _check_imports_resolve(repo: Path, patch: str, cap: int = 4) -> List[str]:
+    """Return advisory strings for imports that the patch added but that don't
+    resolve to a tracked module / file / well-known package.
+
+    Soft signal — caller surfaces these as a self-check advisory; we do NOT
+    fail the build because cross-package resolution is genuinely ambiguous.
+    """
+    if not patch:
+        return []
+    try:
+        out: List[str] = []
+        # Only inspect lines ADDED by the patch ('+' lines, excluding header)
+        # so we don't keep flagging pre-existing imports.
+        added_by_file: Dict[str, List[str]] = {}
+        current_path = "<unknown>"
+        for line in patch.splitlines():
+            if line.startswith("diff --git"):
+                m = re.match(r"^diff --git a/(.+?) b/(.+?)$", line)
+                if m:
+                    current_path = m.group(2)
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                added_by_file.setdefault(current_path, []).append(line[1:])
+        for relative_path, added in added_by_file.items():
+            if len(out) >= cap:
+                break
+            suffix = Path(relative_path).suffix.lower()
+            added_text = "\n".join(added)
+            if suffix in {".py", ".pyi"}:
+                # Collect Python imports from the added lines.
+                py_imports: set = set()
+                for m in _IMPORT_PY_FROM_RE.finditer(added_text):
+                    py_imports.add(m.group(1))
+                for m in _IMPORT_PY_PLAIN_RE.finditer(added_text):
+                    # `import a, b, c` — split on commas
+                    for tok in re.split(r"\s*,\s*", m.group(1)):
+                        if tok:
+                            py_imports.add(tok)
+                for dotted in sorted(py_imports):
+                    if not dotted or dotted.startswith("."):
+                        continue
+                    top = dotted.split(".", 1)[0]
+                    if top in _PY_STDLIB or top in _PY_KNOWN_THIRD_PARTY:
+                        continue
+                    if _module_in_repo(repo, dotted):
+                        continue
+                    out.append(
+                        f"{relative_path}: 'import {dotted}' may not resolve "
+                        f"(module not found in repo, stdlib, or known deps)"
+                    )
+                    if len(out) >= cap:
+                        break
+            elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+                # Collect JS/TS imports from added lines.
+                js_specs: set = set()
+                for m in _IMPORT_JS_RE.finditer(added_text):
+                    js_specs.add(m.group(1))
+                for m in _IMPORT_JS_REQUIRE_RE.finditer(added_text):
+                    js_specs.add(m.group(1))
+                for spec in sorted(js_specs):
+                    if not spec:
+                        continue
+                    # Bare specifiers (react, lodash, ...) — we'd need
+                    # package.json parsing; skip to avoid false positives.
+                    if not (spec.startswith(".") or spec.startswith("/")):
+                        continue
+                    if _resolve_js_relative(repo, relative_path, spec):
+                        continue
+                    out.append(
+                        f"{relative_path}: 'import \"{spec}\"' relative path "
+                        f"does not resolve under repo"
+                    )
+                    if len(out) >= cap:
+                        break
+        return out
+    except Exception:
+        return []
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -3633,6 +3854,7 @@ def build_self_check_prompt(
     issue_text: str,
     inplace_advisories: Optional[List[str]] = None,
     caller_audit_advisories: Optional[List[str]] = None,
+    import_advisories: Optional[List[str]] = None,
 ) -> str:
     """Show the model its own draft and ask for a focused self-review.
 
@@ -3673,6 +3895,22 @@ def build_self_check_prompt(
             "     verify they have been updated to the new symbol.\n"
             "Stale callers are a frequent cause of incomplete patches that "
             "leave a build broken even when the new symbol is correct.\n"
+        )
+    if import_advisories:
+        ibullets = "\n  ".join(f"- {a}" for a in import_advisories[:4])
+        advisory_block += (
+            "\nIMPORT RESOLUTION (newly-added imports flagged as possibly "
+            "unresolvable):\n"
+            f"  {ibullets}\n"
+            "For each line above:\n"
+            "  - Confirm the module exists at the expected path "
+            "(`git ls-files | grep ...`).\n"
+            "  - If you intended a relative import, switch to it.\n"
+            "  - If the module needs to be CREATED as part of this patch, "
+            "ensure your patch creates it.\n"
+            "Soft check only — bare third-party imports we can't see in "
+            "package.json / requirements.txt will be flagged here; that "
+            "is acceptable as long as you know they are runtime-installed.\n"
         )
     return (
         "Self-check pass. Review your patch on three independent axes — "
@@ -4442,12 +4680,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"CALLER_AUDIT: {len(_caller_adv)} removed/renamed "
                     f"symbol(s) flagged for caller verification"
                 )
+            # senoo v2.t2.10 — compile-clean preflight (import resolution).
+            _import_adv = _check_imports_resolve(repo, patch)
+            if _import_adv:
+                logs.append(
+                    f"IMPORT_PREFLIGHT: {len(_import_adv)} newly-added "
+                    f"import(s) flagged as possibly unresolvable"
+                )
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(
                     patch, issue,
                     inplace_advisories=_inplace_adv,
                     caller_audit_advisories=_caller_adv,
+                    import_advisories=_import_adv,
                 ),
                 "SELF_CHECK_QUEUED",
             )
