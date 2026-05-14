@@ -1037,6 +1037,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
+    files = _augment_with_directory_companions(files, tracked_set)
 
     parts: List[str] = []
     included: List[str] = []
@@ -1238,6 +1239,135 @@ def _looks_like_integration_surface(relative_path: str) -> bool:
         return True
     tokens = _split_path_tokens(relative_path)
     return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
+
+
+# senoo v2.t1.2 — same-directory companion files. Many duel losses stem from
+# the model finding the right "main" file but missing a sibling that needs to
+# be co-edited (e.g. fixing a layout but skipping the page that imports it,
+# editing a Python module without updating its `__init__.py` exports, or
+# changing a Rust struct without touching its `mod.rs`). King PR #1450 added a
+# similar mechanism but limited it to the Next.js / web-stack basename catalog;
+# we extend coverage to Python, Go, Rust, Java, Kotlin, and Erlang/Elixir.
+#
+# Per-language sibling stems. The key is the file SUFFIX of the top-ranked
+# anchor; the value is the set of basename STEMS (no extension) that, if
+# present in the same directory, are likely co-edit candidates.
+_COMPANION_SIBLINGS_BY_SUFFIX: Dict[str, set] = {
+    # Python: package init, test peer, conftest, setup, type stubs, public api
+    ".py": {"__init__", "conftest", "setup", "_version", "types", "constants",
+            "schema", "models", "config", "exceptions", "errors", "__main__",
+            "api", "interfaces"},
+    # JavaScript / TypeScript: barrel index, types, constants, route + Next.js
+    # app-router specials. (App-router conventions are a king-known surface;
+    # we keep them here so we don't regress on web-stack repos.)
+    ".ts": {"index", "types", "constants", "schema", "config", "route", "page",
+            "layout", "loading", "error", "metadata", "manifest", "head",
+            "template", "_meta", "_root", "styles", "middleware"},
+    ".tsx": {"index", "types", "constants", "schema", "config", "route", "page",
+             "layout", "loading", "error", "metadata", "manifest", "head",
+             "template", "_meta", "_root", "styles", "middleware"},
+    ".js": {"index", "types", "constants", "schema", "config", "route", "page",
+            "layout", "loading", "error", "metadata", "manifest"},
+    ".jsx": {"index", "types", "constants", "schema", "config", "route", "page",
+             "layout", "loading", "error", "metadata", "manifest"},
+    # Go: package main and adjacent _test peer
+    ".go": {"main", "doc", "types", "consts", "constants", "errors", "config",
+            "interfaces"},
+    # Rust: module roots
+    ".rs": {"mod", "lib", "main", "types", "errors", "config", "prelude"},
+    # Java / Kotlin: package-info, common types
+    ".java": {"package-info", "Constants", "Types", "Schema", "Config"},
+    ".kt": {"Constants", "Types", "Schema", "Config"},
+    # C/C++: header peers handled below as a special case
+    ".c": {"types", "config", "errors"},
+    ".cpp": {"types", "config", "errors"},
+    # Elixir / Erlang
+    ".ex": {"application", "supervisor", "types"},
+    ".exs": {"test_helper"},
+    # Configuration anchors
+    ".yaml": {"values", "defaults", "schema"},
+    ".yml": {"values", "defaults", "schema"},
+    ".json": {"package", "tsconfig", "schema", "config"},
+}
+
+# Languages where header/source pairs are a near-universal companion need.
+_HEADER_SOURCE_PAIRS = {
+    ".c": (".h",),
+    ".cpp": (".h", ".hpp", ".hxx"),
+    ".cc": (".h", ".hpp"),
+    ".cxx": (".h", ".hpp", ".hxx"),
+    ".m": (".h",),
+    ".mm": (".h", ".hpp"),
+    ".h": (".c", ".cpp", ".cc"),
+    ".hpp": (".cpp", ".cc", ".cxx"),
+}
+
+
+def _augment_with_directory_companions(
+    files: List[str], tracked: set, max_companions: int = 4, anchors_to_scan: int = 3,
+) -> List[str]:
+    """Append same-directory companion files of the top-ranked anchors.
+
+    Pure set-membership lookups; no I/O or subprocess. Targets stems likely to
+    require co-editing. Anchors-to-scan defaults to 3 so that a multi-module
+    issue gets companions from each anchor, not only the top-1 (which is the
+    king's PR #1450 design — we generalize it).
+    """
+    if not files or not tracked:
+        return files
+
+    seen = set(files)
+    out_extra: List[str] = []
+    for anchor in files[:anchors_to_scan]:
+        try:
+            anchor_path = Path(anchor)
+            anchor_dir = str(anchor_path.parent).replace("\\", "/")
+            if anchor_dir in {"", "."}:
+                continue
+            anchor_suffix = anchor_path.suffix.lower()
+            anchor_stem = anchor_path.stem
+            wanted_stems = _COMPANION_SIBLINGS_BY_SUFFIX.get(anchor_suffix, set())
+            paired_suffixes = _HEADER_SOURCE_PAIRS.get(anchor_suffix, ())
+        except Exception:
+            continue
+
+        for candidate in tracked:
+            if candidate in seen:
+                continue
+            try:
+                cand_path = Path(candidate)
+                if str(cand_path.parent).replace("\\", "/") != anchor_dir:
+                    continue
+                cand_suffix = cand_path.suffix.lower()
+                cand_stem = cand_path.stem
+
+                accept = False
+                # Stem-based companion (e.g. layout next to page)
+                if cand_stem in wanted_stems and cand_suffix == anchor_suffix:
+                    accept = True
+                # Header/source pair (e.g. foo.h next to foo.cpp)
+                elif paired_suffixes and cand_suffix in paired_suffixes and cand_stem == anchor_stem:
+                    accept = True
+                # Python test peer next to source (test_foo.py next to foo.py)
+                elif (anchor_suffix == ".py" and cand_suffix == ".py"
+                      and cand_stem in {f"test_{anchor_stem}", f"{anchor_stem}_test"}):
+                    accept = True
+                # Go test peer (foo_test.go next to foo.go)
+                elif (anchor_suffix == ".go" and cand_suffix == ".go"
+                      and cand_stem == f"{anchor_stem}_test"):
+                    accept = True
+
+                if not accept:
+                    continue
+                if candidate in out_extra:
+                    continue
+                out_extra.append(candidate)
+                seen.add(candidate)
+                if len(out_extra) >= max_companions:
+                    return files + out_extra
+            except Exception:
+                continue
+    return files + out_extra
 
 
 def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
