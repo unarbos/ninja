@@ -1883,6 +1883,214 @@ def _inplace_intent_advisories(
         return []
 
 
+# senoo v2.t1.6 — Caller audit on removed definitions.
+#
+# When a patch removes a public function/class/method/struct, the LLM judge
+# almost always penalises the patch unless EVERY caller was updated. King
+# PR #1450 has a basic version (`_REMOVED_DEF_RES`, 6 regex patterns,
+# returns flat list of names). Our version covers ~14 language constructs,
+# carries the originating file path with each removed name, detects in-patch
+# renames (a removed name paired with an added similar name in the same hunk
+# is a rename, not a true removal), and emits per-name grep-pattern hints so
+# the model can locate callers without spending a turn on trial-and-error.
+#
+# The advisory is folded into the same self-check turn as the in-place
+# warning so we don't burn a separate refinement slot.
+
+# Per-language compiled patterns. Each entry: (regex, kind_label).
+# Pattern matches the FIRST captured group from a removed line (`^-...`).
+_REMOVED_SYMBOL_PATTERNS: Tuple[Tuple["re.Pattern", str], ...] = (
+    # Python — def/class, sync and async, with optional decorators stripped
+    (re.compile(r"^-\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("), "py-def"),
+    (re.compile(r"^-\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "py-class"),
+    # JavaScript / TypeScript
+    (re.compile(r"^-\s*(?:export\s+(?:default\s+)?)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("), "js-function"),
+    (re.compile(r"^-\s*export\s+(?:default\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*[=:]"), "js-exported-const"),
+    (re.compile(r"^-\s*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"), "js-class"),
+    (re.compile(r"^-\s*(?:export\s+)?(?:interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"), "ts-type"),
+    # Go
+    (re.compile(r"^-\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("), "go-func"),
+    (re.compile(r"^-\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func)\b"), "go-type"),
+    # Rust
+    (re.compile(r"^-\s*(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"), "rs-fn"),
+    (re.compile(r"^-\s*(?:pub(?:\([^)]+\))?\s+)?(?:struct|enum|trait)\s+([A-Z][A-Za-z0-9_]*)\b"), "rs-type"),
+    (re.compile(r"^-\s*(?:pub(?:\([^)]+\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\b"), "rs-mod"),
+    # Java / Kotlin (capture the method/class identifier near a left paren)
+    (re.compile(r"^-\s*(?:public|private|protected|internal|fun|static|final)\s+(?:[A-Za-z_$][\w$<>?\[\],\s]*\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*\("), "jvm-method"),
+    (re.compile(r"^-\s*(?:public|private|protected|abstract|final|open|sealed)?\s*(?:class|interface|enum|object)\s+([A-Z][A-Za-z0-9_]*)\b"), "jvm-class"),
+    # C / C++ / Objective-C function / type
+    (re.compile(r"^-\s*(?:static\s+|inline\s+|extern\s+)*(?:[A-Za-z_][\w\s\*&<>,]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{?\s*$"), "c-func"),
+    (re.compile(r"^-\s*(?:struct|union|enum|class)\s+([A-Z][A-Za-z0-9_]*)\b"), "c-type"),
+    # Ruby
+    (re.compile(r"^-\s*def\s+(?:self\.)?([a-zA-Z_][a-zA-Z0-9_!?]*)\b"), "rb-def"),
+    (re.compile(r"^-\s*(?:class|module)\s+([A-Z][A-Za-z0-9_]*)\b"), "rb-class"),
+    # PHP / Swift / Kotlin function shorthand
+    (re.compile(r"^-\s*(?:public\s+|private\s+|protected\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("), "php-function"),
+    (re.compile(r"^-\s*(?:public\s+|private\s+|fileprivate\s+|internal\s+|open\s+)?func\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("), "swift-func"),
+)
+
+# Names too generic to be useful caller-audit targets.
+_REMOVED_SYMBOL_BLOCKLIST = frozenset({
+    "main", "init", "setUp", "tearDown", "setup", "teardown",
+    "test", "Test", "run", "Run", "constructor",
+    "toString", "hashCode", "equals", "__init__", "__str__",
+    "__repr__", "__del__", "__hash__", "__eq__",
+})
+
+
+def _patch_added_lines(patch: str) -> List[str]:
+    """Return the body of every '+' line (no header `+++` lines) in the patch."""
+    return [
+        line[1:]
+        for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+
+def _patch_removed_symbols(
+    patch: str,
+    cap: int = 8,
+) -> List[Dict[str, str]]:
+    """Return removed top-level symbols.
+
+    Each item is {"name": ..., "kind": ..., "path": ..., "rename_to": ...}.
+    `rename_to` is "" unless the SAME hunk also added a similar-shaped name
+    (we treat that as a rename, surfaced separately so the model can verify
+    callers updated to the NEW name rather than removed altogether).
+    """
+    if not patch:
+        return []
+    try:
+        # Track current b/-path as we scan the diff so each removed name is
+        # tagged with its file. The current_path resets at each `diff --git`
+        # header.
+        current_path = "<unknown>"
+        # Removed names by (name, kind), preserving first-seen order.
+        seen: set = set()
+        records: List[Dict[str, str]] = []
+        # Collect added-line names to detect renames; built on a per-file basis.
+        added_per_file: Dict[str, set] = {}
+        # First pass — gather added names per file.
+        for line in patch.splitlines():
+            if line.startswith("diff --git"):
+                m = re.match(r"^diff --git a/(.+?) b/(.+?)$", line)
+                if m:
+                    current_path = m.group(2)
+            elif line.startswith("+") and not line.startswith("+++"):
+                # Re-use the same regex catalog but on '+' lines: replace
+                # the leading '-' anchor with '+'.
+                for regex, _kind in _REMOVED_SYMBOL_PATTERNS:
+                    pat_plus = re.compile("^\\+" + regex.pattern[2:])
+                    m = pat_plus.match(line)
+                    if m:
+                        added_per_file.setdefault(current_path, set()).add(m.group(1))
+                        break
+        # Second pass — find removed names; tag rename when a similar name
+        # was added in the same file.
+        current_path = "<unknown>"
+        for line in patch.splitlines():
+            if line.startswith("diff --git"):
+                m = re.match(r"^diff --git a/(.+?) b/(.+?)$", line)
+                if m:
+                    current_path = m.group(2)
+                continue
+            if not line.startswith("-") or line.startswith("---"):
+                continue
+            for regex, kind in _REMOVED_SYMBOL_PATTERNS:
+                m = regex.match(line)
+                if not m:
+                    continue
+                name = m.group(1)
+                if name in _REMOVED_SYMBOL_BLOCKLIST:
+                    break
+                key = (name, current_path)
+                if key in seen:
+                    break
+                seen.add(key)
+                rename_to = ""
+                added_names = added_per_file.get(current_path, set())
+                # Heuristic: a rename target shares a meaningful prefix or
+                # suffix with the original name (>=4 chars overlap).
+                for cand in added_names:
+                    if cand == name or cand in seen:
+                        continue
+                    if len(cand) < 4 or len(name) < 4:
+                        continue
+                    common_prefix = 0
+                    for a, b in zip(name, cand):
+                        if a == b:
+                            common_prefix += 1
+                        else:
+                            break
+                    common_suffix = 0
+                    for a, b in zip(reversed(name), reversed(cand)):
+                        if a == b:
+                            common_suffix += 1
+                        else:
+                            break
+                    if common_prefix >= 4 or common_suffix >= 4:
+                        rename_to = cand
+                        break
+                records.append({
+                    "name": name,
+                    "kind": kind,
+                    "path": current_path,
+                    "rename_to": rename_to,
+                })
+                if len(records) >= cap:
+                    return records
+                break
+        return records
+    except Exception:
+        return []
+
+
+def _caller_audit_advisories(
+    patch: str,
+    cap: int = 4,
+) -> List[str]:
+    """Format removed-symbol records as concise advisory bullets.
+
+    Each bullet pairs the removed name with a likely-effective grep pattern.
+    Renames get their own bullet style so the model knows to update callers
+    to the NEW name rather than to a removed name.
+    """
+    records = _patch_removed_symbols(patch, cap=cap + 2)
+    if not records:
+        return []
+    out: List[str] = []
+    for r in records:
+        name = r["name"]
+        kind = r["kind"]
+        path = r["path"]
+        rename_to = r["rename_to"]
+        # Build a grep pattern hint based on the kind.
+        if kind in {"py-def", "js-function", "go-func", "rs-fn",
+                    "jvm-method", "c-func", "rb-def", "php-function",
+                    "swift-func"}:
+            grep_hint = f"\\b{name}\\("
+        elif kind in {"py-class", "js-class", "ts-type", "go-type",
+                      "rs-type", "jvm-class", "c-type", "rb-class",
+                      "rs-mod", "js-exported-const"}:
+            grep_hint = f"\\b{name}\\b"
+        else:
+            grep_hint = f"\\b{name}\\b"
+        if rename_to:
+            out.append(
+                f"{kind}: {name!r} in {path!r} appears renamed to "
+                f"{rename_to!r} — verify all callers updated "
+                f"(grep `{grep_hint}` for any stale references)"
+            )
+        else:
+            out.append(
+                f"{kind}: {name!r} removed from {path!r} — verify all "
+                f"callers handled (grep `{grep_hint}`)"
+            )
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -3273,13 +3481,15 @@ def build_self_check_prompt(
     patch: str,
     issue_text: str,
     inplace_advisories: Optional[List[str]] = None,
+    caller_audit_advisories: Optional[List[str]] = None,
 ) -> str:
     """Show the model its own draft and ask for a focused self-review.
 
-    When `inplace_advisories` is non-empty (Tier-1.5 — a new file was
-    created at a path that has a same-basename or same-stem peer that was
-    not edited), we surface those bullets at the top so the model is forced
-    to justify the new file vs. an in-place edit before locking the patch.
+    When `inplace_advisories` is non-empty (Tier-1.5), surface the
+    same-basename/same-stem collision so the model justifies or folds back.
+    When `caller_audit_advisories` is non-empty (Tier-1.6), surface the
+    list of removed/renamed top-level symbols so the model verifies every
+    caller has been updated.
     """
     truncated = (
         patch
@@ -3289,7 +3499,7 @@ def build_self_check_prompt(
     advisory_block = ""
     if inplace_advisories:
         bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
-        advisory_block = (
+        advisory_block += (
             "\nIN-PLACE EDIT WARNINGS (verify before locking the patch):\n"
             f"  {bullets}\n"
             "For each warning above, choose ONE of:\n"
@@ -3297,6 +3507,20 @@ def build_self_check_prompt(
             "  (b) Justify why a new file is REQUIRED (the issue mandates a new "
             "location, the existing peer is unrelated, etc.).\n"
             "Do not silently leave a duplicate-name pair.\n"
+        )
+    if caller_audit_advisories:
+        cbullets = "\n  ".join(f"- {a}" for a in caller_audit_advisories[:4])
+        advisory_block += (
+            "\nCALLER AUDIT (removed or renamed symbols — verify nothing is broken):\n"
+            f"  {cbullets}\n"
+            "For each entry above:\n"
+            "  1. Run `git grep` with the suggested pattern.\n"
+            "  2. If references remain in untouched files, EDIT them now\n"
+            "     (use the new name on rename, or the replacement function on\n"
+            "      pure removal).\n"
+            "  3. If references appear in committed lines of touched files,\n"
+            "     verify they have been updated to the new symbol.\n"
+            "Stale callers are the #1 cause of judge-flagged 'incomplete' patches.\n"
         )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
@@ -4021,6 +4245,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             fresh_inplace_collision = bool(
                 _inplace_intent_advisories(patch, issue, _tracked_for_gate)
             )
+            # senoo v2.t1.6 — keep self-check turn when removed/renamed
+            # symbols haven't yet been audited against their callers.
+            fresh_caller_audit_pending = bool(_caller_audit_advisories(patch))
             if not (
                 fresh_syntax_errors
                 or fresh_missing
@@ -4029,6 +4256,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 or fresh_deletion_gap
                 or fresh_creation_gap
                 or fresh_inplace_collision
+                or fresh_caller_audit_pending
             ):
                 logs.append(
                     "CONFIDENT_EARLY_EXIT: structural gates clean "
@@ -4055,10 +4283,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"INPLACE_ADVISORY: {len(_inplace_adv)} warning(s) "
                     f"injected into self-check"
                 )
+            # senoo v2.t1.6 — caller audit on removed/renamed top-level symbols.
+            _caller_adv = _caller_audit_advisories(patch)
+            if _caller_adv:
+                logs.append(
+                    f"CALLER_AUDIT: {len(_caller_adv)} removed/renamed "
+                    f"symbol(s) flagged for caller verification"
+                )
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(
-                    patch, issue, inplace_advisories=_inplace_adv
+                    patch, issue,
+                    inplace_advisories=_inplace_adv,
+                    caller_audit_advisories=_caller_adv,
                 ),
                 "SELF_CHECK_QUEUED",
             )
