@@ -116,7 +116,8 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 # already inspected and demands an edit command in the next response.
 _MID_LOOP_RESCUE_FRACTION = 0.55
 _MID_LOOP_RESCUE_SECOND_FRACTION = 0.78  # second escape valve king does not have
-MAX_MID_LOOP_RESCUE_TURNS = 2            # one early, one late; hard cap
+_MID_LOOP_RESCUE_FINAL_FRACTION = 0.92   # last gasp before time hard-stops
+MAX_MID_LOOP_RESCUE_TURNS = 3            # early/late/final; hard cap
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -2587,6 +2588,251 @@ def _signature_audit_advisories(
         return []
 
 
+# Recursion / literal-unicode-escape: two cheap textual checks on the diff
+# that have caught real-world failures we observed. The recursion check
+# pattern-matches a function definition and inspects its first non-trivial
+# body line for a self-call; the unicode check flags `\\uNNNN` literals
+# that may not be runtime-interpreted in the target language (e.g. PHP
+# single-quoted strings) so the model can confirm intent.
+_FN_DEF_PATTERNS_FOR_RECURSION: List[Tuple[re.Pattern, str]] = [
+    # Python def: tolerate `-> ReturnType:` return-type annotation.
+    (
+        re.compile(
+            r"^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)"
+            r"\s*(?:->\s*[^:]+)?\s*:"
+        ),
+        "py",
+    ),
+    (
+        re.compile(
+            r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"
+        ),
+        "js",
+    ),
+    (
+        re.compile(
+            r"^\s*(?:export\s+(?:default\s+)?)?(?:const|let|var)\s+"
+            r"([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*=>"
+        ),
+        "js",
+    ),
+    (
+        re.compile(r"^\s*func\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)"),
+        "go",
+    ),
+]
+
+# Keywords that signal a REAL base case on the first body line. We
+# deliberately exclude the bare "return " prefix because the bug pattern
+# we want to catch is exactly `return fn(args)` — that's a self-call
+# wrapped in a return statement, not a base case. Specific literals like
+# `return None`, `return 0`, `return false` ARE real base cases.
+_RECURSION_BASE_CASE_HINTS = (
+    "if ", "if(", "elif ", "elif(",
+    "raise ", "throw ", "guard ", "assert ",
+    "return None", "return null", "return ;", "return;",
+    "return -1", "return 0", "return False", "return false",
+    "return True", "return true",
+    "return \"", "return '", 'return "', "return ''", 'return ""',
+    "return []", "return {}", "return ()",
+)
+
+
+def _recursion_advisories(patch: str, cap: int = 4) -> List[str]:
+    """Detect newly-added functions whose first body line calls themselves.
+
+    The signal is a `def fn(...)` (or `function fn(...)` / `const fn = (...) =>`
+    / `func fn(...)`) added in the patch where the very first non-trivial
+    body line invokes `fn(...)` again — typically the pattern that produced
+    the stack-overflow bug we observed in duel 004749 round 065044, where a
+    helper called itself from inside its own body with no base case.
+
+    Heuristics:
+      - Only inspects ADDED lines (`+` prefixed) so it doesn't flag
+        existing recursive utilities.
+      - Skips when the first body line contains an obvious base-case keyword
+        (`if`, `return None`, `raise`, `throw`, `guard`, etc.) — recursion
+        with a guard is fine.
+      - Caps at 4 advisories so noisy patches don't drown out real signals.
+    """
+    if not patch:
+        return []
+    advisories: List[str] = []
+    seen_keys: set = set()
+    cur_path: Optional[str] = None
+    lines = patch.split("\n")
+    n = len(lines)
+    i = 0
+    while i < n:
+        raw = lines[i]
+        if raw.startswith("diff --git"):
+            m = re.match(r"^diff --git a/(.+?) b/(.+?)$", raw)
+            if m:
+                cur_path = m.group(2)
+            i += 1
+            continue
+        if raw.startswith("+++ b/"):
+            cur_path = raw[6:].split("\t", 1)[0].strip()
+            i += 1
+            continue
+        if (
+            raw.startswith("+++ ")
+            or raw.startswith("--- ")
+            or raw.startswith("@@")
+            or raw.startswith("index ")
+        ):
+            i += 1
+            continue
+        if not raw.startswith("+"):
+            i += 1
+            continue
+        body = raw[1:]
+        fn_name: Optional[str] = None
+        for pat, _lang in _FN_DEF_PATTERNS_FOR_RECURSION:
+            m = pat.match(body)
+            if m:
+                fn_name = m.group(1)
+                break
+        if not fn_name:
+            i += 1
+            continue
+        # Walk forward to find the first non-trivial body line still in the
+        # added/context region. Bail after a short lookahead so we don't
+        # scan the entire patch on a hot loop.
+        j = i + 1
+        first_body: Optional[str] = None
+        lookahead = 12
+        while j < n and lookahead > 0:
+            lookahead -= 1
+            cand = lines[j]
+            if (
+                cand.startswith("@@")
+                or cand.startswith("diff --git")
+                or cand.startswith("+++ ")
+                or cand.startswith("--- ")
+            ):
+                break
+            if cand.startswith("-"):
+                j += 1
+                continue
+            if not (cand.startswith("+") or cand.startswith(" ")):
+                j += 1
+                continue
+            text = cand[1:] if cand[:1] in "+ " else cand
+            stripped = text.strip()
+            if not stripped:
+                j += 1
+                continue
+            if stripped.startswith(("#", "//", "/*", "*")):
+                j += 1
+                continue
+            if stripped.startswith(('"""', "'''", "/**")):
+                # Docstring/JSDoc — skip until we leave it. Cheap heuristic:
+                # consume one line and continue; deeply nested doc blocks
+                # are uncommon and the lookahead cap protects us.
+                j += 1
+                continue
+            first_body = stripped
+            break
+        if not first_body:
+            i += 1
+            continue
+        # Self-call detection: literal `fn_name(` token in the first body line.
+        recur_re = re.compile(rf"\b{re.escape(fn_name)}\s*\(")
+        if not recur_re.search(first_body):
+            i += 1
+            continue
+        # Skip if the same line shows a base-case structure.
+        low = first_body
+        if any(hint in low for hint in _RECURSION_BASE_CASE_HINTS):
+            # Guarded recursion is fine; do not advise.
+            i += 1
+            continue
+        key = (cur_path or "?", fn_name)
+        if key in seen_keys:
+            i += 1
+            continue
+        seen_keys.add(key)
+        preview = first_body[:80]
+        advisories.append(
+            f"{cur_path or '?'}: function `{fn_name}` first body line "
+            f"calls itself ({preview!r}) — verify base case to prevent "
+            f"non-terminating recursion"
+        )
+        if len(advisories) >= cap:
+            return advisories
+        i += 1
+    return advisories
+
+
+# Languages where `\uNNNN` inside a string literal is COMMONLY interpreted
+# as the actual Unicode codepoint (these are LOW false-positive risk for
+# the literal-escape advisory). We *do* still scan files in this set but
+# weight them lower — see _literal_unicode_escape_advisories below.
+_UNICODE_ESCAPE_INTERPRETED_SUFFIXES = {".js", ".ts", ".tsx", ".jsx", ".json"}
+
+_UNICODE_ESCAPE_LITERAL_RE = re.compile(r"(?<!\\)\\u[0-9a-fA-F]{4}")
+
+
+def _literal_unicode_escape_advisories(patch: str, cap: int = 4) -> List[str]:
+    """Flag added lines containing literal `\\uNNNN` escape sequences.
+
+    Foot-gun we observed in duel 004749 round 065051: model wrote the
+    literal six-character sequence `\\u2728` inside a PHP single-quoted
+    string, which PHP stores verbatim and never expands to the sparkle
+    glyph. The fix would have been to write the actual Unicode character
+    in the source.
+
+    Strategy:
+      - Scan ADDED lines (`+` prefixed) for `\\u[0-9a-fA-F]{4}`.
+      - Skip lines that look like comments (`#`, `//`, `/*`, `*`).
+      - Skip when the literal is doubled (`\\\\u...`) which is intentional.
+      - Cap at 4 so a long patch with many escapes doesn't drown self-check.
+    Per-file dedup so a regex pattern containing `\\uNNNN` only fires once.
+    """
+    if not patch:
+        return []
+    advisories: List[str] = []
+    seen: set = set()
+    cur_path: Optional[str] = None
+    for raw in patch.split("\n"):
+        if raw.startswith("diff --git"):
+            m = re.match(r"^diff --git a/(.+?) b/(.+?)$", raw)
+            if m:
+                cur_path = m.group(2)
+            continue
+        if raw.startswith("+++ b/"):
+            cur_path = raw[6:].split("\t", 1)[0].strip()
+            continue
+        if (
+            raw.startswith("+++ ")
+            or raw.startswith("--- ")
+            or raw.startswith("@@")
+            or raw.startswith("index ")
+        ):
+            continue
+        if not raw.startswith("+"):
+            continue
+        line = raw[1:]
+        stripped = line.strip()
+        if stripped.startswith(("#", "//", "/*", "*", "<!--", ";", "//!")):
+            continue
+        for m in _UNICODE_ESCAPE_LITERAL_RE.finditer(line):
+            key = (cur_path or "?", m.group(0))
+            if key in seen:
+                continue
+            seen.add(key)
+            preview = stripped[:80]
+            advisories.append(
+                f"{cur_path or '?'}: literal {m.group(0)} added — confirm "
+                f"the runtime interprets this escape, otherwise write the "
+                f"actual Unicode character (line: {preview!r})"
+            )
+            if len(advisories) >= cap:
+                return advisories
+    return advisories
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -2625,6 +2871,17 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
 
+# Python class declarations that name a keyword (None/True/False/...) as
+# the class. ast.parse normally catches these, but ast on the model-written
+# file occasionally succeeds when a textual mutation produces something
+# parser-equivalent that still breaks at type-check / import time. Cheap
+# pre-flight regex: cost is a single regex evaluation per .py file.
+_PY_INVALID_KEYWORD_CLASS_RE = re.compile(
+    r"^\s*class\s+(None|True|False|__debug__)\s*\(",
+    re.MULTILINE,
+)
+
+
 def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     full = (repo / relative_path).resolve()
     try:
@@ -2637,6 +2894,15 @@ def _check_python_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         source = full.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
+    # Defensive pre-flight: catch `class None(Base):` etc. before ast.parse.
+    # ast already rejects these, but the explicit error message makes the
+    # refinement turn produce a more targeted fix prompt.
+    m = _PY_INVALID_KEYWORD_CLASS_RE.search(source)
+    if m:
+        return (
+            f"{relative_path}:{source.count(chr(10), 0, m.start()) + 1}: "
+            f"invalid class name '{m.group(1)}' is a Python keyword/builtin"
+        )
     try:
         import ast as _ast
         _ast.parse(source)
@@ -2681,6 +2947,70 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}:{exc.lineno}: {exc.msg}"
     except Exception as exc:
         return f"{relative_path}: parse failure: {exc}"
+
+
+# Suffixes where we run an additional "orphan trailer" check (content after
+# the last top-level export/declaration) — JSX/TSX components are the
+# common offender: an extra `</div>` or stray fragment dangling after the
+# component's `export default` parses as a brace-balanced file but is a
+# real syntax error in any JSX tooling.
+_JSX_TAIL_CHECK_SUFFIXES = {".jsx", ".tsx"}
+
+# Pattern for the LAST top-level export/module-end statement we expect.
+_JSX_TRAILING_EXPORT_RE = re.compile(
+    r"(?:^|\n)\s*(?:export\s+default\s+\w[\w$]*\s*;?|module\.exports\s*=\s*\w[\w$]*\s*;?)\s*"
+    r"$",
+    re.MULTILINE,
+)
+
+
+def _check_jsx_orphan_tail_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Detect orphan content after the last `export default Component;`.
+
+    This catches the "dangling `</div>` after the export" failure mode where
+    the brace counter says balanced but the file still won't parse with any
+    JSX-aware tool. Skips files where no `export default` is present (those
+    are validated elsewhere or are not standard React component modules).
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Find ALL top-level `export default <Identifier>;` / `module.exports = X;`
+    # lines, take the last one, and check that nothing meaningful follows it.
+    last_match: Optional[re.Match] = None
+    for m in re.finditer(
+        r"^\s*(?:export\s+default\s+\w[\w$]*\s*;?|module\.exports\s*=\s*\w[\w$]*\s*;?)\s*$",
+        source,
+        flags=re.MULTILINE,
+    ):
+        last_match = m
+    if last_match is None:
+        return None
+
+    trailer = source[last_match.end():]
+    # Strip whitespace and JS line/block comments from the trailer.
+    cleaned = re.sub(r"//[^\n]*", "", trailer)
+    cleaned = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    # Real-life trailers we tolerate: blank lines and comments only. Anything
+    # else (a `</div>`, an extra brace, a stray expression) is suspect.
+    line_no = source.count("\n", 0, last_match.end()) + 1
+    preview = cleaned.splitlines()[0][:80]
+    return (
+        f"{relative_path}:{line_no}: orphan content after final export "
+        f"({preview!r})"
+    )
 
 
 # Restricted to languages where ' is a real string delimiter (JS-family +
@@ -2795,6 +3125,13 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+        # Additional JSX/TSX-specific check: orphan content after the last
+        # top-level export. Runs in addition to the brace balance check
+        # because brace count is not sensitive to dangling JSX tags.
+        if suffix in _JSX_TAIL_CHECK_SUFFIXES:
+            tail_result = _check_jsx_orphan_tail_one(repo, relative_path)
+            if tail_result:
+                errors.append(tail_result)
     return errors
 
 
@@ -4204,6 +4541,8 @@ def build_self_check_prompt(
     caller_audit_advisories: Optional[List[str]] = None,
     import_advisories: Optional[List[str]] = None,
     signature_advisories: Optional[List[str]] = None,
+    recursion_advisories: Optional[List[str]] = None,
+    unicode_escape_advisories: Optional[List[str]] = None,
 ) -> str:
     """Show the model its own draft and ask for a focused self-review.
 
@@ -4278,6 +4617,39 @@ def build_self_check_prompt(
             "you removed).\n"
             "API-changing tasks consistently fail when one or two out-of-tree "
             "callers are missed.\n"
+        )
+    if recursion_advisories:
+        rbullets = "\n  ".join(f"- {a}" for a in recursion_advisories[:4])
+        advisory_block += (
+            "\nRECURSION SANITY CHECK (possible non-terminating self-call):\n"
+            f"  {rbullets}\n"
+            "For each entry above:\n"
+            "  1. Confirm the function has a base case BEFORE the recursive "
+            "call (an `if` guard, an early return, a parameter that shrinks).\n"
+            "  2. If recursion is intentional, ensure the recursive call "
+            "uses different arguments so the recursion terminates.\n"
+            "  3. If recursion is unintended, replace the inner call with "
+            "the actual logic the function should perform.\n"
+            "Stack-overflow on the first invocation is a 100%% loss; this "
+            "check is the cheapest place to catch it.\n"
+        )
+    if unicode_escape_advisories:
+        ubullets = "\n  ".join(f"- {a}" for a in unicode_escape_advisories[:4])
+        advisory_block += (
+            "\nLITERAL UNICODE ESCAPE CHECK (possible non-interpreted "
+            "`\\uNNNN`):\n"
+            f"  {ubullets}\n"
+            "For each entry above:\n"
+            "  1. If the surrounding context interprets escapes (JSON, "
+            "JavaScript double-quoted, Python `str`, etc.), the literal is "
+            "fine — no action needed.\n"
+            "  2. If the context does NOT interpret escapes (PHP "
+            "single-quoted string, raw string, struct tag, regex literal "
+            "where the glyph is intended), replace `\\uNNNN` with the "
+            "actual Unicode character.\n"
+            "  3. Common offenders: PHP `'…'`, Python `r'…'`, Go single "
+            "quotes, struct tags, YAML strings without explicit escape "
+            "syntax.\n"
         )
     return (
         "Self-check pass. Review your patch on three independent axes — "
@@ -4456,12 +4828,16 @@ def build_mid_loop_rescue_prompt(
     inspected_paths: List[str],
     already_edited: List[str],
     is_late_pass: bool = False,
+    is_final_pass: bool = False,
 ) -> str:
-    """Mid-loop rescue: fired when the model has consumed >55% of wall-clock
-    without producing any edit (or >78% on the late pass). Differs from the
-    final hail-mary in two ways: (1) it surfaces both files-inspected and
-    files-already-edited so the model targets a NEW location, (2) it allows a
-    second pass at a later threshold so a single stuck step isn't fatal.
+    """Mid-loop rescue: fired when the model has consumed >55% / >78% / >92%
+    of wall-clock without producing any edit. Differs from the original
+    hail-mary in three ways: (1) it surfaces both files-inspected and
+    files-already-edited so the model targets a NEW location, (2) it allows
+    multiple passes at later thresholds so a single stuck step isn't fatal,
+    (3) the FINAL pass at 92% drops every consideration except "emit any
+    plausible edit now" — empty-patch losses we observed on retest cost a
+    full round each, so even a partial edit is worth more than nothing.
     """
     pct_used = int(100 * elapsed / budget) if budget > 0 else 60
     remaining = max(0.0, budget - elapsed)
@@ -4484,7 +4860,15 @@ def build_mid_loop_rescue_prompt(
             "edit a NEW one now; otherwise refine the existing edit and call <final>.\n"
         )
 
-    if is_late_pass:
+    if is_final_pass:
+        urgency = (
+            f"FINAL HAIL-MARY — only ~{remaining:.0f}s remain ({pct_used}% "
+            "consumed) and your patch is STILL empty. An empty patch scores "
+            "ZERO every time. Emit ONE edit command in your VERY NEXT "
+            "message — no further reads, no greps, no analysis. Even a "
+            "partial fix scores higher than nothing."
+        )
+    elif is_late_pass:
         urgency = (
             f"LATE-PASS RESCUE — only ~{remaining:.0f}s of wall-clock remain "
             f"({pct_used}% consumed). This is the last realistic chance to land an edit "
@@ -4496,14 +4880,34 @@ def build_mid_loop_rescue_prompt(
             "Stop reading new files; reading time is over."
         )
 
+    if is_final_pass:
+        action_block = (
+            "Action required in your NEXT message (NO exceptions):\n"
+            "  1. Pick the single most likely file from the preloads or the "
+            "files you have already inspected.\n"
+            "  2. Emit ONE `sed -i ...` or `python - <<'PY' ... PY` command "
+            "that makes a SINGLE targeted code change to that file.\n"
+            "  3. Call `<final>` immediately. Skip verification — there is "
+            "no time for it.\n"
+            "  4. Do NOT delete files. Do NOT change file modes. Do NOT add "
+            "comment-only edits.\n"
+        )
+    else:
+        action_block = (
+            "Action required in your NEXT message:\n"
+            "  1. Pick the single most likely file based on the issue and "
+            "what you have already read.\n"
+            "  2. Emit ONE edit command — `sed -i`, a Python heredoc "
+            "(`python - <<'PY' ... PY`), or a short script that performs "
+            "the targeted code change. No broad searches; no new reads.\n"
+            "  3. Run ONE quick verification (e.g. `python -c 'import "
+            "target'`) ONLY if it costs <5s.\n"
+            "  4. Call `<final>` immediately after.\n"
+        )
+
     return (
         f"{urgency}\n\n"
-        "Action required in your NEXT message:\n"
-        "  1. Pick the single most likely file based on the issue and what you have already read.\n"
-        "  2. Emit ONE edit command — `sed -i`, a Python heredoc (`python - <<'PY' ... PY`), or a\n"
-        "     short script that performs the targeted code change. No broad searches; no new reads.\n"
-        "  3. Run ONE quick verification (e.g. `python -c 'import target'`) ONLY if it costs <5s.\n"
-        "  4. Call `<final>` immediately after.\n"
+        f"{action_block}"
         f"{inspected_block}{edited_block}\n"
         "Task (reminder, truncated):\n"
         f"{short}"
@@ -4776,8 +5180,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
-    mid_loop_rescue_turns_used = 0  # dual-pass mid-loop rescue when patch is empty mid-flight
-    mid_loop_rescue_pass_done = {"early": False, "late": False}
+    mid_loop_rescue_turns_used = 0  # tri-pass mid-loop rescue when patch is empty mid-flight
+    mid_loop_rescue_pass_done = {"early": False, "late": False, "final": False}
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -5012,6 +5416,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             # likely breaks existing call sites (added required arg, dropped
             # arg, optional→required) and the model hasn't yet audited.
             fresh_signature_pending = bool(_signature_audit_advisories(patch))
+            # Stay in the loop if a newly-added function looks like it
+            # recurses without a base case — our cheapest defense against
+            # the kind of stack overflow that turns into a guaranteed loss.
+            fresh_recursion_pending = bool(_recursion_advisories(patch))
+            # Stay in the loop if a literal `\uNNNN` was added in a context
+            # likely not to interpret it (PHP single-quoted, raw strings).
+            fresh_unicode_escape_pending = bool(
+                _literal_unicode_escape_advisories(patch)
+            )
             if not (
                 fresh_syntax_errors
                 or fresh_missing
@@ -5022,6 +5435,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 or fresh_inplace_collision
                 or fresh_caller_audit_pending
                 or fresh_signature_pending
+                or fresh_recursion_pending
+                or fresh_unicode_escape_pending
             ):
                 logs.append(
                     "CONFIDENT_EARLY_EXIT: structural gates clean "
@@ -5069,6 +5484,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"SIGNATURE_AUDIT: {len(_sig_adv)} caller-breaking "
                     f"signature change(s) flagged"
                 )
+            # Recursion sanity check on newly-added functions.
+            _recursion_adv = _recursion_advisories(patch)
+            if _recursion_adv:
+                logs.append(
+                    f"RECURSION_AUDIT: {len(_recursion_adv)} possibly "
+                    f"non-terminating self-call(s) flagged"
+                )
+            # Literal Unicode-escape check on added lines.
+            _unicode_adv = _literal_unicode_escape_advisories(patch)
+            if _unicode_adv:
+                logs.append(
+                    f"UNICODE_ESCAPE_AUDIT: {len(_unicode_adv)} literal "
+                    f"`\\uNNNN` sequence(s) flagged for verification"
+                )
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(
@@ -5077,6 +5506,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     caller_audit_advisories=_caller_adv,
                     import_advisories=_import_adv,
                     signature_advisories=_sig_adv,
+                    recursion_advisories=_recursion_adv,
+                    unicode_escape_advisories=_unicode_adv,
                 ),
                 "SELF_CHECK_QUEUED",
             )
@@ -5132,27 +5563,36 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 break
 
-            # Dual-pass mid-loop rescue. When the model is still reading
+            # Tri-pass mid-loop rescue. When the model is still reading
             # files at ~55% of wall-clock with NO edits applied yet, surface
             # inspected paths + already-edited paths and demand an edit in
-            # the next response. A second pass fires at ~78% if the patch
-            # is still empty, so a single stuck step isn't fatal.
+            # the next response. A second pass fires at ~78% and a final
+            # pass at ~92% if the patch is still empty — empty-patch losses
+            # we observed on retest cost a guaranteed round, so even a
+            # partial last-second edit is worth more than zero.
             if mid_loop_rescue_turns_used < MAX_MID_LOOP_RESCUE_TURNS:
                 _elapsed_now = time.monotonic() - solve_started_at
                 _patch_now = get_patch(repo)
                 if not _patch_now.strip():
                     _early_threshold = _MID_LOOP_RESCUE_FRACTION * wall_clock_budget
                     _late_threshold = _MID_LOOP_RESCUE_SECOND_FRACTION * wall_clock_budget
+                    _final_threshold = _MID_LOOP_RESCUE_FINAL_FRACTION * wall_clock_budget
+                    _fire_final = (
+                        _elapsed_now >= _final_threshold
+                        and not mid_loop_rescue_pass_done["final"]
+                    )
                     _fire_late = (
                         _elapsed_now >= _late_threshold
                         and not mid_loop_rescue_pass_done["late"]
+                        and not _fire_final
                     )
                     _fire_early = (
                         _elapsed_now >= _early_threshold
                         and not mid_loop_rescue_pass_done["early"]
                         and not _fire_late
+                        and not _fire_final
                     )
-                    if _fire_early or _fire_late:
+                    if _fire_early or _fire_late or _fire_final:
                         _inspected = _recent_files_in_logs(logs)
                         _already = _patch_changed_files(_patch_now) if _patch_now else []
                         messages.append({
@@ -5164,16 +5604,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                                 inspected_paths=_inspected,
                                 already_edited=_already,
                                 is_late_pass=_fire_late,
+                                is_final_pass=_fire_final,
                             ),
                         })
                         mid_loop_rescue_turns_used += 1
-                        if _fire_late:
+                        if _fire_final:
+                            mid_loop_rescue_pass_done["final"] = True
+                            _pass_label = "final"
+                        elif _fire_late:
                             mid_loop_rescue_pass_done["late"] = True
+                            _pass_label = "late"
                         else:
                             mid_loop_rescue_pass_done["early"] = True
+                            _pass_label = "early"
                         logs.append(
                             f"MID_LOOP_RESCUE_FIRED: "
-                            f"pass={'late' if _fire_late else 'early'} "
+                            f"pass={_pass_label} "
                             f"elapsed={_elapsed_now:.1f}s budget={wall_clock_budget:.1f}s "
                             f"inspected={len(_inspected)} edited={len(_already)}"
                         )
