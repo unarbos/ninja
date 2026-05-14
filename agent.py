@@ -108,8 +108,6 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
-MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -954,28 +952,35 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
-    """Preload the highest-ranked tracked files plus their companion tests.
+    """Build the preloaded file-snippet block shown to the model on turn 0.
 
-    Returns `(context_text, included_files)` so late solve steps can drop the
-    bulky snippets while keeping a file-name breadcrumb.
+    Returns ``(context_text, included_files)``. The text is a concatenated
+    block of file excerpts; the file list is a breadcrumb so later solve
+    steps can drop the bulky text while still naming what was preloaded.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Inputs to the ranker (in order of effect):
 
-      1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
-         X_test.go for X.go, etc.) are slotted in right after their source
-         partner. Real GitHub-derived tasks almost always need source+test
-         changes together; without the test in context the agent patches only
-         the source and misses the companion test update.
+      * Path mentions and backtick-wrapped identifiers in the issue (largest
+        boost — the task author named these files explicitly).
+      * Symbol-grep hits for identifier-shaped tokens from the issue
+        (catches "fix ``do_thing``" style asks that omit the path).
+      * Plain term overlap between the issue text and each tracked path.
 
-      2. Files that match identifier-shaped symbols extracted from the issue
-         text get a substantial rank boost via `_symbol_grep_hits`. This
-         catches the common case where the bug is described by function or
-         class name without mentioning the file path.
+    On top of the raw ranking, two augmentation passes append files the
+    primary scoring would have missed:
 
-      3. A small number of integration partners (routes, API helpers, schemas,
-         migrations, UI entry points, package/build files) are appended after
-         the direct hits. This improves file targeting on feature tasks without
-         displacing the primary target files.
+      * Companion test partners (``tests/test_X.py`` for ``X.py``,
+        ``X.test.ts`` for ``X.ts``, ``X_test.go`` for ``X.go``, etc.) are
+        slotted in next to their source. GitHub-derived tasks almost always
+        require coordinated source+test edits.
+      * A small number of integration-surface files (routes, API helpers,
+        schemas, migrations, UI entry points, package/build manifests) are
+        appended after the direct hits to improve targeting on feature work
+        without displacing the primary candidates.
+
+    A rescue-ranker fallback also fires when ``top_score`` from the primary
+    pass is too weak to be meaningful, surfacing a small banner of broad-grep
+    matches so the model is not left guessing from a near-random top file.
     """
     files, top_score = _rank_context_files(repo, issue)
     tracked_set = set(_tracked_files(repo))
@@ -999,7 +1004,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
-    files = _augment_with_directory_siblings(files, tracked_set)
 
     parts: List[str] = []
     included: List[str] = []
@@ -1056,10 +1060,16 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
-    """Returns (ranked_paths, top_score). top_score is the highest computed
-    score in the scoring pass; callers use it to detect "weak ranking"
-    rounds where no path/identifier signal hit, so the top file is
-    functionally random and the rescue-ranker fallback should fire.
+    """Score every tracked file against the issue and return the ranking.
+
+    Returns ``(ranked_paths, top_score)``. ``ranked_paths`` is sorted by
+    descending score (path-mention and backtick-identifier files always
+    appear first because they are scored with the largest boost).
+    ``top_score`` is the highest score produced by the scoring pass —
+    callers use it to detect "weak ranking" rounds where no path mention
+    and no symbol-grep hit landed, so the top file is essentially random
+    and the rescue-ranker fallback in ``build_preloaded_context`` should
+    fire.
     """
     tracked = _tracked_files(repo)
     if not tracked:
@@ -1092,7 +1102,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
-    id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1115,8 +1124,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
-        # Boost files whose path/name matches identifier-shaped tokens from the issue.
-        score += 35 * id_boost.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1199,50 +1206,20 @@ def _split_path_tokens(relative_path: str) -> set:
 
 
 def _looks_like_integration_surface(relative_path: str) -> bool:
+    """True when the path looks like wiring rather than core logic.
+
+    A path qualifies if its basename is a known root-level integration file
+    (``package.json``, ``Cargo.toml``, ``next.config.js``, etc.) or if any
+    of its directory components matches an integration marker (``routes``,
+    ``api``, ``schema``, ``migrations``, ``pages``, ``handlers``, ...).
+    Used by ``_augment_with_integration_partners`` to decide which
+    neighboring files to append after direct rank hits.
+    """
     path = Path(relative_path)
     if path.name in _INTEGRATION_ROOT_FILES:
         return True
     tokens = _split_path_tokens(relative_path)
     return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
-
-
-_DIRECTORY_SIBLING_BASENAMES = {
-    "layout", "index", "page", "route", "loading", "error", "metadata",
-    "manifest", "head", "template", "_meta", "_root", "styles", "types",
-    "constants", "schema",
-}
-
-
-def _augment_with_directory_siblings(
-    files: List[str], tracked_set: set, limit: int = 3
-) -> List[str]:
-    """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
-
-    Targets high-leverage basenames (layout, index, schema, etc.) that commonly
-    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
-    """
-    try:
-        if not files:
-            return files
-        top = files[0]
-        top_dir = str(Path(top).parent).replace("\\", "/")
-        if top_dir in {"", "."}:
-            return files
-        seen = set(files)
-        siblings: List[str] = []
-        for candidate in tracked_set:
-            if candidate in seen:
-                continue
-            cpath = Path(candidate)
-            if str(cpath.parent).replace("\\", "/") != top_dir:
-                continue
-            if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
-                siblings.append(candidate)
-            if len(siblings) >= limit:
-                break
-        return files + siblings[:limit]
-    except Exception:
-        return files
 
 
 def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
@@ -1566,98 +1543,19 @@ def _diff_low_signal_summary(patch: str) -> str:
 
 
 def _patch_changed_files(patch: str) -> List[str]:
-    """Return the list of `b/` paths touched by a unified diff, in order."""
+    """Return the destination (``b/``) paths touched by a unified diff.
+
+    Order matches the diff: each ``diff --git a/<old> b/<new>`` header is
+    scanned in sequence and the new-side path is appended on first sight.
+    Duplicates within a single patch are skipped so the result is a stable
+    de-duplicated list suitable for coverage and overlap checks.
+    """
     seen: List[str] = []
     for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
         path = match.group(2)
         if path and path not in seen:
             seen.append(path)
     return seen
-
-
-_NEW_FILE_RE = re.compile(
-    r"^--- /dev/null\n\+\+\+ b/(.+?)$",
-    re.MULTILINE,
-)
-_RELOCATION_TRIGGERS = re.compile(
-    r"\b(move|rename|extract|belongs under|new location|create a new|convert to)\b",
-    re.IGNORECASE,
-)
-
-
-def _patch_newly_created_files(patch: str) -> List[str]:
-    """Return paths of files created from scratch (--- /dev/null) in the patch."""
-    try:
-        return [m.group(1) for m in _NEW_FILE_RE.finditer(patch)]
-    except Exception:
-        return []
-
-
-def _check_inplace_intent(
-    patch: str, issue_text: str, tracked_set: set
-) -> List[str]:
-    """Return advisories when the patch creates a new file while an existing same-basename file was not edited.
-
-    Catches the 'new file at wrong path instead of in-place refactor' failure mode.
-    Suppressed when the issue contains a relocation trigger phrase.
-    """
-    try:
-        if _RELOCATION_TRIGGERS.search(issue_text):
-            return []
-        advisories: List[str] = []
-        changed = set(_patch_changed_files(patch))
-        for new_path in _patch_newly_created_files(patch)[:6]:
-            new_basename = Path(new_path).name
-            for existing in tracked_set:
-                if existing in changed:
-                    continue
-                if Path(existing).name == new_basename:
-                    advisories.append(
-                        f"created new file {new_path!r} while existing {existing!r} "
-                        "with same name was untouched"
-                    )
-                    break
-            if len(advisories) >= 3:
-                break
-        return advisories
-    except Exception:
-        return []
-
-
-_REMOVED_DEF_RES = (
-    re.compile(r"^-\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    re.compile(r"^-\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*export\s+(?:default\s+)?(?:const|function|class)\s+([A-Za-z_][A-Za-z0-9_]*)"),
-    re.compile(r"^-\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"),
-)
-
-
-def _patch_removed_definitions(patch: str, cap: int = 8) -> List[str]:
-    """Return names of definitions removed by the patch (def/class/function/export/func/fn lines).
-
-    Pure diff-text scan — no subprocess, no I/O. Used to build a caller-audit advisory.
-    """
-    try:
-        seen: set = set()
-        results: List[str] = []
-        for line in patch.splitlines():
-            if not line.startswith("-"):
-                continue
-            for pattern in _REMOVED_DEF_RES:
-                m = pattern.match(line)
-                if m:
-                    name = m.group(1)
-                    if name not in seen:
-                        seen.add(name)
-                        results.append(name)
-                    break
-            if len(results) >= cap:
-                break
-        return results
-    except Exception:
-        return []
 
 
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
@@ -1740,6 +1638,14 @@ def _check_node_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Try to ``json.loads`` one tracked JSON file and return any error.
+
+    Returns ``None`` when the file parses cleanly, is missing, or escapes
+    the repo root via symlink/``..`` traversal (treated as "not our problem"
+    rather than reported as a defect). On a parse failure the returned
+    string is formatted as ``<path>:<line>: <message>`` so it can be
+    surfaced verbatim through the syntax-fix refinement turn.
+    """
     full = (repo / relative_path).resolve()
     try:
         full.relative_to(repo.resolve())
@@ -1768,9 +1674,6 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
-    ".rs", ".go", ".java", ".kt",
-    ".c", ".cc", ".cpp", ".h", ".hpp",
-    ".cs", ".php",
 }
 
 
@@ -2407,11 +2310,19 @@ _SYMBOL_STOP = {
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
-    """Pull identifier-shaped tokens from the issue text.
+    """Pull identifier-shaped tokens out of the issue body for symbol grep.
 
-    Heuristic: any CamelCase or snake_case identifier, plus any all-lowercase
-    identifier of length >=4 (so we catch `pairs`, `solve`, `parse`, etc.).
-    Stop-words and very short tokens are filtered out.
+    Accepts three identifier shapes:
+
+      * CamelCase or mixedCase (``MyClass``, ``parseToken``)
+      * snake_case with at least one underscore (``do_thing``)
+      * plain lowercase tokens of length >= 4 (``pairs``, ``solve``,
+        ``parse``) — included so single-word function names still hit.
+
+    English stop-words and very short bare tokens are filtered out so the
+    downstream grep is not flooded with matches for ``the``, ``has``, etc.
+    Order is preserved (first occurrence wins) and duplicates are dropped.
+    Capped at ``max_symbols`` so the caller's symbol grep stays bounded.
     """
     seen: set = set()
     out: List[str] = []
@@ -2430,52 +2341,6 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if len(out) >= max_symbols:
             break
     return out
-
-
-_IDENTIFIER_STOPWORDS = {
-    "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
-    "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
-    "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
-}
-
-_CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
-_HOOK_RE = re.compile(r"\b(use|get|set|fetch|handle|build|create)[A-Z][a-zA-Z0-9_]{2,}\b")
-_SNAKE_RE = re.compile(r"\b([a-z][a-zA-Z0-9]+_[a-z][a-zA-Z0-9_]+)\b")
-
-
-def _issue_identifier_path_boost(
-    issue_text: str, tracked_files: List[str], cap: int = 20
-) -> Dict[str, int]:
-    """Return per-file hit counts for identifier-shaped tokens extracted from the issue text.
-
-    Uses only path-segment substring matching — no I/O, no subprocess.
-    Weight 35 per hit matches the existing path-mention scoring bonus.
-    """
-    try:
-        identifiers: set = set()
-        for m in _CAMEL_RE.finditer(issue_text):
-            tok = m.group(1)
-            if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
-                identifiers.add(tok.lower())
-        for m in _HOOK_RE.finditer(issue_text):
-            if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
-        for m in _SNAKE_RE.finditer(issue_text):
-            if len(identifiers) < cap:
-                identifiers.add(m.group(1).lower())
-        if not identifiers:
-            return {}
-        boost: Dict[str, int] = {}
-        for rel in tracked_files:
-            path_obj = Path(rel)
-            basename_lower = path_obj.name.lower()
-            parent_lower = str(path_obj.parent).lower()
-            hits = sum(1 for ident in identifiers if ident in basename_lower or ident in parent_lower)
-            if hits:
-                boost[rel] = hits
-        return boost
-    except Exception:
-        return {}
 
 
 def _symbol_grep_hits(
@@ -2811,15 +2676,21 @@ def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
     relocation_gap: bool = False,
-    removed_names: Optional[List[str]] = None,
 ) -> str:
-    """Tell the model which issue-mentioned paths are still untouched.
+    """Build the coverage-nudge refinement prompt for unedited required paths.
 
-    Incomplete coverage is common on multi-file tasks. When the issue names
-    specific files and the draft skips them, surface that gap directly — much
-    cheaper than hoping the self-check catches it. When `relocation_gap` is
-    set, also instruct the model to CREATE a new file at the implied path
-    (king_analysis P1 fix: don't just edit the old-path file).
+    ``missing_paths`` is the set of paths the issue explicitly names that
+    the current draft patch has not yet touched. The prompt asks the model
+    to open each path and either edit it or confirm by inspection that no
+    edit is needed — incomplete multi-file coverage is one of the most
+    common LLM-judge deductions, and naming the gap concretely is much
+    cheaper than waiting for the self-check pass to catch it.
+
+    When ``relocation_gap`` is true, the prompt is prefixed with an extra
+    instruction to CREATE the file at the implied new path (with a heredoc)
+    rather than editing the old-path file in place. This handles the
+    "move X to Y" / "rebuild as separate components" failure mode where
+    the model mis-reads a relocation task as an in-place edit.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     relocation_hint = ""
@@ -2835,17 +2706,8 @@ def build_coverage_nudge_prompt(
             "importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
-    removed_hint = ""
-    if removed_names:
-        names_str = ", ".join(removed_names[:8])
-        removed_hint = (
-            f"AUDIT: this patch removes/renames the following names — "
-            f"verify every caller has been updated: {names_str}. "
-            "Run `git grep` for each before <final> if uncertain.\n\n"
-        )
     return (
         f"{relocation_hint}"
-        f"{removed_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2859,26 +2721,24 @@ def build_coverage_nudge_prompt(
     )
 
 
-def build_self_check_prompt(
-    patch: str,
-    issue_text: str,
-    inplace_advisories: Optional[List[str]] = None,
-) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+def build_self_check_prompt(patch: str, issue_text: str) -> str:
+    """Build the self-check refinement prompt around the model's draft patch.
+
+    Echoes the (possibly head/tail-truncated) patch back to the model along
+    with the original task and a checklist organized by what the LLM judge
+    actually weights: correctness (root-cause fix, edge cases, functional
+    test evidence), completeness (every requirement addressed, companion
+    tests updated, no broken imports), and scope (no whitespace-only,
+    comment-only, type-annotation-only, or refactor hunks). The model is
+    told to reply with exactly ``<final>OK</final>`` if every item passes,
+    or otherwise to emit corrective ``<command>`` blocks in the same turn
+    before finalizing.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
-    advisory_block = ""
-    if inplace_advisories:
-        bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
-        advisory_block = (
-            "\nIN-PLACE EDIT WARNINGS (check before finalizing):\n"
-            f"  {bullets}\n"
-            "If the task is a refactor (not a new-file relocation), fix each by editing "
-            "the EXISTING file rather than creating a new one at a different path.\n"
-        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
@@ -2895,8 +2755,7 @@ def build_self_check_prompt(
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n"
-        f"{advisory_block}\n"
+        "  - No new helper functions or defensive checks not required by the task\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -3010,63 +2869,6 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
-    )
-
-
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
-    """Extract file paths recently read by the model from the last `window` log entries.
-
-    Scans for paths surfaced via read_file/cat observations so the mid-loop
-    hail-mary prompt can suggest concrete edit targets. Pure Python; no subprocess.
-    """
-    try:
-        path_re = re.compile(r"(?:^|\s|/|')([A-Za-z0-9_.\-/]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|rb|swift|svelte|md|json|toml|yaml|yml|sh))\b")
-        seen: set = set()
-        results: List[str] = []
-        for entry in logs[-window:]:
-            for m in path_re.finditer(entry):
-                p = m.group(1).lstrip("/")
-                if p and p not in seen and len(p) >= 4:
-                    seen.add(p)
-                    results.append(p)
-                    if len(results) >= 8:
-                        return results
-        return results
-    except Exception:
-        return []
-
-
-def build_mid_loop_hail_mary_prompt(
-    issue_text: str,
-    elapsed: float,
-    budget: float,
-    last_observed_paths: List[str],
-) -> str:
-    """Emergency prompt fired mid-loop when no edit has been made and >55% of wall-clock is gone.
-
-    Tells the model explicitly: stop reading, pick the most likely target file,
-    and emit edit_file commands now.
-    """
-    pct = int(100 * elapsed / budget) if budget > 0 else 55
-    path_hint = ""
-    if last_observed_paths:
-        path_hint = (
-            "\n\nFiles you have already read (most likely candidates for the fix):\n"
-            + "".join(f"  - {p}\n" for p in last_observed_paths[:5])
-        )
-    short_issue = issue_text[:800] if len(issue_text) > 800 else issue_text
-    return (
-        f"MID-LOOP BUDGET ALERT: {pct}% of wall-clock is gone and no code has been edited yet.\n\n"
-        "STOP READING FILES. You must emit edit commands NOW.\n\n"
-        "Pick the single most likely file to fix based on the issue and what you have already read. "
-        "Use `sed -i`, a python heredoc, or `python - <<'PY' ... PY` to make the smallest "
-        "targeted change that addresses the ROOT CAUSE. Do not run broad searches. "
-        "If you are still uncertain, make a best-effort minimal edit to the most plausible location "
-        "and iterate.\n"
-        f"{path_hint}\n"
-        "Task (reminder):\n"
-        f"{short_issue}\n\n"
-        "Emit your edit command(s) now, then run one verification command, then <final>."
     )
 
 
@@ -3305,8 +3107,20 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
-    """Original solve loop, callable through kwargs to avoid re-stating the
-    validator-protected parameter signature outside of solve()."""
+    """Run one full attempt of the agent's read-think-edit-verify loop.
+
+    Accepts arguments via ``**kwargs`` rather than a named signature so the
+    validator-protected ``solve()`` entry point is the only public surface
+    that pins the parameter list — this lets the helper evolve (extra
+    refinement budgets, prior-attempt summaries, wall-clock overrides, ...)
+    without touching the contract markers.
+
+    Drives the per-step LLM call, command parsing and execution, refinement
+    gating (coverage nudge, self-check, syntax fix, test fix, polish, hail
+    mary), wall-clock and step accounting, and patch assembly. Returns the
+    standard solve result dict (``patch``, ``logs``, ``cost``, ``success``,
+    metadata) consumed by ``solve()``.
+    """
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
@@ -3330,7 +3144,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    mid_loop_hail_mary_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3506,8 +3319,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap,
-                        removed_names=_patch_removed_definitions(patch),
+                        missing, issue, relocation_gap=relocation_gap
                     ),
                     marker,
                 )
@@ -3528,10 +3340,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
-            _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
+                build_self_check_prompt(patch, issue),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -3544,7 +3355,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
-        _tracked_set_for_checks: set = set(_tracked_files(repo))
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3586,23 +3396,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
-
-            _elapsed_now = time.monotonic() - solve_started_at
-            if (
-                mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
-                and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
-                and not get_patch(repo).strip()
-            ):
-                mid_loop_hail_mary_used += 1
-                messages.append({
-                    "role": "user",
-                    "content": build_mid_loop_hail_mary_prompt(
-                        issue, _elapsed_now, wall_clock_budget,
-                        _recently_observed_paths(logs),
-                    ),
-                })
-                logs.append("MID_LOOP_HAIL_MARY_FIRED")
-                continue
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
