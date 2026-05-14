@@ -3869,6 +3869,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
+        _solve_elapsed = time.monotonic() - solve_started_at
+        logs.append(
+            f"\nSOLVE_ELAPSED_SEC:\n{_solve_elapsed:.1f}s inner loop "
+            f"(wall budget {wall_clock_budget:.1f}s)\n"
+        )
         return AgentResult(
             patch=patch,
             logs=_safe_join_logs(logs),
@@ -3919,13 +3924,25 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " all passed",
         " tests passed",
         "success",
+        "0 failed",
+        "0 failures",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
 
     has_good = any(marker in lower for marker in good_markers)
-    has_bad = any(marker in lower for marker in bad_markers)
+    has_bad = False
+    for marker in bad_markers:
+        if marker not in lower:
+            continue
+        # Pytest/Jest often print "N passed, 0 failed" — do not treat as failure.
+        if marker == " failed" and re.search(r"\b0\s+failed\b", lower):
+            continue
+        if marker == " failures" and "0 failures" in lower:
+            continue
+        has_bad = True
+        break
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
@@ -3944,7 +3961,9 @@ def _looks_like_verification_command(command: str) -> bool:
         r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
         r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
         r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
-        r"\bnpx\s+tsc\b",
+        r"\bnpx\s+(tsc|vitest|jest)\b",
+        r"\b(vitest|jest)\b",
+        r"\bdeno\s+test\b",
         r"\btsc\b",
         r"\bgo\s+test\b",
         r"\bcargo\s+(test|check|clippy|build)\b",
