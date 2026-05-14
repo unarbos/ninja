@@ -124,6 +124,13 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 
+# Mid-loop rescue: when the model is still reading at this wall-clock fraction
+# and has produced zero edits, fire one emergency prompt that lists the files
+# already inspected and demands an edit command in the next response.
+_MID_LOOP_RESCUE_FRACTION = 0.55
+_MID_LOOP_RESCUE_SECOND_FRACTION = 0.78  # second escape valve king does not have
+MAX_MID_LOOP_RESCUE_TURNS = 2            # one early, one late; hard cap
+
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
 # loops indefinitely on a borderline patch.
@@ -2887,6 +2894,100 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
+_RECENT_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s/'\"`(\[])"
+    r"([A-Za-z0-9_.\-/]+\."
+    r"(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hxx|"
+    r"php|rb|swift|m|mm|svelte|vue|astro|md|mdx|json|toml|yaml|yml|sh|bash|zsh|"
+    r"sql|graphql|gql|proto|sol|lua|r|scala|dart|zig|nim|ex|exs|erl|hrl|clj|cljs))\b"
+)
+
+
+def _recent_files_in_logs(logs: List[str], window: int = 36, max_files: int = 6) -> List[str]:
+    """Extract distinct file paths the model has inspected in the last `window` log entries.
+
+    Uses a richer extension catalogue than the default observed-paths scanner so
+    backend repos (Rust/Go/Java/Erlang/Elixir/Solidity/etc.) surface useful hints
+    when the loop is stuck without an edit.
+    """
+    try:
+        seen: set = set()
+        out: List[str] = []
+        for entry in logs[-window:]:
+            for m in _RECENT_FILE_PATH_RE.finditer(entry):
+                p = m.group(1).lstrip("/")
+                if not p or len(p) < 4 or p in seen:
+                    continue
+                seen.add(p)
+                out.append(p)
+                if len(out) >= max_files:
+                    return out
+        return out
+    except Exception:
+        return []
+
+
+def build_mid_loop_rescue_prompt(
+    issue_text: str,
+    elapsed: float,
+    budget: float,
+    inspected_paths: List[str],
+    already_edited: List[str],
+    is_late_pass: bool = False,
+) -> str:
+    """Mid-loop rescue: fired when the model has consumed >55% of wall-clock
+    without producing any edit (or >78% on the late pass). Differs from the
+    final hail-mary in two ways: (1) it surfaces both files-inspected and
+    files-already-edited so the model targets a NEW location, (2) it allows a
+    second pass at a later threshold so a single stuck step isn't fatal.
+    """
+    pct_used = int(100 * elapsed / budget) if budget > 0 else 60
+    remaining = max(0.0, budget - elapsed)
+    short = issue_text[:900] if len(issue_text) > 900 else issue_text
+
+    inspected_block = ""
+    if inspected_paths:
+        bullets = "\n".join(f"  - {p}" for p in inspected_paths[:6])
+        inspected_block = (
+            "\nFiles you have already inspected this session — choose ONE as the edit target "
+            "unless the issue clearly points elsewhere:\n"
+            f"{bullets}\n"
+        )
+
+    edited_block = ""
+    if already_edited:
+        edits = ", ".join(f"`{p}`" for p in already_edited[:5])
+        edited_block = (
+            f"\nYou HAVE already touched: {edits}. If the issue requires more files, "
+            "edit a NEW one now; otherwise refine the existing edit and call <final>.\n"
+        )
+
+    if is_late_pass:
+        urgency = (
+            f"LATE-PASS RESCUE — only ~{remaining:.0f}s of wall-clock remain "
+            f"({pct_used}% consumed). This is the last realistic chance to land an edit "
+            "before the loop hard-stops."
+        )
+    else:
+        urgency = (
+            f"MID-LOOP RESCUE — {pct_used}% of wall-clock is gone with NO edits applied yet. "
+            "Stop reading new files; reading time is over."
+        )
+
+    return (
+        f"{urgency}\n\n"
+        "Action required in your NEXT message:\n"
+        "  1. Pick the single most likely file based on the issue and what you have already read.\n"
+        "  2. Emit ONE edit command — `sed -i`, a Python heredoc (`python - <<'PY' ... PY`), or a\n"
+        "     short script that performs the targeted code change. No broad searches; no new reads.\n"
+        "  3. Run ONE quick verification (e.g. `python -c 'import target'`) ONLY if it costs <5s.\n"
+        "  4. Call `<final>` immediately after.\n"
+        f"{inspected_block}{edited_block}\n"
+        "Task (reminder, truncated):\n"
+        f"{short}"
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -3153,6 +3254,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    mid_loop_rescue_turns_used = 0  # senoo v2: dual-pass mid-loop rescue when patch is empty mid-flight
+    mid_loop_rescue_pass_done = {"early": False, "late": False}
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3445,6 +3548,53 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            # senoo v2 — dual-pass mid-loop rescue. When the model is still
+            # reading files at ~55% of wall-clock with NO edits applied yet,
+            # surface inspected paths + already-edited paths and demand an
+            # edit in the next response. A second pass fires at ~78% if the
+            # patch is still empty, so a single stuck step isn't fatal.
+            if mid_loop_rescue_turns_used < MAX_MID_LOOP_RESCUE_TURNS:
+                _elapsed_now = time.monotonic() - solve_started_at
+                _patch_now = get_patch(repo)
+                if not _patch_now.strip():
+                    _early_threshold = _MID_LOOP_RESCUE_FRACTION * wall_clock_budget
+                    _late_threshold = _MID_LOOP_RESCUE_SECOND_FRACTION * wall_clock_budget
+                    _fire_late = (
+                        _elapsed_now >= _late_threshold
+                        and not mid_loop_rescue_pass_done["late"]
+                    )
+                    _fire_early = (
+                        _elapsed_now >= _early_threshold
+                        and not mid_loop_rescue_pass_done["early"]
+                        and not _fire_late
+                    )
+                    if _fire_early or _fire_late:
+                        _inspected = _recent_files_in_logs(logs)
+                        _already = _patch_changed_files(_patch_now) if _patch_now else []
+                        messages.append({
+                            "role": "user",
+                            "content": build_mid_loop_rescue_prompt(
+                                issue_text=issue,
+                                elapsed=_elapsed_now,
+                                budget=wall_clock_budget,
+                                inspected_paths=_inspected,
+                                already_edited=_already,
+                                is_late_pass=_fire_late,
+                            ),
+                        })
+                        mid_loop_rescue_turns_used += 1
+                        if _fire_late:
+                            mid_loop_rescue_pass_done["late"] = True
+                        else:
+                            mid_loop_rescue_pass_done["early"] = True
+                        logs.append(
+                            f"MID_LOOP_RESCUE_FIRED: "
+                            f"pass={'late' if _fire_late else 'early'} "
+                            f"elapsed={_elapsed_now:.1f}s budget={wall_clock_budget:.1f}s "
+                            f"inspected={len(_inspected)} edited={len(_already)}"
+                        )
+                        continue
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
