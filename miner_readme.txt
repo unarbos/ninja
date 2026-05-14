@@ -5,111 +5,72 @@ This repo is the public miner harness for Subnet 66. For production mining,
 edit only agent.py. The validator imports agent.py, calls solve(...), and
 compares your agent against the current king on hidden tasks.
 
-Before You Start
+Before You Submit
+-----------------
+
+1. Edit agent.py only.
+2. Keep the solve(repo_path, issue, model, api_base, api_key) contract.
+3. Use only the model, api_base, and api_key passed by the validator.
+4. Do not add provider keys, wallets, validator tooling, CI files, or
+   third-party dependencies.
+5. Make sure your Bittensor wallet hotkey is the registered miner hotkey you
+   want credited.
+
+Submit Privately
 ----------------
 
-1. Fork or branch from unarbos/ninja main.
-2. Edit agent.py only.
-3. Keep the solve(repo_path, issue, model, api_base, api_key) contract.
-4. Use only the model, api_base, and api_key passed by the validator.
-5. Do not add provider keys, wallets, validator tooling, CI files, or
-   third-party dependencies.
+Run:
 
-Your PR title must start with your exact registered miner hotkey:
-
-<miner-hotkey> improve command loop
-
-Do not add hkey:, uid:, brackets, or any other prefix before the hotkey.
-
-Option A: Pre-PR Commitment
----------------------------
-
-Use this when you want to commit ownership of your final code before the PR is
-public.
-
-1. Commit your final agent.py change locally.
-2. Run local preflight:
-
-./scripts/precommit_ninja_pr.py \
-  --hotkey <miner-hotkey-ss58> \
-  --judge
-
-The script prints a commitment like:
-
-github-pr-head:unarbos/ninja@<head-sha>
-
-With --judge, it calls the same OpenRouter judge prompt used by PR CI. Set
-OPENROUTER_API_KEY in your environment first. Without --judge, it still runs
-local static CI-style checks.
-
-3. Submit the commitment on-chain before opening the PR:
-
-./scripts/precommit_ninja_pr.py \
-  --hotkey <miner-hotkey-ss58> \
-  --judge \
-  --commit-on-chain \
-  --wallet-name <wallet-name> \
-  --wallet-hotkey <wallet-hotkey-name>
-
-You can also submit the printed commitment directly:
-
-./scripts/commit_on_chain.py \
+./scripts/submit_private_submission.py \
   --wallet-name <wallet-name> \
   --wallet-hotkey <wallet-hotkey-name> \
-  --hotkey <miner-hotkey-ss58> \
-  --netuid 66 \
-  --commit "github-pr-head:unarbos/ninja@<head-sha>"
+  --hotkey <miner-hotkey-ss58>
 
-4. Push the exact same commit and open a PR to unarbos/ninja:main.
-5. Make sure the PR title starts with the same hotkey.
+The script:
 
-The validator waits until it finds an open PR whose title hotkey, base branch,
-and current head SHA match your pre-PR commitment.
+- reads agent.py
+- derives a submission id and sha256
+- signs tau-private-submission-v1:<hotkey>:<submission-id>:<sha256>
+- uploads agent.py to https://ninja66.ai/api/submissions
+- prints the API response
 
-Option B: Classic PR-Number Commitment
---------------------------------------
+If checks fail, accepted is false and the response includes ci_checks and
+llm_judge details. Fix agent.py and submit again after reviewing those findings.
 
-Use this when you are comfortable opening the PR first.
+After Acceptance
+----------------
 
-1. Commit your final agent.py change locally.
-2. Push and open a PR to unarbos/ninja:main.
-3. Make sure the PR title starts with your exact miner hotkey.
-4. Copy the PR number and current PR head SHA.
-5. Submit this commitment on-chain:
+If the API accepts your submission, it returns:
 
-github-pr:unarbos/ninja#<pr-number>@<head-sha>
+private-submission:<submission-id>:<sha256-of-agent.py>
 
-Helper command:
-
-./scripts/commit_on_chain.py \
-  --wallet-name <wallet-name> \
-  --wallet-hotkey <wallet-hotkey-name> \
-  --hotkey <miner-hotkey-ss58> \
-  --netuid 66 \
-  --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
-
-Local Checks
-------------
-
-Run this before opening a PR:
-
-./scripts/precommit_ninja_pr.py --hotkey <miner-hotkey-ss58> --judge
-
-What it checks:
-
-- worktree is clean by default
-- HEAD is the commit that will be committed on-chain
-- changed files stay inside agent.py
-- solve(...) contract and basic static guardrails pass
-- optional OpenRouter judge preflight approximates PR CI before upload
+No separate on-chain commitment is required. The validator reads accepted API
+submissions from the private ledger, verifies your hotkey is still registered,
+and queues the bundle directly.
 
 Important Details
 -----------------
 
-- The Git commit SHA must not change after you commit it on-chain.
-- Rebasing, amending, changing the commit message, or using GitHub's web editor
-  creates a new SHA and invalidates the old commitment.
-- Required PR CI must still pass after upload: PR Scope Guard and OpenRouter PR
-  Judge.
-- One accepted submission spends the miner hotkey for the current submission
-  window.
+- The hotkey that signs the API payload is the hotkey credited by the validator.
+- Only one accepted submission is eligible per miner hotkey registration.
+- A second accepted submission from the same hotkey is allowed only after the
+  hotkey is freshly registered again.
+- Public accepted-submission metadata is available at:
+
+https://ninja66.ai/api/submissions
+
+- The public metadata does not reveal submitted agent.py contents or signatures.
+
+Submission Checks
+-----------------
+
+The private API runs:
+
+- Agent Smoke
+- Submission Scope Guard
+- OpenRouter Submission Judge
+- Registration Gate
+
+The most common rejection reasons are changing solve(...), adding provider keys
+or endpoints, adding sampling controls, importing third-party packages, or
+trying to route around the validator-managed model/proxy.
