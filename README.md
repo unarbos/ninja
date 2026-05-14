@@ -4,10 +4,10 @@
 `agent.py` and keep validator systems, task generators, scoring, wallets, and
 infrastructure out of this repo.
 
-Miner submissions happen only through pull requests to this repo. The validator
-does not queue raw `owner/repo@sha` commitments or arbitrary external repos; it
-only runs PR heads from `unarbos/ninja` that are also committed on-chain by a
-registered miner hotkey.
+Production submissions are private. Send your `agent.py` to the Subnet 66
+submission API with a signature from your registered miner hotkey. Once the API
+accepts it, the validator can queue it directly from the private submission
+ledger.
 
 For the miner-facing submission guide, see
 [`MINER_SUBMISSION_CHECKLIST.md`](./MINER_SUBMISSION_CHECKLIST.md).
@@ -16,9 +16,9 @@ For the miner-facing submission guide, see
 
 - `agent.py` for miner submissions
 
-Miner PRs must not modify anything else. Docs in this repo may be updated by
-maintainers to clarify policy, but production miner submissions are judged only
-when the PR diff is limited to `agent.py`.
+Do not add production mining changes outside `agent.py`. Docs and helper scripts
+may be updated by maintainers, but the submitted miner code is the single
+`agent.py` file sent to the private submission API.
 
 Nothing else should be added here for production mining, including
 (but not limited to):
@@ -68,9 +68,8 @@ surface.
 
 Sampling is also validator-owned. Do not add or tune request fields such as
 `temperature`, `top_p`, `top_k`, `seed`, penalties, `logit_bias`, or
-`logprobs`. The validator proxy enforces the managed policy (for example
-`temperature=0.0`, `top_p=1.0`) and strips miner-controlled fields before
-forwarding.
+`logprobs`. The validator proxy enforces the managed policy and strips
+miner-controlled fields before forwarding.
 
 ## Editing
 
@@ -100,143 +99,86 @@ Keep these boundaries intact:
 - do not read or exfiltrate host secrets, hidden tests, prompts, or evaluator
   data
 
-### PR-blocked edits
+### Blocked Edits
 
-PRs are blocked (or fail CI) if they:
+Submissions are rejected if they:
 
-- modify files outside `agent.py`
-- try to submit or point the validator at another repo instead of this PR head
 - change the `solve(...)` entry-point contract
 - add forbidden provider/secret references
 - attempt to hardcode or route around the managed model/proxy (`api_base`,
   `api_key`, `model`)
-- add sampling/decoding control (`temperature`, `top_p`, `top_k`, `seed`, penalties,
-  `logit_bias`, `logprobs`, etc.)
-- include non-miner infra files or workflow/config changes
-- touch validation, scoring, or repo-control paths not related to agent
-  behavior
+- add sampling/decoding control (`temperature`, `top_p`, `top_k`, `seed`,
+  penalties, `logit_bias`, `logprobs`, etc.)
+- include non-miner infra code or workflow/config assumptions
+- touch validation, scoring, or repo-control behavior instead of agent behavior
 
-## Miner PR Flow
+## Private Submission Flow
 
-There are two supported ways to bind your PR to your miner hotkey. The newer
-pre-PR flow gives you a private period: you commit the exact Git head on-chain
-before the PR is public, then open the PR after the commitment is included. The
-classic flow still works if you prefer to open the PR first and commit
-`github-pr:unarbos/ninja#<pr-number>@<head-sha>` afterward.
-
-### Option A: pre-PR commitment
-
-1. Fork or branch from `unarbos/ninja`.
-2. Edit `agent.py`.
-3. Commit the final local change to Git. The commit SHA must be the exact commit
-   you later push/open as the PR head.
-4. Run local preflight:
+1. Edit `agent.py`.
+2. Make sure the hotkey you will sign with is currently registered on Subnet 66.
+3. Submit it to the private API with your registered miner hotkey wallet:
 
 ```bash
-./scripts/precommit_ninja_pr.py \
-  --hotkey <miner-hotkey-ss58> \
-  --judge
-```
-
-The script prints the commitment:
-
-```text
-github-pr-head:unarbos/ninja@<head-sha>
-```
-
-It refuses dirty worktrees by default, runs local static CI-style checks, and
-with `--judge` calls the same OpenRouter judge prompt used by PR CI. Set
-`OPENROUTER_API_KEY` for the judge step.
-
-5. Submit the pre-PR commitment before pushing/opening the PR:
-
-```bash
-./scripts/precommit_ninja_pr.py \
-  --hotkey <miner-hotkey-ss58> \
-  --judge \
-  --commit-on-chain \
-  --wallet-name <wallet-name> \
-  --wallet-hotkey <wallet-hotkey-name>
-```
-
-You can also submit the printed string directly:
-
-```bash
-./scripts/commit_on_chain.py \
+./scripts/submit_private_submission.py \
   --wallet-name <wallet-name> \
   --wallet-hotkey <wallet-hotkey-name> \
-  --hotkey <miner-hotkey-ss58> \
-  --netuid 66 \
-  --commit "github-pr-head:unarbos/ninja@<head-sha>"
+  --hotkey <miner-hotkey-ss58>
 ```
 
-6. Push the same commit and open a PR back to `unarbos/ninja:main`.
-7. Make the PR title start with your exact miner hotkey:
+The script signs this payload with your hotkey:
 
 ```text
-<miner-hotkey> improve command loop
+tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 ```
 
-Do not use any prefix like `hkey:` before the hotkey. The hotkey must be the
-first characters in the title.
-
-The validator will wait until it finds an open PR whose title hotkey, base repo,
-base branch, and current head SHA match the pre-PR commitment.
-
-### Option B: classic PR-number commitment
-
-1. Fork or branch from `unarbos/ninja`.
-2. Edit `agent.py`.
-3. Open a PR back to `unarbos/ninja:main`.
-4. Make the PR title start with your exact miner hotkey.
-5. Commit the PR head on-chain using:
+The API returns JSON. If checks fail, `accepted` is `false`, the response
+includes `ci_checks`/`llm_judge` details, and the script exits nonzero. If
+accepted, no pull request or on-chain commitment is required. The response
+includes the private submission commitment id the validator tracks internally:
 
 ```text
-github-pr:unarbos/ninja#<pr-number>@<head-sha>
+private-submission:<submission-id>:<sha256-of-agent.py>
 ```
 
-This repo includes a helper for submitting that exact string with Bittensor.
-It defaults to subnet 66:
+Only one accepted submission is eligible per miner hotkey registration. After an
+accepted submission, that hotkey is spent for future submissions until it is
+freshly registered again.
 
-```bash
-./scripts/commit_on_chain.py \
-  --wallet-name <wallet-name> \
-  --wallet-hotkey <wallet-hotkey-name> \
-  --hotkey <miner-hotkey-ss58> \
-  --netuid 66 \
-  --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
+Accepted public submission metadata is visible at:
+
+```text
+https://ninja66.ai/api/submissions
 ```
 
-`--hotkey` is checked against the loaded wallet hotkey so the PR title, wallet,
-and on-chain commitment all refer to the same miner.
+The public API does not reveal submitted `agent.py` contents or hotkey
+signatures.
 
-Only one accepted submission is eligible per miner hotkey registration. The
-validator uses block `8,104,340` as the hotkey-spent cutoff: commitments before
-that block do not spend a hotkey for the current submission window, while any
-accepted commitment at or after that block does. After an accepted submission,
-that hotkey is spent for future submissions until it is freshly registered again.
+## Submission Guardrails
 
-The validator binds the PR to the committing hotkey by checking that the PR title
-starts with the same hotkey that made the on-chain commitment. It also checks that
-the committed SHA matches the current PR head SHA.
+The private submission API runs these gates in order:
 
-### PR Guardrails
+- `Signature Gate`
+- `Registration Gate`
+- `Agent Smoke`
+- `Submission Scope Guard`
+- `OpenRouter Submission Judge`
 
-The validator requires these checks before queuing a PR:
+`Signature Gate` rejects malformed or invalid hotkey signatures before any
+expensive checks run.
 
-- `Agent PR Smoke`
-- `PR Scope Guard`
-- `OpenRouter PR Judge`
+`Registration Gate` confirms the signing hotkey is currently registered and has
+not already spent its current registration on an accepted private submission.
 
-`Agent PR Smoke` catches basic syntax/import regressions in `agent.py` before
-the heavier policy and judge gates run.
+`Agent Smoke` compiles `agent.py` and checks for obvious static issues.
 
-`PR Scope Guard` rejects edits that break these boundaries (file scope,
-contract scope, forbidden provider/sampling/secret usage).
+`Submission Scope Guard` rejects edits that break the solve contract, add
+forbidden provider/sampling/secret usage, or try to bypass the validator-managed
+proxy.
 
-`OpenRouter PR Judge` sends only the PR diff to an LLM judge and rejects poor or
-unsafe edits. The judge is configured to score edits against the reference
-without running miner code.
+`OpenRouter Submission Judge` uses the same gatekeeping judge prompt as the
+legacy ninja CI, run through OpenRouter with `anthropic/claude-opus-4.7`,
+temperature `0`, and medium reasoning effort. It rejects poor, unsafe,
+cosmetic, copied, or out-of-scope edits.
 
 ## Scoring Target
 
@@ -263,6 +205,6 @@ configured margin.
 The validator still compares king and challenger patches for copy detection, but
 that pairwise similarity does not replace the Cursor baseline scoring target.
 
-When a PR challenger becomes king, the validator merges that PR into
-`unarbos/ninja:main`; future miners branch from that new base harness. Validator
-weights are assigned to the winning hotkey on the next allowed weight-set epoch.
+When a private challenger becomes king, the validator publishes the winning
+`agent.py` into the public base harness and assigns validator weights to the
+winning hotkey on the next allowed weight-set epoch.

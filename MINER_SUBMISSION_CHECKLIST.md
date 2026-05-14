@@ -1,509 +1,141 @@
-# SN66 Ninja — Miner Submission Checklist
+# SN66 Ninja Miner Submission Checklist
 
-> **Subnet 66 "ninja"** — Bittensor coding agent competition.  
-> Miners submit `agent.py`, a code-fixing AI agent. Validators run king-vs-challenger duels on real GitHub issues (50 rounds). Win condition: `wins - losses > 3`.
+Subnet 66 miners submit exactly one file, `agent.py`, to the private submission
+API. The validator verifies the signing hotkey, runs private gates, stores the
+accepted bundle, and queues accepted challengers from the private submission
+ledger.
 
----
+There is no miner pull request flow and no on-chain commitment flow for ninja
+submissions.
 
-## ⚡ Quick Reference (Experienced Miners)
-
-```
-1. git checkout -b submission/my-agent && edit agent.py only
-2. ./scripts/precommit_ninja_pr.py --hotkey <SS58> --judge
-3. git add agent.py && git commit -m "Improve agent: <description>"
-4. git push origin submission/my-agent
-   → OPTION A: run precommit/commit helper FIRST → open PR
-   → OPTION B: open PR first → commit "github-pr:unarbos/ninja#<PR>@<SHA>" on-chain
-5. PR title = "<exact-SS58-hotkey> <description>" (nothing before the SS58!)
-6. Monitor CI — do NOT amend/rebase/edit via GitHub web after SHA committed
-```
-
-**Hard stops before any commit:**
-- [ ] Only `agent.py` is staged — nothing else
-- [ ] No hardcoded API keys, model names, or URLs
-- [ ] No `temperature`, `top_p`, `seed` parameters
-- [ ] `solve(repo_path, issue, model, api_base, api_key)` signature untouched
-- [ ] No third-party pip packages imported
-- [ ] No validator-detection or environment-sniffing code
-
----
-
-## Phase 1 — Pre-Development Setup
-
-### 1.1 Environment & Registration
-
-- [ ] Confirm your hotkey is registered on SN66 (netuid 66):
-  ```bash
-  btcli subnet metagraph --netuid 66 --subtensor.network finney | grep <your-coldkey>
-  ```
-- [ ] Note your exact SS58 hotkey address — you'll need it verbatim for the PR title:
-  ```bash
-  btcli wallet overview --wallet.name <wallet> --wallet.hotkey <hotkey>
-  ```
-- [ ] Confirm you have **not** already spent this hotkey on a previous accepted submission (one submission per hotkey registration).
-- [ ] Ensure you have enough TAO to cover registration + on-chain commitment transaction fees.
-
-### 1.2 Repository Setup
-
-- [ ] Fork `unarbos/ninja` to your GitHub account (do not push directly to upstream).
-- [ ] Clone your fork locally:
-  ```bash
-  git clone https://github.com/<your-username>/ninja.git
-  cd ninja
-  ```
-- [ ] Add upstream remote for staying current:
-  ```bash
-  git remote add upstream https://github.com/unarbos/ninja.git
-  ```
-- [ ] Fetch latest upstream and rebase your base before starting:
-  ```bash
-  git fetch upstream
-  git checkout main
-  git merge upstream/main
-  ```
-- [ ] Create a dedicated branch for your submission:
-  ```bash
-  git checkout -b submission/<short-description>
-  ```
-
-> ⚠️ **Never work directly on `main`.** Always use a feature branch.
-
-### 1.3 Study the Competition
-
-- [ ] Read `README.md` and all docs in the repo from top to bottom.
-- [ ] Review the existing `agent.py` to understand the baseline contract.
-- [ ] Check the current leaderboard / king's agent (if publicly visible) to understand what you're competing against.
-- [ ] Read through recent PR comments on merged submissions to learn from accepted patterns.
-- [ ] Review recently rejected PRs (if visible) to understand disqualification triggers.
-
----
-
-## Phase 2 — Agent Development
-
-### 2.1 Contract Compliance
-
-- [ ] Keep the validator-facing `solve(repo_path, issue, model, api_base, api_key, ...)` entry point intact.
-- [ ] Do not remove, rename, or reorder the validator-owned parameters `repo_path`, `issue`, `model`, `api_base`, and `api_key`.
-- [ ] `solve(...)` must return a dict containing `patch`, `logs`, `steps`, `cost`, and `success`.
-- [ ] The `patch` field should contain a unified diff, and failure paths should return `success=False` with an empty `patch` instead of crashing.
-- [ ] You use `model`, `api_base`, and `api_key` **exclusively as passed** — no overrides, no fallbacks to your own credentials.
-- [ ] You do **not** set any sampling parameters when calling the LLM API:
-  - ❌ `temperature=...`
-  - ❌ `top_p=...`
-  - ❌ `top_k=...`
-  - ❌ `seed=...`
-  - ❌ `presence_penalty=...`
-  - ❌ Any other generation control parameter
-
-> ⚠️ **The validator controls all sampling. Adding your own parameters is an automatic disqualification.**
-
-### 2.2 Dependencies & Imports
-
-- [ ] Use Python standard library only for new logic in `agent.py`; do not add new third-party package requirements to this starter harness.
-- [ ] Do NOT import third-party packages not already present in the repo:
-  - ❌ `pip install <anything-new>` then import it
-  - ❌ `langchain`, `crewai`, `autogen`, `instructor`, `tiktoken`, or any new library
-- [ ] If you need a capability, implement it with stdlib or by refactoring the existing harness logic.
-- [ ] Verify your imports at the top of `agent.py` — none should introduce a new dependency requirement.
-
-### 2.3 Security & Integrity Rules
-
-- [ ] **No hardcoded credentials** of any kind:
-  - ❌ `api_key = "sk-..."` or any literal key
-  - ❌ `openai.api_key = "..."` or equivalent
-  - ❌ Hardcoded OpenRouter, OpenAI, Anthropic, or Chutes API keys
-- [ ] **No hardcoded model names or URLs** — always use the `model` and `api_base` arguments.
-- [ ] **No validator-avoidance code:**
-  - ❌ Detecting if `api_base` matches a known validator endpoint
-  - ❌ Checking environment variables to switch behavior during evaluation
-  - ❌ `os.environ.get("VALIDATOR", ...)` style checks
-  - ❌ Short-circuiting logic that returns canned answers for known tasks
-- [ ] **No network calls** outside the LLM API call provided by the validator (no external fetches, no telemetry, no logging services).
-
-### 2.4 Code Quality Targets
-
-- [ ] Your agent handles edge cases gracefully (malformed diffs, empty issues, API errors) — return `success=False` with an empty `patch` rather than letting exceptions escape.
-- [ ] Your agent produces **syntactically valid unified diffs** — test this locally.
-- [ ] Your patch is **complete** — addresses the full issue, not just a partial fix.
-- [ ] Your patch is **aligned** with the stated issue — judges score on task alignment.
-- [ ] Your agent logic is **meaningfully different** from the baseline and existing submissions — copy detection will flag similarity.
-- [ ] Code is clean, readable, and well-structured — LLM judge evaluates quality.
-
----
-
-## Phase 3 — Local Testing
-
-### 3.1 Syntax & Import Check
-
-- [ ] Run Python syntax check:
-  ```bash
-  python3 -m py_compile agent.py && echo "Syntax OK"
-  ```
-- [ ] Verify the module imports cleanly:
-  ```bash
-  python3 -c "from agent import solve; print('Import OK')"
-  ```
-- [ ] Check that `solve` has the correct signature:
-  ```bash
-  python3 -c "
-  import inspect
-  from agent import solve
-  sig = inspect.signature(solve)
-  params = list(sig.parameters.keys())
-  expected_prefix = ['repo_path', 'issue', 'model', 'api_base', 'api_key']
-  assert params[:len(expected_prefix)] == expected_prefix, f'Signature mismatch: {params}'
-  print('Signature prefix OK:', params)
-  "
-  ```
-
-### 3.2 Functional Testing
-
-- [ ] Run against at least 3 diverse test cases using a real LLM (via an API you control):
-  - Simple single-file fix
-  - Multi-file change
-  - Issue requiring code understanding (not just string replacement)
-- [ ] Confirm each test result includes a non-empty `patch` and a sensible `success` flag.
-- [ ] Validate the returned `patch` field format:
-  ```bash
-  echo "<your-patch-output>" | patch --dry-run -p1
-  ```
-  Or use Python:
-  ```python
-  import subprocess
-  result = subprocess.run(['patch', '--dry-run', '-p1'], input=patch, capture_output=True, text=True)
-  print(result.returncode, result.stderr)
-  ```
-- [ ] Test graceful failure — pass an invalid API key and confirm it returns `success=False` with an empty `patch` instead of crashing.
-- [ ] Test with a large repo (>100 files) to verify no timeout issues.
-
-### 3.3 Performance Check
-
-- [ ] Your agent completes within the validator's time budget (check README for current timeout).
-- [ ] No infinite loops or unbounded retries that could cause timeouts.
-- [ ] Memory usage is reasonable — no loading large models or files into memory.
-
----
-
-## Phase 4 — Pre-Commit Checks
-
-### 4.1 Run the Official Preflight Tool
-
-- [ ] Run the repo's precommit checker with LLM judge enabled:
-  ```bash
-  ./scripts/precommit_ninja_pr.py --hotkey <your-SS58-hotkey> --judge
-  ```
-- [ ] Confirm **all checks pass** before proceeding. Fix any failures before continuing.
-- [ ] If `--judge` is slow or costly, run without it first, then with it as final gate:
-  ```bash
-  # Fast checks only
-  ./scripts/precommit_ninja_pr.py --hotkey <your-SS58-hotkey>
-  # Full check including LLM judge preview
-  ./scripts/precommit_ninja_pr.py --hotkey <your-SS58-hotkey> --judge
-  ```
-
-### 4.2 Worktree Cleanliness
-
-- [ ] Check git status — only `agent.py` should be modified:
-  ```bash
-  git status
-  git diff --name-only
-  ```
-- [ ] Stage **only** `agent.py`:
-  ```bash
-  git add agent.py
-  git status  # confirm: only agent.py in "Changes to be committed"
-  ```
-- [ ] Verify no unintended files are staged:
-  ```bash
-  git diff --cached --name-only
-  # Expected output: agent.py (only)
-  ```
-
-> ⚠️ **If ANY file other than `agent.py` is staged, the PR Scope Guard will reject your PR.**
-
-### 4.3 Disqualification Pattern Scan
-
-Run these grep checks to catch common DQ triggers:
-
-- [ ] No sampling parameters:
-  ```bash
-  grep -n "temperature\|top_p\|top_k\|seed\|presence_penalty\|frequency_penalty" agent.py
-  # Expected: no output
-  ```
-- [ ] No hardcoded API keys:
-  ```bash
-  grep -n "sk-\|Bearer \|api_key\s*=\s*['\"]" agent.py
-  # Expected: no output (only the parameter usage is fine)
-  ```
-- [ ] No validator-detection patterns:
-  ```bash
-  grep -n "environ\|getenv\|validator\|EVAL\|IS_TEST" agent.py
-  # Review any matches carefully
-  ```
-- [ ] No new pyflakes warnings (Agent PR Smoke gate):
-  ```bash
-  python3 -m pyflakes agent.py
-  # Expected: no output (clean) or only the known baseline warning
-  ```
-- [ ] No third-party imports (adjust list as needed):
-  ```bash
-  grep -n "^import\|^from" agent.py | grep -v "^import os\|^import re\|^import json\|^import sys\|^import subprocess\|^import pathlib\|^import typing\|^import collections\|^import itertools\|^import functools\|^import time\|^import copy\|^import math\|^import random\|^import string\|^import textwrap\|^import difflib\|^import ast\|^import openai\|^from openai\|^from typing\|^from pathlib\|^from collections"
-  # Review any remaining imports for third-party packages
-  ```
-- [ ] No infrastructure files modified:
-  ```bash
-  git diff --name-only HEAD
-  # Should show: agent.py (only)
-  ```
-
----
-
-## Phase 5 — Commit
-
-### 5.1 Create the Commit
-
-- [ ] Write a clear, descriptive commit message. The commit message does NOT need the hotkey — that's for the PR title.
-  ```bash
-  git commit -m "Improve agent: <brief description of your approach>"
-  ```
-- [ ] Capture the exact commit SHA immediately after committing:
-  ```bash
-  git rev-parse HEAD
-  # Save this — you'll need it for on-chain commitment
-  COMMIT_SHA=$(git rev-parse HEAD)
-  echo "Your SHA: $COMMIT_SHA"
-  ```
-
-> ⚠️ **CRITICAL: After you commit your SHA on-chain, DO NOT:**
-> - `git commit --amend`
-> - `git rebase`
-> - `git push --force`
-> - Edit files via GitHub web interface
-> - Make any additional commits to this branch
->
-> **Any of these will create a new HEAD SHA, causing a SHA mismatch and automatic disqualification.**
-
-### 5.2 Push to Your Fork
-
-- [ ] Push your branch to GitHub:
-  ```bash
-  git push origin submission/<your-branch-name>
-  ```
-- [ ] Verify the push succeeded and GitHub shows the correct latest commit SHA:
-  ```bash
-  # Confirm remote SHA matches local
-  git ls-remote origin submission/<your-branch-name>
-  ```
-
----
-
-## Phase 6 — On-Chain Commitment
-
-Choose **Option A** (recommended — gives a private window) or **Option B**.
-
-### Option A — Commit SHA Before Opening PR (Private Window)
-
-- [ ] Generate the pre-PR commitment string and run local checks:
-  ```bash
-  ./scripts/precommit_ninja_pr.py --hotkey <your-SS58-hotkey> --judge
-  # Prints: github-pr-head:unarbos/ninja@<head-sha>
-  ```
-- [ ] Submit that exact printed commitment on-chain before creating the PR:
-  ```bash
-  ./scripts/precommit_ninja_pr.py \
-    --hotkey <your-SS58-hotkey> \
-    --judge \
-    --commit-on-chain \
-    --wallet-name <wallet-name> \
-    --wallet-hotkey <wallet-hotkey-name>
-  ```
-- [ ] If Finney RPC has SSL timeouts, use an alternative public subtensor endpoint (check the community Discord for current options).
-- [ ] Confirm the transaction succeeded and note the block number.
-- [ ] **Now** open the PR on GitHub (instructions in Phase 7).
-
-### Option B — PR First, Then Commit
-
-- [ ] Open the PR on GitHub first (Phase 7).
-- [ ] Note the PR number (e.g., `#123`).
-- [ ] Submit the combined reference on-chain:
-  ```bash
-  ./scripts/commit_on_chain.py \
-    --wallet-name <wallet-name> \
-    --wallet-hotkey <wallet-hotkey-name> \
-    --hotkey <your-SS58-hotkey> \
-    --netuid 66 \
-    --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
-  ```
-
-### On-Chain Verification
-
-- [ ] Verify your commitment landed on-chain:
-  ```bash
-  btcli subnet get_commitment \
-    --netuid 66 \
-    --hotkey <your-SS58-hotkey> \
-    --subtensor.network finney
-  ```
-- [ ] Confirm the stored value matches exactly what you submitted (`github-pr-head:unarbos/ninja@<head-sha>` or `github-pr:unarbos/ninja#<pr-number>@<head-sha>`).
-
----
-
-## Phase 7 — PR Submission
-
-### 7.1 Open the Pull Request
-
-- [ ] Go to `https://github.com/unarbos/ninja/pulls` and click **New pull request**.
-- [ ] Set base: `unarbos/ninja:main` | compare: `<your-fork>:submission/<your-branch>`.
-- [ ] **PR Title** — This is critical:
-  - ✅ `5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY Improve reasoning chain`
-  - ❌ `hkey:5Grw... My agent` (no prefix before the SS58)
-  - ❌ `uid:42 5Grw... My agent` (no prefix before the SS58)
-  - ❌ `My awesome agent 5Grw...` (hotkey must be FIRST)
-  - **The title must start with your exact SS58 hotkey address — no prefix, no decoration.**
-
-- [ ] PR description should include:
-  - Brief explanation of your agent's approach
-  - Key improvements over baseline (without revealing implementation details if using Option A)
-  - Any relevant test results
-
-### 7.2 Final Verification After PR Opens
-
-- [ ] Confirm the PR head commit SHA matches the `<head-sha>` embedded in your on-chain commitment string.
-- [ ] Confirm the PR only modifies `agent.py` (visible in the "Files changed" tab).
-- [ ] Confirm PR title starts with your exact SS58 hotkey.
-- [ ] Watch CI checks — they will run automatically. Do NOT touch the branch while CI runs.
-
----
-
-## Phase 8 — Post-Submission Monitoring
-
-### 8.1 CI Check Results
-
-- [ ] Monitor the PR for CI status (usually runs within a few minutes).
-- [ ] **Agent PR Smoke** checks:
-  - `agent.py` must compile without syntax errors (`py_compile`)
-  - No new `pyflakes` warnings beyond the known baseline
-  - Run locally: `python3 -m py_compile agent.py && python3 -m pyflakes agent.py`
-- [ ] **PR Scope Guard** checks:
-  - Files outside `agent.py` → rejected
-  - Forbidden API patterns → rejected
-  - Sampling parameters → rejected
-  - Contract signature changes → rejected
-  - Validator-avoidance code → rejected
-- [ ] **LLM PR Judge** checks:
-  - Agent quality assessment → may reject poor quality
-  - Copy detection → may reject agents too similar to existing submissions
-
-### 8.2 If CI Fails
-
-> ⚠️ **If you need to fix a CI failure AFTER committing SHA on-chain, you must:**
-> 1. Register a NEW hotkey (the old one is spent on the failed attempt)
-> 2. Fix your agent
-> 3. Start the entire process over from Phase 1
->
-> **You cannot amend, rebase, or re-push to fix a SHA-committed branch.**
-
-- [ ] If CI fails BEFORE you commit on-chain (Option A): you can push fixes freely — just re-capture the new SHA.
-- [ ] If CI fails AFTER on-chain commitment: assess whether it's a validator error (rare) or your code's fault.
-- [ ] Read CI failure logs carefully — understand the exact rule that was violated.
-- [ ] Document what went wrong to avoid repeating it.
-
-### 8.3 Duel Monitoring
-
-- [ ] Once PR is accepted, your agent enters the duel queue.
-- [ ] Monitor your hotkey's duel results on the validator leaderboard/API.
-- [ ] Win condition: `wins - losses > 3` over 50 rounds to dethrone the king.
-- [ ] Monitor the PR for final confirmation after a duel win — results may take additional time to be finalized.
-- [ ] Track your score progression to understand where your agent wins/loses.
-
----
-
-## Common Disqualification Reference
-
-| Mistake | Consequence | Prevention |
-|---|---|---|
-| GitHub web editor after SHA committed | SHA mismatch → DQ | Never use web editor post-commit |
-| `git rebase` after SHA committed | SHA mismatch → DQ | Freeze branch after SHA committed |
-| `--amend` after SHA committed | SHA mismatch → DQ | Never amend committed branches |
-| Files besides `agent.py` in PR | Scope Guard → rejected | `git diff --cached --name-only` |
-| `temperature=` / `top_p=` in code | Scope Guard → rejected | Grep before committing |
-| Hardcoded API key in code | Scope Guard → rejected | Grep for `sk-` / `Bearer` |
-| Hotkey prefix in PR title (`hkey:`) | Title mismatch → rejected | SS58 must be the very first token |
-| Third-party pip package | Import error → broken | Stdlib + existing deps only |
-| Validator-detection code | Scope Guard → DQ | No env-sniffing, no endpoint-checking |
-| Copy-pasted agent | Copy detection → rejected | Write original logic |
-| Changing `solve()` signature | Contract check → rejected | Never touch parameter names/order |
-| New `pyflakes` warnings in `agent.py` | Agent PR Smoke → rejected | Run `python3 -m pyflakes agent.py` before committing |
-| Syntax error in `agent.py` | Agent PR Smoke → rejected | Run `python3 -m py_compile agent.py` before committing |
-
----
-
-## Checklist Summary (Final Gate Before Each Phase)
-
-### Before Committing (Phase 5 Gate)
-```bash
-git diff --cached --name-only         # Must show: agent.py only
-python3 -m py_compile agent.py        # Must show: no output (OK)
-python3 -m pyflakes agent.py          # Must show: no output (no new warnings)
-grep -n "temperature\|top_p\|top_k" agent.py  # Must show: no output
-./scripts/precommit_ninja_pr.py --hotkey <SS58> --judge  # Must show: all pass
-```
-
-### Before On-Chain Commitment (Phase 6 Gate)
-```bash
-git rev-parse HEAD                    # Capture this SHA
-git ls-remote origin <branch>         # Verify remote SHA matches
-# Confirm you will NOT touch this branch again
-```
-
-### Before Opening PR (Phase 7 Gate)
-```bash
-# Verify on-chain commitment landed:
-btcli subnet get_commitment --netuid 66 --hotkey <SS58> --subtensor.network finney
-# Verify the <head-sha> inside the stored commitment string matches your branch:
-echo "Branch HEAD: $(git rev-parse HEAD)"
-```
-
----
-
-## Useful Commands Reference
+## Quick Path
 
 ```bash
-# Check registration
-btcli subnet metagraph --netuid 66 --subtensor.network finney
+python3 -m py_compile agent.py
+python3 -c "from agent import solve; print('Import OK')"
 
-# Get your hotkey SS58
-btcli wallet overview --wallet.name <name> --wallet.hotkey <hotkey>
-
-# Run preflight (no LLM judge)
-./scripts/precommit_ninja_pr.py --hotkey <SS58>
-
-# Run preflight (with LLM judge)
-./scripts/precommit_ninja_pr.py --hotkey <SS58> --judge
-
-# Get current HEAD SHA
-git rev-parse HEAD
-
-# Commit pre-PR head on-chain (Option A)
-./scripts/commit_on_chain.py --wallet-name <name> --wallet-hotkey <hotkey> \
-  --hotkey <SS58> --netuid 66 \
-  --commit "github-pr-head:unarbos/ninja@<head-sha>"
-
-# Commit PR-number reference on-chain (Option B)
-./scripts/commit_on_chain.py --wallet-name <name> --wallet-hotkey <hotkey> \
-  --hotkey <SS58> --netuid 66 \
-  --commit "github-pr:unarbos/ninja#<pr-number>@<head-sha>"
-
-# Verify on-chain commitment
-btcli subnet get_commitment --netuid 66 --hotkey <SS58> --subtensor.network finney
-
-# Check staged files
-git diff --cached --name-only
-
-# Syntax check
-python3 -m py_compile agent.py && echo "OK"
+./scripts/submit_private_submission.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58>
 ```
 
----
+The default endpoint is:
 
-*This checklist covers the complete SN66 ninja submission flow as of the current validator version. Always cross-reference with the latest `README.md` in `unarbos/ninja` — rules may be updated between validator versions.*
+```text
+https://ninja66.ai/api/submissions
+```
+
+For local testing, pass `--api-url http://127.0.0.1:8066/api/submissions`.
+
+## Before You Submit
+
+- [ ] Your hotkey is registered on Subnet 66.
+- [ ] This registration has not already produced an accepted private submission.
+- [ ] `agent.py` is 5 MB or smaller.
+- [ ] `agent.py` compiles with `python3 -m py_compile agent.py`.
+- [ ] `from agent import solve` imports cleanly.
+- [ ] `solve(repo_path, issue, model, api_base, api_key)` still accepts the
+  validator-owned parameters in that order.
+- [ ] `solve(...)` returns a dict with `patch`, `logs`, `steps`, `cost`, and
+  `success`.
+- [ ] New logic uses Python standard library only.
+- [ ] No hardcoded API keys, bearer tokens, provider URLs, or wallet material.
+- [ ] No hardcoded model names. Use the `model` argument supplied by the
+  validator.
+- [ ] No sampling controls such as `temperature`, `top_p`, `top_k`, `seed`,
+  penalties, `logit_bias`, or `logprobs`.
+- [ ] No validator-detection, hidden-test sniffing, telemetry, or external
+  network calls outside the validator-provided LLM endpoint.
+
+## Submit
+
+Run:
+
+```bash
+./scripts/submit_private_submission.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58>
+```
+
+The helper reads `agent.py`, derives a submission id, signs this payload with
+your wallet hotkey, and posts a multipart request to the API:
+
+```text
+tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
+```
+
+Use `--dry-run` to print the request summary without sending it.
+
+## API Result
+
+If the API rejects the submission, the helper prints the JSON response and exits
+nonzero. Fix the issue and submit again only if your registration is still
+eligible.
+
+If the API accepts the submission, the response includes:
+
+```text
+private-submission:<submission-id>:<sha256-of-agent.py>
+```
+
+Accepted public metadata is published at:
+
+```text
+https://ninja66.ai/api/submissions
+```
+
+That public payload does not expose your submitted `agent.py` contents or
+signature.
+
+## Validator Gates
+
+The API rejects cheap invalid requests first, then runs heavier checks:
+
+- `Signature Gate` validates the signed hotkey payload.
+- `Registration Gate` confirms the hotkey is currently registered and not spent
+  for this registration.
+- `Agent Smoke` compiles/imports `agent.py` and checks basic contract shape.
+- `Submission Scope Guard` rejects forbidden files, provider bypasses, sampling
+  controls, secret usage, and contract breaks.
+- `OpenRouter Submission Judge` uses the same gatekeeping judge prompt as the
+  legacy ninja CI, with `anthropic/claude-opus-4.7`, temperature `0`, and medium
+  reasoning effort.
+
+## Common Rejection Reasons
+
+| Mistake | Result |
+|---|---|
+| Invalid signature or wrong wallet hotkey | Quick API rejection |
+| Hotkey is not registered | Rejected before smoke/judge checks |
+| Hotkey already accepted for this registration | Rejected before smoke/judge checks |
+| `agent.py` exceeds 5 MB | Rejected before validation |
+| Syntax/import error | `Agent Smoke` fails |
+| Changed `solve(...)` contract | Scope guard or smoke fails |
+| Hardcoded model/provider/API key | Scope guard fails |
+| Sampling parameters in LLM calls | Scope guard fails |
+| Cosmetic or copied agent change | Submission judge fails |
+| External network calls or telemetry | Scope guard or judge fails |
+
+## Local Checks
+
+```bash
+python3 -m py_compile agent.py
+python3 -c "from agent import solve; print('Import OK')"
+python3 - <<'PY'
+import inspect
+from agent import solve
+
+params = list(inspect.signature(solve).parameters)
+expected = ["repo_path", "issue", "model", "api_base", "api_key"]
+assert params[: len(expected)] == expected, params
+print("Signature OK:", params)
+PY
+rg -n "temperature|top_p|top_k|seed|presence_penalty|frequency_penalty|logit_bias|logprobs" agent.py
+rg -n "sk-|Bearer |api_key\\s*=\\s*['\\\"]|OPENROUTER|OPENAI_API_KEY|ANTHROPIC" agent.py
+```
+
+Review any `rg` matches carefully before submitting. Some matches can be benign
+when they refer to validator-supplied parameters, but hardcoded secrets,
+providers, models, or sampling controls are disqualifying.
