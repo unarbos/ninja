@@ -723,19 +723,22 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
         ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
         "node_modules",
         "coverage",
         "dist",
         "build",
         "target",
         ".git",
+        ".mypy_cache", ".ruff_cache", ".tox",
+        ".idea", ".vscode",
+        ".next", ".turbo",
     }
     generated_suffixes = {
         ".class",
@@ -1768,9 +1771,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
-    ".rs", ".go", ".java", ".kt",
     ".c", ".cc", ".cpp", ".h", ".hpp",
-    ".cs", ".php",
+    ".cs", ".php", ".dart",
+    ".rs", ".go", ".java", ".kt",
 }
 
 
@@ -2621,6 +2624,18 @@ When a change necessarily spans multiple files (interface, signature, type, head
 
 When 3+ consecutive statements share the same shape, prefer a loop / map / list comprehension / table-driven test instead of unrolled copy-paste — but only inside the code you already have to change.
 
+- PRESERVE SIBLING IDENTIFIERS: When adding a new ref, hook, store
+  slice, file-input, event handler, filter predicate, modal-open
+  state, query parameter, or DAO field next to an existing one,
+  ADD a distinctly-named sibling — do not rename or re-purpose the
+  existing identifier and do not share its target. If the existing
+  renderer applies a .filter(...)/conditional .map(...) over a
+  category/tag/status, the new code path must thread the SAME
+  filter; rendering all items regardless of the active filter is a
+  regression even if the new feature works. Modal/dialog chains:
+  do not call closeModal() in the same tick as opening the next
+  modal — open the new one first, then close the old one.
+
 ====================================================================
 TESTS AND VERIFICATION
 ====================================================================
@@ -2664,6 +2679,14 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 ====================================================================
 SCOPE DISCIPLINE
 ====================================================================
+
+- TASK SCOPE LOCK: Read the task spec ONCE and write the explicit
+  file/feature whitelist it implies. Your final diff may only touch
+  files explicitly named in the spec OR files that are obviously
+  required to wire those changes (e.g. router config when adding a
+  route, types file when adding a typed prop). If a change you are
+  considering is not justifiable by the spec text, drop it — the
+  reference patch did not touch it either
 
 Do NOT change:
 - Whitespace-only, comment-only, or blank-line-only hunks
@@ -2901,6 +2924,28 @@ def build_self_check_prompt(
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
+        "====================================================================\n"
+        "UNDEFINED-IDENTIFIER HARD STOP\n"
+        "====================================================================\n\n"
+        "Before finishing, list every identifier you introduced in this patch "
+        "(new variable names, new function names, new imports, new JSX/HTML "
+        "tags, new CSS class references, new SQL column names). For each one, "
+        "state on a single line: \"<name> -> defined at <file>:<line>\" pointing "
+        "at the patch hunk that defines it OR at a pre-existing definition in "
+        "the repo. If any introduced identifier has no such definition, the "
+        "patch is broken — emit a corrective edit in this same turn before "
+        "returning. Common failures to catch: timers/handlers referenced from "
+        "JSX but never declared, helper functions called but never defined, "
+        "relative import paths that point to non-existent files.\n\n"
+        "====================================================================\n"
+        "DELIVERABLE COVERAGE\n"
+        "====================================================================\n\n"
+        "Re-read the task spec. List every distinct deliverable it asks for as "
+        "a numbered bullet (UI element, behavior, endpoint, copy string, "
+        "setting, schema change, test). For each, name the file:hunk in this "
+        "patch that delivers it. If any deliverable maps to no hunk, emit the "
+        "fix in this turn — partial coverage is the most common loss reason "
+        "on multi-component tasks.\n\n"
         "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
