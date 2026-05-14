@@ -1061,7 +1061,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        # senoo v2.t2.11 — pass the issue text so large files get region-
+        # selected (relevance-scored) instead of head-truncated.
+        snippet = _read_context_file(repo, relative_path, per_file_budget, issue)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1537,7 +1539,12 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    issue: str = "",
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1550,7 +1557,151 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    # senoo v2.t2.11 — selective region preload. When the file substantially
+    # exceeds the per-file budget, head-of-file truncation throws away the
+    # interesting parts. Replace with relevance-scored region selection so the
+    # model sees the lines that actually match issue anchors.
+    if issue and len(text) > max_chars * _REGION_PRELOAD_RATIO:
+        regions = _select_relevant_regions(text, issue, relative_path, max_chars)
+        if regions:
+            return regions
     return _truncate(text, max_chars)
+
+
+# Trigger region-preload only when the file is meaningfully larger than the
+# per-file budget — for files near or below budget, head truncate is fine.
+_REGION_PRELOAD_RATIO = 1.6
+# How many lines of context to attach above/below a hot line.
+_REGION_CONTEXT_BEFORE = 6
+_REGION_CONTEXT_AFTER = 14
+# A region must score at least this much to be included (filters single weak
+# hits in otherwise irrelevant files).
+_REGION_MIN_SCORE = 3
+# Per-anchor weights — favour identifier hits (specific) over term hits (broad).
+_REGION_WEIGHT_IDENTIFIER = 6
+_REGION_WEIGHT_TERM = 1
+# When merging adjacent regions, allow up to this many lines of gap before
+# splitting them into two regions.
+_REGION_MERGE_GAP = 4
+# Hard cap on number of regions per file.
+_REGION_MAX_REGIONS = 5
+
+
+def _select_relevant_regions(
+    text: str,
+    issue: str,
+    relative_path: str,
+    max_chars: int,
+) -> str:
+    """Return the most relevant regions of `text` formatted as one block.
+
+    Strategy:
+      1. Build the anchor set: issue identifiers (high-weight) + issue terms
+         (low-weight). Identifiers are reused from Tier-1.3's extractor.
+      2. Score every line by sum of anchor weights it contains.
+      3. Find lines exceeding _REGION_MIN_SCORE and grow each into a region of
+         ±context lines.
+      4. Merge regions whose gap is <= _REGION_MERGE_GAP.
+      5. Sort regions by total score and greedily fit into max_chars,
+         preserving original-line order for the chosen regions.
+      6. Format with a header showing the line range and a `... (N lines elided
+         around line X) ...` separator between non-adjacent regions.
+
+    On any failure or when no region scores high enough, return "" so the
+    caller falls back to head truncation.
+    """
+    try:
+        lines = text.splitlines()
+        n_lines = len(lines)
+        if n_lines == 0:
+            return ""
+        # Build anchors. Extracted identifiers come from Tier-1.3.
+        identifiers_raw = _extract_issue_identifiers(issue) if issue else []
+        terms = _issue_terms(issue) if issue else []
+        # Add path basename and stem as low-weight anchors so files indexed
+        # explicitly in the issue still self-reinforce.
+        try:
+            base = Path(relative_path).name.lower()
+            stem = Path(relative_path).stem.lower()
+            extra_terms = [t for t in (base, stem) if t and len(t) >= 3]
+        except Exception:
+            extra_terms = []
+        # Lowercase + length filter on anchors.
+        identifiers = [t.lower() for t in identifiers_raw if t and len(t) >= 4]
+        terms_lower = [t.lower() for t in terms if t and len(t) >= 3]
+        all_terms = list({*terms_lower, *extra_terms})
+        if not identifiers and not all_terms:
+            return ""
+        # Score lines.
+        line_scores: List[int] = [0] * n_lines
+        for i, raw_line in enumerate(lines):
+            low = raw_line.lower()
+            if not low.strip():
+                continue
+            score = 0
+            for ident in identifiers:
+                if ident in low:
+                    score += _REGION_WEIGHT_IDENTIFIER
+            for term in all_terms:
+                if term in low:
+                    score += _REGION_WEIGHT_TERM
+            line_scores[i] = score
+        # Find hot lines.
+        hot_indices = [i for i, s in enumerate(line_scores) if s >= _REGION_MIN_SCORE]
+        if not hot_indices:
+            return ""
+        # Grow each hot line into a region of (start, end_exclusive, total_score).
+        regions: List[List[int]] = []
+        for i in hot_indices:
+            start = max(0, i - _REGION_CONTEXT_BEFORE)
+            end = min(n_lines, i + _REGION_CONTEXT_AFTER + 1)
+            score = sum(line_scores[start:end])
+            regions.append([start, end, score])
+        # Merge regions sequentially when they overlap or are close.
+        regions.sort(key=lambda r: r[0])
+        merged: List[List[int]] = []
+        for r in regions:
+            if merged and r[0] - merged[-1][1] <= _REGION_MERGE_GAP:
+                merged[-1][1] = max(merged[-1][1], r[1])
+                merged[-1][2] = sum(line_scores[merged[-1][0]:merged[-1][1]])
+            else:
+                merged.append(r[:])
+        # Greedy fit: sort by score desc, take regions until budget exhausted.
+        merged.sort(key=lambda r: -r[2])
+        chosen: List[List[int]] = []
+        used = 0
+        for r in merged[: _REGION_MAX_REGIONS * 2]:
+            chunk = "\n".join(lines[r[0]:r[1]])
+            if used + len(chunk) > max_chars and chosen:
+                continue
+            chosen.append(r)
+            used += len(chunk)
+            if len(chosen) >= _REGION_MAX_REGIONS:
+                break
+            if used >= max_chars:
+                break
+        if not chosen:
+            return ""
+        # Restore source order for human-readable output.
+        chosen.sort(key=lambda r: r[0])
+        out_parts: List[str] = []
+        prev_end = 0
+        for start, end, _score in chosen:
+            if prev_end > 0 and start > prev_end:
+                gap = start - prev_end
+                out_parts.append(f"... ({gap} lines elided) ...")
+            elif prev_end == 0 and start > 0:
+                out_parts.append(f"... ({start} lines elided from file head) ...")
+            out_parts.append(
+                f"# region L{start + 1}-L{end}:\n"
+                + "\n".join(lines[start:end])
+            )
+            prev_end = end
+        if prev_end < n_lines:
+            out_parts.append(f"... ({n_lines - prev_end} lines elided from file tail) ...")
+        return "\n".join(out_parts)
+    except Exception:
+        return ""
 
 
 # -----------------------------
