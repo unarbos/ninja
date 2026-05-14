@@ -3742,7 +3742,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if (
                 soft_nudge_used < MAX_SOFT_NUDGE_TURNS
                 and step >= _SOFT_NUDGE_STEP_THRESHOLD
-                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and _elapsed_now >= min(_SOFT_NUDGE_ELAPSED_SECONDS, 0.3 * wall_clock_budget)
                 and not get_patch(repo).strip()
                 and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
             ):
