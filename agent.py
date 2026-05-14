@@ -49,9 +49,11 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -723,7 +725,9 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
 
 def _should_skip_patch_path(relative_path: str) -> bool:
     path = Path(relative_path)
-    if path.suffix in {".pyc", ".pyo"}:
+    if path.suffix in {".pyc", ".pyo", ".swp", ".swo", ".bak"}:
+        return True
+    if path.name in {".DS_Store", "Thumbs.db"}:
         return True
     generated_parts = {
         "__pycache__",
@@ -736,6 +740,12 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         "build",
         "target",
         ".git",
+        ".idea",
+        ".vscode",
+        ".next",
+        ".turbo",
+        ".parcel-cache",
+        ".tox",
     }
     generated_suffixes = {
         ".class",
@@ -1054,6 +1064,56 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+_ROUTE_PATH_RE_RANK = re.compile(
+    r"(?:^|[\s\"'`])(/[a-z][a-z0-9/_\-]+)(?=[\s\"'`),.;:]|$)")
+_CONFIG_KEY_RE_RANK = re.compile(r"\b([A-Z][A-Z0-9_]{3,})\b")
+_CAPS_STOPWORDS = {
+    "API", "URL", "HTTP", "HTTPS", "JSON", "HTML", "CSS", "XML",
+    "SQL", "UUID", "GUID", "TODO", "FIXME", "README", "LICENSE",
+    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+    "OK", "ERROR", "WARN", "INFO", "DEBUG", "NULL", "NONE", "TRUE",
+    "FALSE", "CRUD", "REST", "GRPC", "ASCII", "UTF",
+}
+
+
+def _resolve_reference_targets(repo: Path, issue_text: str,
+                                tracked: set) -> List[str]:
+    """Return tracked files referenced by (a) route paths like
+    /admin/users and (b) ALL_CAPS config keys like ACTIVE_SPORTS
+    that appear in the issue. These are dropped by the existing
+    path-mention and backtick-ident extractors."""
+    hits: List[str] = []
+    seen: set = set()
+    routes = {
+        r for r in _ROUTE_PATH_RE_RANK.findall(issue_text)
+        if len(r) >= 4 and r not in {"/etc", "/tmp", "/usr",
+                                      "/var", "/opt", "/home"}
+    }
+    keys = {
+        k for k in _CONFIG_KEY_RE_RANK.findall(issue_text)
+        if k not in _CAPS_STOPWORDS and len(k) >= 4
+    }
+    for token in list(routes) + list(keys):
+        try:
+            res = run_command(
+                f"git grep -lF -- {shlex.quote(token)} || true",
+                cwd=repo, timeout=6,
+            )
+        except Exception:
+            continue
+        for path in (res.stdout or "").splitlines():
+            path = path.strip()
+            if (path and path in tracked
+                    and _context_file_allowed(path)
+                    and path not in seen):
+                hits.append(path)
+                seen.add(path)
+            if len(hits) >= 12:
+                break
+        if len(hits) >= 12:
+            break
+    return hits
+
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
@@ -1089,6 +1149,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                 if m not in seen_mentioned:
                     mentioned.append(m)
                     seen_mentioned.add(m)
+
+    reference_hits = _resolve_reference_targets(repo, issue, tracked_set)
+    for hit in reference_hits:
+        if hit not in seen_mentioned:
+            mentioned.append(hit)
+            seen_mentioned.add(hit)
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
@@ -1850,6 +1916,128 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+_JSX_REF_RE = re.compile(r"<([A-Z][A-Za-z0-9]{1,})\b")
+_JSX_DEFINING_RE = re.compile(
+    r"(?:^|[\s,{(])"
+    r"(?:import|function|const|let|var|class|type|interface|export)\b"
+    r"[\s\S]{0,80}?\b([A-Z][A-Za-z0-9]{1,})\b"
+)
+_JSX_NAMED_IMPORT_RE = re.compile(
+    r"import\s+\{[^}]*\b([A-Z][A-Za-z0-9]{1,})\b[^}]*\}\s+from"
+)
+_JSX_DEFAULT_IMPORT_RE = re.compile(
+    r"import\s+([A-Z][A-Za-z0-9]{1,})\s+from"
+)
+_JSX_INTRINSIC_STOP = {
+    "Fragment", "Suspense", "Children", "React", "Component",
+    "PureComponent", "StrictMode", "Provider", "Consumer",
+    "ErrorBoundary",
+}
+_JSX_SUFFIXES = {".jsx", ".tsx", ".js", ".ts"}
+
+
+def _check_undefined_jsx_components(repo: Path,
+                                    patch: str) -> List[str]:
+    """For each .jsx/.tsx/.js/.ts file in the patch, find capitalized
+    <Foo> JSX usages and verify a definition or import exists in the
+    same file. Hard caps: at most 5 errors per file, 25 overall."""
+    errors: List[str] = []
+    total = 0
+    for relative_path in _patch_changed_files(patch):
+        if total >= 25:
+            break
+        suffix = Path(relative_path).suffix.lower()
+        if suffix not in _JSX_SUFFIXES:
+            continue
+        full = repo / relative_path
+        try:
+            source = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(source) > 200_000:
+            continue
+        refs = set(_JSX_REF_RE.findall(source))
+        if not refs:
+            continue
+        defined = set(_JSX_DEFINING_RE.findall(source))
+        defined |= set(_JSX_NAMED_IMPORT_RE.findall(source))
+        defined |= set(_JSX_DEFAULT_IMPORT_RE.findall(source))
+        defined |= _JSX_INTRINSIC_STOP
+        missing = sorted(r for r in refs if r not in defined)
+        if not missing:
+            continue
+        shown = missing[:5]
+        errors.append(
+            f"{relative_path}: JSX references undefined components "
+            f"{', '.join(shown)} — add an import or local definition."
+        )
+        total += 1
+    return errors
+
+
+_TEST_PATH_PATTERNS = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"_test\.(py|go)$"),
+    re.compile(r"\.test\.(ts|tsx|js|jsx)$"),
+    re.compile(r"\.spec\.(ts|tsx|js|jsx)$"),
+)
+
+
+def _is_test_path(relative_path: str) -> bool:
+    return any(p.search(relative_path) for p in _TEST_PATH_PATTERNS)
+
+
+def _check_test_quality_one(repo: Path, relative_path: str,
+                            patch_added_names: set) -> Optional[str]:
+    """Flag test files that contain no invocation assertions for
+    any of the names added or modified by the patch."""
+    full = repo / relative_path
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not relative_path.endswith(".py"):
+        if re.search(r"\.toBe\(|\.toEqual\(|expect\(", source):
+            return None
+        return f"{relative_path}: test file has no invocation assertions"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    calls_referencing_patch: list = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = node.func
+            while isinstance(target, ast.Attribute):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id in patch_added_names:
+                calls_referencing_patch.append(target.id)
+    if calls_referencing_patch:
+        return None
+    return (
+        f"{relative_path}: test file does not invoke any of the patch's "
+        f"added/modified names — likely a stub-level test"
+    )
+
+
+def _check_syntax_test_quality(repo: Path, patch: str) -> List[str]:
+    """Check test files in the patch for stub-level (non-invocation) tests."""
+    if not patch.strip():
+        return []
+    added_name_re = re.compile(r"^\+(?:def|class)\s+(\w+)", re.MULTILINE)
+    patch_added_names = set(added_name_re.findall(patch))
+    if not patch_added_names:
+        return []
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        if _is_test_path(relative_path):
+            result = _check_test_quality_one(repo, relative_path, patch_added_names)
+            if result:
+                errors.append(result)
+    return errors
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -1875,6 +2063,8 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+    errors.extend(_check_undefined_jsx_components(repo, patch))
+    errors.extend(_check_syntax_test_quality(repo, patch))
     return errors
 
 
@@ -3191,6 +3381,39 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+def _capture_intermediate_patch(repo: Path,
+                                best_so_far: Dict[str, Any]) -> None:
+    """Snapshot the current working tree patch. If it has more substantive
+    lines than best_so_far['patch'], update best_so_far in-place."""
+    try:
+        current = get_patch(repo)
+    except Exception:
+        return
+    if not current or not current.strip():
+        return
+    lines = _multishot_count_substantive(current)
+    if lines > best_so_far.get("lines", 0):
+        best_so_far["patch"] = current
+        best_so_far["lines"] = lines
+
+
+def _restore_best_intermediate(repo: Path, best_so_far: Dict[str, Any],
+                               final_patch: str) -> str:
+    """If final_patch is empty or thinner than best_so_far, apply
+    best_so_far to the working tree and return it. Otherwise return
+    final_patch unchanged."""
+    final_lines = _multishot_count_substantive(final_patch or "")
+    best_lines = best_so_far.get("lines", 0)
+    best_patch = best_so_far.get("patch", "")
+    if best_patch and best_lines > final_lines:
+        try:
+            _multishot_apply_patch(repo, best_patch)
+        except Exception:
+            return final_patch
+        return best_patch
+    return final_patch
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -3545,6 +3768,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
+        _best: Dict[str, Any] = {"patch": "", "lines": 0}
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3748,6 +3972,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                 messages.append({"role": "user", "content": observation_text})
 
+            _capture_intermediate_patch(repo, _best)
+
             if success:
                 break
 
@@ -3755,6 +3981,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        patch = _restore_best_intermediate(repo, _best, patch)
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
