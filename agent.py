@@ -90,23 +90,17 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 25000  # P4-α: halved 50000→25000. Suite analysis
-                                     # showed avg prompt_tokens/request ≈ 14.5K
-                                     # × ~10 requests dominated the budget; the
-                                     # preload block alone was ~12.5K tokens
-                                     # being re-sent every request. Halving frees
-                                     # ~6K tokens/request × 10 = ~60K tokens of
-                                     # extra runway before token_limit_exceeded.
-MAX_PRELOADED_FILES = 12              # halved 18→12 in lockstep with the chars
-                                     # cap so per-file budget stays meaningful
-                                     # (~2K chars/file). Cutting only the chars
-                                     # cap would have no effect — the floor at
-                                     # max(1500, MAX_CHARS//N_FILES) clamps and
-                                     # we'd merely preload fewer same-sized
-                                     # files. Forces _rank_context_files to be
-                                     # more selective on cross-module issues;
-                                     # the bash exploration loop can still cat
-                                     # additional files when needed.
+# Wider preload reduces catastrophic-floor rounds (empty patches / wrong-file
+# edits) on issues spanning multiple modules. Cutting the cap to "save token
+# runway" backfires in practice: the model just spends those saved tokens on
+# bash exploration, which costs MORE per byte (cat output is wrapped in shell
+# observation framing). With the selective region-preload below, oversized
+# files are already trimmed to relevance-scored regions, so a generous chars
+# cap is paid for in quality, not waste. Validator's max_prompt_tokens cap
+# counts FULL prompt tokens (cached portions included), so caching does not
+# create extra runway here — see openrouter_proxy.py:891 for accounting.
+MAX_PRELOADED_CONTEXT_CHARS = 50000
+MAX_PRELOADED_FILES = 18
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
