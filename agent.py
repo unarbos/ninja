@@ -1724,8 +1724,6 @@ _REACH_SKIP_PATH_RE = re.compile(
     r"(?:^|/)migrations/|"
     r"(?:^|/)alembic/|"
     r"\.sql$|"
-    r"(?:^|/)seeds?/|"
-    r"(?:^|/)seed[^/]*\.(?:py|ts|js|rb|sql|json)$|"
     r"(?:^|/)index\.(?:ts|tsx|js|jsx|mjs|cjs)$|"
     r"(?:^|/)mod\.rs$|"
     r"\.d\.ts$|"
