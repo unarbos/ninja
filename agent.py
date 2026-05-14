@@ -1130,6 +1130,10 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # senoo v2.t1.3 — score boost for paths matching identifier-shaped tokens
+    # extracted from the issue (CamelCase / hookPattern / snake_case /
+    # kebab-case / dotted). Tiered weights: parent-dir > basename > ancestor.
+    id_scores = _score_paths_by_issue_identifiers(issue, list(tracked))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1152,6 +1156,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # senoo v2.t1.3 — boost files whose path/name matches identifier-shaped
+        # tokens from the issue. Capped at +120 so it can't overwhelm explicit
+        # path mentions (which still score +100) but is large enough to lift a
+        # path-matched candidate above generic term-matched noise.
+        if relative_path in id_scores:
+            score += min(120, id_scores[relative_path])
         if score > 0:
             scored.append((score, relative_path))
 
@@ -2514,6 +2524,207 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         if len(out) >= max_symbols:
             break
     return out
+
+
+# senoo v2.t1.3 — Issue-identifier path boost.
+#
+# Patches frequently miss the right file because `_rank_context_files` matches
+# only literal-path / term substrings. When the issue says "fix `useDebounced
+# Search` so it...", the model needs to see `hooks/use-debounced-search.ts`
+# even though that exact filename is not quoted.
+#
+# This module extracts identifier-shaped tokens from the issue text and scores
+# tracked-file paths by how those tokens align with their parent dir, basename,
+# or ancestor segments. King PR #1450 added a similar mechanism, but with:
+#   • only 3 regex patterns (CamelCase / hook / snake_case)
+#   • a flat +35 weight regardless of WHERE the match landed in the path
+# We extend with two more patterns (kebab-case, DOTTED_SCREAMING) and tier the
+# weights so a parent-dir match outranks an ancestor segment far from the leaf.
+
+# English stopwords that are CamelCase but never identifiers worth boosting.
+_IDENT_STOPWORDS_EN = frozenset({
+    # Articles, pronouns, common sentence-starters
+    "The", "This", "That", "These", "Those", "What", "When", "Then", "Else",
+    "User", "Users", "Item", "Items", "Value", "Values",
+    # Generic technical nouns
+    "API", "URL", "URI", "HTTP", "HTTPS", "JSON", "HTML", "CSS", "SQL", "XML",
+    "YAML", "TOML", "UUID", "ASCII", "UTF",
+    # Python builtins (CamelCased Type spellings)
+    "None", "True", "False", "Error", "Exception", "Type", "List", "Dict",
+    "Tuple", "Set", "Bytes", "Path", "File", "Data", "Test", "Base", "Mock",
+    "Object", "Class", "From", "With", "Into", "Onto",
+    # JS / TS noise
+    "Promise", "Array", "Map", "Function", "Boolean", "Number", "String",
+    "Element", "Component", "Props", "State", "Event", "Node", "Buffer",
+    # Catch-alls
+    "Default", "Static", "Final", "Public", "Private", "Async", "Await",
+    # Common sentence-starter verbs that look like CamelCase identifiers but
+    # are almost always English (e.g. "Update foo() to..." or "Rename bar()").
+    "Update", "Rename", "Refactor", "Remove", "Delete", "Replace", "Revert",
+    "Create", "Implement", "Implement", "Improve", "Modify", "Move", "Make",
+    "Migrate", "Add", "Allow", "Avoid", "Apply", "Build",
+    "Change", "Check", "Cleanup", "Convert", "Configure",
+    "Disable", "Enable", "Ensure", "Extend", "Extract", "Expose",
+    "Fix", "Format", "Handle", "Investigate", "Introduce",
+    "Optimize", "Output", "Patch", "Provide", "Reduce", "Resolve",
+    "Skip", "Support", "Split", "Throw", "Track", "Validate",
+})
+
+# A short cap on how many identifiers we extract — long issues with > 30 PIIs
+# should not drown out the existing scoring axes.
+_IDENT_EXTRACT_CAP = 25
+_IDENT_MIN_LEN = 4
+
+# Tiered match weights (king has flat 35; we differentiate so a leaf-named
+# match beats an unrelated parent-segment match).
+_IDENT_WEIGHT_BASENAME = 28
+_IDENT_WEIGHT_PARENT_DIR = 40
+_IDENT_WEIGHT_ANCESTOR = 18
+
+# Pattern catalog. Compiled once; safe to share.
+_IDENT_RE_CAMEL = re.compile(r"(?<![A-Za-z0-9_])([A-Z][a-z][a-zA-Z0-9]{2,})\b")
+# Common hook/getter/setter/handler/builder/etc prefixes that often map to a
+# named file. We cover more verbs than king (which has 7).
+_IDENT_RE_HOOK = re.compile(
+    r"\b((?:use|get|set|fetch|handle|build|create|render|parse|compute|"
+    r"validate|transform|update|format|resolve)[A-Z][a-zA-Z0-9_]{2,})\b"
+)
+_IDENT_RE_SNAKE = re.compile(r"\b([a-z][a-z0-9]+(?:_[a-z][a-z0-9]+){1,4})\b")
+# kebab-case identifiers like `use-debounced-search` (king does not cover).
+_IDENT_RE_KEBAB = re.compile(r"\b([a-z][a-z0-9]+(?:-[a-z][a-z0-9]+){1,4})\b")
+# Dotted/screaming constants like `MAX_RETRIES`, `config.options.foo`.
+_IDENT_RE_SCREAM = re.compile(r"\b([A-Z][A-Z0-9]+(?:_[A-Z][A-Z0-9]+){1,4})\b")
+# Generic lowerCamelCase like `processPayment`, `submitForm`. Runs after the
+# hook regex so prefixed-verb patterns still get matched first (and dedup'd).
+_IDENT_RE_LOWER_CAMEL = re.compile(
+    r"(?<![A-Za-z0-9_])([a-z][a-z0-9]+(?:[A-Z][a-z0-9]+){1,4})\b"
+)
+
+
+# Splits a CamelCase or hookCamel token into lowercase parts.
+# 'useDebouncedSearch' → ['use', 'debounced', 'search']
+_IDENT_CAMEL_SPLIT_RE = re.compile(r"[A-Z]+[a-z0-9]*|[a-z0-9]+")
+
+
+def _split_camel(token: str) -> List[str]:
+    parts = _IDENT_CAMEL_SPLIT_RE.findall(token)
+    return [p.lower() for p in parts if p]
+
+
+def _extract_issue_identifiers(issue_text: str) -> List[str]:
+    """Extract distinct identifier-shaped tokens from issue text.
+
+    Returns the *original-cased* token deduped (case-insensitive), capped at
+    _IDENT_EXTRACT_CAP. Original case is preserved so the scorer can split
+    CamelCase into kebab/snake variants. Stopwords that look like identifiers
+    (e.g. 'Component', 'Promise') are filtered.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+
+    def _push(token: str) -> str:
+        # Return values:
+        #   "ok"   → token accepted, keep going
+        #   "skip" → rejected (stopword/short/dup), keep going
+        #   "stop" → cap hit, caller should bail out completely
+        token = token.strip("_-.")
+        if not token or len(token) < _IDENT_MIN_LEN:
+            return "skip"
+        if token in _IDENT_STOPWORDS_EN:
+            return "skip"
+        low = token.lower()
+        if low in seen:
+            return "skip"
+        seen.add(low)
+        out.append(token)
+        return "stop" if len(out) >= _IDENT_EXTRACT_CAP else "ok"
+
+    for regex in (_IDENT_RE_HOOK, _IDENT_RE_CAMEL, _IDENT_RE_LOWER_CAMEL,
+                  _IDENT_RE_SCREAM, _IDENT_RE_SNAKE, _IDENT_RE_KEBAB):
+        for m in regex.finditer(issue_text):
+            if _push(m.group(1)) == "stop":
+                return out
+    return out
+
+
+def _score_paths_by_issue_identifiers(
+    issue_text: str, tracked_files: List[str]
+) -> Dict[str, int]:
+    """Per-file integer score: sum of weighted identifier matches in the path.
+
+    Weighting tiers:
+      • parent-dir (the immediate folder containing the file) → +40 / hit
+      • basename (file leaf, with or without extension)       → +28 / hit
+      • any ancestor segment further up the path              → +18 / hit
+    A single identifier token contributes to AT MOST one tier per file: the
+    highest-priority match wins so we don't double-count a substring that
+    happens to appear in multiple ancestors.
+    """
+    identifiers = _extract_issue_identifiers(issue_text)
+    if not identifiers:
+        return {}
+
+    # Variant builders for each identifier so we match across naming styles.
+    # 'useDebouncedSearch' should match 'use-debounced-search' or 'use_debounced_search'.
+    def _variants(token: str) -> List[str]:
+        v: set = set()
+        low = token.lower()
+        v.add(low)
+        # CamelCase / hookCamel → split on case, rejoin in kebab/snake/collapsed.
+        camel_parts = _split_camel(token)
+        if len(camel_parts) >= 2:
+            v.add("-".join(camel_parts))
+            v.add("_".join(camel_parts))
+            v.add("".join(camel_parts))
+        # snake/kebab swaps
+        if "_" in low:
+            v.add(low.replace("_", "-"))
+            v.add(low.replace("_", ""))
+        if "-" in low:
+            v.add(low.replace("-", "_"))
+            v.add(low.replace("-", ""))
+        # Strip a leading hook verb to match files named after the noun only.
+        for verb in ("use-", "use_", "get-", "get_", "set-", "set_",
+                     "fetch-", "fetch_", "handle-", "handle_"):
+            for variant in list(v):
+                if variant.startswith(verb):
+                    rest = variant[len(verb):]
+                    if len(rest) >= _IDENT_MIN_LEN:
+                        v.add(rest)
+        return [s for s in v if len(s) >= _IDENT_MIN_LEN]
+
+    variants_by_id: Dict[str, List[str]] = {tok: _variants(tok) for tok in identifiers}
+
+    scores: Dict[str, int] = {}
+    for relative_path in tracked_files:
+        try:
+            p = Path(relative_path)
+            basename_lower = p.name.lower()
+            stem_lower = p.stem.lower()
+            parent_lower = str(p.parent).replace("\\", "/").lower()
+            parts_lower = [s.lower() for s in p.parent.parts]
+            parent_leaf = parts_lower[-1] if parts_lower else ""
+            ancestors = parts_lower[:-1]
+        except Exception:
+            continue
+
+        total = 0
+        for variants in variants_by_id.values():
+            best = 0
+            for v in variants:
+                if v in basename_lower or v in stem_lower:
+                    best = max(best, _IDENT_WEIGHT_BASENAME)
+                elif parent_leaf and v in parent_leaf:
+                    best = max(best, _IDENT_WEIGHT_PARENT_DIR)
+                elif any(v in seg for seg in ancestors):
+                    best = max(best, _IDENT_WEIGHT_ANCESTOR)
+            if best:
+                total += best
+        if total:
+            scores[relative_path] = total
+    return scores
 
 
 def _symbol_grep_hits(
