@@ -108,8 +108,17 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.50  # v34: 0.55→0.50 (from challenger1467)
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+
+# v34: soft-nudge (ported from challenger1467). Gentler predecessor to
+# mid-loop hail-mary: fires once when the model has spent ≥6 steps and ≥90s
+# with no edits, before the hail-mary budget window. Reminds the model to
+# commit without forcing an edit, which is helpful when the target is
+# already identified but the model is still investigating.
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -122,6 +131,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_STATIC_FIX_TURNS = 1   # v34: lint/static-analyzer errors (ruff for python, eslint+tsc for js/ts)
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -584,7 +594,10 @@ def get_patch(repo: Path) -> str:
         timeout=30,
     )
     if untracked.returncode != 0:
-        return diff_output
+        # v34: ensure even the early-exit path runs through sanitization
+        # so a transient `git ls-files` failure can't ship an unsanitized
+        # diff (e.g. with mode-only hunks or low-signal cruft).
+        return _sanitize_patch(diff_output)
 
     for relative_path in [item for item in untracked.stdout.split("\0") if item]:
         if _should_skip_patch_path(relative_path):
@@ -633,6 +646,11 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
+    # v34: JS/TS concat-repair (ported from 1513 winner). Splits `+` lines
+    # where a `//` comment ending and a JS/TS `import` statement were
+    # concatenated onto one line — a corruption that silently turns the
+    # import into a comment and breaks the file.
+    cleaned = _split_comment_import_concat(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
     # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
@@ -719,6 +737,65 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+# v34: JS/TS concat-repair (ported verbatim from round-1513 winner).
+_IMPORT_CONCAT_PATTERN = re.compile(r'[)};](?=import\s+[{*\w])')
+_HUNK_HEADER_RE = re.compile(r'^@@ -(\d+(?:,\d+)?) \+(\d+)(?:,(\d+))? @@(.*)$')
+
+
+def _split_comment_import_concat(diff_output: str) -> str:
+    """Repair '+' lines where a // comment ending and a JS/TS import statement
+    got concatenated onto one line (e.g. ')import {x}'). In JS/TS // extends to
+    end of line, so the concatenation silently turns the import into a comment
+    and breaks the file. Split at the boundary and bump the hunk's added-line
+    count. Narrow trigger: '//' must precede a close-bracket that is immediately
+    followed by 'import <brace-or-ident>' inside a '+' line."""
+    if not diff_output.strip() or '//' not in diff_output:
+        return diff_output
+    if not _IMPORT_CONCAT_PATTERN.search(diff_output):
+        return diff_output
+
+    lines = diff_output.splitlines(keepends=True)
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _HUNK_HEADER_RE.match(line.rstrip('\n'))
+        if not m:
+            out_lines.append(line)
+            i += 1
+            continue
+        old_part = m.group(1)
+        new_start = int(m.group(2))
+        new_count = int(m.group(3)) if m.group(3) else 1
+        tail = m.group(4)
+        j = i + 1
+        delta = 0
+        body: List[str] = []
+        while j < n and not lines[j].startswith('@@') and not lines[j].startswith('diff --git'):
+            bl = lines[j]
+            if bl.startswith('+') and not bl.startswith('+++') and '//' in bl:
+                ends_nl = bl.endswith('\n')
+                content = bl[1:].rstrip('\n')
+                mm = _IMPORT_CONCAT_PATTERN.search(content)
+                if mm and '//' in content[:mm.start()]:
+                    left = content[:mm.end()].rstrip()
+                    right = content[mm.end():].lstrip()
+                    if left and right:
+                        body.append('+' + left + '\n')
+                        body.append('+' + right + ('\n' if ends_nl else ''))
+                        delta += 1
+                        j += 1
+                        continue
+            body.append(bl)
+            j += 1
+        new_header = '@@ -%s +%d,%d @@%s\n' % (old_part, new_start, new_count + delta, tail)
+        out_lines.append(new_header)
+        out_lines.extend(body)
+        i = j
+    return ''.join(out_lines)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1894,6 +1971,149 @@ def _has_executable(name: str) -> bool:
         return False
 
 
+# -----------------------------
+# Static-analyzer gate (v34)
+# -----------------------------
+#
+# The syntax gate catches gross parse failures, but real reference patches
+# typically pass a linter cleanly: unused imports, undefined names, type
+# mismatches are caught by `ruff` / `eslint` / `tsc --noEmit` and never make
+# it into a maintainer's commit. Adding a static-analyzer gate gives the
+# model one chance to clean those up before <final>.
+#
+# Best-effort by design: each tool is skipped silently when not on PATH;
+# errors are collected without aborting if a single file blows up the tool.
+
+_STATIC_TIMEOUT = 8  # per-tool-invocation cap
+
+
+def _run_ruff_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `ruff check` on one Python file. Returns lint error strings.
+
+    Restricted to error-level rules (E, F) so the gate flags genuine bugs
+    (undefined names, syntax-adjacent issues, unused imports introduced by
+    the patch) without nagging the model about style.
+    """
+    if not _has_executable("ruff"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "ruff", "check",
+                "--select=E,F",
+                "--no-fix",
+                "--output-format=concise",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    return [line.strip() for line in out if line.strip()][:8]
+
+
+def _run_eslint_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `eslint` on one JS/TS file. Returns error-level findings only."""
+    if not _has_executable("eslint"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "eslint",
+                "--no-color",
+                "--format=compact",
+                "--no-eslintrc",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    errs: List[str] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if " error " in line or line.lower().endswith(" error"):
+            errs.append(line)
+        if len(errs) >= 8:
+            break
+    return errs
+
+
+def _run_tsc_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `tsc --noEmit` on one .ts/.tsx file to catch type errors."""
+    if not _has_executable("tsc"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "tsc",
+                "--noEmit",
+                "--target", "ES2020",
+                "--module", "commonjs",
+                "--esModuleInterop",
+                "--strict", "false",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    errs: List[str] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if "error TS" in line:
+            errs.append(line)
+        if len(errs) >= 8:
+            break
+    return errs
+
+
+def _check_static_analysis(repo: Path, patch: str) -> List[str]:
+    """Aggregate static-analyzer errors across files touched by the patch."""
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            errors.extend(_run_ruff_check(repo, relative_path))
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            errors.extend(_run_eslint_check(repo, relative_path))
+            if suffix in {".ts", ".tsx"}:
+                errors.extend(_run_tsc_check(repo, relative_path))
+        if len(errors) >= 12:
+            break
+    return errors[:12]
+
+
 def _shell_quote(value: str) -> str:
     """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
@@ -2859,6 +3079,52 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    """v34: Return a 1-line type-specific cue prepended to the self-check prompt.
+
+    Heuristic keyword scan over the issue text. Empty when no strong type
+    signal lands (the prompt then degrades to the generic boilerplate).
+    Cheap and stateless.
+    """
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -2879,7 +3145,9 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    type_cue = _self_check_type_cue(issue_text)
     return (
+        f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
@@ -2905,6 +3173,26 @@ def build_self_check_prompt(
         "Otherwise emit corrective <command> blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+    )
+
+
+def build_static_fix_prompt(errors: List[str]) -> str:
+    """v34: Quote a linter's error output back at the model.
+
+    Frames the errors as bugs rather than style. The model frequently
+    introduces stray leftover imports or references to a renamed variable
+    when patching; surfacing those before <final> turns them from "subtle
+    bug in the diff" into "obvious thing to fix in one more turn".
+    """
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Static analysis flagged issues on touched file(s):\n  {bullets}\n\n"
+        "These are likely real bugs introduced by the patch — undefined "
+        "names, unused imports left behind by a rename, type mismatches, "
+        "references to removed symbols, etc. Issue the smallest fix "
+        "command(s) to clear the listed errors. Do NOT broaden the patch, "
+        "do NOT refactor, do NOT silence the linter with comments. Then "
+        "end with <final>summary</final>."
     )
 
 
@@ -3034,6 +3322,24 @@ def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
         return results
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    """v34: Mild budget reminder fired once when the model has cycled
+    several steps without committing.
+
+    Unlike build_mid_loop_hail_mary_prompt, this does NOT order the model
+    to stop reading or pick a file — it nudges toward commitment without
+    derailing a legitimate plan.
+    """
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_hail_mary_prompt(
@@ -3326,11 +3632,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    static_fix_turns_used = 0  # v34
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
+    soft_nudge_used = 0  # v34: soft-nudge counter (challenger1467 design)
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3372,7 +3680,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, static_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3423,6 +3731,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # v34: Static-analyzer gate. Fires after syntax (file parses) and
+        # before test (linter is cheaper than running a real test). Skips
+        # silently when the tool isn't on PATH so no wasted turn on no-op.
+        if static_fix_turns_used < MAX_STATIC_FIX_TURNS:
+            static_errors = _check_static_analysis(repo, patch)
+            if static_errors:
+                static_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_static_fix_prompt(static_errors),
+                    "STATIC_FIX_QUEUED:\n  " + "\n  ".join(static_errors[:5]),
                 )
                 return True
 
@@ -3588,6 +3911,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            # v34: soft-nudge fires BEFORE the hail-mary window — a gentle
+            # reminder to commit when 6+ steps and 90+ seconds have elapsed
+            # without any edits. Guarded by the hail-mary fraction so it
+            # never fires inside the emergency window.
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and not get_patch(repo).strip()
+                and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            ):
+                soft_nudge_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_soft_nudge_prompt(step, _elapsed_now),
+                })
+                logs.append(f"SOFT_NUDGE_FIRED: step={step} elapsed={_elapsed_now:.1f}s")
+                continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
