@@ -166,8 +166,10 @@ The private submission API runs:
 forbidden provider/sampling/secret usage, or try to bypass the validator-managed
 proxy.
 
-`OpenRouter Submission Judge` reviews the diff with the validator judge and
-rejects poor, unsafe, cosmetic, or out-of-scope edits.
+`OpenRouter Submission Judge` reviews the diff with the same
+`anthropic/claude-opus-4.7` gatekeeping prompt used by ninja CI, through
+OpenRouter at temperature 0. It rejects poor, unsafe, cosmetic, Goodharting,
+obfuscated, or out-of-scope edits.
 
 `Registration Gate` enforces one accepted private submission per hotkey
 registration.

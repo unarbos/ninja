@@ -18,7 +18,7 @@ from typing import Any
 
 
 DEFAULT_API_URL = "https://ninja66.ai/api/submissions"
-DEFAULT_NETUID = 66
+MAX_AGENT_BYTES = 5_000_000
 PRIVATE_SUBMISSION_RE = re.compile(r"^private-submission:[A-Za-z0-9_.-]{1,128}:[0-9a-f]{64}$")
 
 
@@ -31,8 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wallet-name", default=os.getenv("BT_WALLET_NAME", "default"))
     parser.add_argument("--wallet-hotkey", default=os.getenv("BT_WALLET_HOTKEY", "default"))
     parser.add_argument("--wallet-path", default=os.getenv("BT_WALLET_PATH"))
-    parser.add_argument("--netuid", type=int, default=int(os.getenv("BT_NETUID", DEFAULT_NETUID)))
-    parser.add_argument("--network", default=os.getenv("BT_SUBTENSOR_NETWORK"))
     parser.add_argument("--dry-run", action="store_true", help="Build and print the request without sending it.")
     return parser.parse_args()
 
@@ -42,6 +40,8 @@ def main() -> int:
     try:
         agent_path = args.agent.expanduser().resolve()
         agent_py = agent_path.read_bytes()
+        if len(agent_py) > MAX_AGENT_BYTES:
+            raise ValueError(f"agent.py is {len(agent_py)} bytes; maximum is {MAX_AGENT_BYTES} bytes")
         agent_sha256 = hashlib.sha256(agent_py).hexdigest()
         wallet = load_wallet(args)
         hotkey = wallet.hotkey.ss58_address

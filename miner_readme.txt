@@ -71,6 +71,9 @@ The private API runs:
 - OpenRouter Submission Judge
 - Registration Gate
 
+OpenRouter Submission Judge uses anthropic/claude-opus-4.7 with the same
+gatekeeping prompt as ninja CI, at temperature 0.
+
 The most common rejection reasons are changing solve(...), adding provider keys
 or endpoints, adding sampling controls, importing third-party packages, or
 trying to route around the validator-managed model/proxy.
