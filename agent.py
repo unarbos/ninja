@@ -1680,6 +1680,9 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
+    ".rs", ".go", ".java", ".kt", ".kts",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+    ".cs", ".php", ".scala", ".dart", ".groovy",
 }
 
 
