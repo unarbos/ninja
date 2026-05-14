@@ -2239,6 +2239,295 @@ def _caller_audit_advisories(
     return out
 
 
+# Signature-change audit (extends the caller audit to MODIFIED — not just
+# removed — definitions).
+#
+# When the patch keeps a function but changes its parameter list in a way
+# that breaks existing callers (added required arg, removed arg, or flipped
+# optional→required), the LLM judge consistently down-rates the patch
+# because untouched callers will fail at compile / call time. This audit
+# detects three caller-breaking shapes:
+#
+#   1. added_required       new required parameter not present before
+#   2. removed              parameter dropped from the signature
+#   3. optional_to_required parameter that had a default lost its default
+#
+# Additive-only changes (new optional/defaulted parameter, new *args /
+# **kwargs / variadic) and pure type-annotation tweaks are intentionally
+# IGNORED because they don't break existing call sites. Multi-line
+# signatures are also skipped (parens don't balance on the same line ⇒
+# we can't reliably parse). Pairing is hunk-scoped: within a single hunk,
+# a `-` and `+` line that both carry the same function name are treated as
+# a modification; cross-hunk same-name pairs are skipped to avoid pairing
+# unrelated methods that just share a name.
+
+# Per-language declaration patterns: each captures the FIRST identifier
+# group that immediately precedes a `(`. The signature parser then walks
+# forward from that `(` to find the balanced close-paren.
+_SIG_DECL_PATTERNS: Tuple[Tuple["re.Pattern", str], ...] = (
+    # Python — sync and async def
+    (re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\("), "py"),
+    # JS / TS — `function name(` and `function* name(`
+    (re.compile(
+        r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*"
+        r"([A-Za-z_$][\w$]*)\s*\("
+    ), "js"),
+    # JS / TS — arrow fn bound to const/let/var:
+    #   `const f = (a, b) => ...`
+    #   `export const f = async (a) => ...`
+    (re.compile(
+        r"^\s*(?:export\s+(?:default\s+)?)?(?:const|let|var)\s+"
+        r"([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s+)?\("
+    ), "js"),
+    # Go — `func Name(` or `func (recv T) Name(`
+    (re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\("), "go"),
+    # Rust — `fn name(` (with optional pub / async / generics)
+    (re.compile(
+        r"^\s*(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?fn\s+"
+        r"([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\("
+    ), "rs"),
+)
+
+
+def _extract_signature_from_line(line: str) -> Optional[Tuple[str, str, str]]:
+    """Return (name, params, language) for a single-line function signature.
+
+    Walks forward from the opening `(` matched by the language pattern and
+    only succeeds when the closing `)` is on the SAME line (i.e. the entire
+    parameter list fits on one diff line). Multi-line signatures return
+    None and are silently skipped.
+
+    String literals are tracked so commas / parens inside default-value
+    string defaults don't confuse the balance counter.
+    """
+    for pat, lang in _SIG_DECL_PATTERNS:
+        m = pat.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        # Locate the `(` immediately after the name.
+        open_paren = line.find("(", m.end() - 1)
+        if open_paren < 0:
+            continue
+        depth = 0
+        end = -1
+        in_string: Optional[str] = None
+        i = open_paren
+        while i < len(line):
+            ch = line[i]
+            if in_string is not None:
+                if ch == "\\" and i + 1 < len(line):
+                    i += 2
+                    continue
+                if ch == in_string:
+                    in_string = None
+                i += 1
+                continue
+            if ch in ('"', "'", "`"):
+                in_string = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        if end < 0:
+            return None
+        return name, line[open_paren + 1 : end], lang
+    return None
+
+
+def _parse_sig_params(
+    param_str: str, language: str
+) -> List[Tuple[str, bool]]:
+    """Parse a parameter list string into [(name, has_default)].
+
+    Drops variadic markers (`*args`, `**kwargs`, `...rest`, Go `...T`),
+    the bare PEP-3102 `*` separator, the PEP-570 `/` separator, and Rust
+    `self` receivers — none of these can break existing callers when added
+    or removed (they're either receivers or accept-anything sinks).
+
+    `has_default` is True when the parameter has either a `=` default or
+    (TS only) a `?:` optional marker.
+    """
+    parts: List[str] = []
+    depth = 0
+    cur: List[str] = []
+    in_string: Optional[str] = None
+    for ch in param_str:
+        if in_string is not None:
+            cur.append(ch)
+            if ch == in_string:
+                in_string = None
+            continue
+        if ch in ('"', "'", "`"):
+            in_string = ch
+            cur.append(ch)
+            continue
+        if ch in "([{<":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}>":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            piece = "".join(cur).strip()
+            if piece:
+                parts.append(piece)
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        last = "".join(cur).strip()
+        if last:
+            parts.append(last)
+
+    out: List[Tuple[str, bool]] = []
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        # Skip *args / **kwargs / bare *.
+        if s.startswith("**"):
+            continue
+        if s.startswith("*"):
+            continue
+        if s == "/":
+            continue
+        # Rust self receivers.
+        if language == "rs" and s in ("self", "&self", "&mut self", "mut self"):
+            continue
+        # JS / TS rest: `...args`.
+        if language == "js" and s.startswith("..."):
+            continue
+        # Go variadic: `name ...Type`.
+        if language == "go" and "..." in s:
+            continue
+        # Strip Rust modifiers (mut / ref) before extracting the name.
+        if language == "rs":
+            s = re.sub(r"^(?:mut\s+|ref\s+)+", "", s)
+        # Strip leading decorators (@something).
+        s = re.sub(r"^@\w+\s+", "", s)
+        m = re.match(r"^([A-Za-z_$][\w$]*)", s)
+        if not m:
+            continue
+        name = m.group(1)
+        rest = s[m.end():].strip()
+        has_default = "=" in rest
+        # TS optional marker: `name?:` or `name?,`.
+        if language == "js" and rest.startswith("?"):
+            has_default = True
+        out.append((name, has_default))
+    return out
+
+
+def _signature_audit_advisories(
+    patch: str,
+    cap: int = 4,
+) -> List[str]:
+    """Detect signature changes that may break existing callers.
+
+    Walks the patch hunk by hunk and pairs every `-` line with a matching
+    `+` line in the same hunk that declares the same function. For each
+    such pair, computes parameter-list diffs and emits one advisory per
+    caller-breaking change (capped). Empty list when no breaking shapes
+    are found or the patch can't be parsed.
+    """
+    if not patch:
+        return []
+    try:
+        cur_path = "<unknown>"
+        # Per-hunk staging.
+        old_in_hunk: Dict[str, Tuple[str, str]] = {}
+        new_in_hunk: Dict[str, Tuple[str, str]] = {}
+        out: List[str] = []
+
+        def _flush_hunk() -> None:
+            for fname in sorted(old_in_hunk.keys() & new_in_hunk.keys()):
+                if fname in _REMOVED_SYMBOL_BLOCKLIST:
+                    continue
+                old_params, old_lang = old_in_hunk[fname]
+                new_params, new_lang = new_in_hunk[fname]
+                lang = new_lang or old_lang
+                old_list = _parse_sig_params(old_params, lang)
+                new_list = _parse_sig_params(new_params, lang)
+                old_names = {n for n, _ in old_list}
+                new_names = {n for n, _ in new_list}
+                old_required = {n for n, hd in old_list if not hd}
+                new_required = {n for n, hd in new_list if not hd}
+                added_required = new_required - old_names
+                removed = old_names - new_names
+                common = old_names & new_names
+                old_map = dict(old_list)
+                new_map = dict(new_list)
+                optional_to_required = {
+                    n for n in common if old_map.get(n) and not new_map.get(n)
+                }
+                for p in sorted(added_required):
+                    out.append(
+                        f"{fname!r} in {cur_path!r}: added required parameter "
+                        f"{p!r} — existing callers without that argument will "
+                        f"break (grep `\\b{fname}\\(` for callers)"
+                    )
+                    if len(out) >= cap:
+                        return
+                for p in sorted(removed):
+                    out.append(
+                        f"{fname!r} in {cur_path!r}: removed parameter {p!r} — "
+                        f"callers passing it will break "
+                        f"(grep `\\b{fname}\\(` for callers)"
+                    )
+                    if len(out) >= cap:
+                        return
+                for p in sorted(optional_to_required):
+                    out.append(
+                        f"{fname!r} in {cur_path!r}: parameter {p!r} changed "
+                        f"from optional to required — callers omitting it will "
+                        f"break (grep `\\b{fname}\\(` for callers)"
+                    )
+                    if len(out) >= cap:
+                        return
+
+        for raw in patch.splitlines():
+            if raw.startswith("diff --git"):
+                _flush_hunk()
+                old_in_hunk.clear()
+                new_in_hunk.clear()
+                m = re.match(r"^diff --git a/(.+?) b/(.+?)$", raw)
+                if m:
+                    cur_path = m.group(2)
+                continue
+            if raw.startswith("@@"):
+                _flush_hunk()
+                old_in_hunk.clear()
+                new_in_hunk.clear()
+                if len(out) >= cap:
+                    return out
+                continue
+            if raw.startswith("---") or raw.startswith("+++"):
+                continue
+            if raw.startswith("-"):
+                ext = _extract_signature_from_line(raw[1:])
+                if ext is not None:
+                    name, params, lang = ext
+                    if name not in old_in_hunk:
+                        old_in_hunk[name] = (params, lang)
+                continue
+            if raw.startswith("+"):
+                ext = _extract_signature_from_line(raw[1:])
+                if ext is not None:
+                    name, params, lang = ext
+                    if name not in new_in_hunk:
+                        new_in_hunk[name] = (params, lang)
+                continue
+        _flush_hunk()
+        return out[:cap]
+    except Exception:
+        return []
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -3852,6 +4141,7 @@ def build_self_check_prompt(
     inplace_advisories: Optional[List[str]] = None,
     caller_audit_advisories: Optional[List[str]] = None,
     import_advisories: Optional[List[str]] = None,
+    signature_advisories: Optional[List[str]] = None,
 ) -> str:
     """Show the model its own draft and ask for a focused self-review.
 
@@ -3859,7 +4149,10 @@ def build_self_check_prompt(
     same-stem collision so the model justifies or folds back. When
     `caller_audit_advisories` is non-empty, surface the list of
     removed/renamed top-level symbols so the model verifies every caller
-    has been updated.
+    has been updated. When `signature_advisories` is non-empty, surface
+    the modified-but-not-removed functions whose new parameter shape will
+    break existing callers (added required arg, dropped arg, optional →
+    required).
     """
     truncated = (
         patch
@@ -3908,6 +4201,21 @@ def build_self_check_prompt(
             "Soft check only — bare third-party imports we can't see in "
             "package.json / requirements.txt will be flagged here; that "
             "is acceptable as long as you know they are runtime-installed.\n"
+        )
+    if signature_advisories:
+        sbullets = "\n  ".join(f"- {a}" for a in signature_advisories[:4])
+        advisory_block += (
+            "\nSIGNATURE CHANGE AUDIT (existing callers may break):\n"
+            f"  {sbullets}\n"
+            "For each entry above:\n"
+            "  1. Run `git grep` with the suggested pattern to locate every "
+            "call site outside the touched files.\n"
+            "  2. Update each caller to match the new signature, OR\n"
+            "  3. If you intended this to be backward-compatible, give the "
+            "added parameter a default value (or restore the optional/default "
+            "you removed).\n"
+            "API-changing tasks consistently fail when one or two out-of-tree "
+            "callers are missed.\n"
         )
     return (
         "Self-check pass. Review your patch on three independent axes — "
@@ -4635,6 +4943,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             # Keep self-check turn when removed/renamed symbols haven't yet
             # been audited against their callers.
             fresh_caller_audit_pending = bool(_caller_audit_advisories(patch))
+            # Keep self-check turn when a signature change in the patch
+            # likely breaks existing call sites (added required arg, dropped
+            # arg, optional→required) and the model hasn't yet audited.
+            fresh_signature_pending = bool(_signature_audit_advisories(patch))
             if not (
                 fresh_syntax_errors
                 or fresh_missing
@@ -4644,6 +4956,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 or fresh_creation_gap
                 or fresh_inplace_collision
                 or fresh_caller_audit_pending
+                or fresh_signature_pending
             ):
                 logs.append(
                     "CONFIDENT_EARLY_EXIT: structural gates clean "
@@ -4684,6 +4997,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"IMPORT_PREFLIGHT: {len(_import_adv)} newly-added "
                     f"import(s) flagged as possibly unresolvable"
                 )
+            # Signature-change audit (caller-breaking parameter shifts).
+            _sig_adv = _signature_audit_advisories(patch)
+            if _sig_adv:
+                logs.append(
+                    f"SIGNATURE_AUDIT: {len(_sig_adv)} caller-breaking "
+                    f"signature change(s) flagged"
+                )
             queue_refinement_turn(
                 assistant_text,
                 build_self_check_prompt(
@@ -4691,6 +5011,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     inplace_advisories=_inplace_adv,
                     caller_audit_advisories=_caller_adv,
                     import_advisories=_import_adv,
+                    signature_advisories=_sig_adv,
                 ),
                 "SELF_CHECK_QUEUED",
             )
