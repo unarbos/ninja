@@ -108,8 +108,11 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.50
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -122,6 +125,32 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_REACH_NUDGES = 1       # surface new public symbols with zero callers (orphaned wiring); see _unreachable_new_symbols
+_REACH_MAX_SYMBOLS_CHECKED = 8     # cap symbols probed via git grep so the gate stays under ~2s static work
+_REACH_GREP_TIMEOUT_SECONDS = 1.5  # per-symbol git-grep timeout
+_REACH_TIME_FLOOR_SECONDS = 30.0   # skip the reach gate when wall-clock remaining is tighter than this
+# Generic per-gate wall-clock floor for LLM-driven refinement gates.
+#
+# Every nudge cycle (queue_refinement_turn -> next LLM step -> patch apply ->
+# optional verification) costs roughly:
+#   LLM call ~8-20s + patch apply ~1s + verification ~3-8s + buffer ~5s.
+#
+# When fewer than this many seconds remain, queueing another nudge would push
+# the inner loop past WALL_CLOCK_RESERVE_SECONDS (=20s) and risk getting killed
+# mid-step, losing the current patch entirely. Skipping the gate instead lets
+# the outer loop exit cleanly and ship whatever patch is already on disk.
+#
+# Applied to: test_fix, deletion, criteria, coverage, polish, self_check.
+# NOT applied to: syntax_fix (broken syntax = 0 score, always worth fixing),
+# hail_mary (last-resort for empty patches), must_edit_after_gap recovery
+# (critical gap-close), or reach (has its own _REACH_TIME_FLOOR_SECONDS=30s
+# because the write-intensive wiring step needs more headroom).
+#
+# Strength preservation: UI / refactor / bug-fix rounds typically complete
+# with >100s remaining, so this floor is dormant on the strength path and
+# only activates on the timeout-bound weakness path (run-history 2025/11 +
+# 2026/05 manual duels: ~9 of 11 weakness losses had ch_timeout_s <= 250s).
+_GATE_TIME_FLOOR_SECONDS = 25.0
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -1660,6 +1689,187 @@ def _patch_removed_definitions(patch: str, cap: int = 8) -> List[str]:
         return []
 
 
+# -----------------------------
+# Symbol-reachability gate
+# -----------------------------
+#
+# Duel data shows recurring losses where the model creates a NEW utility,
+# helper, or module file and never imports it from any existing call site
+# (rounds 065034 ML utility, 065044 preview helpers, 065064 KB modules).
+# The model marks the task "done" because the new file exists, but the
+# feature is functionally dead. This gate finds public symbols defined in
+# newly-created files that appear nowhere outside the defining file and
+# surfaces them so the model can wire them up before <final>.
+#
+# Guardrails (minimise harm to UI/refactor/test-adding strengths):
+#   - Skip test/migration/index/type-only/stylesheet defining files so
+#     legitimately-uncalled-from-prod files don't trigger false positives.
+#   - Skip private symbols (leading underscore) — those are internal by
+#     convention.
+#   - Whole-word `git grep -lw` catches direct imports, JSX `<Name`, string
+#     refs, dynamic imports — not just `import` statements.
+#   - Only inspect newly-created files (not added exports in existing
+#     files), keeping the false-positive surface small.
+#   - Time-floored: the calling gate skips the check entirely when the
+#     wall-clock budget is tight (see MAX_REACH_NUDGES wiring).
+
+_REACH_SKIP_PATH_RE = re.compile(
+    r"(?:"
+    r"(?:^|/)__tests__/|"
+    r"(?:^|/)tests?/|"
+    r"\.test\.[^/]*$|"
+    r"\.spec\.[^/]*$|"
+    r"_test\.[^/]*$|"
+    r"(?:^|/)conftest\.py$|"
+    r"(?:^|/)migrations/|"
+    r"(?:^|/)alembic/|"
+    r"\.sql$|"
+    r"(?:^|/)seeds?/|"
+    r"(?:^|/)seed[^/]*\.(?:py|ts|js|rb|sql|json)$|"
+    r"(?:^|/)index\.(?:ts|tsx|js|jsx|mjs|cjs)$|"
+    r"(?:^|/)mod\.rs$|"
+    r"\.d\.ts$|"
+    r"\.(?:css|scss|sass|less|styl)$"
+    r")",
+    re.IGNORECASE,
+)
+
+_REACH_SUPPORTED_SUFFIX_RE = re.compile(r"\.(py|pyi|ts|tsx|js|jsx|mjs|cjs)$", re.IGNORECASE)
+_REACH_PY_DEF_RE = re.compile(r"^(?:async\s+def|def|class)\s+([A-Za-z][A-Za-z0-9_]*)")
+_REACH_JS_EXPORT_RE = re.compile(
+    r"^export\s+"
+    r"(?:default\s+)?"
+    r"(?:async\s+)?"
+    r"(?:function\*?|class|const|let|var|interface|type|enum)\s+"
+    r"([A-Za-z_$][A-Za-z0-9_$]*)"
+)
+_REACH_JS_NAMED_RE = re.compile(r"^export\s*\{\s*([^}]+?)\s*\}")
+_REACH_IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def _patch_new_file_added_lines(patch: str) -> Dict[str, List[str]]:
+    """Group `+` content lines per newly-created file. A new file is detected
+    via the `--- /dev/null` diff header (consistent with _NEW_FILE_RE)."""
+    result: Dict[str, List[str]] = {}
+    lines = patch.splitlines()
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        if line == "--- /dev/null" and i + 1 < n and lines[i + 1].startswith("+++ b/"):
+            path = lines[i + 1][len("+++ b/"):]
+            collected: List[str] = []
+            j = i + 2
+            while j < n and not lines[j].startswith("diff --git "):
+                cur = lines[j]
+                if cur.startswith("+") and not cur.startswith("+++"):
+                    collected.append(cur[1:])
+                j += 1
+            result[path] = collected
+            i = j
+            continue
+        i += 1
+    return result
+
+
+def _extract_new_file_symbols(path: str, added_lines: List[str]) -> List[str]:
+    """Public top-level symbol names defined in a newly-created file.
+
+    Skips private names (leading `_`) and dedupes. Caps internally so a
+    single mega-file can't dominate the orphan list.
+    """
+    syms: List[str] = []
+    seen: set = set()
+    cap = _REACH_MAX_SYMBOLS_CHECKED * 2
+    is_python = path.endswith((".py", ".pyi"))
+    for content in added_lines:
+        stripped = content.lstrip()
+        names: List[str] = []
+        if is_python:
+            m = _REACH_PY_DEF_RE.match(stripped)
+            if m:
+                names.append(m.group(1))
+        else:
+            m = _REACH_JS_EXPORT_RE.match(stripped)
+            if m:
+                names.append(m.group(1))
+            else:
+                m = _REACH_JS_NAMED_RE.match(stripped)
+                if m:
+                    for raw in m.group(1).split(","):
+                        candidate = raw.strip().split(" as ")[0].strip()
+                        if candidate and _REACH_IDENT_RE.match(candidate):
+                            names.append(candidate)
+        for name in names:
+            if not name or name.startswith("_") or name in seen:
+                continue
+            seen.add(name)
+            syms.append(name)
+            if len(syms) >= cap:
+                return syms
+    return syms
+
+
+def _git_grep_word_outside(repo: Path, symbol: str, exclude_path: str, timeout: float) -> bool:
+    """True iff `symbol` (whole-word) appears anywhere in the tracked tree
+    EXCEPT `exclude_path`. Fail-open: any error returns True so the gate
+    never fires on infrastructure/grep problems."""
+    try:
+        proc = subprocess.run(
+            ["git", "grep", "-lw", "--", symbol, ":!" + exclude_path],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return bool(proc.stdout.strip())
+    except Exception:
+        return True
+
+
+def _unreachable_new_symbols(
+    repo: Path,
+    patch: str,
+    max_symbols: int = _REACH_MAX_SYMBOLS_CHECKED,
+    grep_timeout: float = _REACH_GREP_TIMEOUT_SECONDS,
+) -> List[Tuple[str, str]]:
+    """Return [(symbol, defining_path)] for public symbols defined in
+    newly-created files that have zero callers outside the defining file.
+
+    Returns an empty list when the patch contains no new files, when no
+    eligible files remain after the skip filter, or when the grep fails."""
+    try:
+        new_files = _patch_new_file_added_lines(patch)
+    except Exception:
+        return []
+    if not new_files:
+        return []
+    candidates: List[Tuple[str, str]] = []
+    for path, added in new_files.items():
+        if _REACH_SKIP_PATH_RE.search(path):
+            continue
+        if not _REACH_SUPPORTED_SUFFIX_RE.search(path):
+            continue
+        for sym in _extract_new_file_symbols(path, added):
+            candidates.append((sym, path))
+            if len(candidates) >= max_symbols:
+                break
+        if len(candidates) >= max_symbols:
+            break
+    if not candidates:
+        return []
+    orphans: List[Tuple[str, str]] = []
+    seen_names: set = set()
+    for sym, path in candidates:
+        if sym in seen_names:
+            continue
+        seen_names.add(sym)
+        if not _git_grep_word_outside(repo, sym, path, grep_timeout):
+            orphans.append((sym, path))
+    return orphans
+
+
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -2350,6 +2560,44 @@ def _patch_has_deletions(patch: str) -> bool:
     return False
 
 
+def _patch_has_real_content(patch: str) -> bool:
+    """True iff the patch contains at least one added or removed line with
+    non-whitespace, non-comment content (or a binary-file change).
+
+    Why this exists: a unified diff can pass a naive `patch.strip()` test
+    while containing only mode-change headers (`old mode 100644 / new mode
+    100755`), rename metadata, similarity indices, or comment-only edits —
+    none of which score with the LLM judge. Manual duel 2026-05-14 round
+    000135 was a 426s timeout where the challenger shipped a chmod-only
+    patch and scored 0.010; the existing hail-mary triggers missed it
+    because `patch.strip()` returned True on the `old mode / new mode`
+    headers.
+
+    Used by the soft_nudge, mid-loop hail-mary, and refinement-gate
+    hail-mary triggers so each of them correctly identifies "no real
+    progress" and queues the recovery prompt instead of letting a
+    meaningless patch ship.
+
+    Strength-preserving by construction: any genuine code edit returns
+    True immediately, so strength rounds (UI/refactor/bug-fix) never enter
+    the hail-mary branch. `Binary files … differ` lines count as real
+    content because binary file additions are legitimate task work that
+    simply isn't text-diffable.
+    """
+    if not patch:
+        return False
+    for line in patch.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("Binary files "):
+            return True
+        if line.startswith("+") or line.startswith("-"):
+            body = line[1:].strip()
+            if body and not _line_is_comment(body):
+                return True
+    return False
+
+
 def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
@@ -2436,6 +2684,25 @@ _IDENTIFIER_STOPWORDS = {
     "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
     "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
     "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
+    "Card", "Modal", "Form", "Button", "Input", "Label", "Image", "Menu",
+    "Header", "Footer", "Layout", "Page", "Section", "Container", "Wrapper",
+    "Element", "Component", "Service", "Manager", "Handler", "Provider",
+    "Context", "Status", "Value", "Field", "Item", "Result", "Response",
+    "Request", "Config", "Settings", "Options", "Properties", "Default",
+    "Module", "Class", "Object", "String", "Number", "Array", "Function",
+    "Method", "Action", "State", "Store", "Schema", "Model", "View",
+    "Index", "Route", "Router", "Render", "Update", "Create", "Delete",
+    "useState", "useEffect", "useCallback", "useMemo", "useRef", "useContext",
+    "useRouter", "setState", "setValue", "getValue", "getDefault",
+    "handleClick", "handleChange", "handleSubmit", "handleClose", "handleError",
+    "fetchData", "createElement", "createContext", "buildPath", "buildUrl",
+}
+
+_HOOK_GENERIC_PREFIXES_LOWER = {
+    "usestate", "useeffect", "usecallback", "usememo", "useref", "usecontext",
+    "userouter", "setstate", "setvalue", "getvalue", "getdefault",
+    "handleclick", "handlechange", "handlesubmit", "handleclose", "handleerror",
+    "fetchdata", "createelement", "createcontext", "buildpath", "buildurl",
 }
 
 _CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
@@ -2458,8 +2725,11 @@ def _issue_identifier_path_boost(
             if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
                 identifiers.add(tok.lower())
         for m in _HOOK_RE.finditer(issue_text):
+            hook_lower = m.group(0).lower()
+            if hook_lower in _HOOK_GENERIC_PREFIXES_LOWER:
+                continue
             if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
+                identifiers.add(hook_lower)
         for m in _SNAKE_RE.finditer(issue_text):
             if len(identifiers) < cap:
                 identifiers.add(m.group(1).lower())
@@ -2859,6 +3129,51 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    """Return a 1-line type-specific cue prepended to the self-check prompt.
+
+    Heuristic keyword scan over the issue text. Empty when no strong type signal lands
+    (the prompt then degrades to the generic boilerplate). Cheap and stateless.
+    """
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -2879,7 +3194,9 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    type_cue = _self_check_type_cue(issue_text)
     return (
+        f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
@@ -2982,6 +3299,37 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_reach_nudge_prompt(orphans: List[Tuple[str, str]], issue_text: str) -> str:
+    """Tell the model which newly-added public symbols have no callers anywhere
+    else in the repo, so it can wire them into the appropriate consumer.
+
+    Duel data: rounds 065034, 065044, 065064 all lost because the model added
+    a helper/utility/module file and never imported it from the existing code.
+    The judge correctly flagged these as "not integrated" / "feature is dead".
+    """
+    bullets = "\n  ".join(f"- `{sym}` (defined in {path})" for sym, path in orphans[:5]) or "(none)"
+    short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
+    return (
+        "Wiring gap — these public symbols are defined in NEW files you just "
+        "created, but they do not appear anywhere else in the repository. The "
+        "feature is functionally dead unless an existing file imports or "
+        "references them:\n"
+        f"  {bullets}\n\n"
+        "For each unused symbol, decide:\n"
+        "  (a) it IS already reached via dynamic import, framework registry, "
+        "or template syntax that whole-word grep would miss -> respond with "
+        "<final>summary</final> and explain how it is reached; OR\n"
+        "  (b) it really IS orphaned -> identify the consumer file(s) that "
+        "should import/call it, add the missing wiring with the SMALLEST "
+        "possible edit, then emit <final>summary</final>.\n\n"
+        "Do NOT add scope the task did not ask for. Do NOT delete the new "
+        "files — wire them up. Do NOT add re-exports in a barrel file just "
+        "to silence this check.\n\n"
+        "Task (for reference):\n"
+        f"{short}\n"
+    )
+
+
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
@@ -3013,7 +3361,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+def _recently_observed_paths(logs: List[str], window: int = 80) -> List[str]:
     """Extract file paths recently read by the model from the last `window` log entries.
 
     Scans for paths surfaced via read_file/cat observations so the mid-loop
@@ -3034,6 +3382,23 @@ def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
         return results
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    """Mild budget reminder fired once when the model has cycled several steps without committing.
+
+    Unlike build_mid_loop_hail_mary_prompt, this does NOT order the model to stop reading or
+    pick a file — it nudges toward commitment without derailing a legitimate plan. Empty when
+    the model already has a clear target and will edit naturally.
+    """
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_hail_mary_prompt(
@@ -3331,12 +3696,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
+    soft_nudge_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    reach_nudges_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -3367,12 +3734,24 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                       fails, feed the failure tail back via build_test_fix_prompt
             4. coverage-nudge — name issue-mentioned paths still untouched
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            6. reach-nudge   — new public symbols with zero callers in the
+                               working tree (orphaned wiring; time-floored)
+            7. self-check    — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
+
+        Time-floor policy (timeout-defense layer):
+          - ALWAYS-FIRE (no floor): must_edit_after_gap recovery, hail_mary
+            (patch is empty), syntax_fix (broken syntax = zero score).
+          - FLOORED at _GATE_TIME_FLOOR_SECONDS (=25s): test, deletion,
+            criteria, coverage, polish, self_check. Below the floor a nudge
+            cycle can't safely round-trip before WALL_CLOCK_RESERVE_SECONDS,
+            so the gate skips and the loop ships the current patch.
+          - FLOORED at _REACH_TIME_FLOOR_SECONDS (=30s): reach (write-heavy
+            wiring step needs extra headroom to actually edit, not just ack).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, reach_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3393,13 +3772,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # exit. Hail-mary is exempt from the total-refinement cap because
         # it's the only thing standing between us and a guaranteed-zero
         # empty-patch result.
-        if not patch.strip():
+        #
+        # The emptiness check is content-aware (_patch_has_real_content):
+        # mode-only diffs, rename metadata, and comment-only edits also
+        # count as "effectively empty" so the hail-mary fires for the
+        # 000135 chmod-only timeout pattern, not just for `.strip() == ""`.
+        if not _patch_has_real_content(patch):
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                    "HAIL_MARY_QUEUED: patch lacks real +/- content at refinement gate",
                 )
                 return True
             return False
@@ -3435,7 +3819,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # actually fails, surface the failure tail to the model as one fix
         # turn. This is the only refinement step in the chain backed by a
         # real runner rather than heuristics.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+        #
+        # Time-floored (_GATE_TIME_FLOOR_SECONDS): test_fix carries an 8s
+        # subprocess timeout plus a ~15s LLM nudge — at <25s remaining the
+        # nudge cycle would push past WALL_CLOCK_RESERVE and risk killing
+        # the run mid-fix.
+        if (
+            test_fix_turns_used < MAX_TEST_FIX_TURNS
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
                 test_path, output = failure
@@ -3451,7 +3843,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Deletion gap: issue says remove/delete/replace but patch has no deletions.
         # Fires before criteria/coverage: a missing removal is a structural omission,
         # not a coverage gap — surface it while refinement budget remains.
-        if deletion_nudges_used < MAX_DELETION_NUDGES:
+        # Time-floored: skip when remaining budget can't absorb the nudge cycle.
+        if (
+            deletion_nudges_used < MAX_DELETION_NUDGES
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             if _issue_requires_deletion(issue) and not _patch_has_deletions(patch):
                 deletion_nudges_used += 1
                 total_refinement_turns_used += 1
@@ -3467,7 +3863,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
         # are directly scored by the LLM judge — addressing them is higher-value
         # than covering additional file paths.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
+        # Time-floored: skip when remaining budget can't absorb the nudge cycle.
+        if (
+            criteria_nudges_used < MAX_CRITERIA_NUDGES
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             unaddressed = _unaddressed_criteria(patch, issue)
             if unaddressed:
                 criteria_nudges_used += 1
@@ -3481,7 +3881,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+        # Time-floored: skip when remaining budget can't absorb the nudge cycle.
+        if (
+            coverage_nudges_used < MAX_COVERAGE_NUDGES
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             missing = _uncovered_required_paths(patch, issue)
             # king_analysis P1: issue says "move/relocate/rebuild as separate"
             # but the patch contains no `new file mode` header — the model
@@ -3513,7 +3917,40 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if polish_turns_used < MAX_POLISH_TURNS:
+        # Reach-nudge: public symbols defined in NEW files with no callers
+        # anywhere else in the repo (rounds 065034 / 065044 / 065064).
+        # Time-floored — skip when remaining budget can't absorb one nudge
+        # cycle (~15-25s), so the gate never converts a passing run into a
+        # timeout. Whole-word grep keeps the false-positive surface small
+        # for UI/refactor wins (catches JSX `<Foo`, dynamic imports, string
+        # refs — not just `import` statements).
+        if (
+            reach_nudges_used < MAX_REACH_NUDGES
+            and time_remaining() > _REACH_TIME_FLOOR_SECONDS
+        ):
+            orphans = _unreachable_new_symbols(repo, patch)
+            if orphans:
+                reach_nudges_used += 1
+                total_refinement_turns_used += 1
+                must_edit_after_gap = True
+                must_edit_patch = patch
+                marker = "REACH_NUDGE_QUEUED:\n  " + " | ".join(
+                    f"{sym} in {pth}" for sym, pth in orphans[:4]
+                )
+                queue_refinement_turn(
+                    assistant_text,
+                    build_reach_nudge_prompt(orphans, issue),
+                    marker,
+                )
+                return True
+
+        # Time-floored: polish is the lowest-priority gate (cosmetic hunk cleanup);
+        # never let it consume budget that a correctness gate could use, and never
+        # let it queue a nudge that won't have time to come back.
+        if (
+            polish_turns_used < MAX_POLISH_TURNS
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             junk = _diff_low_signal_summary(patch)
             if junk:
                 polish_turns_used += 1
@@ -3525,7 +3962,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
+        # Time-floored: self_check is a final-review LLM pass; skip when tight
+        # so the current patch ships instead of dying mid-review.
+        if (
+            self_check_turns_used < MAX_SELF_CHECK_TURNS
+            and time_remaining() > _GATE_TIME_FLOOR_SECONDS
+        ):
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
@@ -3588,10 +4030,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            # Emptiness for both nudges is content-aware: a chmod-only or
+            # rename-only patch passes `.strip()` but produces no real edit
+            # (manual duel round 000135). _patch_has_real_content forces
+            # the nudges to fire on those cases too.
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and not _patch_has_real_content(get_patch(repo))
+                and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            ):
+                soft_nudge_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_soft_nudge_prompt(step, _elapsed_now),
+                })
+                logs.append(f"SOFT_NUDGE_FIRED: step={step} elapsed={_elapsed_now:.1f}s")
+                continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
-                and not get_patch(repo).strip()
+                and not _patch_has_real_content(get_patch(repo))
             ):
                 mid_loop_hail_mary_used += 1
                 messages.append({
