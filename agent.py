@@ -118,6 +118,7 @@ MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
+MAX_TS_COMPILE_TURNS = 1   # run tsc --noEmit when TS files touched; fix type/import errors
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
@@ -630,6 +631,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -717,6 +719,29 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode <N>` and `new mode <N>` lines from any file
+    block that survived `_strip_mode_only_file_diffs`.
+
+    Belt-and-suspenders with the `git config core.fileMode false` setting
+    applied at solve startup: that setting prevents the lines from being
+    generated in the first place, but if it fails to take effect (older
+    git version, sandbox config quirk, alternate diff backend) the lines
+    can still appear. This strip is purely text-level — it removes only
+    metadata lines, never content `+`/`-` lines or hunk headers, so the
+    patch remains structurally valid for the validator's diff applier.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -1745,6 +1770,67 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+def _check_ts_compilation(repo: Path, patch: str, timeout: int = 15) -> List[str]:
+    """Try tsc --noEmit when the patch touches TypeScript files.
+
+    Returns up to 10 error lines (filtered to changed files only) if tsc reports
+    errors, or an empty list on success, unavailability, or no .ts/.tsx files
+    touched.  Filtering to changed-file errors avoids flagging pre-existing
+    baseline noise in the repo.
+
+    Only uses the locally-installed tsc binary (node_modules/.bin/tsc) to avoid
+    any npx network access.  Silent no-op when tsconfig.json is absent, tsc is
+    not installed, or the subprocess times out.
+    """
+    changed = _patch_changed_files(patch)
+    ts_changed = [p for p in changed if p.endswith((".ts", ".tsx"))]
+    if not ts_changed:
+        return []
+    if not (repo / "tsconfig.json").exists():
+        return []
+
+    tsc_candidates: List[str] = []
+    for rel in ("node_modules/.bin/tsc", "node_modules/typescript/bin/tsc"):
+        if (repo / rel).exists():
+            tsc_candidates.append(f"./{rel}")
+    if _has_executable("tsc"):
+        tsc_candidates.append("tsc")
+    if not tsc_candidates:
+        return []
+
+    for tsc_bin in tsc_candidates:
+        try:
+            proc = subprocess.run(
+                f"{tsc_bin} --noEmit --pretty false 2>&1",
+                cwd=str(repo),
+                shell=True,
+                executable="/bin/bash",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                env=_command_env(),
+            )
+            raw = (proc.stdout or "").strip()
+            if proc.returncode == 0 or not raw:
+                return []
+            # Only surface errors in patch-changed files to avoid baseline noise.
+            error_lines: List[str] = []
+            for line in raw.splitlines():
+                if ": error TS" not in line and ": error:" not in line:
+                    continue
+                for cp in ts_changed:
+                    if cp in line or Path(cp).name in line:
+                        error_lines.append(line)
+                        break
+            return error_lines[:10]
+        except subprocess.TimeoutExpired:
+            return []
+        except Exception:
+            continue
+    return []
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2208,6 +2294,76 @@ _RELOCATION_PHRASE_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Functional-area gap detection
+# ---------------------------------------------------------------------------
+#
+# The coverage nudge fires on *file-path* mentions in the issue. But many
+# tasks name functional areas ("CI workflow", "GitHub Actions", "Dockerfile")
+# without ever spelling out the exact path. These checks bridge that gap:
+# when the issue matches a functional-area keyword and the patch doesn't
+# touch ANY of the corresponding path hints, surface a targeted nudge so the
+# model doesn't leave the whole area unedited.
+#
+# Design: conservative patterns and specific path hints keep false-positive
+# rates low.  A CI check only fires when issue language clearly implies a
+# GitHub Actions workflow file; it won't trigger for generic mentions of
+# "integration" or "CI" that don't relate to .github/ files.
+
+_FUNCTIONAL_AREA_CHECKS: List[Tuple[str, "re.Pattern[str]", Tuple[str, ...]]] = [
+    (
+        "CI / GitHub Actions workflow (.github/workflows/*.yml)",
+        re.compile(
+            r"(?:"
+            r"github\s+actions?"
+            r"|github\s+workflow"
+            r"|\.github/workflows"
+            r"|workflow\.ya?ml"
+            r"|ci\s+(?:workflow|pipeline|job|step)"
+            r"|runs-on:"
+            r"|the\s+(?:CI|CD)\s+(?:workflow|pipeline|step|job)"
+            r")",
+            re.IGNORECASE,
+        ),
+        (".github/", "workflows/", ".github"),
+    ),
+    (
+        "Dockerfile / deployment configuration",
+        re.compile(
+            r"(?:"
+            r"dockerfile"
+            r"|docker-compose\.ya?ml"
+            r"|deployment\.ya?ml"
+            r"|deploy/[\w]"
+            r"|kubernetes\b"
+            r"|\bk8s\b"
+            r")",
+            re.IGNORECASE,
+        ),
+        ("Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+         "deployment.yml", "deployment.yaml", "deploy/", "k8s/", "kubernetes/"),
+    ),
+]
+
+
+def _missing_functional_areas(patch: str, issue_text: str) -> List[str]:
+    """Return functional area names the issue mentions but the patch doesn't touch.
+
+    Complements _uncovered_required_paths: catches 'CI workflow' / 'Dockerfile'
+    references that never name the actual file path, so the path-mention gate
+    stays silent while an entire required file category is skipped.
+    """
+    changed_lower = [p.lower() for p in _patch_changed_files(patch)]
+    missing: List[str] = []
+    for area_name, pattern, path_hints in _FUNCTIONAL_AREA_CHECKS:
+        if not pattern.search(issue_text):
+            continue
+        if any(hint.lower() in cp for cp in changed_lower for hint in path_hints):
+            continue
+        missing.append(area_name)
+    return missing
+
+
 def _patch_has_deletions(patch: str) -> bool:
     """True if the patch contains at least one substantive deletion line."""
     for line in patch.splitlines():
@@ -2373,6 +2529,11 @@ First response format:
 - Requirement: restate every secondary clause, edge case, "also", "and", "unless", "only", "should not", or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+  Examples of integration points that are easy to miss and ALWAYS required when mentioned:
+  * CI / GitHub Actions: add `.github/workflows/*.yml` as an explicit plan row when the issue mentions CI, pipeline, workflow, GitHub Actions, or running checks on push/PR.
+  * Deployment: add `Dockerfile`, `docker-compose.yml`, or `deploy/` files as plan rows when the issue mentions deployment, containerization, or deploy config.
+  * Server + client: when the issue describes both backend behavior AND a UI change, list both `server.js`/`app.py`/API route AND the frontend component as separate plan rows.
+  * Props/state cascade: when a component's state or props change, list every child that consumes those props as its own plan row — do NOT stop after moving the state without wiring it back in.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2632,14 +2793,15 @@ def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
     relocation_gap: bool = False,
+    missing_areas: Optional[List[str]] = None,
 ) -> str:
-    """Tell the model which issue-mentioned paths are still untouched.
+    """Tell the model which issue-mentioned paths and functional areas are still untouched.
 
     Incomplete coverage is common on multi-file tasks. When the issue names
-    specific files and the draft skips them, surface that gap directly — much
-    cheaper than hoping the self-check catches it. When `relocation_gap` is
-    set, also instruct the model to CREATE a new file at the implied path
-    (king_analysis P1 fix: don't just edit the old-path file).
+    specific files and the draft skips them, surface that gap directly. When
+    `relocation_gap` is set, instruct the model to CREATE a new file.
+    When `missing_areas` is set, call out whole functional categories (e.g.
+    CI workflow, Dockerfile) the issue implies but the patch ignores.
     """
     bullets = "\n  ".join(f"- {p}" for p in missing_paths[:8]) or "(none)"
     relocation_hint = ""
@@ -2655,15 +2817,30 @@ def build_coverage_nudge_prompt(
             "importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
-    return (
-        f"{relocation_hint}"
+    area_hint = ""
+    if missing_areas:
+        area_bullets = "\n  ".join(f"- {a}" for a in missing_areas)
+        area_hint = (
+            "FUNCTIONAL AREA GAP — the task references the following category/categories "
+            "but your current patch does NOT touch any file in those areas:\n"
+            f"  {area_bullets}\n\n"
+            "Locate the relevant file(s) now (e.g. `find . -name '*.yml' | head -20`, "
+            "`ls .github/workflows/`, `ls Dockerfile*`), inspect them, and add the "
+            "required edits before <final>.\n\n"
+        )
+    path_section = (
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
-        "unrelated work and do not stop early until you have either edited "
-        "each path or confirmed via inspection that no edit is required.\n\n"
+    ) if missing_paths else ""
+    return (
+        f"{relocation_hint}"
+        f"{area_hint}"
+        f"{path_section}"
+        "Open each missing path now (cat -n) and issue the edit commands needed "
+        "to satisfy the task for them. Do not start unrelated work and do not "
+        "stop early until you have either edited each path or confirmed via "
+        "inspection that no edit is required.\n\n"
         "Task (for reference):\n"
         f"{issue_text[:1500]}\n\n"
         "After your edits, end with <final>summary</final>."
@@ -2671,24 +2848,47 @@ def build_coverage_nudge_prompt(
 
 
 def build_self_check_prompt(patch: str, issue_text: str) -> str:
-    """Show the model its own draft and ask for a focused self-review."""
+    """Show the model its own draft and ask for a focused self-review.
+
+    Fix 5: pre-extract acceptance criteria and inject them as an explicit
+    numbered checklist so the model verifies each one instead of re-deriving
+    them from the truncated issue text.  Fix 4: adds explicit completeness
+    checks for missing imports and JSX sibling-wrapping errors.
+    """
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
+
+    # Build an explicit criteria checklist from the issue. The LLM judge scores
+    # each acceptance criterion — surfacing them here lets the model tick them
+    # off before declaring done rather than hoping it remembers them all.
+    criteria = _extract_acceptance_criteria(issue_text)
+    criteria_block = ""
+    if criteria:
+        items = "\n".join(f"  [ ] {c}" for c in criteria[:8])
+        criteria_block = (
+            "ACCEPTANCE CRITERIA — tick each before responding:\n"
+            f"{items}\n\n"
+        )
+
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
-        "CORRECTNESS (LLM judge weight — high impact):\n"
+        + criteria_block
+        + "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
+        "  - Every acceptance criterion in the checklist above is addressed.\n"
+        "  - Companion tests broken by the source change are updated.\n"
+        "  - No missing imports: every new identifier or component used in changed files\n"
+        "    has a corresponding import statement (grep for the name if unsure).\n"
+        "  - No adjacent JSX siblings without a wrapping fragment (<>...</>) or element.\n"
+        "  - No TypeScript interface or type changed without updating all implementors.\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
@@ -3066,6 +3266,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    ts_compile_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3111,7 +3312,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, ts_compile_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3162,6 +3363,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # TypeScript compilation gate — fires after syntax check, before test.
+        # Catches missing imports, interface mismatches, and type errors (e.g. a
+        # parameter typed as bool instead of string) that node --check and the
+        # brace-balance heuristic both miss.  Filtered to errors in patch-changed
+        # files only, so pre-existing repo baseline errors don't trigger the gate.
+        if ts_compile_turns_used < MAX_TS_COMPILE_TURNS:
+            ts_errors = _check_ts_compilation(repo, patch)
+            if ts_errors:
+                ts_compile_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_syntax_fix_prompt(ts_errors),
+                    "TS_COMPILE_FIX_QUEUED:\n  " + "\n  ".join(ts_errors[:4]),
                 )
                 return True
 
@@ -3230,22 +3448,30 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            # Functional-area check: issue mentions CI/GitHub Actions/Dockerfile
+            # but patch doesn't touch .github/ or Dockerfile-type files.
+            missing_areas = _missing_functional_areas(patch, issue)
+            if missing or relocation_gap or missing_areas:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
-                marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
+                if missing_areas:
+                    logs.append("FIRE: functional_area_gap: " + ", ".join(missing_areas))
+                marker_paths = ", ".join(missing) if missing else "(no literal paths)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
                     + ("\n  [+relocation-gap]" if relocation_gap else "")
+                    + ("\n  [+area-gap: " + "; ".join(missing_areas) + "]" if missing_areas else "")
                 )
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap
+                        missing, issue,
+                        relocation_gap=relocation_gap,
+                        missing_areas=missing_areas,
                     ),
                     marker,
                 )
@@ -3279,6 +3505,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable git's executable-bit tracking for this attempt. In this
+        # sandbox the working-tree mode drifts from HEAD's recorded mode
+        # for incidental reasons (container umask, side effects of
+        # `sed -i`, stray chmod). Each drift causes `git diff` to emit
+        # `old mode <N>` / `new mode <N>` metadata lines on otherwise
+        # content-only edits. The reference patch never carries those
+        # lines, so they only widen cursor-similarity distance. Setting
+        # `core.fileMode=false` tells git to ignore mode bits when
+        # computing diffs, so the metadata disappears at the source.
+        # Repo-local config; does not affect any other repo or run.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
 
@@ -3291,8 +3538,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3453,7 +3698,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 if not success and get_patch(repo).strip():
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
-                        "1. Any remaining file edits or companion test updates.\n"
+                        "1. Cross-cutting coverage check — before moving on, verify:\n"
+                        "   a) If the issue mentions CI/GitHub Actions/workflow: did you edit .github/workflows/*.yml?\n"
+                        "   b) If the issue mentions deployment/Dockerfile/docker-compose: did you edit those files?\n"
+                        "   c) If the issue involves both backend AND frontend: did you edit both sides?\n"
+                        "   d) If you moved state or props to a parent component: did you pass them back down to every consumer?\n"
+                        "   For each 'no': issue the missing edit commands NOW before proceeding.\n"
                         "2. Run the most targeted functional test available "
                         "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
                         "to verify correctness — passing tests are strong evidence for the final patch.\n"
