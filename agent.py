@@ -117,6 +117,8 @@ MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_COMPILE_SANITY_TURNS = 1  # repair Dart Consumer-base mismatch + broken relative imports
+MAX_UNDEFINED_HELPER_TURNS = 1  # repair call-without-definition (e.g. buildXyz that was never written)
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -536,18 +538,30 @@ def extract_final(model_text: str) -> Optional[str]:
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
-    if git_dir.exists():
-        return
+    if not git_dir.exists():
+        subprocess.run(
+            "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
+            cwd=str(repo),
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
 
+    # Disable filemode tracking so docker-checkout executable-bit churn
+    # (100755 → 100644 on shell scripts etc.) never leaks into the diff the
+    # judge sees. In duels 4696–4731 this pattern was responsible for ~13%
+    # of king losses — entire patches were spammed with `old mode/new mode`
+    # blocks and judges flagged them as "unrelated churn".
     subprocess.run(
-        "git init >/dev/null 2>&1 && git add . >/dev/null 2>&1 && git commit -m 'initial task state' >/dev/null 2>&1 || true",
+        ["git", "config", "core.fileMode", "false"],
         cwd=str(repo),
-        shell=True,
-        executable="/bin/bash",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=30,
+        timeout=10,
     )
 
 
@@ -1878,6 +1892,325 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     return errors
 
 
+_DART_REF_USE_RE = re.compile(r"\bref\.(?:watch|read|listen)\b")
+_DART_CLASS_RE = re.compile(r"^\s*class\s+(\w+)\s+extends\s+(\w+(?:<[^>]+>)?)", re.MULTILINE)
+_DART_NON_CONSUMER_BASES = ("StatelessWidget", "StatefulWidget", "State")
+
+
+def _check_dart_consumer_bases(repo: Path, relative_path: str) -> List[str]:
+    """Flag .dart classes that use `ref.watch/read/listen` while extending
+    StatelessWidget/StatefulWidget/State<X> instead of the Consumer* variants.
+
+    This is one of the most common silent compile-break patterns observed in
+    duels 004696-004700: the model adds a Riverpod ref call inside a widget
+    body but leaves the base class as StatelessWidget, which fails at build
+    time and the LLM judge marks the whole patch as broken.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    findings: List[str] = []
+    matches = list(_DART_CLASS_RE.finditer(source))
+    for idx, m in enumerate(matches):
+        class_name = m.group(1)
+        base_full = m.group(2)
+        base_root = base_full.split("<", 1)[0]
+        if base_root not in _DART_NON_CONSUMER_BASES:
+            continue
+        body_start = m.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(source)
+        body = source[body_start:body_end]
+        if not _DART_REF_USE_RE.search(body):
+            continue
+        line_no = source.count("\n", 0, m.start()) + 1
+        suggested = {
+            "StatelessWidget": "ConsumerWidget",
+            "StatefulWidget": "ConsumerStatefulWidget",
+            "State": "ConsumerState",
+        }[base_root]
+        findings.append(
+            f"{relative_path}:{line_no}: class {class_name} extends {base_root} "
+            f"uses ref.watch/read/listen — change base to {suggested}"
+        )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+_TS_IMPORT_RE = re.compile(
+    r"""^\s*import\s+(?:[^'";\n]*?\s+from\s+)?["']([^"']+)["']""",
+    re.MULTILINE,
+)
+_TS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts")
+
+
+def _check_relative_import_paths(
+    repo: Path, relative_path: str, created_files: set
+) -> List[str]:
+    """Flag relative imports whose target file is not in the repo and not
+    created by this patch.
+
+    Pattern observed in duels: model writes
+    `import { X } from "./components/foo"` after adding a new component, but
+    the file at ./components/foo doesn't exist and isn't created in the patch.
+    Build fails immediately.
+    """
+    full = (repo / relative_path).resolve()
+    repo_resolved = repo.resolve()
+    try:
+        full.relative_to(repo_resolved)
+    except (ValueError, RuntimeError):
+        return []
+    if not full.exists():
+        return []
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    findings: List[str] = []
+    file_dir = full.parent
+    for m in _TS_IMPORT_RE.finditer(source):
+        spec = m.group(1).strip()
+        if not (spec.startswith("./") or spec.startswith("../")):
+            continue
+        target = (file_dir / spec).resolve()
+        candidates: List[Path] = []
+        if Path(spec).suffix:
+            candidates.append(target)
+        else:
+            for ext in _TS_RESOLVE_EXTS:
+                candidates.append(Path(str(target) + ext))
+            for ext in _TS_RESOLVE_EXTS:
+                candidates.append(target / f"index{ext}")
+        if any(c.exists() for c in candidates):
+            continue
+        # Allow imports satisfied by files created in this patch.
+        created_hit = False
+        for c in candidates:
+            try:
+                rel = str(c.relative_to(repo_resolved))
+            except ValueError:
+                continue
+            if rel in created_files:
+                created_hit = True
+                break
+        if created_hit:
+            continue
+        line_no = source.count("\n", 0, m.start()) + 1
+        findings.append(
+            f"{relative_path}:{line_no}: import '{spec}' — target file not found "
+            "in repo and not created by this patch"
+        )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+_COMPILE_SANITY_JS_LIKE = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+
+
+def _check_compile_sanity(repo: Path, patch: str) -> List[str]:
+    """Cheap deterministic compile-correctness checks beyond _check_syntax.
+
+    Targets two patterns that the parser/node check cannot catch but that
+    consistently broke king's diffs in duels 004696-004700:
+      - Dart classes using `ref.*` while extending StatelessWidget/StatefulWidget
+      - Relative imports pointing to files that don't exist after the patch
+    """
+    errors: List[str] = []
+    created = set(_patch_newly_created_files(patch))
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".dart":
+            errors.extend(_check_dart_consumer_bases(repo, relative_path))
+        elif suffix in _COMPILE_SANITY_JS_LIKE:
+            errors.extend(_check_relative_import_paths(repo, relative_path, created))
+        if len(errors) >= 6:
+            break
+    return errors[:6]
+
+
+# Identifiers we never want to flag as "undefined" — language keywords,
+# common globals, and the few stdlib names that show up across many files.
+# Keep this conservative: false positives here cost a refinement turn.
+_UNDEFINED_HELPER_IGNORE = frozenset({
+    # Keywords / pseudo-builtins across JS+TS+Python that look like calls
+    "if", "else", "for", "while", "switch", "case", "return", "throw", "new",
+    "typeof", "instanceof", "await", "async", "function", "class", "yield",
+    "in", "of", "do", "try", "catch", "finally", "from", "import", "export",
+    "default", "as", "delete", "void", "this", "super", "self", "and", "or",
+    "not", "is", "with", "lambda", "pass", "raise", "global", "nonlocal",
+    "assert", "print", "len", "range", "str", "int", "float", "bool", "list",
+    "tuple", "set", "dict", "type", "id", "hex", "bin", "oct", "ord", "chr",
+    "abs", "min", "max", "sum", "any", "all", "map", "filter", "zip",
+    "enumerate", "reversed", "sorted", "iter", "next", "open", "input",
+    "format", "repr", "bytes", "bytearray", "frozenset", "object",
+    "isinstance", "issubclass", "callable", "hasattr", "getattr", "setattr",
+    "delattr", "vars", "dir", "globals", "locals", "round", "pow", "divmod",
+    "hash", "memoryview", "slice", "complex", "exec", "eval", "compile",
+    "super", "property", "staticmethod", "classmethod", "BaseException",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "RuntimeError", "AttributeError", "NotImplementedError", "StopIteration",
+    "True", "False", "None",
+    # JS/TS common globals & idiomatic call sites
+    "console", "window", "document", "process", "require", "module",
+    "Promise", "Array", "Object", "String", "Number", "Boolean", "Math",
+    "JSON", "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Symbol",
+    "Error", "TypeError", "RangeError", "URL", "URLSearchParams", "FormData",
+    "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "queueMicrotask", "structuredClone", "atob", "btoa", "encodeURIComponent",
+    "decodeURIComponent", "parseInt", "parseFloat", "isNaN", "isFinite",
+    "Buffer", "globalThis", "self", "describe", "it", "test", "expect",
+    "beforeEach", "afterEach", "beforeAll", "afterAll", "jest", "vi",
+    "useState", "useEffect", "useMemo", "useCallback", "useRef", "useContext",
+    "useReducer", "useLayoutEffect", "useImperativeHandle", "useDebugValue",
+    "useTransition", "useDeferredValue", "useId", "useSyncExternalStore",
+    "Fragment", "createElement", "cloneElement", "createContext", "memo",
+    "forwardRef", "lazy", "Suspense", "createRoot", "render", "ReactDOM",
+})
+
+# Function calls written into + lines whose name starts with one of these
+# verbs and is >= MIN_LEN chars are almost always custom helpers the model
+# is supposed to define in the same patch. Keeping the prefix list short
+# (and tightly focused on king-loss patterns) reduces false positives.
+_UNDEFINED_HELPER_VERB_PREFIXES = (
+    "build", "make", "compute", "derive", "construct", "assemble",
+    "format", "render", "generate", "create", "parse", "serialize",
+    "validate", "normalize", "resolve", "fetch", "load", "save",
+    "encode", "decode", "transform", "calculate",
+)
+_UNDEFINED_HELPER_MIN_LEN = 12
+_UNDEFINED_HELPER_CALL_RE = re.compile(
+    r"(?<![.\w])([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+)
+_UNDEFINED_HELPER_LANG_SUFFIXES = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py",
+}
+
+
+def _patch_added_lines_by_file(patch: str) -> Dict[str, List[str]]:
+    """Group every `+` line in the patch by the file it lives in."""
+    result: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            result.setdefault(current, [])
+        elif line.startswith("+++ "):
+            current = None
+        elif line.startswith("--- "):
+            # `--- ` resets in case of malformed sections
+            pass
+        elif current is not None and line.startswith("+") and not line.startswith("++"):
+            result[current].append(line[1:])
+    return result
+
+
+def _name_has_definition(name: str, source: str) -> bool:
+    """Return True if `name` appears as a definition or import in `source`.
+
+    Covers the common patterns across JS/TS/Python — function/const/let/var/
+    class/def declarations, ES module imports (named, namespace, default),
+    and Python `import` / `from ... import`. The check is intentionally
+    permissive: any plausible definition counts so we don't false-positive
+    on legitimate code.
+    """
+    escaped = re.escape(name)
+    patterns = (
+        rf"\bfunction\s+{escaped}\b",
+        rf"\bclass\s+{escaped}\b",
+        rf"\bdef\s+{escaped}\b",
+        rf"\b(?:const|let|var)\s+{escaped}\b",
+        rf"\bexport\s+(?:default\s+)?(?:async\s+)?function\s+{escaped}\b",
+        rf"\bexport\s+(?:const|let|var|class)\s+{escaped}\b",
+        rf"\b{escaped}\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)",
+        rf"\bimport\s+\{{[^}}]*\b{escaped}\b[^}}]*\}}",
+        rf"\bimport\s+\*\s+as\s+{escaped}\b",
+        rf"\bimport\s+{escaped}\b\s+from",
+        rf"\bfrom\s+\S+\s+import\s+[^#\n]*\b{escaped}\b",
+        rf"\bimport\s+(?:[\w.]+\s*,\s*)*{escaped}\b",
+        rf"\b{escaped}\s*=\s*require\s*\(",
+        # Function declared as object/class method or property bag entry:
+        rf"\b{escaped}\s*\([^)]*\)\s*\{{",
+        rf"\b{escaped}\s*:\s*(?:async\s*)?\(",
+    )
+    return any(re.search(p, source) for p in patterns)
+
+
+def _check_undefined_helpers(repo: Path, patch: str) -> List[str]:
+    """Flag patches that call a custom-looking helper that is neither defined
+    in the patch nor anywhere in the post-patch version of the file.
+
+    This is the loss pattern from duel 4696 round task 064632: king's patch
+    added `buildWalletHistoryDiagnostics(query, env)` without defining the
+    helper anywhere — the call site was correct but the function did not
+    exist, so the runtime fails immediately. King lost this task 17/17 times.
+
+    Conservative on purpose: only flags identifiers that
+      - are >= 12 chars (rules out stdlib names like `print`, `len`, `fetch`)
+      - start with a verb prefix indicating they're a custom helper
+      - have no `.` immediately before them (skips method calls)
+      - and are not present as a definition / import in the post-patch file.
+    """
+    findings: List[str] = []
+    added_by_file = _patch_added_lines_by_file(patch)
+    if not added_by_file:
+        return findings
+
+    repo_resolved = repo.resolve()
+    for relative_path, added_lines in added_by_file.items():
+        if not added_lines:
+            continue
+        suffix = Path(relative_path).suffix.lower()
+        if suffix not in _UNDEFINED_HELPER_LANG_SUFFIXES:
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            post_content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        seen_local: set = set()
+        for line in added_lines:
+            for m in _UNDEFINED_HELPER_CALL_RE.finditer(line):
+                name = m.group(1)
+                if name in seen_local:
+                    continue
+                if name in _UNDEFINED_HELPER_IGNORE:
+                    continue
+                if len(name) < _UNDEFINED_HELPER_MIN_LEN:
+                    continue
+                lower = name.lower()
+                if not any(lower.startswith(p) for p in _UNDEFINED_HELPER_VERB_PREFIXES):
+                    continue
+                if _name_has_definition(name, post_content):
+                    continue
+                seen_local.add(name)
+                findings.append(
+                    f"{relative_path}: calls `{name}(...)` but no definition or "
+                    "import for that name is present in the file after the patch"
+                )
+                if len(findings) >= 6:
+                    return findings
+    return findings
+
+
 def _has_executable(name: str) -> bool:
     """True if `name` is on PATH. Uses shutil.which (stdlib).
 
@@ -2659,7 +2992,15 @@ LANGUAGE-SPECIFIC COMPLETENESS RULES
 
 **Dart/Flutter:** When the task ADDS or MOVES a screen / page / route, enumerate EVERY `*_screen.dart`, `*_page.dart`, `*_view.dart` it implies as its own plan row — including ones the issue text does not name literally. Flutter screens live in their own files under `lib/features/<feature>/(pages|screens|views)/`; missing one is the most common loss mode. After patching, mentally check `git diff --stat | grep -E "_screen\\.dart|_page\\.dart|_view\\.dart"` against the plan rows and add any omitted screen file before `<final>`.
 
+**Dart/Riverpod compile gate:** Any class that calls `ref.watch`, `ref.read`, or `ref.listen` MUST extend `ConsumerWidget` (with `build(BuildContext, WidgetRef ref)`) or `ConsumerStatefulWidget` (with `ConsumerState<...>` and `ref` available via the state). Editing `StatelessWidget`/`StatefulWidget` to use `ref` without changing the base class WILL NOT COMPILE — a very common silent loss mode. Before `<final>`, scan every `+` line containing `ref.` and confirm its enclosing class extends a Consumer base.
+
+**JS/TS state-lifting gate:** When you move a `useState` declaration up to a parent and pass setters down, EVERY old reference (`chainId`, `setChainId`, etc.) in the child must be either replaced with the prop / context value or removed. Leaving `value={chainId}` in a child after the state was lifted gives "chainId is not defined" at compile time. Re-grep the changed file for the lifted identifier names before `<final>`.
+
+**Import-path reality check:** Every new `import` you add MUST point to a path that either already exists in the repo OR is being created in this same patch. `import { X } from "./components/foo"` where `./components/foo` does not exist and is not added is a guaranteed compile failure. Cross-check every added relative import against `ls`/`git ls-files` of its target directory.
+
 **Multi-file tasks:** Complete ALL genuinely affected files in the same diff — never leave a related file partially edited, but do not broaden the patch beyond the task\'s behaviour.
+
+**Helper-without-integration anti-pattern:** If the task names multiple consumers (routes, pages, components, dashboards) of a new shared helper/utility, adding ONLY the helper file scores near zero. After creating the helper, import and call it from every named consumer in the SAME patch — otherwise the LLM judge treats the integration as missing.
 
 ====================================================================
 SCOPE DISCIPLINE
@@ -2677,6 +3018,10 @@ Do NOT change:
 - File permissions or mode bits (chmod is forbidden)
 
 **Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
+
+**Narrow-tweak anti-rewrite rule:** When the task asks for a localized change inside a file (e.g., "update the formatting of the total line", "tweak the styling of the header", "fix the validation in createUser"), edit ONLY the named region. Do NOT rewrite adjacent functions, restyle unrelated sections, or refactor the rest of the file even if it would look cleaner — the LLM judge penalises "unrelated rewrites" as heavily as missed requirements, and large rewrites also raise the chance of introducing compile errors elsewhere in the file.
+
+**Explicit cleanup recognition:** Phrases like "remove the old X", "delete App.css", "drop the legacy Y", "no longer needed" require an actual deletion in the patch (`rm path`, `git rm`, or `--- /dev/null` rename). Adding the new code without removing the old leaves the cleanup undone.
 
 ====================================================================
 SAFETY
@@ -2712,6 +3057,16 @@ Repository summary:
 {repo_summary}
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+
+Scope discipline: only modify files the task explicitly names plus the minimum cross-file edits needed to keep them compiling. Do not rewrite working code in adjacent files even if a refactor would improve it; the judge penalises unrelated rewrites as heavily as missed requirements. When the task asks for a NARROW change inside a file (formatting tweak, single-line fix, styling adjustment), edit ONLY that region — do not rewrite adjacent functions in the same file.
+
+Integration completeness: if the task names multiple consumers of a shared utility (routes, pages, components), wire the utility into EACH of them in the same patch. Adding just the helper file without integration scores near zero on the LLM judge.
+
+Compile-sanity self-check before <final>:
+- Confirm every added `import` path points to a file that exists in the repo or is created in this patch.
+- For Dart: any class using `ref.watch` / `ref.read` / `ref.listen` MUST extend `ConsumerWidget` or `ConsumerStatefulWidget` (not `StatelessWidget` / `StatefulWidget`).
+- For JS/TS: after lifting state to a parent, no child still references the old local names (e.g. `chainId`, `setChainId`).
+Silent compile breaks are the most common loss mode.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
 
@@ -2799,7 +3154,11 @@ def build_polish_prompt(junk_summary: str) -> str:
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
-        "  - Cosmetic refactors not asked for by the task\n\n"
+        "  - Cosmetic refactors not asked for by the task\n"
+        "  - Wholesale rewrites of files / functions the task did not name "
+        "(judges flag these as \"unrelated rewrites\" and they tank the LLM score)\n"
+        "  - Deletions of files (typography.md, README sections, etc.) the task "
+        "did not ask to remove\n\n"
         "Keep substantive code changes. After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
@@ -2881,21 +3240,37 @@ def build_self_check_prompt(
         )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
-        "with the reference — review your patch against all three:\n\n"
+        "with the reference — review your patch against all four:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
+        "COMPILE SANITY (highest-leverage gate — silent failures here halve the LLM score):\n"
+        "  - Every added `import` path points to a file that EXISTS in the repo or is "
+        "being CREATED in this patch. No `./components/foo` imports for paths that don't exist.\n"
+        "  - In Dart files: any class using `ref.watch` / `ref.read` / `ref.listen` extends "
+        "`ConsumerWidget` or `ConsumerStatefulWidget` (NOT `StatelessWidget` / `StatefulWidget`).\n"
+        "  - When state was lifted from a child to a parent, the child has NO remaining "
+        "references to the old local names (`chainId`, `setChainId`, etc.) — they are passed via props.\n"
+        "  - JSX/components referenced by tags or imports actually exist (defined locally, "
+        "imported, or in this patch).\n"
+        "  - Brackets/braces/parens balance in every added block; no truncated functions; "
+        "no \"// similar logic\" stubs.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "  - If a new helper/util file was added, every consumer named or implied by the "
+        "task imports and uses it (helper-without-integration scores near zero).\n"
+        "  - If the task says \"remove\" / \"delete\" / \"drop\", the patch contains a real "
+        "deletion (file removed or `--- /dev/null`) — not just an additive replacement.\n"
+        "  - Companion tests broken by the source change are updated.\n\n"
+        "SCOPE (similarity score weight — medium impact, BUT \"unrelated rewrites\" tank LLM score too):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n"
+        "  - When the task asked for a NARROW tweak in a file, only that region is changed; "
+        "the rest of the file is untouched (no full-section rewrites of working code).\n"
         f"{advisory_block}\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
@@ -2916,6 +3291,55 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
         "Issue the smallest possible fix command(s) to restore parseable code. "
         "Do NOT introduce new edits, do NOT refactor. Then end with "
         "<final>summary</final>."
+    )
+
+
+def build_compile_sanity_fix_prompt(errors: List[str]) -> str:
+    """Surface deterministic compile-break findings from _check_compile_sanity.
+
+    Both classes of finding (Dart Consumer-base mismatch, broken relative
+    import path) are guaranteed build failures in their target language. The
+    fix is mechanical, so the prompt nails down exactly what to change.
+    """
+    bullets = "\n  ".join(errors[:6]) or "(none)"
+    return (
+        f"Compile-sanity check found likely build breakers introduced by your patch:\n  {bullets}\n\n"
+        "These are NOT style nits — each one will fail at build/compile time and the LLM judge "
+        "will mark the whole patch as broken. Fix each one now with the SMALLEST possible edit:\n"
+        "  - Dart `class X extends StatelessWidget` using `ref.*` -> change base to `ConsumerWidget` "
+        "and update build signature to `build(BuildContext context, WidgetRef ref)`.\n"
+        "  - Dart `class X extends StatefulWidget` paired with `State<X>` using `ref.*` -> "
+        "change to `ConsumerStatefulWidget` and `ConsumerState<X>`.\n"
+        "  - Missing relative-import target -> either create the missing file in this patch, "
+        "fix the import path to point at an existing file, or remove the unused import.\n\n"
+        "Do NOT add unrelated edits. Do NOT rewrite working code. Issue the corrective "
+        "<command> blocks now, then end with <final>summary</final>."
+    )
+
+
+def build_undefined_helpers_fix_prompt(errors: List[str]) -> str:
+    """Surface findings from _check_undefined_helpers.
+
+    The loss pattern: model inserts `<verbHelperName>(...)` at a call site
+    but forgets to add the helper definition. Runtime fails on the first
+    call. King lost duel 4696 task 064632 17 / 17 times to this exact bug —
+    `buildWalletHistoryDiagnostics(query, env)` was called but never defined.
+    """
+    bullets = "\n  ".join(errors[:6]) or "(none)"
+    return (
+        f"Reference-without-definition check found likely runtime-break callers in your patch:\n  {bullets}\n\n"
+        "Each line above is a `+` you added that calls a helper which is NOT defined or imported "
+        "anywhere in the post-patch file. This is a guaranteed failure — the first time that code "
+        "path runs, the program throws `<name> is not defined` / `NameError` / `ReferenceError`.\n\n"
+        "Fix each one NOW with one of these options (pick whichever is smallest):\n"
+        "  1. Add the helper definition in this same patch, in the same file, with the exact "
+        "signature implied by the call site.\n"
+        "  2. Add the missing `import` from wherever the helper actually lives in the repo "
+        "(grep for the name to find it; if it doesn't exist anywhere, you MUST define it).\n"
+        "  3. If the call was a stray / wrong, remove the call and substitute the correct "
+        "existing function.\n\n"
+        "Do NOT add unrelated edits, do NOT refactor surrounding code. Issue the corrective "
+        "<command> blocks now, then end with <final>summary</final>."
     )
 
 
@@ -3326,6 +3750,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    compile_sanity_turns_used = 0
+    undefined_helper_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
@@ -3372,7 +3798,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, compile_sanity_turns_used, undefined_helper_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3423,6 +3849,41 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Compile-sanity gate: deterministic checks for build breakers beyond
+        # what _check_syntax can catch — Dart Consumer-base mismatch and
+        # missing relative-import targets. Both were repeat loss patterns for
+        # king in duels 004696-004700.
+        if compile_sanity_turns_used < MAX_COMPILE_SANITY_TURNS:
+            compile_errors = _check_compile_sanity(repo, patch)
+            if compile_errors:
+                compile_sanity_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_compile_sanity_fix_prompt(compile_errors),
+                    "COMPILE_SANITY_QUEUED:\n  " + "\n  ".join(compile_errors),
+                )
+                return True
+
+        # Undefined-helper gate: catches the king-loss pattern from duel 4696
+        # task 064632 (lost 17/17). The patch calls a custom helper like
+        # `buildWalletHistoryDiagnostics(...)` but never defines or imports
+        # it, so the runtime fails on the first call. Conservative: only
+        # flags >= 12-char identifiers with verb prefixes (build, parse,
+        # create, …) that have no `.` before the call and no definition or
+        # import anywhere in the post-patch file.
+        if undefined_helper_turns_used < MAX_UNDEFINED_HELPER_TURNS:
+            undef_errors = _check_undefined_helpers(repo, patch)
+            if undef_errors:
+                undefined_helper_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_undefined_helpers_fix_prompt(undef_errors),
+                    "UNDEFINED_HELPER_QUEUED:\n  " + "\n  ".join(undef_errors),
                 )
                 return True
 
