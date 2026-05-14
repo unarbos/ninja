@@ -108,8 +108,6 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
-MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -122,6 +120,7 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_STATIC_FIX_TURNS = 1   # repair lint/static-analyzer errors (ruff for python, eslint for js/ts)
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -632,6 +631,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -719,6 +719,29 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+def _strip_mode_metadata_lines(diff_output: str) -> str:
+    """Drop residual `old mode <N>` and `new mode <N>` lines from any file
+    block that survived `_strip_mode_only_file_diffs`.
+
+    Belt-and-suspenders with the `git config core.fileMode false` setting
+    applied at solve startup: that setting prevents the lines from being
+    generated in the first place, but if it fails to take effect (older
+    git version, sandbox config quirk, alternate diff backend) the lines
+    can still appear. This strip is purely text-level — it removes only
+    metadata lines, never content `+`/`-` lines or hunk headers, so the
+    patch remains structurally valid for the validator's diff applier.
+    """
+    if not diff_output.strip():
+        return diff_output
+    out: List[str] = []
+    for line in diff_output.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("old mode ") or stripped.startswith("new mode "):
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -999,7 +1022,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
-    files = _augment_with_directory_siblings(files, tracked_set)
 
     parts: List[str] = []
     included: List[str] = []
@@ -1092,7 +1114,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
-    id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1115,8 +1136,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
-        # Boost files whose path/name matches identifier-shaped tokens from the issue.
-        score += 35 * id_boost.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -1204,45 +1223,6 @@ def _looks_like_integration_surface(relative_path: str) -> bool:
         return True
     tokens = _split_path_tokens(relative_path)
     return any(marker in tokens for marker in _INTEGRATION_PATH_MARKERS)
-
-
-_DIRECTORY_SIBLING_BASENAMES = {
-    "layout", "index", "page", "route", "loading", "error", "metadata",
-    "manifest", "head", "template", "_meta", "_root", "styles", "types",
-    "constants", "schema",
-}
-
-
-def _augment_with_directory_siblings(
-    files: List[str], tracked_set: set, limit: int = 3
-) -> List[str]:
-    """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
-
-    Targets high-leverage basenames (layout, index, schema, etc.) that commonly
-    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
-    """
-    try:
-        if not files:
-            return files
-        top = files[0]
-        top_dir = str(Path(top).parent).replace("\\", "/")
-        if top_dir in {"", "."}:
-            return files
-        seen = set(files)
-        siblings: List[str] = []
-        for candidate in tracked_set:
-            if candidate in seen:
-                continue
-            cpath = Path(candidate)
-            if str(cpath.parent).replace("\\", "/") != top_dir:
-                continue
-            if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
-                siblings.append(candidate)
-            if len(siblings) >= limit:
-                break
-        return files + siblings[:limit]
-    except Exception:
-        return files
 
 
 def _augment_with_integration_partners(files: List[str], tracked: set, issue: str) -> List[str]:
@@ -1575,91 +1555,6 @@ def _patch_changed_files(patch: str) -> List[str]:
     return seen
 
 
-_NEW_FILE_RE = re.compile(
-    r"^--- /dev/null\n\+\+\+ b/(.+?)$",
-    re.MULTILINE,
-)
-_RELOCATION_TRIGGERS = re.compile(
-    r"\b(move|rename|extract|belongs under|new location|create a new|convert to)\b",
-    re.IGNORECASE,
-)
-
-
-def _patch_newly_created_files(patch: str) -> List[str]:
-    """Return paths of files created from scratch (--- /dev/null) in the patch."""
-    try:
-        return [m.group(1) for m in _NEW_FILE_RE.finditer(patch)]
-    except Exception:
-        return []
-
-
-def _check_inplace_intent(
-    patch: str, issue_text: str, tracked_set: set
-) -> List[str]:
-    """Return advisories when the patch creates a new file while an existing same-basename file was not edited.
-
-    Catches the 'new file at wrong path instead of in-place refactor' failure mode.
-    Suppressed when the issue contains a relocation trigger phrase.
-    """
-    try:
-        if _RELOCATION_TRIGGERS.search(issue_text):
-            return []
-        advisories: List[str] = []
-        changed = set(_patch_changed_files(patch))
-        for new_path in _patch_newly_created_files(patch)[:6]:
-            new_basename = Path(new_path).name
-            for existing in tracked_set:
-                if existing in changed:
-                    continue
-                if Path(existing).name == new_basename:
-                    advisories.append(
-                        f"created new file {new_path!r} while existing {existing!r} "
-                        "with same name was untouched"
-                    )
-                    break
-            if len(advisories) >= 3:
-                break
-        return advisories
-    except Exception:
-        return []
-
-
-_REMOVED_DEF_RES = (
-    re.compile(r"^-\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    re.compile(r"^-\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*export\s+(?:default\s+)?(?:const|function|class)\s+([A-Za-z_][A-Za-z0-9_]*)"),
-    re.compile(r"^-\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    re.compile(r"^-\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"),
-)
-
-
-def _patch_removed_definitions(patch: str, cap: int = 8) -> List[str]:
-    """Return names of definitions removed by the patch (def/class/function/export/func/fn lines).
-
-    Pure diff-text scan — no subprocess, no I/O. Used to build a caller-audit advisory.
-    """
-    try:
-        seen: set = set()
-        results: List[str] = []
-        for line in patch.splitlines():
-            if not line.startswith("-"):
-                continue
-            for pattern in _REMOVED_DEF_RES:
-                m = pattern.match(line)
-                if m:
-                    name = m.group(1)
-                    if name not in seen:
-                        seen.add(name)
-                        results.append(name)
-                    break
-            if len(results) >= cap:
-                break
-        return results
-    except Exception:
-        return []
-
-
 def _patch_covers_required_paths(patch: str, issue_text: str) -> bool:
     """All paths the issue explicitly mentions must appear in the patch."""
     return not _uncovered_required_paths(patch, issue_text)
@@ -1768,9 +1663,6 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 # to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
-    ".rs", ".go", ".java", ".kt",
-    ".c", ".cc", ".cpp", ".h", ".hpp",
-    ".cs", ".php",
 }
 
 
@@ -1892,6 +1784,128 @@ def _has_executable(name: str) -> bool:
         return shutil.which(name) is not None
     except Exception:
         return False
+
+
+# -----------------------------
+# Static-analyzer gate (v29)
+# -----------------------------
+#
+# The syntax gate above catches gross parse failures, but real reference
+# patches usually pass a linter cleanly: unused imports, undefined names,
+# obviously-broken refs are caught by `ruff check` or `eslint` and never make
+# it into a maintainer's commit. Adding a static-analyzer gate gives the model
+# one chance to clean those up before <final>.
+#
+# Best-effort by design: each tool is skipped silently when not on PATH, and
+# errors are collected without aborting if a single file blows up the tool.
+# The gate is wired in between syntax-fix and test-fix in
+# maybe_queue_refinement — after we know the file parses but before we spend
+# wall-clock on running tests.
+
+_STATIC_TIMEOUT = 8  # per-tool-invocation cap
+
+
+def _run_ruff_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `ruff check` on one Python file. Returns lint error strings.
+
+    We restrict to error-level rules (E, F) so the gate flags genuine bugs
+    (undefined names, syntax-adjacent issues, unused imports introduced by
+    the patch) without nagging the model about whitespace/style — those
+    would just trigger a polish-equivalent loop and waste the refinement
+    budget.
+    """
+    if not _has_executable("ruff"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "ruff", "check",
+                "--select=E,F",
+                "--no-fix",
+                "--output-format=concise",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    return [line.strip() for line in out if line.strip()][:8]
+
+
+def _run_eslint_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `eslint` on one JS/TS file. Returns error-level findings only.
+
+    We use `--format=compact` because it's the most parseable for our
+    "quote-the-lines-back-at-the-model" path. eslint's default exit code is
+    1 on any error; we read stdout regardless and filter to lines that
+    contain "error" (skipping warnings) so the gate doesn't fire for cosmetic
+    style preferences.
+    """
+    if not _has_executable("eslint"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "eslint",
+                "--no-color",
+                "--format=compact",
+                "--no-eslintrc",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    errs: List[str] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        # `--quiet` already drops warnings, but be defensive: only keep lines
+        # that look like real errors so a misconfigured ruleset doesn't flood
+        # the gate.
+        if " error " in line or line.lower().endswith(" error"):
+            errs.append(line)
+        if len(errs) >= 8:
+            break
+    return errs
+
+
+def _check_static_analysis(repo: Path, patch: str) -> List[str]:
+    """Aggregate static-analyzer errors across files touched by the patch.
+
+    Returns a flat list of error strings (capped at 12 total) suitable for
+    quoting back to the model. Skips files we have no analyzer for and tools
+    not installed on PATH; both cases produce no false-positive errors.
+    """
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            errors.extend(_run_ruff_check(repo, relative_path))
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            errors.extend(_run_eslint_check(repo, relative_path))
+        if len(errors) >= 12:
+            break
+    return errors[:12]
 
 
 def _shell_quote(value: str) -> str:
@@ -2432,52 +2446,6 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     return out
 
 
-_IDENTIFIER_STOPWORDS = {
-    "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
-    "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
-    "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
-}
-
-_CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
-_HOOK_RE = re.compile(r"\b(use|get|set|fetch|handle|build|create)[A-Z][a-zA-Z0-9_]{2,}\b")
-_SNAKE_RE = re.compile(r"\b([a-z][a-zA-Z0-9]+_[a-z][a-zA-Z0-9_]+)\b")
-
-
-def _issue_identifier_path_boost(
-    issue_text: str, tracked_files: List[str], cap: int = 20
-) -> Dict[str, int]:
-    """Return per-file hit counts for identifier-shaped tokens extracted from the issue text.
-
-    Uses only path-segment substring matching — no I/O, no subprocess.
-    Weight 35 per hit matches the existing path-mention scoring bonus.
-    """
-    try:
-        identifiers: set = set()
-        for m in _CAMEL_RE.finditer(issue_text):
-            tok = m.group(1)
-            if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
-                identifiers.add(tok.lower())
-        for m in _HOOK_RE.finditer(issue_text):
-            if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
-        for m in _SNAKE_RE.finditer(issue_text):
-            if len(identifiers) < cap:
-                identifiers.add(m.group(1).lower())
-        if not identifiers:
-            return {}
-        boost: Dict[str, int] = {}
-        for rel in tracked_files:
-            path_obj = Path(rel)
-            basename_lower = path_obj.name.lower()
-            parent_lower = str(path_obj.parent).lower()
-            hits = sum(1 for ident in identifiers if ident in basename_lower or ident in parent_lower)
-            if hits:
-                boost[rel] = hits
-        return boost
-    except Exception:
-        return {}
-
-
 def _symbol_grep_hits(
     repo: Path,
     tracked_set: set,
@@ -2811,7 +2779,6 @@ def build_coverage_nudge_prompt(
     missing_paths: List[str],
     issue_text: str,
     relocation_gap: bool = False,
-    removed_names: Optional[List[str]] = None,
 ) -> str:
     """Tell the model which issue-mentioned paths are still untouched.
 
@@ -2835,17 +2802,8 @@ def build_coverage_nudge_prompt(
             "importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
-    removed_hint = ""
-    if removed_names:
-        names_str = ", ".join(removed_names[:8])
-        removed_hint = (
-            f"AUDIT: this patch removes/renames the following names — "
-            f"verify every caller has been updated: {names_str}. "
-            "Run `git grep` for each before <final> if uncertain.\n\n"
-        )
     return (
         f"{relocation_hint}"
-        f"{removed_hint}"
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
@@ -2859,26 +2817,13 @@ def build_coverage_nudge_prompt(
     )
 
 
-def build_self_check_prompt(
-    patch: str,
-    issue_text: str,
-    inplace_advisories: Optional[List[str]] = None,
-) -> str:
+def build_self_check_prompt(patch: str, issue_text: str) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
         patch
         if len(patch) <= 4000
         else patch[:2000] + "\n...[truncated]...\n" + patch[-1500:]
     )
-    advisory_block = ""
-    if inplace_advisories:
-        bullets = "\n  ".join(f"- {a}" for a in inplace_advisories[:3])
-        advisory_block = (
-            "\nIN-PLACE EDIT WARNINGS (check before finalizing):\n"
-            f"  {bullets}\n"
-            "If the task is a refactor (not a new-file relocation), fix each by editing "
-            "the EXISTING file rather than creating a new one at a different path.\n"
-        )
     return (
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
@@ -2895,8 +2840,7 @@ def build_self_check_prompt(
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n"
-        f"{advisory_block}\n"
+        "  - No new helper functions or defensive checks not required by the task\n\n"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
@@ -2915,6 +2859,28 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
         f"Syntax check failed on touched file(s):\n  {bullets}\n\n"
         "Issue the smallest possible fix command(s) to restore parseable code. "
         "Do NOT introduce new edits, do NOT refactor. Then end with "
+        "<final>summary</final>."
+    )
+
+
+def build_static_fix_prompt(errors: List[str]) -> str:
+    """Quote a linter's error output back at the model.
+
+    Specifically frames the errors as bugs (`F` rules for ruff catch undefined
+    names and unused imports; `error` lines for eslint catch the same class
+    of issues) rather than style. The model frequently introduces stray
+    leftover imports or references to a renamed variable when patching;
+    surfacing those before <final> turns them from "subtle bug in the diff"
+    into "obvious thing to fix in one more turn".
+    """
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Static analysis flagged issues on touched file(s):\n  {bullets}\n\n"
+        "These are likely real bugs introduced by the patch — undefined "
+        "names, unused imports left behind by a rename, references to "
+        "removed symbols, etc. Issue the smallest fix command(s) to clear "
+        "the listed errors. Do NOT broaden the patch, do NOT refactor, do "
+        "NOT silence the linter with comments. Then end with "
         "<final>summary</final>."
     )
 
@@ -3010,63 +2976,6 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
-    )
-
-
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
-    """Extract file paths recently read by the model from the last `window` log entries.
-
-    Scans for paths surfaced via read_file/cat observations so the mid-loop
-    hail-mary prompt can suggest concrete edit targets. Pure Python; no subprocess.
-    """
-    try:
-        path_re = re.compile(r"(?:^|\s|/|')([A-Za-z0-9_.\-/]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|rb|swift|svelte|md|json|toml|yaml|yml|sh))\b")
-        seen: set = set()
-        results: List[str] = []
-        for entry in logs[-window:]:
-            for m in path_re.finditer(entry):
-                p = m.group(1).lstrip("/")
-                if p and p not in seen and len(p) >= 4:
-                    seen.add(p)
-                    results.append(p)
-                    if len(results) >= 8:
-                        return results
-        return results
-    except Exception:
-        return []
-
-
-def build_mid_loop_hail_mary_prompt(
-    issue_text: str,
-    elapsed: float,
-    budget: float,
-    last_observed_paths: List[str],
-) -> str:
-    """Emergency prompt fired mid-loop when no edit has been made and >55% of wall-clock is gone.
-
-    Tells the model explicitly: stop reading, pick the most likely target file,
-    and emit edit_file commands now.
-    """
-    pct = int(100 * elapsed / budget) if budget > 0 else 55
-    path_hint = ""
-    if last_observed_paths:
-        path_hint = (
-            "\n\nFiles you have already read (most likely candidates for the fix):\n"
-            + "".join(f"  - {p}\n" for p in last_observed_paths[:5])
-        )
-    short_issue = issue_text[:800] if len(issue_text) > 800 else issue_text
-    return (
-        f"MID-LOOP BUDGET ALERT: {pct}% of wall-clock is gone and no code has been edited yet.\n\n"
-        "STOP READING FILES. You must emit edit commands NOW.\n\n"
-        "Pick the single most likely file to fix based on the issue and what you have already read. "
-        "Use `sed -i`, a python heredoc, or `python - <<'PY' ... PY` to make the smallest "
-        "targeted change that addresses the ROOT CAUSE. Do not run broad searches. "
-        "If you are still uncertain, make a best-effort minimal edit to the most plausible location "
-        "and iterate.\n"
-        f"{path_hint}\n"
-        "Task (reminder):\n"
-        f"{short_issue}\n\n"
-        "Emit your edit command(s) now, then run one verification command, then <final>."
     )
 
 
@@ -3326,11 +3235,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    static_fix_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
-    mid_loop_hail_mary_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3372,7 +3281,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, static_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3409,7 +3318,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Gate order: syntax → static → test → deletion → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -3423,6 +3332,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Static-analyzer gate (v29). Fires after syntax (we already know the
+        # file parses) and before test (running ruff/eslint is much cheaper
+        # than running a real test). Skips silently when the tool isn't on
+        # PATH so it never wastes a refinement turn on a no-op.
+        if static_fix_turns_used < MAX_STATIC_FIX_TURNS:
+            static_errors = _check_static_analysis(repo, patch)
+            if static_errors:
+                static_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_static_fix_prompt(static_errors),
+                    "STATIC_FIX_QUEUED:\n  " + "\n  ".join(static_errors[:5]),
                 )
                 return True
 
@@ -3506,8 +3431,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 queue_refinement_turn(
                     assistant_text,
                     build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap,
-                        removed_names=_patch_removed_definitions(patch),
+                        missing, issue, relocation_gap=relocation_gap
                     ),
                     marker,
                 )
@@ -3528,10 +3452,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
-            _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
+                build_self_check_prompt(patch, issue),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -3542,9 +3465,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path)
         model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
+        # Disable git's executable-bit tracking for this attempt. In this
+        # sandbox the working-tree mode drifts from HEAD's recorded mode
+        # for incidental reasons (container umask, side effects of
+        # `sed -i`, stray chmod). Each drift causes `git diff` to emit
+        # `old mode <N>` / `new mode <N>` metadata lines on otherwise
+        # content-only edits. The reference patch never carries those
+        # lines, so they only widen cursor-similarity distance. Setting
+        # `core.fileMode=false` tells git to ignore mode bits when
+        # computing diffs, so the metadata disappears at the source.
+        # Repo-local config; does not affect any other repo or run.
+        try:
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
-        _tracked_set_for_checks: set = set(_tracked_files(repo))
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -3586,23 +3529,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "exiting loop early to return whatever patch we have."
                 )
                 break
-
-            _elapsed_now = time.monotonic() - solve_started_at
-            if (
-                mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
-                and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
-                and not get_patch(repo).strip()
-            ):
-                mid_loop_hail_mary_used += 1
-                messages.append({
-                    "role": "user",
-                    "content": build_mid_loop_hail_mary_prompt(
-                        issue, _elapsed_now, wall_clock_budget,
-                        _recently_observed_paths(logs),
-                    ),
-                })
-                logs.append("MID_LOOP_HAIL_MARY_FIRED")
-                continue
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
