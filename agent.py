@@ -108,8 +108,11 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.50
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -117,6 +120,7 @@ MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
+MAX_CORRECTNESS_FIX_TURNS = 1  # repair undefined-name / missing-import bugs that parse cleanly
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -1900,6 +1904,201 @@ def _shell_quote(value: str) -> str:
 
 
 # -----------------------------
+# Pre-final correctness gate
+# -----------------------------
+#
+# _check_syntax catches a SyntaxError. It does NOT catch a name that parses
+# fine but is bound nowhere (undefined variable), or a React hook used without
+# an import. Those two bug classes are the dominant *non-timeout* loss mode in
+# duel 004699/004700 round data: the challenger repeatedly shipped patches that
+# parsed cleanly but referenced `uploadingProgress` / `allExercises` / `session`
+# (bound nowhere) or used `useMemo` / `useEffect` without importing them. This
+# gate adds a cheap, language-targeted check for exactly those two classes.
+
+_REACT_HOOKS = (
+    "useState", "useEffect", "useMemo", "useCallback", "useRef",
+    "useContext", "useReducer", "useLayoutEffect", "useImperativeHandle",
+    "useDeferredValue", "useTransition", "useId", "useSyncExternalStore",
+)
+
+
+def _read_repo_text(repo: Path, relative_path: str) -> Optional[str]:
+    """Read a repo-relative file as text, or None if missing / outside repo."""
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        return full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _py_bound_names(tree: Any) -> set:
+    """Every name bound anywhere in the module, scope-flattened.
+
+    Flattening is deliberate: it can MISS a real use-before-scope bug (a false
+    negative we accept) but never invents one. We only want names bound
+    *nowhere* — the genuine 'undefined variable' class.
+    """
+    import ast as _ast
+    bound: set = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, _ast.Name) and isinstance(node.ctx, (_ast.Store, _ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, _ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, _ast.alias):
+            # `import a.b.c` binds `a`; `import a.b.c as d` binds `d`.
+            bound.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (_ast.Global, _ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, _ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        else:
+            for attr in ("name", "rest"):  # ast.MatchAs / ast.MatchStar / ast.MatchMapping
+                val = getattr(node, attr, None)
+                if isinstance(val, str) and type(node).__name__.startswith("Match"):
+                    bound.add(val)
+    return bound
+
+
+def _check_undefined_names_py(repo: Path, relative_path: str) -> List[str]:
+    """Flag bare names used (Load context) but bound nowhere in the module."""
+    source = _read_repo_text(repo, relative_path)
+    if source is None:
+        return []
+    try:
+        import ast as _ast
+        tree = _ast.parse(source)
+    except Exception:
+        return []  # the syntax gate owns parse failures
+    for node in _ast.walk(tree):
+        # A star-import makes scope-flattening unreliable — skip the file.
+        if isinstance(node, _ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            return []
+    import builtins as _bi
+    known = _py_bound_names(tree) | set(dir(_bi)) | {
+        "__file__", "__name__", "__doc__", "__package__", "__spec__",
+        "__loader__", "__builtins__", "__all__", "__path__", "__dict__",
+        "__class__", "__module__", "__qualname__", "__annotations__",
+    }
+    undefined: List[Tuple[int, str]] = []
+    seen: set = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Name) and isinstance(node.ctx, _ast.Load):
+            if node.id not in known and node.id not in seen:
+                seen.add(node.id)
+                undefined.append((getattr(node, "lineno", 0), node.id))
+    # >3 distinct undefined names: scope-flattening is probably wrong for this
+    # file (heavy metaprogramming, etc.) — stay silent rather than spam a turn.
+    if not undefined or len(undefined) > 3:
+        return []
+    return [
+        f"{relative_path}:{lineno}: name '{name}' is used but never defined or imported"
+        for lineno, name in undefined
+    ]
+
+
+def _check_react_hook_imports(repo: Path, relative_path: str) -> List[str]:
+    """Flag React hooks called in a file that never imports them from 'react'."""
+    if Path(relative_path).suffix.lower() not in {".js", ".jsx", ".ts", ".tsx"}:
+        return []
+    source = _read_repo_text(repo, relative_path)
+    if source is None:
+        return []
+    namespace = bool(re.search(r"""import\s+\*\s+as\s+\w+\s+from\s+['"]react['"]""", source))
+    require_react = bool(re.search(r"""require\(\s*['"]react['"]\s*\)""", source))
+    imported: set = set()
+    for clause in re.findall(r"""import\s+(.+?)\s+from\s+['"]react['"]""", source, re.DOTALL):
+        for m in re.finditer(r"[A-Za-z_$][\w$]*", clause):
+            imported.add(m.group(0))
+    errors: List[str] = []
+    for hook in _REACT_HOOKS:
+        # Bare call `useMemo(` — the `.`/word lookbehind excludes `React.useMemo`.
+        if not re.search(rf"(?<![\w.]){hook}\s*\(", source):
+            continue
+        if namespace or require_react:
+            continue  # React.useMemo / require style — can't cheaply verify
+        if hook not in imported:
+            errors.append(f"{relative_path}: '{hook}' is called but not imported from 'react'")
+    return errors[:5]
+
+
+def _check_correctness(repo: Path, patch: str) -> List[str]:
+    """Catch undefined-name / missing-import bugs that parse cleanly.
+
+    Grounded in duel 004699/004700 round data — see the section comment above.
+    """
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        try:
+            if suffix == ".py":
+                errors.extend(_check_undefined_names_py(repo, relative_path))
+            elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+                errors.extend(_check_react_hook_imports(repo, relative_path))
+        except Exception:
+            continue
+        if len(errors) >= 10:
+            break
+    return errors
+
+
+def _check_orphaned_new_files(repo: Path, patch: str) -> List[str]:
+    """Advise when the patch creates a new file that nothing else references.
+
+    Grounded in duel 004700 (065034): the challenger 'only adds the utility
+    file, does not integrate it'. A created module no other file imports or
+    mentions is almost always an incomplete integration.
+    """
+    new_files = _patch_newly_created_files(patch)
+    if not new_files:
+        return []
+    changed = set(_patch_changed_files(patch))
+    advisories: List[str] = []
+    for new_path in new_files[:6]:
+        stem = Path(new_path).stem
+        base = Path(new_path).name.lower()
+        if not stem or len(stem) < 3 or stem.lower() in {"index", "__init__", "mod", "main"}:
+            continue
+        if base.endswith((".md", ".txt", ".json", ".lock", ".cfg", ".ini",
+                          ".toml", ".yaml", ".yml", ".env", ".rst")):
+            continue
+        referenced = False
+        for other in changed:
+            if other == new_path:
+                continue
+            other_src = _read_repo_text(repo, other)
+            if other_src and stem in other_src:
+                referenced = True
+                break
+        if not referenced:
+            try:
+                grep = subprocess.run(
+                    ["git", "grep", "-l", "-F", stem, "--", ":!" + new_path],
+                    cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=10,
+                )
+                # returncode 0 = match found, 1 = no match, other = error.
+                if grep.returncode != 1:
+                    referenced = True
+            except Exception:
+                referenced = True  # never advise on a failed grep
+        if not referenced:
+            advisories.append(
+                f"new file {new_path!r} is not imported or referenced by any other "
+                "file — verify it is actually wired into the codebase"
+            )
+    return advisories[:3]
+
+
+# -----------------------------
 # Companion-test discovery + execution
 # -----------------------------
 #
@@ -2436,6 +2635,25 @@ _IDENTIFIER_STOPWORDS = {
     "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
     "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
     "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
+    "Card", "Modal", "Form", "Button", "Input", "Label", "Image", "Menu",
+    "Header", "Footer", "Layout", "Page", "Section", "Container", "Wrapper",
+    "Element", "Component", "Service", "Manager", "Handler", "Provider",
+    "Context", "Status", "Value", "Field", "Item", "Result", "Response",
+    "Request", "Config", "Settings", "Options", "Properties", "Default",
+    "Module", "Class", "Object", "String", "Number", "Array", "Function",
+    "Method", "Action", "State", "Store", "Schema", "Model", "View",
+    "Index", "Route", "Router", "Render", "Update", "Create", "Delete",
+    "useState", "useEffect", "useCallback", "useMemo", "useRef", "useContext",
+    "useRouter", "setState", "setValue", "getValue", "getDefault",
+    "handleClick", "handleChange", "handleSubmit", "handleClose", "handleError",
+    "fetchData", "createElement", "createContext", "buildPath", "buildUrl",
+}
+
+_HOOK_GENERIC_PREFIXES_LOWER = {
+    "usestate", "useeffect", "usecallback", "usememo", "useref", "usecontext",
+    "userouter", "setstate", "setvalue", "getvalue", "getdefault",
+    "handleclick", "handlechange", "handlesubmit", "handleclose", "handleerror",
+    "fetchdata", "createelement", "createcontext", "buildpath", "buildurl",
 }
 
 _CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
@@ -2458,8 +2676,11 @@ def _issue_identifier_path_boost(
             if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
                 identifiers.add(tok.lower())
         for m in _HOOK_RE.finditer(issue_text):
+            hook_lower = m.group(0).lower()
+            if hook_lower in _HOOK_GENERIC_PREFIXES_LOWER:
+                continue
             if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
+                identifiers.add(hook_lower)
         for m in _SNAKE_RE.finditer(issue_text):
             if len(identifiers) < cap:
                 identifiers.add(m.group(1).lower())
@@ -2859,10 +3080,56 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    """Return a 1-line type-specific cue prepended to the self-check prompt.
+
+    Heuristic keyword scan over the issue text. Empty when no strong type signal lands
+    (the prompt then degrades to the generic boilerplate). Cheap and stateless.
+    """
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
     inplace_advisories: Optional[List[str]] = None,
+    integration_advisories: Optional[List[str]] = None,
 ) -> str:
     """Show the model its own draft and ask for a focused self-review."""
     truncated = (
@@ -2879,7 +3146,18 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    if integration_advisories:
+        bullets = "\n  ".join(f"- {a}" for a in integration_advisories[:3])
+        advisory_block += (
+            "\nINTEGRATION WARNINGS (check before finalizing):\n"
+            f"  {bullets}\n"
+            "A new file that nothing imports or calls is dead code. Either wire it "
+            "into the real call sites the task expects, or fold its contents into an "
+            "existing file — do not leave it orphaned.\n"
+        )
+    type_cue = _self_check_type_cue(issue_text)
     return (
+        f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
@@ -2916,6 +3194,21 @@ def build_syntax_fix_prompt(errors: List[str]) -> str:
         "Issue the smallest possible fix command(s) to restore parseable code. "
         "Do NOT introduce new edits, do NOT refactor. Then end with "
         "<final>summary</final>."
+    )
+
+
+def build_correctness_fix_prompt(errors: List[str]) -> str:
+    """Quote undefined-name / missing-import findings back at the model."""
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        "Correctness check found likely undefined-name / missing-import bugs in "
+        f"your patch — these parse fine but will fail at runtime:\n  {bullets}\n\n"
+        "For each finding, either:\n"
+        "  (a) add the missing import, or define/spell the name correctly; OR\n"
+        "  (b) if it genuinely refers to existing repo code, confirm the spelling "
+        "matches the real symbol.\n"
+        "Issue the smallest fix command(s) only — do NOT refactor or add scope. "
+        "Then end with <final>summary</final>."
     )
 
 
@@ -3013,7 +3306,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+def _recently_observed_paths(logs: List[str], window: int = 80) -> List[str]:
     """Extract file paths recently read by the model from the last `window` log entries.
 
     Scans for paths surfaced via read_file/cat observations so the mid-loop
@@ -3034,6 +3327,23 @@ def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
         return results
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    """Mild budget reminder fired once when the model has cycled several steps without committing.
+
+    Unlike build_mid_loop_hail_mary_prompt, this does NOT order the model to stop reading or
+    pick a file — it nudges toward commitment without derailing a legitimate plan. Empty when
+    the model already has a clear target and will edit naturally.
+    """
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_hail_mary_prompt(
@@ -3326,11 +3636,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    correctness_fix_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
+    soft_nudge_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3361,18 +3673,20 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
+            1. syntax — quote any parser error back at the model
+            2. correctness — undefined-name / missing-import bugs that parse
             3. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
+            4. deletion — issue says remove/delete but patch has no deletions
             5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
+            6. coverage-nudge — name issue-mentioned paths still untouched
+            7. polish — drop low-signal hunks the model still emitted
+            8. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per cycle. Correctness fires AFTER
+        syntax (we know the patch parses) but BEFORE test (a missing import
+        makes the test run meaningless).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, correctness_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3409,7 +3723,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Gate order: syntax → correctness → test → deletion → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -3423,6 +3737,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Correctness gate — runs right after syntax (the patch parses) but
+        # before the test gate (a missing import makes the test run
+        # meaningless). Catches undefined-name / missing-import bugs that
+        # parse cleanly: the dominant non-timeout loss mode in duel
+        # 004699/004700 round data.
+        if correctness_fix_turns_used < MAX_CORRECTNESS_FIX_TURNS:
+            correctness_errors = _check_correctness(repo, patch)
+            if correctness_errors:
+                correctness_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_correctness_fix_prompt(correctness_errors),
+                    "CORRECTNESS_FIX_QUEUED:\n  " + "\n  ".join(correctness_errors[:5]),
                 )
                 return True
 
@@ -3529,9 +3860,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             self_check_turns_used += 1
             total_refinement_turns_used += 1
             _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
+            _integration_adv = _check_orphaned_new_files(repo, patch)
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
+                build_self_check_prompt(
+                    patch, issue,
+                    inplace_advisories=_inplace_adv,
+                    integration_advisories=_integration_adv,
+                ),
                 "SELF_CHECK_QUEUED",
             )
             return True
@@ -3555,8 +3891,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3588,6 +3922,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and not get_patch(repo).strip()
+                and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            ):
+                soft_nudge_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_soft_nudge_prompt(step, _elapsed_now),
+                })
+                logs.append(f"SOFT_NUDGE_FIRED: step={step} elapsed={_elapsed_now:.1f}s")
+                continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
