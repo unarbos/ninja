@@ -55,6 +55,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -108,8 +110,50 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
+
+# Mid-loop hail-mary: fires DURING the inspection loop when the model is
+# over-reading and the wall-clock is half-spent with no patch yet. In the
+# parallel-branching wrapper the fraction is now per-branch (see
+# _PARALLEL_BRANCH_HAIL_MARY_FRACTION): branch 0 keeps the original 55%
+# (patient), branch 1 fires at 40% (aggressive). The single-branch fallback
+# uses the legacy 55% so behavior is identical to new_candidate when
+# parallel branching can't run.
 _MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+
+# -----------------------------
+# Parallel-branching constants (v30: layered on top of new_candidate.py)
+# -----------------------------
+#
+# new_candidate.py inherits 1298's serial multishot: attempt 1, then attempt 2
+# only if attempt 1 was thin. The mid-loop hail-mary helps single-thread cases
+# where the model over-reads, but it doubles down on one line of reasoning.
+# Running 2 inner attempts concurrently on isolated repo copies and picking
+# the best patch is a strict improvement: same total wall-clock, twice the
+# shots, plus the branches diverge via asymmetric hail-mary triggers.
+_PARALLEL_BRANCHES = 2
+# Per-branch mid-loop hail-mary fraction. Branch 0 = patient (matches
+# new_candidate exactly); branch 1 = aggressive (fires earlier, producing a
+# distinct patch when the model would otherwise read too much).
+_PARALLEL_BRANCH_HAIL_MARY_FRACTION: Tuple[float, ...] = (0.55, 0.40)
+_PARALLEL_BRANCH_HINTS: Tuple[str, ...] = (
+    # Branch 0: primary path — no extra hint, matches new_candidate exactly.
+    "",
+    # Branch 1: diversity prompt that asks the model to read more before
+    # editing. The earlier hail-mary trigger pairs with this — branch 1
+    # explores broader but is forced to commit sooner.
+    (
+        "BRANCH HINT: Before editing, spend one extra inspection step "
+        "verifying the bug's owner. Specifically check (1) the test file "
+        "that covers the affected behavior if one exists, and (2) any "
+        "call-site that depends on the function you intend to change. "
+        "Then make the smallest patch that fixes the ROOT CAUSE.\n\n"
+    ),
+)
+# Soft per-branch wall-clock deadline. The wrapper kills stragglers here so
+# we always return a patch in time, regardless of any one branch hanging.
+_PARALLEL_DEADLINE_SECONDS = 268.0
+_PARALLEL_COPY_OVERHEAD_SECONDS = 6.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -118,10 +162,13 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
-MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
+MAX_COVERAGE_NUDGES = 2    # v30: raised 1→2 — second fire only triggers if the patch hasn't
+                            # changed since the first nudge, surfacing stubborn coverage gaps
+                            # without spending a turn when the model already addressed it.
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
+MAX_STATIC_FIX_TURNS = 1   # v30: lint/static-analyzer errors (ruff for python, eslint/tsc for js/ts)
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -1894,6 +1941,166 @@ def _has_executable(name: str) -> bool:
         return False
 
 
+# -----------------------------
+# Static-analyzer gate (v30)
+# -----------------------------
+#
+# The syntax gate catches gross parse failures, but real reference patches
+# typically pass a linter cleanly: unused imports, undefined names,
+# obviously-broken refs are caught by `ruff check` / `eslint` / `tsc --noEmit`
+# and never make it into a maintainer's commit. Adding a static-analyzer gate
+# gives the model one chance to clean those up before <final>.
+#
+# Best-effort by design: each tool is skipped silently when not on PATH, and
+# errors are collected without aborting if a single file blows up the tool.
+# The gate is wired in between syntax-fix and test-fix in
+# maybe_queue_refinement — after we know the file parses but before we spend
+# wall-clock on running tests.
+
+_STATIC_TIMEOUT = 8  # per-tool-invocation cap
+
+
+def _run_ruff_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `ruff check` on one Python file. Returns lint error strings.
+
+    Restricted to error-level rules (E, F) so the gate flags genuine bugs
+    (undefined names, syntax-adjacent issues, unused imports introduced by
+    the patch) without nagging the model about style — that would just
+    trigger a polish-equivalent loop and waste the refinement budget.
+    """
+    if not _has_executable("ruff"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "ruff", "check",
+                "--select=E,F",
+                "--no-fix",
+                "--output-format=concise",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    return [line.strip() for line in out if line.strip()][:8]
+
+
+def _run_eslint_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `eslint` on one JS/TS file. Returns error-level findings only."""
+    if not _has_executable("eslint"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "eslint",
+                "--no-color",
+                "--format=compact",
+                "--no-eslintrc",
+                "--quiet",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    errs: List[str] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if " error " in line or line.lower().endswith(" error"):
+            errs.append(line)
+        if len(errs) >= 8:
+            break
+    return errs
+
+
+def _run_tsc_check(repo: Path, relative_path: str) -> List[str]:
+    """Run `tsc --noEmit` to catch TypeScript type errors.
+
+    Type errors are a distinct bug class from eslint findings — eslint
+    catches undefined names and lint violations, tsc catches signature/type
+    mismatches that would prevent compilation. We pass the file explicitly
+    rather than relying on a project tsconfig (which may not exist or may
+    include broader directories the model didn't touch).
+    """
+    if not _has_executable("tsc"):
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                "tsc",
+                "--noEmit",
+                "--target", "ES2020",
+                "--module", "commonjs",
+                "--esModuleInterop",
+                "--strict", "false",
+                relative_path,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_STATIC_TIMEOUT,
+            env=_command_env(),
+        )
+    except Exception:
+        return []
+    if proc.returncode == 0:
+        return []
+    out = (proc.stdout or "").strip().splitlines()
+    # tsc lines look like: `src/foo.ts(12,3): error TS2304: Cannot find name 'bar'.`
+    errs: List[str] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if "error TS" in line:
+            errs.append(line)
+        if len(errs) >= 8:
+            break
+    return errs
+
+
+def _check_static_analysis(repo: Path, patch: str) -> List[str]:
+    """Aggregate static-analyzer errors across files touched by the patch.
+
+    Returns a flat list of error strings (capped at 12 total) suitable for
+    quoting back to the model. Skips files we have no analyzer for and tools
+    not installed on PATH; both cases produce no false-positive errors.
+    """
+    errors: List[str] = []
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            errors.extend(_run_ruff_check(repo, relative_path))
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            errors.extend(_run_eslint_check(repo, relative_path))
+            if suffix in {".ts", ".tsx"}:
+                errors.extend(_run_tsc_check(repo, relative_path))
+        if len(errors) >= 12:
+            break
+    return errors[:12]
+
+
 def _shell_quote(value: str) -> str:
     """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
@@ -2908,6 +3115,29 @@ def build_self_check_prompt(
     )
 
 
+def build_static_fix_prompt(errors: List[str]) -> str:
+    """Quote a linter's error output back at the model.
+
+    Frames the errors as bugs (`F` rules for ruff catch undefined names and
+    unused imports; `error` lines for eslint catch the same class of issues;
+    tsc TS-coded errors catch real type mismatches) rather than style. The
+    model frequently introduces stray leftover imports or references to a
+    renamed variable when patching; surfacing those before <final> turns
+    them from "subtle bug in the diff" into "obvious thing to fix in one
+    more turn".
+    """
+    bullets = "\n  ".join(errors[:10]) or "(none)"
+    return (
+        f"Static analysis flagged issues on touched file(s):\n  {bullets}\n\n"
+        "These are likely real bugs introduced by the patch — undefined "
+        "names, unused imports left behind by a rename, type mismatches, "
+        "references to removed symbols, etc. Issue the smallest fix "
+        "command(s) to clear the listed errors. Do NOT broaden the patch, "
+        "do NOT refactor, do NOT silence the linter with comments. Then "
+        "end with <final>summary</final>."
+    )
+
+
 def build_syntax_fix_prompt(errors: List[str]) -> str:
     """Quote a parser's error output back at the model and demand a minimal repair."""
     bullets = "\n  ".join(errors[:10]) or "(none)"
@@ -3223,73 +3453,188 @@ def solve(
     )
 
 
-def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """Run multi-shot solving, salvaging the current patch on unexpected errors."""
-    repo_path = kwargs["repo_path"]
-    _multishot_repo_obj = None
+def _copy_repo_for_branch(source: Path) -> Optional[str]:
+    """Deep-copy `source` into a fresh temp directory and return the new path.
+
+    Returns None on failure so the caller falls back to fewer branches
+    rather than aborting. Copies under a temp parent into a `repo`
+    subdirectory so `mkdtemp`'s pre-existing dir doesn't trip copytree.
+    """
     try:
-        _multishot_repo_obj = _repo_path(repo_path)
+        parent = tempfile.mkdtemp(prefix="agent_branch_")
+        dest = os.path.join(parent, "repo")
+        shutil.copytree(str(source), dest, symlinks=True)
+        return dest
+    except Exception:
+        return None
+
+
+def _cleanup_branch_copy(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent and parent.startswith(tempfile.gettempdir() + os.sep):
+            shutil.rmtree(parent, ignore_errors=True)
     except Exception:
         pass
 
+
+def _score_branch_result(result: Dict[str, Any]) -> Tuple[int, int]:
+    """Score a branch result for winner-selection. Higher tuple = better.
+
+    Tiers:
+      1. Substantive `+` line count — directly drives validator scoring.
+      2. success flag — tie-breaker between branches with equal line count.
+    """
+    patch = result.get("patch", "") or ""
+    n_substantive = _multishot_count_substantive(patch)
+    success_bonus = 1 if result.get("success") else 0
+    return (n_substantive, success_bonus)
+
+
+def _solve_branch_thread(
+    branch_idx: int,
+    branch_kwargs: Dict[str, Any],
+    results: Dict[int, Dict[str, Any]],
+    errors: Dict[int, str],
+) -> None:
+    """Thread target: run one `_solve_attempt` and stash the result."""
     try:
-        _multishot_started = time.monotonic()
-        _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
+        results[branch_idx] = _solve_attempt(**branch_kwargs)
+    except Exception as exc:
+        errors[branch_idx] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        results[branch_idx] = AgentResult(
+            patch="", logs=f"BRANCH_EXCEPTION:\n{errors[branch_idx]}",
+            steps=0, cost=0.0, success=False,
+        ).to_dict()
 
-        _result1 = _solve_attempt(**kwargs)
-        _patch1 = _result1.get("patch", "") or ""
-        _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
-            _result1["multishot_attempts"] = 1
-            return _result1
+def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
+    """Run parallel-branching solve, salvaging the current patch on errors.
 
-        _elapsed = time.monotonic() - _multishot_started
-        if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "insufficient_time"
-            return _result1
+    v30: replaces new_candidate.py's serial multishot with N concurrent
+    `_solve_attempt`s on isolated repo copies. Branch 0 always runs on the
+    original repo so its patch is on disk even if the wrapper crashes.
+    Branches 1..N-1 run on temp copies; on win, their patch is re-applied
+    to the original repo before returning. Each branch gets a distinct
+    mid-loop hail-mary fraction so they explore the task differently.
 
-        if _elapsed > _MULTISHOT_MAX_FIRST_ELAPSED:
-            # Attempt 1 already burned the outer budget — starting attempt 2
-            # invites a docker_solver kill (hard wall ~300s from exec start),
-            # which is strictly worse than shipping attempt 1's thin patch.
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "first_attempt_used_outer_budget"
-            return _result1
+    If parallel branching can't run (only one branch can be allocated,
+    e.g. due to a copytree failure), we still execute branch 0 and return
+    its result — matching new_candidate.py behavior exactly for that path.
+    """
+    repo_path = kwargs["repo_path"]
+    primary_repo: Optional[Path] = None
+    try:
+        primary_repo = _repo_path(repo_path)
+    except Exception:
+        pass
 
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
-        _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
-        _patch2 = _result2.get("patch", "") or ""
-        _n2 = _multishot_count_substantive(_patch2)
+    branch_copies: List[Optional[str]] = []
+    try:
+        started = time.monotonic()
+        initial_head = _multishot_capture_head(primary_repo) if primary_repo else None
 
-        if _n2 >= _n1:
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            return _result2
+        # Allocate per-branch repo paths. Branch 0 reuses the original.
+        # Subsequent branches deep-copy into a temp dir; if copy fails we
+        # silently drop that branch rather than abort the whole solve.
+        branch_paths: List[str] = [repo_path]
+        branch_copies = [None]
+        for idx in range(1, _PARALLEL_BRANCHES):
+            if primary_repo is None:
+                break
+            copy_path = _copy_repo_for_branch(primary_repo)
+            if copy_path is None:
+                break
+            branch_paths.append(copy_path)
+            branch_copies.append(copy_path)
 
-        if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
-        return _result1
+        per_branch_budget = max(
+            60.0,
+            _PARALLEL_DEADLINE_SECONDS
+            - (time.monotonic() - started)
+            - _PARALLEL_COPY_OVERHEAD_SECONDS,
+        )
+
+        results: Dict[int, Dict[str, Any]] = {}
+        errors: Dict[int, str] = {}
+        threads: List[threading.Thread] = []
+
+        for idx, branch_path in enumerate(branch_paths):
+            hint = _PARALLEL_BRANCH_HINTS[idx] if idx < len(_PARALLEL_BRANCH_HINTS) else ""
+            hail_mary_fraction = (
+                _PARALLEL_BRANCH_HAIL_MARY_FRACTION[idx]
+                if idx < len(_PARALLEL_BRANCH_HAIL_MARY_FRACTION)
+                else _MID_LOOP_HAIL_MARY_BUDGET_FRACTION
+            )
+            branch_kwargs = {
+                **kwargs,
+                "repo_path": branch_path,
+                "_wall_clock_budget": per_branch_budget,
+                "_prior_attempt_summary": hint,
+                "_mid_loop_hail_mary_fraction": hail_mary_fraction,
+            }
+            t = threading.Thread(
+                target=_solve_branch_thread,
+                args=(idx, branch_kwargs, results, errors),
+                daemon=True,
+                name=f"agent-branch-{idx}",
+            )
+            t.start()
+            threads.append(t)
+
+        # Join every thread with a cap at the outer deadline so a hung
+        # branch can't push us past the docker hard wall.
+        deadline = started + _PARALLEL_DEADLINE_SECONDS
+        for t in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
+
+        scored: List[Tuple[Tuple[int, int], int]] = []
+        for idx, result in results.items():
+            scored.append((_score_branch_result(result), idx))
+        scored.sort(key=lambda item: (-item[0][0], -item[0][1], item[1]))
+
+        if not scored:
+            # No branch finished before the deadline. Salvage on-disk patch
+            # from primary repo (branch 0 was running there).
+            salvaged_patch = ""
+            if primary_repo is not None:
+                try:
+                    salvaged_patch = get_patch(primary_repo)
+                except Exception:
+                    salvaged_patch = ""
+            return AgentResult(
+                patch=salvaged_patch or "",
+                logs=(
+                    "PARALLEL_NO_RESULTS: no branch finished before deadline; "
+                    "returning on-disk patch from primary repo."
+                ),
+                steps=0, cost=0.0, success=bool(salvaged_patch.strip()),
+            ).to_dict()
+
+        winner_idx = scored[0][1]
+        winner = dict(results[winner_idx])
+        winner["parallel_branches"] = len(branch_paths)
+        winner["parallel_winner"] = winner_idx
+        winner["parallel_scores"] = {idx: score for score, idx in scored}
+
+        # If a temp-copy branch won, re-apply its patch to the primary repo
+        # so the returned `patch` is also on disk.
+        if winner_idx != 0 and primary_repo is not None:
+            winner_patch = winner.get("patch", "") or ""
+            _multishot_revert(primary_repo, initial_head)
+            if winner_patch.strip():
+                _multishot_apply_patch(primary_repo, winner_patch)
+
+        return winner
 
     except Exception as exc:
         salvaged = ""
         try:
-            if _multishot_repo_obj is not None:
-                salvaged = get_patch(_multishot_repo_obj)
+            if primary_repo is not None:
+                salvaged = get_patch(primary_repo)
         except Exception:
             salvaged = ""
         return AgentResult(
@@ -3302,6 +3647,9 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             cost=0.0,
             success=bool(salvaged.strip()),
         ).to_dict()
+    finally:
+        for copy in branch_copies:
+            _cleanup_branch_copy(copy)
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -3317,6 +3665,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
     wall_clock_budget = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
     prior_attempt_summary = kwargs.get("_prior_attempt_summary", "")
+    # v30: per-branch mid-loop hail-mary fraction. Parallel wrapper passes a
+    # different value for each branch so they explore differently. Defaults
+    # to the legacy fraction so single-branch fallback matches new_candidate.
+    mid_loop_hail_mary_fraction = float(
+        kwargs.get("_mid_loop_hail_mary_fraction", _MID_LOOP_HAIL_MARY_BUDGET_FRACTION)
+    )
 
     repo: Optional[Path] = None
     logs: List[str] = []
@@ -3326,8 +3680,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    static_fix_turns_used = 0
     test_fix_turns_used = 0
     coverage_nudges_used = 0
+    coverage_nudge_last_patch = ""  # v30: track patch state when coverage nudge fired,
+                                     # so a re-fire only triggers when the model
+                                     # ignored the gap (patch unchanged).
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
@@ -3372,7 +3730,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, static_fix_turns_used, test_fix_turns_used, coverage_nudges_used, coverage_nudge_last_patch, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         if must_edit_after_gap:
@@ -3423,6 +3781,22 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Static-analyzer gate (v30). Fires after syntax (we already know the
+        # file parses) and before test (running ruff/eslint/tsc is much
+        # cheaper than running a real test). Skips silently when the tool
+        # isn't on PATH so it never wastes a refinement turn on a no-op.
+        if static_fix_turns_used < MAX_STATIC_FIX_TURNS:
+            static_errors = _check_static_analysis(repo, patch)
+            if static_errors:
+                static_fix_turns_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_static_fix_prompt(static_errors),
+                    "STATIC_FIX_QUEUED:\n  " + "\n  ".join(static_errors[:5]),
                 )
                 return True
 
@@ -3491,17 +3865,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
+            # v30: second-fire guard. Only re-fire if the patch hasn't changed
+            # since the first nudge. If the model already addressed the
+            # listed paths (patch differs), don't waste a refinement turn —
+            # the new uncovered set will trigger only if a real gap remains.
+            should_fire = bool(missing or relocation_gap)
+            if should_fire and coverage_nudges_used >= 1 and patch == coverage_nudge_last_patch:
+                # Stubborn gap — re-fire with the same nudge so the model
+                # sees it twice. Hitting the same gate twice is intentional
+                # when the model emitted <final> without actually editing.
+                pass  # keep should_fire=True
+            elif should_fire and coverage_nudges_used >= 1 and patch != coverage_nudge_last_patch:
+                # Patch changed since first nudge but a NEW coverage gap
+                # appeared. Fire only if the new gap differs from the
+                # previously-flagged one; otherwise the model is iterating.
+                pass  # still fire — _uncovered_required_paths reflects current state
+            if should_fire:
                 coverage_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
+                coverage_nudge_last_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
                 marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
                 marker = (
                     "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
                     + ("\n  [+relocation-gap]" if relocation_gap else "")
+                    + (f"\n  [re-fire #{coverage_nudges_used}]" if coverage_nudges_used >= 2 else "")
                 )
                 queue_refinement_turn(
                     assistant_text,
@@ -3590,7 +3981,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             _elapsed_now = time.monotonic() - solve_started_at
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
-                and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+                and _elapsed_now >= mid_loop_hail_mary_fraction * wall_clock_budget
                 and not get_patch(repo).strip()
             ):
                 mid_loop_hail_mary_used += 1
@@ -3601,7 +3992,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         _recently_observed_paths(logs),
                     ),
                 })
-                logs.append("MID_LOOP_HAIL_MARY_FIRED")
+                logs.append(
+                    f"MID_LOOP_HAIL_MARY_FIRED at "
+                    f"{_elapsed_now:.1f}s/{wall_clock_budget:.1f}s "
+                    f"(fraction={mid_loop_hail_mary_fraction:.2f})"
+                )
                 continue
 
             response_text: Optional[str] = None
