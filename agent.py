@@ -114,10 +114,18 @@ WALL_CLOCK_RESERVE_SECONDS = 20.0
 # Mid-loop rescue: when the model is still reading at this wall-clock fraction
 # and has produced zero edits, fire one emergency prompt that lists the files
 # already inspected and demands an edit command in the next response.
-_MID_LOOP_RESCUE_FRACTION = 0.55
-_MID_LOOP_RESCUE_SECOND_FRACTION = 0.78  # second escape valve king does not have
-_MID_LOOP_RESCUE_FINAL_FRACTION = 0.92   # last gasp before time hard-stops
-MAX_MID_LOOP_RESCUE_TURNS = 3            # early/late/final; hard cap
+_MID_LOOP_RESCUE_FRACTION = 0.50
+_MID_LOOP_RESCUE_SECOND_FRACTION = 0.78
+_MID_LOOP_RESCUE_FINAL_FRACTION = 0.92
+MAX_MID_LOOP_RESCUE_TURNS = 3
+
+# Soft nudge fires earlier than the rescue and is gentler — it does NOT order
+# the model to stop reading or pick a file. Triggers once when several steps
+# have passed without a committed edit; helps push borderline cases over the
+# commit line before the harder rescue path is needed.
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -642,6 +650,7 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_redundant_mode_headers(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
+    cleaned = _split_comment_import_concat(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
     # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
@@ -763,6 +772,64 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
+
+
+_IMPORT_CONCAT_PATTERN = re.compile(r'[)};](?=import\s+[{*\w])')
+_HUNK_HEADER_RE = re.compile(r'^@@ -(\d+(?:,\d+)?) \+(\d+)(?:,(\d+))? @@(.*)$')
+
+
+def _split_comment_import_concat(diff_output: str) -> str:
+    # Repair '+' lines where a // comment and a JS/TS import got concatenated
+    # onto one line (e.g. ')import {x}'). In JS/TS, // extends to end of line,
+    # so the concatenation silently swallows the import and breaks the file.
+    # Split at the boundary and bump the hunk's added-line count. Narrow trigger:
+    # '//' must precede a close-bracket that is immediately followed by
+    # 'import <brace-or-ident>' inside a '+' line.
+    if not diff_output.strip() or '//' not in diff_output:
+        return diff_output
+    if not _IMPORT_CONCAT_PATTERN.search(diff_output):
+        return diff_output
+
+    lines = diff_output.splitlines(keepends=True)
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _HUNK_HEADER_RE.match(line.rstrip('\n'))
+        if not m:
+            out_lines.append(line)
+            i += 1
+            continue
+        old_part = m.group(1)
+        new_start = int(m.group(2))
+        new_count = int(m.group(3)) if m.group(3) else 1
+        tail = m.group(4)
+        j = i + 1
+        delta = 0
+        body: List[str] = []
+        while j < n and not lines[j].startswith('@@') and not lines[j].startswith('diff --git'):
+            bl = lines[j]
+            if bl.startswith('+') and not bl.startswith('+++') and '//' in bl:
+                ends_nl = bl.endswith('\n')
+                content = bl[1:].rstrip('\n')
+                mm = _IMPORT_CONCAT_PATTERN.search(content)
+                if mm and '//' in content[:mm.start()]:
+                    left = content[:mm.end()].rstrip()
+                    right = content[mm.end():].lstrip()
+                    if left and right:
+                        body.append('+' + left + '\n')
+                        body.append('+' + right + ('\n' if ends_nl else ''))
+                        delta += 1
+                        j += 1
+                        continue
+            body.append(bl)
+            j += 1
+        new_header = '@@ -%s +%d,%d @@%s\n' % (old_part, new_start, new_count + delta, tail)
+        out_lines.append(new_header)
+        out_lines.extend(body)
+        i = j
+    return ''.join(out_lines)
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -4534,6 +4601,53 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    # 1-line type-specific cue prepended to the self-check prompt. Heuristic
+    # keyword scan over the issue text. Empty when no strong type signal lands
+    # (the prompt then degrades to the generic boilerplate). Cheap, stateless.
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in (
+        "edge case", "boundary", "off-by-one", "off by one", "overflow",
+        "underflow", "empty list", "empty string", "null", "none case",
+        "zero ", "negative",
+    )):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -4544,17 +4658,10 @@ def build_self_check_prompt(
     recursion_advisories: Optional[List[str]] = None,
     unicode_escape_advisories: Optional[List[str]] = None,
 ) -> str:
-    """Show the model its own draft and ask for a focused self-review.
-
-    When `inplace_advisories` is non-empty, surface the same-basename /
-    same-stem collision so the model justifies or folds back. When
-    `caller_audit_advisories` is non-empty, surface the list of
-    removed/renamed top-level symbols so the model verifies every caller
-    has been updated. When `signature_advisories` is non-empty, surface
-    the modified-but-not-removed functions whose new parameter shape will
-    break existing callers (added required arg, dropped arg, optional →
-    required).
-    """
+    # Show the model its own draft and demand an adversarial self-review.
+    # Reframed from "validate this patch" to "find the weakest link" — models
+    # systematically rubber-stamp their own work when asked to confirm
+    # correctness but surface real flaws when explicitly asked to attack it.
     truncated = (
         patch
         if len(patch) <= 4000
@@ -4651,32 +4758,40 @@ def build_self_check_prompt(
             "quotes, struct tags, YAML strings without explicit escape "
             "syntax.\n"
         )
+    type_cue = _self_check_type_cue(issue_text)
     return (
-        "Self-check pass. Review your patch on three independent axes — "
-        "correctness, completeness, and scope discipline:\n\n"
-        f"{advisory_block}"
-        "CORRECTNESS (highest priority — the patch must actually fix the bug):\n"
-        "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
-        "  - Are edge cases mentioned in the issue handled?\n"
-        "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
-        "or equivalent now. A passing test is required evidence of correctness.\n\n"
-        "COMPLETENESS (covers every requirement the task spells out):\n"
-        "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
-        "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE DISCIPLINE (the patch is tightly tied to the task):\n"
-        "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
-        "  - No type annotation changes not required by the task\n"
-        "  - No refactoring, renaming, or reordering not required by the task\n"
-        "  - No new helper functions or defensive checks not required by the task\n\n"
+        "ADVERSARIAL SELF-REVIEW. The LLM judge compares your patch to a "
+        "reference solution and marks it WRONG if any requirement is missed or "
+        "the root cause isn't fixed. Assume the patch is wrong until proven "
+        "otherwise — your job is to find the weakest link BEFORE submitting.\n\n"
+        f"{type_cue}"
         "Your patch:\n```diff\n"
         f"{truncated}\n```\n\n"
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
-        "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
-        "(run missing tests, fix root causes, revert scope-creep hunks), "
-        "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+        "Answer in order — be specific, name lines/symbols, do not give generic "
+        "answers:\n"
+        "1. ROOT CAUSE: does the diff fix the underlying cause, or only suppress "
+        "a symptom (try/except swallow, default fallback, early return, value "
+        "coerce)? If only a symptom, fix the root.\n"
+        "2. COMPLETENESS: enumerate every concrete requirement in the task. "
+        "Which are NOT obviously addressed by the diff? Address each gap.\n"
+        "3. RUNTIME CHECK: would the most relevant test in this repo pass "
+        "against this patch? If you have NOT run one, run "
+        "`pytest tests/test_<module>.py -x -q` (or the language equivalent for "
+        "the file you edited) NOW. A passing test is the strongest correctness "
+        "evidence.\n"
+        "4. SCOPE: any whitespace-only, comment-only, type-annotation-only, "
+        "renames, new helpers, or unrelated refactors the grader will penalise "
+        "as scope creep? Revert them.\n"
+        f"{advisory_block}\n"
+        "If you find ANY weakness in 1-4 (or any advisory above), emit "
+        "corrective <command> blocks IN THE SAME RESPONSE (run missing tests, "
+        "fix root cause, revert scope creep), then end with "
+        "<final>summary</final>.\n"
+        "Only respond `<final>OK</final>` when you have run a relevant test, "
+        "it passed, AND you cannot identify a weakness above.\n"
+        "Do NOT add new features, destructive operations, or unrelated scope."
     )
 
 
@@ -4819,6 +4934,22 @@ def _recent_files_in_logs(logs: List[str], window: int = 80, max_files: int = 6)
         return out
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    # Mild budget reminder fired once when the model has cycled several steps
+    # without committing. Unlike build_mid_loop_rescue_prompt, this does NOT
+    # order the model to stop reading or pick a file — it nudges toward
+    # commitment without derailing a legitimate plan. Empty when the model
+    # already has a clear target and will edit naturally.
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_rescue_prompt(
@@ -5182,6 +5313,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     deletion_nudges_used = 0
     mid_loop_rescue_turns_used = 0  # tri-pass mid-loop rescue when patch is empty mid-flight
     mid_loop_rescue_pass_done = {"early": False, "late": False, "final": False}
+    soft_nudge_used = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -5563,8 +5695,34 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 break
 
+            # Soft nudge fires once at step ~6 / ~90s with no edits committed,
+            # BEFORE the harder mid-loop rescue. Mild reminder that pushes
+            # borderline cases over the commit line without ordering the model
+            # to abandon a legitimate plan; deliberately gentler than the
+            # rescue path so it does not derail rounds where the model is
+            # close to a clean edit.
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+            ):
+                _soft_elapsed = time.monotonic() - solve_started_at
+                if (
+                    _soft_elapsed >= min(_SOFT_NUDGE_ELAPSED_SECONDS, 0.30 * wall_clock_budget)
+                    and _soft_elapsed < _MID_LOOP_RESCUE_FRACTION * wall_clock_budget
+                    and not get_patch(repo).strip()
+                ):
+                    soft_nudge_used += 1
+                    messages.append({
+                        "role": "user",
+                        "content": build_soft_nudge_prompt(step, _soft_elapsed),
+                    })
+                    logs.append(
+                        f"SOFT_NUDGE_FIRED: step={step} elapsed={_soft_elapsed:.1f}s"
+                    )
+                    continue
+
             # Tri-pass mid-loop rescue. When the model is still reading
-            # files at ~55% of wall-clock with NO edits applied yet, surface
+            # files at ~50% of wall-clock with NO edits applied yet, surface
             # inspected paths + already-edited paths and demand an edit in
             # the next response. A second pass fires at ~78% and a final
             # pass at ~92% if the patch is still empty — empty-patch losses
