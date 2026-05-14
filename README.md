@@ -178,7 +178,7 @@ proxy.
 `OpenRouter Submission Judge` uses the same gatekeeping judge prompt as the
 legacy ninja CI, run through OpenRouter with `anthropic/claude-opus-4.7`,
 temperature `0`, and medium reasoning effort. It rejects poor, unsafe,
-cosmetic, copied, or out-of-scope edits.
+cosmetic, copied, obfuscated, Goodharting, or out-of-scope edits.
 
 ## Scoring Target
 
