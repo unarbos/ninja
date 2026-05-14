@@ -108,8 +108,11 @@ MAX_STEP_RETRIES = 2
 # max(per-task-timeout, 300s) from exec start — see multishot constants below.
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
-_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+_MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.50
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+_SOFT_NUDGE_STEP_THRESHOLD = 6
+_SOFT_NUDGE_ELAPSED_SECONDS = 90.0
+MAX_SOFT_NUDGE_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -632,6 +635,7 @@ def _sanitize_patch(diff_output: str) -> str:
 
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
+    cleaned = _strip_mode_headers_from_content_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -716,6 +720,38 @@ def _strip_mode_only_file_diffs(diff_output: str) -> str:
         kept.append(block)
 
     result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _strip_mode_headers_from_content_diffs(diff_output: str) -> str:
+    """Drop `old mode`/`new mode` header lines from content-bearing diffs.
+
+    The LLM judge dings agents for "unrelated file mode churn" when a real
+    content change happens to also flip the executable bit. Strip only the
+    mode header lines; keep content hunks intact.
+    """
+    if not diff_output.strip():
+        return diff_output
+    if "old mode " not in diff_output and "new mode " not in diff_output:
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block.startswith("diff --git ") or "\nold mode " not in block:
+            out.append(block)
+            continue
+        cleaned_lines = [
+            line for line in block.splitlines(keepends=False)
+            if not line.startswith("old mode ") and not line.startswith("new mode ")
+        ]
+        rebuilt = "\n".join(cleaned_lines)
+        if block.endswith("\n") and not rebuilt.endswith("\n"):
+            rebuilt += "\n"
+        out.append(rebuilt)
+    result = "".join(out)
     if diff_output.endswith("\n") and result and not result.endswith("\n"):
         result += "\n"
     return result
@@ -1054,6 +1090,57 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
 
+# TF-IDF file ranking constants (from uid 127's design — convergent winning pattern).
+# Rare terms (df<=2) get the full bonus; common terms stay at king's prior +3 flat.
+_DOC_FREQUENCY_TERM_CAP = 12
+_DOC_FREQUENCY_MIN_TERM_LEN = 4
+_DOC_FREQUENCY_GREP_TIMEOUT = 3.0
+_TERM_RARITY_BASE = 3
+_TERM_RARITY_CAP = 8
+
+
+def _doc_frequency(terms: List[str], repo: Path) -> Dict[str, int]:
+    """Count how many tracked files reference each issue term.
+
+    Used by `_term_bonus` to give rare terms a larger ranking boost than
+    common terms. Bounded by cap + per-term timeout so total latency stays low.
+    """
+    df: Dict[str, int] = {}
+    eligible = [t for t in terms if len(t) >= _DOC_FREQUENCY_MIN_TERM_LEN][:_DOC_FREQUENCY_TERM_CAP]
+    for term in eligible:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-i", "-F", "--", term],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_DOC_FREQUENCY_GREP_TIMEOUT,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        df[term] = sum(1 for line in proc.stdout.splitlines() if line.strip())
+    return df
+
+
+def _term_bonus(term: str, df: int) -> int:
+    """Per-term rank-score bonus, FLOOR-CLAMPED at king's prior flat +3.
+
+    Pareto-safe: every term scores at least _TERM_RARITY_BASE so this never
+    decreases ranking relative to the prior flat scheme.
+    """
+    if df <= 0:
+        return _TERM_RARITY_BASE
+    if df <= 2:
+        return _TERM_RARITY_CAP
+    if df <= 5:
+        return max(_TERM_RARITY_BASE, _TERM_RARITY_CAP - 2)
+    if df <= 10:
+        return max(_TERM_RARITY_BASE, _TERM_RARITY_CAP - 3)
+    return _TERM_RARITY_BASE
+
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
@@ -1091,6 +1178,8 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                     seen_mentioned.add(m)
 
     terms = _issue_terms(issue)
+    # TF-IDF: rare terms get +8, common +3 (FLOOR-CLAMPED at king's flat +3).
+    term_df = _doc_frequency(terms, repo)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     scored: List[Tuple[int, str]] = []
@@ -1109,7 +1198,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(_term_bonus(term, term_df.get(term, 0)) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
@@ -2436,6 +2525,25 @@ _IDENTIFIER_STOPWORDS = {
     "The", "This", "When", "Then", "User", "API", "URL", "HTTP", "JSON",
     "HTML", "CSS", "SQL", "None", "True", "False", "Error", "Type", "List",
     "Dict", "Path", "File", "Data", "Test", "Base", "From", "With", "That",
+    "Card", "Modal", "Form", "Button", "Input", "Label", "Image", "Menu",
+    "Header", "Footer", "Layout", "Page", "Section", "Container", "Wrapper",
+    "Element", "Component", "Service", "Manager", "Handler", "Provider",
+    "Context", "Status", "Value", "Field", "Item", "Result", "Response",
+    "Request", "Config", "Settings", "Options", "Properties", "Default",
+    "Module", "Class", "Object", "String", "Number", "Array", "Function",
+    "Method", "Action", "State", "Store", "Schema", "Model", "View",
+    "Index", "Route", "Router", "Render", "Update", "Create", "Delete",
+    "useState", "useEffect", "useCallback", "useMemo", "useRef", "useContext",
+    "useRouter", "setState", "setValue", "getValue", "getDefault",
+    "handleClick", "handleChange", "handleSubmit", "handleClose", "handleError",
+    "fetchData", "createElement", "createContext", "buildPath", "buildUrl",
+}
+
+_HOOK_GENERIC_PREFIXES_LOWER = {
+    "usestate", "useeffect", "usecallback", "usememo", "useref", "usecontext",
+    "userouter", "setstate", "setvalue", "getvalue", "getdefault",
+    "handleclick", "handlechange", "handlesubmit", "handleclose", "handleerror",
+    "fetchdata", "createelement", "createcontext", "buildpath", "buildurl",
 }
 
 _CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
@@ -2458,8 +2566,11 @@ def _issue_identifier_path_boost(
             if tok not in _IDENTIFIER_STOPWORDS and len(identifiers) < cap:
                 identifiers.add(tok.lower())
         for m in _HOOK_RE.finditer(issue_text):
+            hook_lower = m.group(0).lower()
+            if hook_lower in _HOOK_GENERIC_PREFIXES_LOWER:
+                continue
             if len(identifiers) < cap:
-                identifiers.add(m.group(0).lower())
+                identifiers.add(hook_lower)
         for m in _SNAKE_RE.finditer(issue_text):
             if len(identifiers) < cap:
                 identifiers.add(m.group(1).lower())
@@ -2859,6 +2970,51 @@ def build_coverage_nudge_prompt(
     )
 
 
+def _self_check_type_cue(issue_text: str) -> str:
+    """Return a 1-line type-specific cue prepended to the self-check prompt.
+
+    Heuristic keyword scan over the issue text. Empty when no strong type signal lands
+    (the prompt then degrades to the generic boilerplate). Cheap and stateless.
+    """
+    text = issue_text.lower()
+    if any(tok in text for tok in (
+        "traceback", "exception", "raises", "raise ", "raised", " error ",
+        "typeerror", "valueerror", "keyerror", "attributeerror", "indexerror",
+        "runtimeerror", "stack trace", "throws", "thrown",
+    )):
+        return (
+            "TYPE-AWARE CUE: this looks like an exception/error bug. Verify the patch "
+            "fixes the ROOT CAUSE at the failing call site (not a try/except suppress) "
+            "and that the exception type/message matches what the issue expects.\n\n"
+        )
+    if any(tok in text for tok in ("remove", "delete", "drop ", " unused", "deprecat")):
+        return (
+            "TYPE-AWARE CUE: this issue asks to remove/delete code. Verify every "
+            "caller, import, and reference of the removed name is also updated; "
+            "leftover dangling references will fail the completeness check.\n\n"
+        )
+    if any(tok in text for tok in ("edge case", "boundary", "off-by-one", "off by one", "overflow", "underflow", "empty list", "empty string", "null", "none case", "zero ", "negative")):
+        return (
+            "TYPE-AWARE CUE: this issue calls out an edge / boundary condition. "
+            "Verify the patch explicitly handles the boundary case named in the issue "
+            "(empty / zero / negative / off-by-one / null) — do not just rely on the "
+            "happy path.\n\n"
+        )
+    if any(tok in text for tok in ("test", "assert", "fixture", "pytest", "expected")):
+        return (
+            "TYPE-AWARE CUE: this issue references tests/assertions. Verify the "
+            "companion test was updated (or added) and that asserted values match "
+            "the new behaviour exactly.\n\n"
+        )
+    if any(tok in text for tok in ("move ", "rename", "extract", "split into", "refactor")):
+        return (
+            "TYPE-AWARE CUE: this issue is a refactor/move. Verify every import "
+            "and caller now points at the NEW location and the OLD location no "
+            "longer holds the moved code.\n\n"
+        )
+    return ""
+
+
 def build_self_check_prompt(
     patch: str,
     issue_text: str,
@@ -2879,7 +3035,9 @@ def build_self_check_prompt(
             "If the task is a refactor (not a new-file relocation), fix each by editing "
             "the EXISTING file rather than creating a new one at a different path.\n"
         )
+    type_cue = _self_check_type_cue(issue_text)
     return (
+        f"{type_cue}"
         "Self-check pass. The LLM judge scores correctness, completeness, and alignment "
         "with the reference — review your patch against all three:\n\n"
         "CORRECTNESS (LLM judge weight — high impact):\n"
@@ -3013,7 +3171,7 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     )
 
 
-def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
+def _recently_observed_paths(logs: List[str], window: int = 80) -> List[str]:
     """Extract file paths recently read by the model from the last `window` log entries.
 
     Scans for paths surfaced via read_file/cat observations so the mid-loop
@@ -3034,6 +3192,23 @@ def _recently_observed_paths(logs: List[str], window: int = 30) -> List[str]:
         return results
     except Exception:
         return []
+
+
+def build_soft_nudge_prompt(step: int, elapsed: float) -> str:
+    """Mild budget reminder fired once when the model has cycled several steps without committing.
+
+    Unlike build_mid_loop_hail_mary_prompt, this does NOT order the model to stop reading or
+    pick a file — it nudges toward commitment without derailing a legitimate plan. Empty when
+    the model already has a clear target and will edit naturally.
+    """
+    return (
+        f"BUDGET CHECK: {step} steps in {elapsed:.0f}s with no edits committed yet.\n\n"
+        "If your investigation has identified a target file and the fix is clear, "
+        "emit edit commands in your next response. "
+        "If you genuinely need one more focused read to confirm the target, take it — "
+        "but avoid broad searches now. Continue working naturally; this is a reminder, "
+        "not a hard stop.\n"
+    )
 
 
 def build_mid_loop_hail_mary_prompt(
@@ -3127,6 +3302,66 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
+
+_FILE_COUNT_ESTIMATE_MIN = 1
+_FILE_COUNT_ESTIMATE_MAX = 12
+_BULLET_PREFIXES = ("- ", "* ", "+ ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
+_UNDERDELIVER_MIN_ESTIMATE = 3
+_UNDERDELIVER_GAP_TOLERANCE = 1
+_UNDERDELIVER_MAX_FIRST_ELAPSED = 100.0
+_ATTEMPT2_BUDGET_MIN = 45.0
+_ATTEMPT2_BUDGET_MAX = 90.0
+
+
+def _estimate_issue_file_count(issue: str) -> int:
+    if not issue:
+        return _FILE_COUNT_ESTIMATE_MIN
+    bullets = 0
+    for raw in issue.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(_BULLET_PREFIXES):
+            bullets += 1
+    mentioned_paths = len(set(_extract_issue_path_mentions(issue)))
+    estimate = max(mentioned_paths, (bullets + 1) // 2)
+    return max(_FILE_COUNT_ESTIMATE_MIN, min(_FILE_COUNT_ESTIMATE_MAX, estimate))
+
+
+def build_attempt2_underdeliver_bootstrap(
+    result1: Dict[str, Any],
+    n_lines: int,
+    actual_files: int,
+    estimated_files: int,
+) -> str:
+    steps = result1.get("steps", 0)
+    patch1 = result1.get("patch", "") or result1.get("diff", "") or ""
+    already_edited: List[str] = []
+    if patch1:
+        for line in patch1.splitlines():
+            if line.startswith("+++ b/"):
+                already_edited.append(line[6:].strip())
+    history_str = ""
+    if already_edited:
+        history_str = (
+            f"\n\nAttempt 1 already edited: {', '.join(already_edited[:5])}. "
+            f"Do NOT re-edit these files — focus only on the missing ones."
+        )
+    return (
+        f"⚠ RETRY: prior attempt wrote {n_lines} line(s) across {actual_files} "
+        f"file(s) in {steps} step(s); the task names ~{estimated_files} "
+        f"files via bullets/paths.{history_str}\n\n"
+        f"For attempt 2, ADD ONLY what is required to cover the missing "
+        f"files. Imitate the codebase's existing style — use the same "
+        f"imports, helpers, and naming patterns as adjacent files. Do NOT "
+        f"refactor the prior attempt's working code; do NOT introduce new "
+        f"abstractions; do NOT add commentary, logging, or defensive "
+        f"validation beyond what the task requires.\n\n"
+        f"Specifically:\n"
+        f"  - When the task names a path, that exact path must appear in the patch.\n"
+        f"  - When the task lists N bullets, each bullet should be addressed "
+        f"by at least one targeted change.\n"
+        f"  - Match the prior attempt's file count + the missing files; "
+        f"do not collapse multiple files into one."
+    )
 
 
 def _multishot_count_substantive(patch: str) -> int:
@@ -3239,12 +3474,29 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result1 = _solve_attempt(**kwargs)
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
+        _elapsed = time.monotonic() - _multishot_started
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        _issue_text = kwargs.get("issue", "") or ""
+        _actual_files_1 = len(_patch_changed_files(_patch1)) if _patch1 else 0
+        _estimated_files = _estimate_issue_file_count(_issue_text)
+        _named_paths = set(_extract_issue_path_mentions(_issue_text))
+        _patch_paths = set(_patch_changed_files(_patch1))
+        _covers_all_named = (
+            bool(_named_paths)
+            and all(any(p in pp or pp in p for pp in _patch_paths) for p in _named_paths)
+        )
+        _underdelivered = (
+            _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD
+            and _estimated_files >= _UNDERDELIVER_MIN_ESTIMATE
+            and _actual_files_1 + _UNDERDELIVER_GAP_TOLERANCE < _estimated_files
+            and _elapsed < _UNDERDELIVER_MAX_FIRST_ELAPSED
+            and not _covers_all_named
+        )
+
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD and not _underdelivered:
             _result1["multishot_attempts"] = 1
             return _result1
 
-        _elapsed = time.monotonic() - _multishot_started
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -3266,13 +3518,30 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # combined runtime past the ~300 s docker hard wall → process killed,
         # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
-        _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        if _underdelivered:
+            _attempt2_budget = max(
+                _ATTEMPT2_BUDGET_MIN,
+                min(_ATTEMPT2_BUDGET_MAX, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE),
+            )
+            _bootstrap = build_attempt2_underdeliver_bootstrap(
+                _result1, _n1, _actual_files_1, _estimated_files,
+            )
+        else:
+            _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+            _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _files2 = len(set(
+            line[6:].strip() for line in _patch2.splitlines()
+            if line.startswith("+++ b/")
+        ))
 
-        if _n2 >= _n1:
+        _attempt2_wins = (
+            (_underdelivered and _files2 > _actual_files_1 and _n2 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD)
+            or (not _underdelivered and _n2 >= _n1)
+        )
+        if _attempt2_wins:
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
             return _result2
@@ -3331,6 +3600,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
+    soft_nudge_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
@@ -3588,6 +3858,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            if (
+                soft_nudge_used < MAX_SOFT_NUDGE_TURNS
+                and step >= _SOFT_NUDGE_STEP_THRESHOLD
+                and _elapsed_now >= _SOFT_NUDGE_ELAPSED_SECONDS
+                and not get_patch(repo).strip()
+                and _elapsed_now < _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            ):
+                soft_nudge_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_soft_nudge_prompt(step, _elapsed_now),
+                })
+                logs.append(f"SOFT_NUDGE_FIRED: step={step} elapsed={_elapsed_now:.1f}s")
+                continue
+
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
                 and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
