@@ -19,7 +19,6 @@ from typing import Any
 
 DEFAULT_API_URL = "https://ninja66.ai/api/submissions"
 MAX_AGENT_BYTES = 5_000_000
-PRIVATE_SUBMISSION_RE = re.compile(r"^private-submission:[A-Za-z0-9_.-]{1,128}:[0-9a-f]{64}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,8 +75,6 @@ def main() -> int:
         print(json.dumps(response, indent=2, sort_keys=True))
         if not bool(response.get("accepted")):
             return 1
-        commitment = str(response.get("commitment") or "")
-        validate_private_commitment(commitment)
         return 0
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -205,12 +202,6 @@ def decode_json_response(body: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("submission API returned non-object JSON")
     return payload
-
-
-def validate_private_commitment(commitment: str) -> None:
-    if not PRIVATE_SUBMISSION_RE.fullmatch(commitment):
-        raise ValueError("accepted API response did not include a valid private-submission commitment")
-
 
 if __name__ == "__main__":
     sys.exit(main())

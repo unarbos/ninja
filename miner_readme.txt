@@ -40,13 +40,10 @@ llm_judge details. Fix agent.py and submit again after reviewing those findings.
 After Acceptance
 ----------------
 
-If the API accepts your submission, it returns:
-
-private-submission:<submission-id>:<sha256-of-agent.py>
-
-No separate on-chain commitment is required. The validator reads accepted API
-submissions from the private ledger, verifies your hotkey is still registered,
-and queues the bundle directly.
+If the API accepts your submission, the helper exits successfully. No pull
+request, on-chain commitment, or separate chain submission step is required. The
+validator reads accepted API submissions from the private ledger, verifies your
+hotkey is still registered, and queues the bundle directly.
 
 Important Details
 -----------------

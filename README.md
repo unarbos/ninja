@@ -131,12 +131,8 @@ tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 
 The API returns JSON. If checks fail, `accepted` is `false`, the response
 includes `ci_checks`/`llm_judge` details, and the script exits nonzero. If
-accepted, no separate on-chain submission step is required. The response includes
-the private submission commitment id the validator tracks internally:
-
-```text
-private-submission:<submission-id>:<sha256-of-agent.py>
-```
+accepted, no pull request, on-chain commitment, or separate chain submission
+step is required.
 
 Only one accepted submission is eligible per miner hotkey registration. After an
 accepted submission, that hotkey is spent for future submissions until it is
