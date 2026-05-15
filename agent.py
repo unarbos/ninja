@@ -2000,8 +2000,90 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
 )
 
 
+_TEST_DIR_MARKERS = ("/tests/", "/test/", "/spec/", "/specs/", "/__tests__/")
+
+_TEST_LANG_SUFFIX_MAP: Dict[str, set] = {
+    ".py": {".py"},
+    ".js": {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"},
+    ".jsx": {".jsx", ".js", ".tsx", ".ts"},
+    ".ts": {".ts", ".tsx", ".js", ".jsx"},
+    ".tsx": {".tsx", ".ts", ".jsx", ".js"},
+    ".mjs": {".mjs", ".js", ".cjs", ".ts"},
+    ".cjs": {".cjs", ".js", ".mjs", ".ts"},
+    ".go": {".go"},
+    ".rs": {".rs"},
+    ".rb": {".rb"},
+    ".java": {".java"},
+    ".kt": {".kt"},
+    ".swift": {".swift"},
+    ".cs": {".cs"},
+    ".php": {".php"},
+}
+
+
+def _find_test_partner_by_grep(relative_path: str, tracked: set) -> Optional[str]:
+    """Fallback test discovery for non-standard layouts.
+
+    Catches conventions the templates miss: `tests/unit/foo_test.py`,
+    `features/foo/__tests__/bar.spec.ts`, `spec/legacy/foo_spec.rb`, etc.
+
+    Scans the tracked set for files that (a) live in a test-shaped directory
+    or have a test-shaped basename, (b) share the source file's stem, (c) match
+    the source file's language family. Pure set/string operations — no I/O.
+    """
+    path = Path(relative_path)
+    name_lower = path.name.lower()
+    if "test" in name_lower or "spec" in name_lower:
+        return None
+    stem = path.stem
+    suffix = path.suffix.lower()
+    if not stem or len(stem) < 3 or not suffix:
+        return None
+    allowed_suffixes = _TEST_LANG_SUFFIX_MAP.get(suffix, {suffix})
+    stem_lower = stem.lower()
+
+    best: Optional[Tuple[int, str]] = None
+    for candidate in tracked:
+        if candidate == relative_path:
+            continue
+        cpath = Path(candidate)
+        if cpath.suffix.lower() not in allowed_suffixes:
+            continue
+        cname_lower = cpath.name.lower()
+        cpath_norm = "/" + candidate.lower().replace("\\", "/")
+        cstem_lower = cpath.stem.lower()
+        in_test_dir = any(marker in cpath_norm for marker in _TEST_DIR_MARKERS)
+        has_test_name = "test" in cname_lower or "spec" in cname_lower
+        if not (in_test_dir or has_test_name):
+            continue
+        if stem_lower not in cstem_lower and stem_lower not in cpath_norm:
+            continue
+        if not _context_file_allowed(candidate):
+            continue
+        score = 0
+        if cstem_lower in {f"test_{stem_lower}", f"{stem_lower}_test"}:
+            score += 10
+        elif cstem_lower in {f"{stem_lower}.test", f"{stem_lower}.spec", f"{stem_lower}_spec"}:
+            score += 10
+        elif cstem_lower == stem_lower and in_test_dir:
+            score += 8
+        elif stem_lower in cstem_lower:
+            score += 3
+        elif stem_lower in cpath_norm:
+            score += 1
+        if score == 0:
+            continue
+        if best is None or score > best[0] or (score == best[0] and len(candidate) < len(best[1])):
+            best = (score, candidate)
+    return best[1] if best else None
+
+
 def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
-    """Return the most plausible test file for a source path, or None."""
+    """Return the most plausible test file for a source path, or None.
+
+    Tries hardcoded templates first; falls back to a grep over the tracked set
+    for repos with non-standard test layouts that the templates can't enumerate.
+    """
     path = Path(relative_path)
     name_lower = path.name.lower()
     if "test" in name_lower or "spec" in name_lower:
@@ -2018,7 +2100,7 @@ def _find_test_partner(relative_path: str, tracked: set) -> Optional[str]:
         candidate = str(Path(candidate))
         if candidate in tracked and _context_file_allowed(candidate):
             return candidate
-    return None
+    return _find_test_partner_by_grep(relative_path, tracked)
 
 
 def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
@@ -2849,6 +2931,42 @@ your command here
 """
 
 
+_BUDGET_PRESSURE_PATH_RE = re.compile(
+    r"[\w./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|rb|swift|svelte|vue|md|json|toml|yaml|yml|sh|sql)"
+)
+
+
+def _last_assistant_named_target(messages: List[Dict[str, str]], tracked_set: set) -> bool:
+    """True if the most recent assistant message references at least one tracked
+    file path (direct match or basename match).
+
+    Used to defer budget-pressure prompts when the model is already committed to
+    inspecting a specific target. Premature pressure here pushes the model to
+    edit the wrong file just to satisfy the prompt, which loses rounds.
+    """
+    if not tracked_set:
+        return False
+    last_content: Optional[str] = None
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            last_content = msg.get("content") or ""
+            break
+    if not last_content:
+        return False
+    candidates: set = set()
+    for m in _BUDGET_PRESSURE_PATH_RE.finditer(last_content):
+        candidates.add(m.group(0).lstrip("./"))
+    if not candidates:
+        return False
+    if candidates & tracked_set:
+        return True
+    basenames = {Path(p).name for p in candidates}
+    for tracked in tracked_set:
+        if Path(tracked).name in basenames:
+            return True
+    return False
+
+
 def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
@@ -3125,12 +3243,15 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     """Inject into attempt 2's first user message so it takes a different path.
 
     Attempt 2 is blind to what attempt 1 tried — it starts a fresh conversation
-    and often repeats the exact same failed approach.  This prefix tells the model
-    what went wrong so it actively diverges: reads more files, picks a different
-    fix site, uses a different library call, etc.
+    and often repeats the exact same failed approach. This prefix tells the model
+    what went wrong AND which files attempt 1 already touched, so it can either
+    re-examine those targets more carefully (thin patch case) or pick different
+    targets entirely (no patch case).
     """
     steps = result1.get("steps", 0)
     logs_text = result1.get("logs", "") or ""
+    prior_patch = result1.get("patch", "") or ""
+    prior_files = _patch_changed_files(prior_patch)
 
     reasons: List[str] = []
     if "WALL_CLOCK_STOP" in logs_text:
@@ -3143,9 +3264,27 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         reasons.append(f"produced only {n_lines} substantive line(s)")
     reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
 
+    file_hint = ""
+    if prior_files and n_lines > 0:
+        files_str = ", ".join(prior_files[:5])
+        file_hint = (
+            f"\nAttempt 1 edited these files but the patch was too thin: {files_str}\n"
+            "These are usually the right target with the wrong fix. Re-examine them: "
+            "was the edit in the wrong function within the right file, or was a "
+            "companion file / call-site update missing? Either inspect them more "
+            "carefully OR look for sibling files the task implies attempt 1 missed.\n"
+        )
+    elif not prior_files and n_lines == 0:
+        file_hint = (
+            "\nAttempt 1 produced no edits at all — likely stuck exploring without "
+            "committing to a target. Pick the most likely target from the preloaded "
+            "snippets within your first 2-3 commands and edit early.\n"
+        )
+
     return (
         f"⚠ RETRY ATTEMPT: A prior attempt at this task {reason_str} "
         f"({steps} steps). Do NOT repeat the same approach.\n"
+        f"{file_hint}"
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
@@ -3924,7 +4063,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             if not get_patch(repo).strip() and step in {2, 4}:
-                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
+                if _last_assistant_named_target(messages, _tracked_set_for_checks):
+                    logs.append(f"BUDGET_PRESSURE_DEFERRED: step={step} (target named in last assistant message)")
+                else:
+                    messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
         if patch.strip() and not success:
