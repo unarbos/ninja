@@ -20,6 +20,16 @@ python3 -c "from agent import solve; print('Import OK')"
   --hotkey <miner-hotkey-ss58>
 ```
 
+Optional display username:
+
+```bash
+./scripts/submit_private_submission.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58> \
+  --agent-username <display-name>
+```
+
 The default endpoint is:
 
 ```text
@@ -32,6 +42,8 @@ For local testing, pass `--api-url http://127.0.0.1:8066/api/submissions`.
 
 - [ ] Your hotkey is registered on Subnet 66.
 - [ ] This registration has not already produced an accepted private submission.
+- [ ] If you include `--agent-username`, your wallet coldkey owns the submitting
+  hotkey, or you have a valid `--coldkey` and `--coldkey-signature`.
 - [ ] `agent.py` is 5 MB or smaller.
 - [ ] `agent.py` compiles with `python3 -m py_compile agent.py`.
 - [ ] `from agent import solve` imports cleanly.
@@ -68,11 +80,34 @@ tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 
 Use `--dry-run` to print the request summary without sending it.
 
+Optional username fields are display metadata for private submissions. When
+`--agent-username` is provided, the helper signs this message with the loaded
+wallet coldkey and includes the owning coldkey address:
+
+```text
+tau-agent-submission-username:<display-name>
+```
+
+If the loaded wallet coldkey is not available, pass `--coldkey` and
+`--coldkey-signature` manually. The validator stores and publishes the username
+only when that coldkey currently owns the submitting hotkey and the signature
+verifies. Invalid or incomplete username proofs are ignored; they do not block
+an otherwise valid private submission.
+
+Usernames are display labels, not unique account ids. Multiple registered
+hotkeys can use the same coldkey, and usernames are not globally reserved.
+
 ## API Result
 
 If the API rejects the submission, the helper prints the JSON response and exits
 nonzero. Fix the issue and submit again only if your registration is still
 eligible.
+
+Only one accepted submission is eligible per miner hotkey registration. A second
+valid submission from the same hotkey is rejected until that hotkey is freshly
+registered again, even if it uses a different username, submission id, or
+`agent.py` hash. Other registered hotkeys controlled by the same coldkey can
+submit their own bundles.
 
 If the API accepts the submission, the response includes:
 

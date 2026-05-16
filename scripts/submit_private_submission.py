@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wallet-name", default=os.getenv("BT_WALLET_NAME", "default"))
     parser.add_argument("--wallet-hotkey", default=os.getenv("BT_WALLET_HOTKEY", "default"))
     parser.add_argument("--wallet-path", default=os.getenv("BT_WALLET_PATH"))
+    parser.add_argument("--agent-username", help="Optional public display username for this miner agent.")
+    parser.add_argument("--coldkey", help="Coldkey SS58 that owns the submitting hotkey. Defaults to the loaded wallet coldkey.")
+    parser.add_argument(
+        "--coldkey-signature",
+        help="Coldkey signature over tau-agent-submission-username:<agent-username>. Defaults to signing with the loaded wallet coldkey.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Build and print the request without sending it.")
     return parser.parse_args()
 
@@ -55,12 +61,14 @@ def main() -> int:
             agent_sha256=agent_sha256,
         )
         signature = sign_payload(wallet, signature_payload)
+        identity = build_username_identity(args=args, wallet=wallet)
         print_request_summary(
             agent_path=agent_path,
             hotkey=hotkey,
             submission_id=submission_id,
             agent_sha256=agent_sha256,
             signature_payload=signature_payload,
+            identity=identity,
         )
         if args.dry_run:
             print("dry_run: true")
@@ -71,6 +79,7 @@ def main() -> int:
             hotkey=hotkey,
             submission_id=submission_id,
             signature=signature,
+            identity=identity,
             agent_filename=agent_path.name,
             agent_py=agent_py,
         )
@@ -119,6 +128,54 @@ def sign_payload(wallet: Any, payload: bytes) -> str:
     raise TypeError(f"unsupported signature type: {type(signature).__name__}")
 
 
+def username_signature_payload(username: str) -> bytes:
+    return f"tau-agent-submission-username:{username}".encode("utf-8")
+
+
+def wallet_coldkey_address(wallet: Any) -> str | None:
+    for attr in ("coldkeypub", "coldkey"):
+        value = getattr(wallet, attr, None)
+        ss58 = getattr(value, "ss58_address", None)
+        if ss58:
+            return str(ss58)
+    return None
+
+
+def sign_with_coldkey(wallet: Any, payload: bytes) -> str:
+    coldkey = getattr(wallet, "coldkey", None)
+    if coldkey is None or not hasattr(coldkey, "sign"):
+        raise RuntimeError("loaded wallet coldkey is not available; pass --coldkey-signature")
+    signature = coldkey.sign(payload)
+    if isinstance(signature, str):
+        return signature.removeprefix("0x")
+    if isinstance(signature, bytes):
+        return signature.hex()
+    if hasattr(signature, "hex"):
+        return signature.hex()
+    raise TypeError(f"unsupported coldkey signature type: {type(signature).__name__}")
+
+
+def build_username_identity(*, args: argparse.Namespace, wallet: Any) -> dict[str, str]:
+    username = (args.agent_username or "").strip()
+    coldkey = (args.coldkey or "").strip()
+    signature = (args.coldkey_signature or "").strip()
+    if not any((username, coldkey, signature)):
+        return {}
+    if not username:
+        raise ValueError("--agent-username is required when passing username identity fields")
+    if not coldkey:
+        coldkey = wallet_coldkey_address(wallet) or ""
+    if not coldkey:
+        raise ValueError("--coldkey is required because the loaded wallet coldkey address was not available")
+    if not signature:
+        signature = sign_with_coldkey(wallet, username_signature_payload(username))
+    return {
+        "agent_username": username,
+        "coldkey": coldkey,
+        "coldkey_signature": signature,
+    }
+
+
 def print_request_summary(
     *,
     agent_path: Path,
@@ -126,12 +183,17 @@ def print_request_summary(
     submission_id: str,
     agent_sha256: str,
     signature_payload: bytes,
+    identity: dict[str, str],
 ) -> None:
     print(f"agent: {agent_path}")
     print(f"hotkey: {hotkey}")
     print(f"submission_id: {submission_id}")
     print(f"agent_sha256: {agent_sha256}")
     print(f"signature_payload: {signature_payload.decode('utf-8')}")
+    if identity:
+        print(f"agent_username: {identity['agent_username']}")
+        print(f"coldkey: {identity['coldkey']}")
+        print(f"username_signature_payload: {username_signature_payload(identity['agent_username']).decode('utf-8')}")
 
 
 def post_submission(
@@ -140,6 +202,7 @@ def post_submission(
     hotkey: str,
     submission_id: str,
     signature: str,
+    identity: dict[str, str],
     agent_filename: str,
     agent_py: bytes,
 ) -> dict[str, Any]:
@@ -148,6 +211,7 @@ def post_submission(
         "submission_id": submission_id,
         "signature": signature,
     }
+    fields.update(identity)
     files = {"agent": (agent_filename, agent_py, "text/x-python")}
     body, content_type = encode_multipart_form(fields=fields, files=files)
     request = urllib.request.Request(
