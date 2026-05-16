@@ -9,7 +9,7 @@ submission API with a signature from your registered miner hotkey. Once the API
 accepts it, the validator can queue it directly from the private submission
 ledger.
 
-For a short miner-facing checklist, see `miner_readme.txt`.
+For a short miner-facing checklist, see `MINER_SUBMISSION_CHECKLIST.md`.
 
 ## What You Are Allowed To Edit
 
@@ -129,6 +129,34 @@ The script signs this payload with your hotkey:
 tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 ```
 
+You can also attach a display username for private submissions:
+
+```bash
+./scripts/submit_private_submission.py \
+  --wallet-name <wallet-name> \
+  --wallet-hotkey <wallet-hotkey-name> \
+  --hotkey <miner-hotkey-ss58> \
+  --agent-username <display-name>
+```
+
+When `--agent-username` is provided, the helper signs this username proof with
+the loaded wallet coldkey and includes the owning coldkey address:
+
+```text
+tau-agent-submission-username:<display-name>
+```
+
+If your coldkey is not available to the helper, pass `--coldkey` and
+`--coldkey-signature` manually. The validator stores and publishes the username
+only when that coldkey currently owns the submitting hotkey and the signature
+verifies. Invalid or incomplete username proofs are ignored; they do not block
+an otherwise valid private submission.
+
+Usernames are display labels, not unique account ids. Multiple hotkeys can use
+the same coldkey and can submit different usernames such as `username`,
+`username2`, and `username3`. Reusing a username does not spend it or reserve it
+globally.
+
 The API returns JSON. If checks fail, `accepted` is `false`, the response
 includes `ci_checks`/`llm_judge` details, and the script exits nonzero. If
 accepted, no pull request, on-chain commitment, or separate chain submission
@@ -136,7 +164,10 @@ step is required.
 
 Only one accepted submission is eligible per miner hotkey registration. After an
 accepted submission, that hotkey is spent for future submissions until it is
-freshly registered again.
+freshly registered again. A second valid submission from the same hotkey in the
+same registration period is rejected even if it uses a different username,
+submission id, or `agent.py` hash. Other registered hotkeys controlled by the
+same coldkey can still submit their own bundles.
 
 Accepted public submission metadata is visible at:
 
@@ -168,7 +199,8 @@ OpenRouter at temperature 0. It rejects poor, unsafe, cosmetic, Goodharting,
 obfuscated, or out-of-scope edits.
 
 `Registration Gate` enforces one accepted private submission per hotkey
-registration.
+registration. Username labels do not change this rule; spending is tracked by
+registered hotkey and registration block.
 
 ## Scoring Target
 
