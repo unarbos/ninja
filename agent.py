@@ -68,7 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "50"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
@@ -93,7 +93,7 @@ MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
 MAX_PRELOADED_FILES = 22              # rounds on issues spanning multiple modules
 MAX_NO_COMMAND_REPAIRS = 2
-MAX_COMMANDS_PER_RESPONSE = 15
+MAX_COMMANDS_PER_RESPONSE = 25
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
@@ -109,6 +109,15 @@ MAX_STEP_RETRIES = 2
 WALL_CLOCK_BUDGET_SECONDS = 248.0
 WALL_CLOCK_RESERVE_SECONDS = 20.0
 _MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
+# === NEW (P1 #5): Step-based mid-loop hail-mary trigger =======================
+# The original wall-clock trigger only catches "slow tool calls eating the
+# budget." A FAST loop that issues 7+ inspection commands without making a
+# single edit also signals "stop reading, start editing" -- the symptom is the
+# same (no patch on disk), only the cause differs (analysis paralysis vs. slow
+# tool calls). Adding a step-count trigger catches the analysis-paralysis case
+# BEFORE 55% of wall-clock has expired, buying back useful edit-and-verify
+# cycles on the back end.
+_MID_LOOP_HAIL_MARY_STEP_TRIGGER = 7
 MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
@@ -127,6 +136,26 @@ MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinement
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
                                 # hard wall).
+# === NEW (P1 #3): Adaptive refinement cap =====================================
+# The MAX_TOTAL_REFINEMENT_TURNS cap above is *structural* -- it stops infinite
+# refinement chains. It offers zero protection when attempt-1 already ate 220s
+# of the 248s wall-clock and the loop still happily queues a 3rd refinement
+# turn, blows the budget, and ships an empty patch.
+#
+# This floor adds a *time-based* veto layered on top: if there is not enough
+# remaining wall-clock to complete one full refinement cycle (LLM call +
+# command execution + observation parsing, empirically ~15-40s in practice),
+# refuse to queue another turn and ship whatever patch we already have.
+#
+# Two tiers -- the empty-patch hail-mary keeps a tighter floor because the
+# alternative (empty patch = 0 score) is qualitatively worse than a thin patch
+# that may still earn cursor-similarity credit. We will roll the dice on a
+# few extra seconds of risk when the baseline is guaranteed-zero.
+_REFINEMENT_TIME_FLOOR_SECONDS = 32.0   # min remaining seconds to queue any
+                                        # refinement turn on a non-empty patch
+_HAIL_MARY_TIME_FLOOR_SECONDS = 18.0    # min remaining seconds for the
+                                        # empty-patch hail-mary turn
+
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -2205,6 +2234,73 @@ def _run_companion_test(
         output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         return output[-2400:] if len(output) > 2400 else output
 
+    # ---- NEW (P1 #4): Go ---------------------------------------------------
+    # Unlike the JS/TS path above (which only PARSES the file via `node
+    # --check`), this branch actually executes `go test`, scoped to the
+    # test's package directory so the run stays cheap. The dominant Go
+    # regression class is "patch broke an assertion", which only a real
+    # runner catches. Skipped silently when `go` is not on PATH (often the
+    # case in slim sandboxes).
+    if suffix == ".go":
+        if not _has_executable("go"):
+            return None
+        pkg_dir = str(Path(test_path).parent) or "."
+        pkg_target = "./" + pkg_dir if pkg_dir != "." else "./..."
+        go_timeout = max(timeout_seconds, 15)  # cold cache needs more than 8s
+        try:
+            proc = subprocess.run(
+                ["go", "test", "-count=1", "-timeout", "10s", pkg_target],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=go_timeout,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` (go test) timed out after {go_timeout}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        # Environmental noise (no module, missing dependencies, no Go files
+        # in the package) is NOT a real test failure. Returning None here
+        # avoids queuing a fix turn for something the agent can't act on.
+        if "no Go files" in output or "cannot find module" in output:
+            return None
+        return output[-2400:] if len(output) > 2400 else output
+
+    # ---- NEW (P1 #4): Rust -------------------------------------------------
+    # Full `cargo test` runs are minutes on a cold target/ cache -- far too
+    # slow for the 8s default budget. `cargo check --tests` compiles the
+    # test crate WITHOUT executing, catching any new compile error the patch
+    # introduced (the dominant regression class for surgical edits).
+    # `--offline` prevents any registry hit so the gate works in sandboxed
+    # runs with no network. Skipped silently when `cargo` is unavailable.
+    if suffix == ".rs":
+        if not _has_executable("cargo"):
+            return None
+        cargo_timeout = max(timeout_seconds, 20)
+        try:
+            proc = subprocess.run(
+                ["cargo", "check", "--tests", "--offline"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=cargo_timeout,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` (cargo check) timed out after {cargo_timeout}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
     return None  # other languages: skip
 
 
@@ -2843,7 +2939,7 @@ Repository summary:
 {context_section}
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. Don't define auxiliary functions or make broad refactors or re-indent lines. Do not change unrelated code. Do not reorder imports or code. Do not weaken or delete existing tests. Do not change original code style.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -3119,9 +3215,16 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
     and often repeats the exact same failed approach.  This prefix tells the model
     what went wrong so it actively diverges: reads more files, picks a different
     fix site, uses a different library call, etc.
+
+    NEW (P1 #2): surface the *specific files* attempt 1 edited. Without this
+    concrete signal, "do something different" is too vague -- the model often
+    retraces its steps and re-edits the same file via a slightly different code
+    path. Showing the actual list of touched paths is the strongest negative
+    example we can hand the next attempt.
     """
     steps = result1.get("steps", 0)
     logs_text = result1.get("logs", "") or ""
+    patch1 = result1.get("patch", "") or ""   # NEW (P1 #2)
 
     reasons: List[str] = []
     if "WALL_CLOCK_STOP" in logs_text:
@@ -3134,9 +3237,29 @@ def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
         reasons.append(f"produced only {n_lines} substantive line(s)")
     reason_str = "; ".join(reasons) if reasons else f"produced only {n_lines} substantive line(s)"
 
+    # NEW (P1 #2): list attempt-1's edited files. An empty patch has no files
+    # to list, but the existing reason_str already says "produced an empty
+    # patch" in that case. When attempt 1 produced *some* patch and we're
+    # retrying because it was thin, telling the model "you already tried X,
+    # consider Y" gives a concrete steer toward a different layer (caller vs.
+    # callee), a different module, or simply files it never read.
+    files_block = ""
+    if patch1.strip():
+        changed = _patch_changed_files(patch1)
+        if changed:
+            file_lines = "\n".join(f"  - {p}" for p in changed[:8])
+            extra = "" if len(changed) <= 8 else f"\n  ... and {len(changed) - 8} more"
+            files_block = (
+                f"Attempt 1 edited these file(s) -- strongly consider DIFFERENT "
+                f"files, different functions within them, OR a different layer "
+                f"of the same problem (caller vs. callee, model vs. view):\n"
+                f"{file_lines}{extra}\n\n"
+            )
+
     return (
         f"⚠ RETRY ATTEMPT: A prior attempt at this task {reason_str} "
         f"({steps} steps). Do NOT repeat the same approach.\n"
+        f"{files_block}"
         "Before writing any code: re-read the issue, check which files "
         "you haven't looked at yet, and choose a different fix strategy "
         "if the previous one produced little output.\n\n"
@@ -3505,6 +3628,31 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
+        # === NEW (P1 #3): Adaptive refinement gating =========================
+        # Skip refinement entirely when there isn't enough remaining wall-clock
+        # to complete a cycle. Two tiers because an empty patch (= 0 score) is
+        # qualitatively worse than a thin patch -- even a near-miss hail-mary
+        # turn is worth a few extra seconds of risk when the alternative is
+        # guaranteed-zero. The fixed MAX_TOTAL_REFINEMENT_TURNS cap can't
+        # detect this on its own; it only counts turns, not the time those
+        # turns will cost.
+        _remaining = time_remaining()
+        if not patch.strip():
+            if _remaining < _HAIL_MARY_TIME_FLOOR_SECONDS:
+                logs.append(
+                    f"REFINEMENT_TIME_GATED:\n  remaining={_remaining:.1f}s "
+                    f"floor={_HAIL_MARY_TIME_FLOOR_SECONDS:.1f}s -- empty "
+                    "patch, too little time even for the hail-mary turn"
+                )
+                return False
+        elif _remaining < _REFINEMENT_TIME_FLOOR_SECONDS:
+            logs.append(
+                f"REFINEMENT_TIME_GATED:\n  remaining={_remaining:.1f}s "
+                f"floor={_REFINEMENT_TIME_FLOOR_SECONDS:.1f}s -- shipping "
+                "current patch rather than risk a wall-clock overrun"
+            )
+            return False
+
         if must_edit_after_gap:
             if patch != must_edit_patch:
                 must_edit_after_gap = False
@@ -3737,12 +3885,28 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
+            # === NEW (P1 #5): dual trigger for the mid-loop hail-mary ========
+            # Original trigger: 55% of wall-clock elapsed with no patch on
+            # disk. That catches the "slow tool calls" case. A FAST loop
+            # doing many quick inspections without editing anything goes
+            # undetected until 55% of wall-clock burns past, by which point
+            # little budget remains for the recovery edit.
+            #
+            # The new step-count trigger fires when the loop has taken many
+            # steps with no patch, regardless of wall-clock. Either condition
+            # is sufficient -- empty patches are bad enough that we want both
+            # safety nets active.
+            _hm_time_trigger = (
+                _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+            )
+            _hm_step_trigger = step >= _MID_LOOP_HAIL_MARY_STEP_TRIGGER
             if (
                 mid_loop_hail_mary_used < MAX_MID_LOOP_HAIL_MARY_TURNS
-                and _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+                and (_hm_time_trigger or _hm_step_trigger)
                 and not get_patch(repo).strip()
             ):
                 mid_loop_hail_mary_used += 1
+                _hm_trigger_reason = "time" if _hm_time_trigger else f"step={step}"
                 messages.append({
                     "role": "user",
                     "content": build_mid_loop_hail_mary_prompt(
@@ -3750,7 +3914,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         _recently_observed_paths(logs),
                     ),
                 })
-                logs.append("MID_LOOP_HAIL_MARY_FIRED")
+                logs.append(f"MID_LOOP_HAIL_MARY_FIRED:{_hm_trigger_reason}")
                 continue
 
             response_text: Optional[str] = None
