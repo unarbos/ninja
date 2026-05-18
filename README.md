@@ -225,9 +225,15 @@ telemetry, copy checks, and timeout calibration data, but Cursor-baseline
 similarity no longer contributes to the winner.
 
 Round score is based only on the LLM diff judgment. The live diff judge uses
-`openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning
-effort and a 16000-token output cap, then scores the king and challenger
-patches against the task/reference context.
+`anthropic/claude-sonnet-4.6` through OpenRouter at temperature 0 with adaptive
+reasoning enabled and a 16000-token output cap, then scores the king and
+challenger patches against the task/reference context. The validator uses
+OpenRouter Anthropic prompt caching with an explicit `cache_control: {"type":
+"ephemeral"}` content-block breakpoint after the stable task and reference
+patch context, leaving candidate patches uncached so repeated tasks can reuse
+cached prompt reads when they meet Sonnet 4.6 cache-size requirements. If Sonnet
+returns the same OpenRouter route/provider no-choices error, the judge falls
+back to `moonshotai/kimi-k2.6` with a plain non-Anthropic prompt shape.
 
 The challenger needs more decisive round wins than the current king. The
 validator may require an extra win margin in production.
