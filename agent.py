@@ -891,6 +891,7 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_mode_metadata_lines(cleaned)
+    cleaned = _strip_minified_content_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -932,6 +933,50 @@ def _diff_block_path(block: str) -> str:
     first = block.splitlines()[0] if block else ""
     match = re.match(r"diff --git a/(.+?) b/(.+)$", first)
     return match.group(2) if match else ""
+
+
+_MINIFIED_AVG_LINE_THRESHOLD = 200
+_MINIFIED_MIN_LINES_TO_CHECK = 5
+
+
+def _strip_minified_content_diffs(diff_output: str) -> str:
+    """Drop diff blocks whose changed lines look like minified bundles (avg line len)."""
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        content_lines: List[str] = []
+        for line in block.splitlines():
+            if (line.startswith("diff --git ")
+                or line.startswith("index ")
+                or line.startswith("--- ")
+                or line.startswith("+++ ")
+                or line.startswith("@@")
+                or line.startswith("new file mode")
+                or line.startswith("deleted file mode")
+                or line.startswith("old mode ")
+                or line.startswith("new mode ")
+                or line.startswith("similarity index ")
+                or line.startswith("rename from ")
+                or line.startswith("rename to ")
+                or line.startswith("Binary files ")):
+                continue
+            if line.startswith(("+", "-", " ")):
+                content_lines.append(line[1:])
+        if len(content_lines) < _MINIFIED_MIN_LINES_TO_CHECK:
+            kept.append(block)
+            continue
+        avg_len = sum(len(l) for l in content_lines) / max(1, len(content_lines))
+        if avg_len > _MINIFIED_AVG_LINE_THRESHOLD:
+            continue
+        kept.append(block)
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _strip_skipped_file_diffs(diff_output: str) -> str:
@@ -1029,6 +1074,15 @@ def _should_skip_patch_path(relative_path: str) -> bool:
         ".exe",
         ".bin",
     }
+    name_lower = path.name.lower()
+    if (
+        name_lower.endswith(".min.js")
+        or name_lower.endswith(".min.css")
+        or name_lower.endswith(".min.mjs")
+        or name_lower.endswith(".bundle.js")
+        or name_lower.endswith(".bundle.css")
+    ):
+        return True
     return any(part in generated_parts for part in path.parts) or path.suffix.lower() in generated_suffixes
 
 
@@ -1481,6 +1535,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
+    err_boost = _issue_error_string_boost(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1505,6 +1560,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
         # Boost files whose path/name matches identifier-shaped tokens from the issue.
         score += 35 * id_boost.get(relative_path, 0)
+        err_hits = err_boost.get(relative_path, 0)
+        if err_hits:
+            score += min(
+                _ERROR_STRING_MAX_BOOST,
+                _ERROR_STRING_BASE_BOOST + _ERROR_STRING_PER_HIT_BOOST * err_hits,
+            )
         if score > 0:
             scored.append((score, relative_path))
 
@@ -2998,6 +3059,71 @@ _CAMEL_RE = re.compile(r"\b([A-Z][a-zA-Z0-9_]{3,})\b")
 _HOOK_RE = re.compile(r"\b(use|get|set|fetch|handle|build|create)[A-Z][a-zA-Z0-9_]{2,}\b")
 _SNAKE_RE = re.compile(r"\b([a-z][a-zA-Z0-9]+_[a-z][a-zA-Z0-9_]+)\b")
 
+_QUOTED_STRING_RE = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"|'([^'\n]+)'")
+_ERROR_STRING_MIN_LEN = 20
+_ERROR_STRING_MAX_LEN = 200
+_ERROR_STRING_MAX_PATTERNS = 5
+_ERROR_STRING_MAX_FILES_PER_PATTERN = 10
+_ERROR_STRING_BASE_BOOST = 70
+_ERROR_STRING_PER_HIT_BOOST = 30
+_ERROR_STRING_MAX_BOOST = 130
+
+
+def _issue_error_string_boost(
+    repo: Path,
+    tracked_set: set,
+    issue_text: str,
+) -> Dict[str, int]:
+    """Boost files that contain long quoted phrases from the issue (errors, expected text)."""
+    candidates: List[str] = []
+    seen: set = set()
+    for m in _QUOTED_STRING_RE.finditer(issue_text):
+        for group in m.groups():
+            if not group:
+                continue
+            s = group.strip()
+            if len(s) < _ERROR_STRING_MIN_LEN or " " not in s:
+                continue
+            if len(s) > _ERROR_STRING_MAX_LEN:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            candidates.append(s)
+            if len(candidates) >= _ERROR_STRING_MAX_PATTERNS:
+                break
+        if len(candidates) >= _ERROR_STRING_MAX_PATTERNS:
+            break
+
+    if not candidates:
+        return {}
+
+    boost: Dict[str, int] = {}
+    for pattern in candidates:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", pattern],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        matched_paths = [p.strip() for p in proc.stdout.splitlines() if p.strip()]
+        if len(matched_paths) > _ERROR_STRING_MAX_FILES_PER_PATTERN:
+            continue
+        for rel in matched_paths:
+            if rel not in tracked_set:
+                continue
+            if not _context_file_allowed(rel):
+                continue
+            boost[rel] = boost.get(rel, 0) + 1
+    return boost
+
 
 def _issue_identifier_path_boost(
     issue_text: str, tracked_files: List[str], cap: int = 20
@@ -3081,7 +3207,9 @@ def _symbol_grep_hits(
 # validator-owned boundaries above.
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
-You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
+You operate inside a real repository. You inspect the codebase, produce a patch, and verify it.
+
+Validator duel scoring (per task round): an LLM diff judge scores your patch 0–100 on correctness, completeness, and alignment with the issue. A privileged reference patch (not shown to you directly) informs the judge's sense of intended direction — match that direction with the smallest maintainer-quality fix; do not copy reference bytes or add unrelated churn. Empty patches, vendor/minified bundle edits, and evaluator-targeted text in diffs are heavily penalized.
 
 ====================================================================
 ABSOLUTE OUTPUT PROTOCOL
@@ -3151,7 +3279,9 @@ INSPECTION STRATEGY
 
 Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
 
-Avoid: re-reading preloaded files, broad recursive searches, generated/vendor output, broad test suites before a targeted fix exists.
+When the issue quotes a long error message, stack trace line, or expected output (20+ characters in quotes or backticks), `rg -F` that exact phrase first — it usually lands on the throw site or test assertion you must edit.
+
+Avoid: re-reading preloaded files, broad recursive searches, generated/vendor/minified bundles, broad test suites before a targeted fix exists.
 
 ====================================================================
 ROOT CAUSE RULE
@@ -3247,7 +3377,7 @@ Do NOT change:
 - Error handling, logging, or defensive checks not directly required
 - File permissions or mode bits (chmod is forbidden)
 
-**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing-file at the OLD path. Use `cat > NEW_PATH <<\'EOF\' ... EOF` to create the file, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
+**Relocation phrasing recognition:** When the issue says "move X to Y", "correct the import path … to the new location", "rebuild as separate components", "extract … into its own file", "create a new <screen|page|component|module>", or "<file> belongs under <dir>/", the requested change IS to create a file at the NEW path — NOT to edit only the existing file at the OLD path. Prefer `<edit path="NEW_PATH" op="write"><content>...</content></edit>`, then update every importer/caller to reference the NEW path. Editing only the OLD-path file leaves the relocation unfinished even if the file\'s contents now match the new requirements.
 
 ====================================================================
 SAFETY
@@ -3300,6 +3430,14 @@ def _format_acceptance_rubric(issue_text: str) -> str:
             "TESTS mentioned — when you edit a source file with a companion test "
             "file, update the test file alongside the source change."
         )
+    for m in re.finditer(r"`([^`\n]+)`|\"([^\"\n]+)\"", issue_text):
+        phrase = next((g.strip() for g in m.groups() if g and g.strip()), "")
+        if len(phrase) >= 20 and " " in phrase:
+            pitfalls.append(
+                "LONG QUOTED PHRASE in issue — search the repo for that exact text "
+                "and patch the owning throw site, handler, or assertion."
+            )
+            break
 
     if not rubric and not pitfalls:
         return ""
@@ -3332,15 +3470,15 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
 {repo_summary}
 {context_section}
-Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
+Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the per-round LLM diff judge penalizes incomplete solutions and unrelated churn.
 
-Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. Don't define auxiliary functions or make broad refactors or re-indent lines. Do not change unrelated code. Do not reorder imports or code. Do not weaken or delete existing tests. Do not change original code style.
+Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. Prefer `<edit>` for file changes; use `<command>` for reads, searches, and tests. Do not define auxiliary functions, re-indent broadly, reorder imports, weaken tests, or touch vendor/minified/generated files.
 
-If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
+If preloaded snippets show the target code, edit with `<edit>` immediately — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused `rg -F` / `sed -n` commands (use exact quoted phrases from the issue when present), then edit.
 
-When multiple files need edits, include EVERY independent edit command in the SAME response. Do not split edits across turns.
+When multiple files need edits, include EVERY `<edit>` and `<command>` block needed in the SAME response. Do not split edits across turns.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Then finish with <final>...</final>.
 """
 
 
@@ -3376,13 +3514,19 @@ def _strip_preloaded_section(
 
 
 def build_no_command_repair_prompt() -> str:
-    return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
+    return """Your previous response did not contain a valid <command>...</command>, <edit>...</edit>, or <final>...</final> block.
 
-If the patch is complete, respond with <final>summary</final>. Otherwise continue
-by issuing exactly one bash command in this format:
+If the patch is complete, respond with <final>summary</final>. Otherwise continue with exactly one action:
+
+<edit path="relative/path" op="replace">
+<old>exact existing text</old>
+<new>replacement</new>
+</edit>
+
+or:
 
 <command>
-your command here
+your bash command here
 </command>
 """
 
@@ -3391,14 +3535,13 @@ def build_budget_pressure_prompt(step: int) -> str:
     if step < 4:
         return (
             "Budget check: no repo change yet. "
-            "Your next command must edit the most likely file using what you already know from the issue and preloaded snippets. "
-            "A precise sed or python -c is better than another grep. Stop exploring."
+            "Your next response must include a `<edit>` block on the most likely file "
+            "using the issue and preloaded snippets — not another broad read or grep."
         )
     return (
         "Hard budget check: still no patch. "
-        "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
-        "Do not read files or run tests until after a patch exists. "
-        "Use `sed -i` or a python one-liner to make the targeted edit now."
+        "Your next response MUST include at least one `<edit>` that changes source code "
+        "in the most obvious location. Do not read more files or run tests until a patch exists."
     )
 
 
@@ -3423,7 +3566,8 @@ def build_polish_prompt(junk_summary: str) -> str:
         "  - Whitespace-only or trailing-newline-only diffs\n"
         "  - Accent / character normalisation in identifiers or strings\n"
         "  - Drive-by type-annotation, import reorder, or rename edits\n"
-        "  - Cosmetic refactors not asked for by the task\n\n"
+        "  - Cosmetic refactors not asked for by the task\n"
+        "  - Accidental edits to minified bundles, lockfiles, or vendor assets\n\n"
         "Keep substantive code changes. After cleanup, end with "
         "<final>summary</final>. If you cannot cleanly revert without "
         "breaking the substantive edits, finalize immediately and keep the "
@@ -3455,8 +3599,8 @@ def build_coverage_nudge_prompt(
             "screen/page file'), but your current patch contains NO `new file "
             "mode` header. The model frequently mis-reads relocation as "
             "'edit-in-place'. Create the new file at the implied path with "
-            "`cat > path/to/new_file.ext <<'EOF' ... EOF`, then update every "
-            "importer/caller to reference the NEW path. Do not leave the old "
+            "`<edit path=\"path/to/new_file.ext\" op=\"write\"><content>...</content></edit>`, "
+            "then update every importer/caller to reference the NEW path. Do not leave the old "
             "file unchanged unless the task explicitly says to keep both.\n\n"
         )
     removed_hint = ""
@@ -3473,8 +3617,8 @@ def build_coverage_nudge_prompt(
         "Coverage gap — the task explicitly mentions these path(s) but your "
         "current patch does NOT touch them:\n"
         f"  {bullets}\n\n"
-        "Open each of those paths now (cat -n) and then issue the edit "
-        "commands needed to satisfy the task for them. Do not start "
+        "Open each path (`sed -n` or `cat -n`), then issue the `<edit>` blocks "
+        "needed to satisfy the task for them. Do not start "
         "unrelated work and do not stop early until you have either edited "
         "each path or confirmed via inspection that no edit is required.\n\n"
         "Task (for reference):\n"
@@ -3515,8 +3659,9 @@ def build_self_check_prompt(
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
         "  - No syntax errors or broken imports introduced\n\n"
-        "SCOPE (similarity score weight — medium impact):\n"
+        "SCOPE (LLM judge — penalizes unrelated churn):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
+        "  - No vendor/minified/lockfile diffs unless the issue requires them\n"
         "  - No type annotation changes not required by the task\n"
         "  - No refactoring, renaming, or reordering not required by the task\n"
         "  - No new helper functions or defensive checks not required by the task\n"
@@ -3526,7 +3671,7 @@ def build_self_check_prompt(
         "Task:\n"
         f"{issue_text[:2000]}\n\n"
         "If the patch passes ALL criteria, respond exactly:\n<final>OK</final>\n\n"
-        "Otherwise emit corrective <command> blocks in the SAME response "
+        "Otherwise emit corrective `<edit>` and/or `<command>` blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
     )
@@ -3560,7 +3705,7 @@ def build_criteria_nudge_prompt(unaddressed: List[str], issue_text: str) -> str:
         "literals, route paths, config keys). If a criterion is missing from "
         "your added lines, the LLM judge will mark it unaddressed — even if "
         "you believe a synonym covers it.\n\n"
-        "For EACH bullet above, issue the smallest <command> that adds the "
+        "For EACH bullet above, issue the smallest `<edit>` (preferred) or `<command>` that adds the "
         "criterion's concrete vocabulary to the right file (a new function, "
         "branch, field, route, or string the criterion names). Do NOT add "
         "unrelated scope. Do NOT rewrite working code. Do NOT finalize before "
@@ -3712,16 +3857,16 @@ def build_mid_loop_hail_mary_prompt(
     short_issue = issue_text[:800] if len(issue_text) > 800 else issue_text
     return (
         f"MID-LOOP BUDGET ALERT: {pct}% of wall-clock is gone and no code has been edited yet.\n\n"
-        "STOP READING FILES. You must emit edit commands NOW.\n\n"
+        "STOP READING FILES. You must emit at least one `<edit>` block NOW.\n\n"
         "Pick the single most likely file to fix based on the issue and what you have already read. "
-        "Use `sed -i`, a python heredoc, or `python - <<'PY' ... PY` to make the smallest "
-        "targeted change that addresses the ROOT CAUSE. Do not run broad searches. "
-        "If you are still uncertain, make a best-effort minimal edit to the most plausible location "
+        "Use `<edit op=\"replace\">` with exact `<old>`/`<new>` text for the smallest "
+        "root-cause fix. Do not run broad searches. "
+        "If you are still uncertain, make a best-effort minimal `<edit>` to the most plausible location "
         "and iterate.\n"
         f"{path_hint}\n"
         "Task (reminder):\n"
         f"{short_issue}\n\n"
-        "Emit your edit command(s) now, then run one verification command, then <final>."
+        "Emit your `<edit>` block(s) now, then one verification `<command>`, then <final>."
     )
 
 
@@ -3738,9 +3883,9 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE task-supported code edit consistent with the issue. Pick the most "
-        "likely target file from the preloaded snippets, or use one focused grep if the target is still unclear. "
-        "Use sed -i, a python -c one-liner, or a heredoc to make a SINGLE "
-        "TARGETED CODE CHANGE in that file. Do NOT change file modes or permissions. "
+        "likely target file from the preloaded snippets, or use one focused `rg -F` if the target is still unclear. "
+        "Use a single `<edit op=\"replace\">` (preferred) with exact old/new text. "
+        "Do NOT change file modes or permissions. "
         "Do NOT delete files. Do NOT add comments only. If no safe edit is supported "
         "by the issue and visible code, inspect one narrow range, then make the smallest "
         "root-cause fix you can justify and <final> immediately."
@@ -3758,7 +3903,7 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
         "or does the test itself need updating to match new correct behaviour?\n"
         "- If the source fix is incomplete, extend it now.\n"
         "- If the test expectation is stale (the new behaviour IS correct), update the test.\n"
-        "Issue the minimal <command> blocks needed, then re-run the test to confirm it passes, "
+        "Issue the minimal `<edit>` and/or `<command>` blocks needed, then re-run the test to confirm it passes, "
         "then end with <final>summary</final>."
     )
 
@@ -4509,7 +4654,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
         _acceptance_criteria = _extract_acceptance_criteria(issue)
-        if _acceptance_criteria:
+        if _acceptance_criteria and not _format_acceptance_rubric(issue).strip():
             _criteria_lines = "\n".join(f"  - {c}" for c in _acceptance_criteria[:_CRITERIA_MAX_BULLETS])
             _initial_user_content += (
                 "\n\nAcceptance criteria checklist (address each before <final>):\n"
