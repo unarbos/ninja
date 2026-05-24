@@ -3120,6 +3120,185 @@ def _detect_broken_files_post_patch(patch: str, repo: Optional[Path]) -> List[st
     return broken
 
 
+# -----------------------------
+# Large multi-component task detection + coverage-first prompting
+# -----------------------------
+#
+# Issues whose reference fix touches many files (a multi-form refactor, a
+# backend+frontend feature with API/route/view/template/migration edits,
+# etc.) routinely receive partial patches when the agent treats them as
+# single-file fixes. A heuristic at solve start spots these from cheap
+# structural signals in the issue text and injects an addendum that asks
+# the model to enumerate every implied file before its first <edit>.
+
+_LGXL_MIN_ISSUE_CHARS = 1800
+_LGXL_MIN_FILE_MENTIONS = 4
+_LGXL_MIN_BULLETS = 5
+_LGXL_MIN_CRITERIA = 4
+
+_LGXL_BULLET_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+|- \[[ x]\])")
+
+
+def _detect_lg_xl_task(issue_text: str) -> Tuple[bool, str]:
+    """Heuristic: return (True, reason) if the issue is multi-component.
+
+    Requires at least TWO independent structural signals to fire, because a
+    single signal (e.g. a long backstory) is not enough evidence of a real
+    multi-file refactor. The combinations that count:
+      - length + file mentions: explicit multi-file refactor
+      - file mentions + acceptance criteria: structured multi-component task
+      - bulleted requirement list + acceptance criteria: enumerated multi-step
+
+    A single signal alone (long prose, many incidental file refs) is treated
+    as a normal task to avoid steering the model toward the wrong strategy.
+    """
+    if not issue_text:
+        return False, ""
+    n_chars = len(issue_text)
+    n_files = len(_extract_issue_path_mentions(issue_text))
+    n_bullets = len(_LGXL_BULLET_RE.findall(issue_text))
+    n_criteria = len(_extract_acceptance_criteria(issue_text))
+    reasons: List[str] = []
+    if n_chars >= _LGXL_MIN_ISSUE_CHARS:
+        reasons.append(f"len={n_chars}")
+    if n_files >= _LGXL_MIN_FILE_MENTIONS:
+        reasons.append(f"files={n_files}")
+    if n_bullets >= _LGXL_MIN_BULLETS:
+        reasons.append(f"bullets={n_bullets}")
+    if n_criteria >= _LGXL_MIN_CRITERIA:
+        reasons.append(f"criteria={n_criteria}")
+    return (len(reasons) >= 2, ",".join(reasons))
+
+
+def build_lgxl_coverage_addendum(reasons: str) -> str:
+    """System-prompt addendum injected for detected multi-component tasks.
+
+    Steers the model toward enumerating every required edit before starting
+    and explicitly forbids destructive empty-file or stub-only patches on
+    existing files. Wording emphasises functional correctness and behavioral
+    preservation.
+    """
+    return (
+        f"\n\nThis issue spans multiple components ({reasons}). Before any "
+        "<edit>, enumerate every file and module the task implies you need "
+        "to change. Partial coverage on a multi-component task ships a "
+        "non-functional repository state.\n\n"
+        "Preservation rules for existing-file edits:\n"
+        "  1. PRESERVE all existing file content. When modifying a file, "
+        "your edit must keep the original code intact and ADD or MODIFY "
+        "only the specific lines the task requires.\n"
+        "  2. NEVER delete or empty an existing file unless the issue text "
+        "EXPLICITLY says to delete/remove that file.\n"
+        "  3. NEVER replace an existing file's body with only imports, only "
+        "a comment block, or only a stub. The resulting file must still "
+        "compile and expose the same surface as before plus the requested "
+        "additions.\n"
+        "  4. If a file is too long to rewrite, edit ONLY the specific "
+        "function or block that needs to change. Leave the rest untouched.\n\n"
+        "Coverage strategy: cover as many of the implied required files as "
+        "you can within budget. Each file's edit must contribute real "
+        "functionality — never regress an existing file to an empty or "
+        "stub state.\n"
+    )
+
+
+# -----------------------------
+# Junk-placeholder + empty-new-file detectors
+# -----------------------------
+
+_EMPTY_NEWFILE_SUFFIXES = {
+    ".py", ".java", ".kt", ".scala", ".go", ".rs", ".cs",
+    ".ts", ".tsx", ".jsx", ".js", ".mjs", ".cjs",
+    ".vue", ".svelte", ".rb", ".php",
+}
+
+_TRIVIAL_LINE_RE = re.compile(
+    r"^\s*(?:#.*|//.*|/\*.*\*/|\*.*|--.*|package\s+[\w.]+\s*;?|"
+    r"import\s+[\w.]+\s*;?|from\s+[\w.]+\s+import.*|"
+    r"using\s+[\w.]+\s*;?|export\s*\{?\}?;?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _detect_empty_new_files(patch: str) -> List[str]:
+    """Flag ``--- /dev/null`` blocks creating source files with <4 substantive
+    added lines. Comments, blanks, package/import boilerplate excluded.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    lines = patch.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if line == "--- /dev/null" and i + 1 < n:
+            plus_line = lines[i + 1]
+            if not plus_line.startswith("+++ b/"):
+                i += 1
+                continue
+            path = plus_line[6:].strip()
+            suffix = Path(path).suffix.lower()
+            if suffix not in _EMPTY_NEWFILE_SUFFIXES:
+                i += 2
+                continue
+            j = i + 2
+            substantive = 0
+            while j < n:
+                bl = lines[j]
+                if bl.startswith("diff --git ") or bl.startswith("--- "):
+                    break
+                if bl.startswith("@@"):
+                    j += 1
+                    continue
+                if bl.startswith("+") and not bl.startswith("+++"):
+                    body = bl[1:]
+                    if not _TRIVIAL_LINE_RE.match(body):
+                        substantive += 1
+                j += 1
+            if substantive < 4:
+                findings.append(f"empty_newfile:{path}({substantive}sub)")
+            i = j
+            continue
+        i += 1
+    return findings[:5]
+
+
+_JUNK_TOKEN_RE = re.compile(
+    r"(?<![a-zA-Z0-9_])"
+    r"(FOUND|FIXME-AI|XXX TODO|XXX-PLACEHOLDER|PLACEHOLDER TEXT|"
+    r"PLACEHOLDER_TEXT|lorem ipsum|YOUR\s+CODE\s+HERE|"
+    r"//\s*FOUND|/\*\s*FOUND\s*\*/|<!--\s*FOUND\s*-->)"
+    r"(?![a-zA-Z0-9_])",
+    re.IGNORECASE,
+)
+
+
+def _detect_junk_placeholders(patch: str) -> List[str]:
+    """Flag literal scratch tokens ('FOUND', 'PLACEHOLDER TEXT', etc.) leaking
+    into ``+`` lines. Narrowly anchored to avoid false-positives on legit
+    identifiers like ``notFoundError`` or ``placeholder=`` HTML attrs.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:]
+        for m in _JUNK_TOKEN_RE.finditer(body):
+            tok = m.group(1).strip()
+            key = tok.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(f"junk_token:{tok}")
+            if len(findings) >= 5:
+                return findings
+    return findings
+
+
 def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     """Structural gaps that correlate with weak patches.
 
@@ -3140,6 +3319,11 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
         blockers.append("relocation_incomplete")
     if len(_unaddressed_criteria(patch, issue)) >= 2:
         blockers.append("criteria_mostly_unaddressed")
+    # Hard-gate on placeholder junk tokens (rare; near-certain patch failure
+    # when present). Triggers refinement retry (bounded by MAX_TOTAL_REFINEMENT_TURNS).
+    junk = _detect_junk_placeholders(patch)
+    if junk:
+        blockers.append("junk_placeholder_tokens")
     return blockers
 
 
@@ -3165,6 +3349,12 @@ def _emit_patch_quality_hints(
         broken = _detect_broken_files_post_patch(diff_text, repo_root)
         if broken:
             hints.append("broken_files_post_patch: " + ",".join(broken[:3]))
+    # Advisory on empty new-file scaffolds. Hint not blocker because legit
+    # empty stubs (__init__.py, type-only barrels) shouldn't block ship; the
+    # hint nudges the next attempt to fill the file with real content.
+    empties = _detect_empty_new_files(diff_text)
+    if empties:
+        hints.append("empty_new_files: " + ",".join(empties[:3]))
     return hints
 
 
@@ -4105,6 +4295,10 @@ Preloaded likely relevant tracked-file snippets (already read for you — do not
 
     rubric_section = _format_acceptance_rubric(issue)
 
+    # Inject coverage-first addendum for detected multi-component tasks.
+    is_lgxl, lgxl_reasons = _detect_lg_xl_task(issue)
+    lgxl_addendum = build_lgxl_coverage_addendum(lgxl_reasons) if is_lgxl else ""
+
     return f"""Fix this issue:
 
 {issue}
@@ -4121,8 +4315,7 @@ If preloaded snippets show the target code, edit with `<edit>` immediately — d
 
 When multiple files need edits, include EVERY `<edit>` and `<command>` block needed in the SAME response. Do not split edits across turns.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Then finish with <final>...</final>.
-"""
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Then finish with <final>...</final>.{lgxl_addendum}"""
 
 
 
@@ -4771,6 +4964,90 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
         return AgentResult(patch=patch_text, logs=_safe_join_logs(logs), steps=0, cost=None, success=False).to_dict()
 
 
+# -----------------------------
+# Tier-B last-resort patch synthesis (single LLM round-trip returning raw diff)
+# -----------------------------
+#
+# The existing emergency single-shot (_solve_emergency_single_shot) runs a
+# full bash sub-loop and needs ~60s of remaining budget. When all multi-shot
+# attempts spend the wall clock, the budget left is usually well under 60s
+# and emergency cannot fire — the agent then ships an empty patch.
+#
+# This Tier-B fallback is a single LLM round-trip with no bash sub-loop,
+# needing only ~15s. It asks for a raw unified diff directly, parses the
+# first `diff --git a/...` block out of the response, and applies it as the
+# final patch. Intent: ensure the agent always returns a non-empty,
+# functionally-motivated patch even on time-starved runs.
+
+_MIN_VIABLE_PATCH_BUDGET = 15.0
+_MIN_VIABLE_PATCH_TIMEOUT = 12
+_MIN_VIABLE_PATCH_MAX_TOKENS = 1024
+
+
+def _build_minimum_viable_patch_prompt(target: str, snippet: str, task_text: str) -> str:
+    task_view = task_text[:1500]
+    return (
+        "You are an emergency unified-diff generator. Prior attempts in this "
+        "session ran out of budget before completing. Produce a single, "
+        "minimal, functionally-correct patch that addresses one concrete "
+        "requirement from the task.\n\n"
+        f"TASK:\n{task_view}\n\n"
+        f"TARGET FILE: {target}\n```\n{snippet}\n```\n\n"
+        "Emit EXACTLY ONE unified diff in standard git format. Begin with "
+        "`diff --git a/{path} b/{path}`. No commentary, no markdown fences, "
+        "no <command> tags - just the raw unified diff. The change must be "
+        "directly motivated by the task description; if you cannot derive "
+        "a correct minimal change from the snippet and task, emit no diff "
+        "rather than guessing."
+    )
+
+
+def _solve_minimum_viable_diff(**kwargs: Any) -> str:
+    """Last-resort: single LLM call returning a raw unified diff.
+
+    Uses **kwargs to avoid duplicating the validator-protected solve() parameter
+    signature outside of solve() itself (same pattern as
+    _solve_emergency_single_shot).
+
+    Fails open: any error or empty model output returns "" so callers can
+    keep their pre-stack behavior of returning the original empty patch.
+    """
+    repo_path_value = kwargs["repo_path"]
+    task_text = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+    try:
+        repo = _repo_path(repo_path_value)
+        ensure_git_repo(repo)
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+        target = _emergency_pick_target(repo, task_text)
+        if target is None:
+            return ""
+        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
+        prompt = _build_minimum_viable_patch_prompt(target, snippet, task_text)
+        messages = [
+            {"role": "system", "content": "You are an emergency unified-diff generator. Output a raw git unified diff only."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response_text, _, _ = chat_completion(
+                messages=messages, model=model_name, api_base=base, api_key=key,
+                max_tokens=_MIN_VIABLE_PATCH_MAX_TOKENS,
+                timeout=_MIN_VIABLE_PATCH_TIMEOUT, max_retries=0,
+            )
+        except Exception:
+            return ""
+        m = re.search(r"diff --git a/.*", response_text or "", flags=re.DOTALL)
+        if not m:
+            return ""
+        diff_text = m.group(0).strip()
+        diff_text = re.sub(r"\n```.*$", "", diff_text, flags=re.DOTALL).strip()
+        return diff_text
+    except Exception:
+        return ""
+
+
 def _diverge_patch(patch: str) -> str:
     """Apply deterministic cosmetic normalizations to added lines so our
     final patch bytes diverge from any other agent that ships the model's
@@ -5002,15 +5279,32 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             if patch_text.strip():
                 return result
             elapsed = time.monotonic() - started_at
-            if (_MULTISHOT_TOTAL_BUDGET - elapsed) < _EMERGENCY_MIN_REMAINING_BUDGET:
-                return result
-            emer = _solve_emergency_single_shot(**kwargs)
-            emer_patch = (emer or {}).get("patch", "") or ""
-            if emer_patch.strip():
-                merged = dict(result or {})
-                merged["patch"] = emer_patch
-                merged["emergency_single_shot_invoked"] = True
-                return merged
+            # Tier-A: full bash-subloop emergency single-shot (needs 60s).
+            if (_MULTISHOT_TOTAL_BUDGET - elapsed) >= _EMERGENCY_MIN_REMAINING_BUDGET:
+                try:
+                    emer = _solve_emergency_single_shot(**kwargs)
+                    emer_patch = (emer or {}).get("patch", "") or ""
+                    if emer_patch.strip():
+                        merged = dict(result or {})
+                        merged["patch"] = emer_patch
+                        merged["emergency_single_shot_invoked"] = True
+                        return merged
+                except Exception:
+                    pass
+            # Tier-B last-resort: minimum-viable diff fallback when emergency
+            # can't fire or returned empty. Single LLM call, ~12s. Ensures a
+            # non-empty patch is always returned within budget.
+            elapsed = time.monotonic() - started_at
+            if (_MULTISHOT_TOTAL_BUDGET - elapsed) >= _MIN_VIABLE_PATCH_BUDGET:
+                try:
+                    mv_patch = _solve_minimum_viable_diff(**kwargs)
+                    if mv_patch.strip():
+                        merged = dict(result or {})
+                        merged["patch"] = mv_patch
+                        merged["min_viable_hail_mary_invoked"] = True
+                        return merged
+                except Exception:
+                    pass
         except Exception:
             pass
         return result
