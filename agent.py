@@ -1425,6 +1425,442 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Repo skeleton map + multi-step localization (stdlib-only; no tree-sitter)
+# ---------------------------------------------------------------------------
+# Coarse-to-fine: BM25 over file-level symbol docs, then TF-IDF cosine over the
+# same tokens (cheap embedding-free similarity). The model sees a compact repo
+# map first; full snippets are loaded only around localized symbols.
+
+_REPO_MAP_MAX_CHARS = 12000
+_REPO_MAP_FULL_SYMBOL_FILES = 14
+_REPO_MAP_STUB_LINES_PER_FILE = 2
+_SKELETON_INDEX_MAX_FILES = 220
+_SKELETON_READ_MAX_BYTES = 120_000
+_LOCALIZE_BM25_WEIGHT = 0.55
+_LOCALIZE_TFIDF_WEIGHT = 0.45
+_LOCALIZE_TOP_SYMBOLS_PER_FILE = 5
+_LOCALIZE_SYMBOL_CTX_BEFORE = 6
+_LOCALIZE_SYMBOL_CTX_AFTER = 18
+# Set only during build_preloaded_context so _rank_context_files keeps king signature.
+_SYMBOL_INDEX_FOR_RANKING: Optional[Dict[str, FileSkeleton]] = None
+
+# Skeleton extraction (per-language line scanners)
+_SKEL_PY_CLASS_RE = re.compile(r"^(\s*)class\s+([A-Za-z_]\w*)", re.M)
+_SKEL_PY_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.M)
+_SKEL_JS_TS_DECL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:function|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+    re.M,
+)
+_SKEL_JS_TS_ARROW_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(",
+    re.M,
+)
+_SKEL_GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\(", re.M)
+_SKEL_GO_TYPE_RE = re.compile(r"^type\s+([A-Za-z_]\w*)\s+", re.M)
+_SKEL_RUST_ITEM_RE = re.compile(
+    r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|type)\s+([A-Za-z_]\w*)",
+    re.M,
+)
+_SKEL_JAVA_TYPE_RE = re.compile(
+    r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?"
+    r"(?:class|interface|enum|record)\s+([A-Z]\w*)",
+    re.M,
+)
+_SKEL_JAVA_METHOD_RE = re.compile(
+    r"^\s*(?:public|private|protected)\s+(?:static\s+)?[\w<>,\[\]\s]+\s+(\w+)\s*\(",
+    re.M,
+)
+_SKEL_GENERIC_DEF_RE = re.compile(
+    r"^\s*(?:def|function|fn|func|sub|proc)\s+([A-Za-z_]\w*)",
+    re.M | re.IGNORECASE,
+)
+
+
+@dataclass
+class SkeletonSymbol:
+    kind: str
+    name: str
+    signature: str
+    line: int  # 1-based
+
+
+@dataclass
+class FileSkeleton:
+    path: str
+    symbols: List[SkeletonSymbol]
+    index_text: str  # BM25 / TF-IDF document
+
+
+def _skeleton_line_signature(line: str, kind: str, name: str) -> str:
+    sig = line.strip()
+    if len(sig) > 120:
+        sig = sig[:117] + "..."
+    return f"{kind} {name}: {sig}" if sig else f"{kind} {name}"
+
+
+def _skeleton_symbols_from_python(text: str) -> List[SkeletonSymbol]:
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out: List[SkeletonSymbol] = []
+    lines = text.splitlines()
+
+    class Visitor(ast.NodeVisitor):
+        def visit_ClassDef(self, node: "ast.ClassDef") -> None:
+            ln = getattr(node, "lineno", 1) or 1
+            line = lines[ln - 1] if 0 < ln <= len(lines) else ""
+            out.append(
+                SkeletonSymbol("class", node.name, _skeleton_line_signature(line, "class", node.name), ln)
+            )
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: "ast.FunctionDef") -> None:
+            ln = getattr(node, "lineno", 1) or 1
+            line = lines[ln - 1] if 0 < ln <= len(lines) else ""
+            out.append(
+                SkeletonSymbol(
+                    "function",
+                    node.name,
+                    _skeleton_line_signature(line, "def", node.name),
+                    ln,
+                )
+            )
+
+        def visit_AsyncFunctionDef(self, node: "ast.AsyncFunctionDef") -> None:
+            ln = getattr(node, "lineno", 1) or 1
+            line = lines[ln - 1] if 0 < ln <= len(lines) else ""
+            out.append(
+                SkeletonSymbol(
+                    "function",
+                    node.name,
+                    _skeleton_line_signature(line, "async def", node.name),
+                    ln,
+                )
+            )
+
+    Visitor().visit(tree)
+    return out
+
+
+def _skeleton_symbols_from_regex(text: str, suffix: str) -> List[SkeletonSymbol]:
+    lines = text.splitlines()
+    out: List[SkeletonSymbol] = []
+    seen: set = set()
+
+    def add(kind: str, name: str, line_no: int) -> None:
+        key = (kind, name, line_no)
+        if name in seen or len(out) >= 64:
+            return
+        seen.add(name)
+        line = lines[line_no - 1] if 0 < line_no <= len(lines) else ""
+        out.append(SkeletonSymbol(kind, name, _skeleton_line_signature(line, kind, name), line_no))
+
+    low = suffix.lower()
+    if low.endswith(".py"):
+        for m in _SKEL_PY_CLASS_RE.finditer(text):
+            add("class", m.group(2), text[: m.start()].count("\n") + 1)
+        for m in _SKEL_PY_DEF_RE.finditer(text):
+            add("function", m.group(2), text[: m.start()].count("\n") + 1)
+        return out
+    if low.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")):
+        for pat in (_SKEL_JS_TS_DECL_RE, _SKEL_JS_TS_ARROW_RE):
+            for m in pat.finditer(text):
+                add("symbol", m.group(1), text[: m.start()].count("\n") + 1)
+        return out
+    if low.endswith(".go"):
+        for m in _SKEL_GO_TYPE_RE.finditer(text):
+            add("type", m.group(1), text[: m.start()].count("\n") + 1)
+        for m in _SKEL_GO_FUNC_RE.finditer(text):
+            add("function", m.group(1), text[: m.start()].count("\n") + 1)
+        return out
+    if low.endswith(".rs"):
+        for m in _SKEL_RUST_ITEM_RE.finditer(text):
+            add("item", m.group(1), text[: m.start()].count("\n") + 1)
+        return out
+    if low.endswith(".java") or low.endswith(".kt"):
+        for m in _SKEL_JAVA_TYPE_RE.finditer(text):
+            add("type", m.group(1), text[: m.start()].count("\n") + 1)
+        for m in _SKEL_JAVA_METHOD_RE.finditer(text):
+            add("method", m.group(1), text[: m.start()].count("\n") + 1)
+        return out
+    for m in _SKEL_GENERIC_DEF_RE.finditer(text):
+        add("function", m.group(1), text[: m.start()].count("\n") + 1)
+    return out
+
+
+def _extract_file_skeleton(repo: Path, relative_path: str) -> Optional[FileSkeleton]:
+    if not _context_file_allowed(relative_path):
+        return None
+    path = repo / relative_path
+    try:
+        data = path.read_bytes()[:_SKELETON_READ_MAX_BYTES]
+    except Exception:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    suffix = Path(relative_path).suffix.lower()
+    symbols: List[SkeletonSymbol] = []
+    if suffix == ".py":
+        symbols = _skeleton_symbols_from_python(text)
+    if not symbols:
+        symbols = _skeleton_symbols_from_regex(text, relative_path)
+    if not symbols:
+        return None
+    names = " ".join(s.name for s in symbols)
+    sigs = " ".join(s.signature for s in symbols)
+    index_text = f"{relative_path} {names} {sigs}".lower()
+    return FileSkeleton(path=relative_path, symbols=symbols, index_text=index_text)
+
+
+def _build_repo_symbol_index(repo: Path, tracked: set) -> Dict[str, FileSkeleton]:
+    index: Dict[str, FileSkeleton] = {}
+    paths = sorted(p for p in tracked if _context_file_allowed(p))[:_SKELETON_INDEX_MAX_FILES]
+    for rel in paths:
+        sk = _extract_file_skeleton(repo, rel)
+        if sk:
+            index[rel] = sk
+    return index
+
+
+def _tokenize_index_text(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9_]{3,}", text.lower())
+
+
+def _bm25_file_scores(
+    query_terms: List[str],
+    index: Dict[str, FileSkeleton],
+) -> Dict[str, float]:
+    if not query_terms or not index:
+        return {}
+    docs = {p: _tokenize_index_text(sk.index_text) for p, sk in index.items()}
+    n_docs = len(docs)
+    if n_docs == 0:
+        return {}
+    df: Dict[str, int] = {}
+    for tokens in docs.values():
+        for t in set(tokens):
+            df[t] = df.get(t, 0) + 1
+    avg_dl = sum(len(t) for t in docs.values()) / max(1, n_docs)
+    k1, b = 1.5, 0.75
+    scores: Dict[str, float] = {}
+    for path, tokens in docs.items():
+        dl = len(tokens) or 1
+        tf: Dict[str, int] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        s = 0.0
+        for qt in query_terms:
+            if qt not in df:
+                continue
+            freq = tf.get(qt, 0)
+            idf = max(0.0, ((n_docs - df[qt] + 0.5) / (df[qt] + 0.5)))
+            denom = freq + k1 * (1 - b + b * dl / avg_dl)
+            s += idf * (freq * (k1 + 1)) / (denom or 1.0)
+        if s > 0:
+            scores[path] = s
+    return scores
+
+
+def _tfidf_cosine_file_scores(
+    query_terms: List[str],
+    index: Dict[str, FileSkeleton],
+) -> Dict[str, float]:
+    if not query_terms or not index:
+        return {}
+    import math
+
+    docs = {p: _tokenize_index_text(sk.index_text) for p, sk in index.items()}
+    n_docs = len(docs)
+    df: Dict[str, int] = {}
+    for tokens in docs.values():
+        for t in set(tokens):
+            df[t] = df.get(t, 0) + 1
+    q_tf: Dict[str, int] = {}
+    for t in query_terms:
+        q_tf[t] = q_tf.get(t, 0) + 1
+
+    def vec(tokens: List[str]) -> Dict[str, float]:
+        tf: Dict[str, int] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        v: Dict[str, float] = {}
+        for t, c in tf.items():
+            v[t] = c * math.log((n_docs + 1) / (df.get(t, 0) + 1))
+        return v
+
+    qv = vec(query_terms)
+    qnorm = math.sqrt(sum(v * v for v in qv.values())) or 1.0
+    scores: Dict[str, float] = {}
+    for path, tokens in docs.items():
+        dv = vec(tokens)
+        dot = sum(qv.get(t, 0.0) * dv.get(t, 0.0) for t in qv)
+        dnorm = math.sqrt(sum(v * v for v in dv.values())) or 1.0
+        cos = dot / (qnorm * dnorm)
+        if cos > 0:
+            scores[path] = cos
+    return scores
+
+
+def _normalize_score_map(scores: Dict[str, float]) -> Dict[str, float]:
+    if not scores:
+        return {}
+    hi = max(scores.values())
+    if hi <= 0:
+        return scores
+    return {k: v / hi for k, v in scores.items()}
+
+
+def _localization_query_terms(issue_text: str) -> List[str]:
+    terms = list(_issue_terms(issue_text))
+    for sym in _extract_issue_symbols(issue_text)[:16]:
+        for part in re.findall(r"[a-z0-9_]{3,}", sym.lower()):
+            if part not in terms:
+                terms.append(part)
+    return terms[:48]
+
+
+def _multistep_localize_file_ranking(
+    issue_text: str,
+    base_ranked: List[str],
+    index: Dict[str, FileSkeleton],
+) -> Tuple[List[str], int]:
+    """Coarse file pass: BM25 + TF-IDF over symbol index, merged with base rank."""
+    if not index or not base_ranked:
+        return base_ranked, 0
+    qterms = _localization_query_terms(issue_text)
+    if not qterms:
+        return base_ranked, 0
+    bm25 = _normalize_score_map(_bm25_file_scores(qterms, index))
+    tfidf = _normalize_score_map(_tfidf_cosine_file_scores(qterms, index))
+    position: Dict[str, int] = {p: i for i, p in enumerate(base_ranked)}
+    combined: Dict[str, float] = {}
+    for path in set(base_ranked) | set(index.keys()):
+        loc = _LOCALIZE_BM25_WEIGHT * bm25.get(path, 0.0) + _LOCALIZE_TFIDF_WEIGHT * tfidf.get(path, 0.0)
+        pos_bonus = max(0.0, 1.0 - 0.04 * position.get(path, 99))
+        combined[path] = loc * 100.0 + pos_bonus * 40.0
+    ordered = sorted(combined.items(), key=lambda kv: (-kv[1], position.get(kv[0], 999), kv[0]))
+    ranked = [p for p, _ in ordered if p in index or p in position]
+    seen: set = set()
+    out: List[str] = []
+    for p in ranked:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    for p in base_ranked:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    top = int(max(combined.values())) if combined else 0
+    return out, top
+
+
+def _localize_file_symbols(issue_text: str, sk: FileSkeleton) -> List[SkeletonSymbol]:
+    """Fine pass: rank symbols inside one file (BM25 + token overlap)."""
+    if not sk.symbols:
+        return []
+    qterms = set(_localization_query_terms(issue_text))
+    if not qterms:
+        return sk.symbols[:_LOCALIZE_TOP_SYMBOLS_PER_FILE]
+    scored: List[Tuple[float, SkeletonSymbol]] = []
+    for sym in sk.symbols:
+        blob = f"{sym.name} {sym.signature} {sym.kind}".lower()
+        tokens = set(_tokenize_index_text(blob))
+        overlap = len(qterms & tokens)
+        name_hit = 3.0 if sym.name.lower() in qterms else 0.0
+        scored.append((overlap + name_hit, sym))
+    scored.sort(key=lambda x: (-x[0], x[1].line))
+    return [s for score, s in scored if score > 0][: _LOCALIZE_TOP_SYMBOLS_PER_FILE] or [
+        s for _, s in scored[:_LOCALIZE_TOP_SYMBOLS_PER_FILE]
+    ]
+
+
+def _format_repo_skeleton_map(
+    index: Dict[str, FileSkeleton],
+    ranked_files: List[str],
+    issue_text: str,
+    budget: int = _REPO_MAP_MAX_CHARS,
+) -> str:
+    if not index or not ranked_files:
+        return ""
+    header = (
+        "### Repo map (symbol skeleton — navigate here before requesting full file dumps)\n"
+        "Coarse index of classes/functions per file. Use `sed -n` on the line numbers "
+        "shown when you need implementation detail.\n"
+    )
+    lines = [header]
+    used = len(header)
+    full_set = set(ranked_files[:_REPO_MAP_FULL_SYMBOL_FILES])
+    for path in ranked_files:
+        if used >= budget:
+            break
+        sk = index.get(path)
+        if not sk:
+            continue
+        if path in full_set:
+            sym_lines = [
+                f"  L{s.line:4d} [{s.kind}] {s.signature}" for s in sk.symbols[:40]
+            ]
+            block = f"**{path}** ({len(sk.symbols)} symbols)\n" + "\n".join(sym_lines)
+        else:
+            preview = "; ".join(f"{s.kind} {s.name}" for s in sk.symbols[:_REPO_MAP_STUB_LINES_PER_FILE])
+            block = f"**{path}** — {preview}"
+        if used + len(block) + 2 > budget:
+            break
+        lines.append(block)
+        used += len(block) + 2
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def _read_localized_symbol_regions(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    symbols: List[SkeletonSymbol],
+    needles: Optional[List[str]] = None,
+) -> str:
+    if not symbols:
+        return _read_context_file(repo, relative_path, max_chars, needles=needles)
+    try:
+        text = (repo / relative_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if len(text) > _SKELETON_READ_MAX_BYTES:
+        text = text[:_SKELETON_READ_MAX_BYTES]
+    lines = text.splitlines()
+    windows: List[Tuple[int, int]] = []
+    for sym in symbols:
+        start = max(0, sym.line - 1 - _LOCALIZE_SYMBOL_CTX_BEFORE)
+        end = min(len(lines), sym.line - 1 + _LOCALIZE_SYMBOL_CTX_AFTER)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+    parts: List[str] = []
+    used = 0
+    for start, end in windows:
+        hdr = f"--- localized {relative_path} L{start + 1}-{end} ---"
+        body = "\n".join(f"{i + 1:5d}| {lines[i]}" for i in range(start, end))
+        block = hdr + "\n" + body
+        if parts and used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block) + 2
+    if not parts:
+        return _read_context_file(repo, relative_path, max_chars, needles=needles)
+    joined = "\n\n".join(parts)
+    if needles:
+        return _extract_relevant_regions(joined, needles, max_chars)
+    return _truncate(joined, max_chars)
+
+
 # === v71 GRAFT FROM v54: needle-aware preload (v54 lines 1516-1605) ===
 
 def _preload_needles(issue: str) -> List[str]:
@@ -1622,7 +2058,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     Returns `(context_text, included_files)` so late solve steps can drop the
     bulky snippets while keeping a file-name breadcrumb.
 
-    Three improvements over a vanilla rank-and-read loop:
+    Four improvements over a vanilla rank-and-read loop:
+
+      0. Repo skeleton map (Aider-style): symbol-level index per file, shown
+         before snippets. Multi-step localization (BM25 + TF-IDF over the index)
+         picks files, then symbols, then loads only localized line regions.
 
       1. Companion test files (tests/test_X.py for X.py, X.test.ts for X.ts,
          X_test.go for X.go, etc.) are slotted in right after their source
@@ -1640,8 +2080,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          the direct hits. This improves file targeting on feature tasks without
          displacing the primary target files.
     """
-    files, top_score = _rank_context_files(repo, issue)
     tracked_set = set(_tracked_files(repo))
+    symbol_index = _build_repo_symbol_index(repo, tracked_set)
+    global _SYMBOL_INDEX_FOR_RANKING
+    _SYMBOL_INDEX_FOR_RANKING = symbol_index
+    try:
+        files, top_score = _rank_context_files(repo, issue)
+    finally:
+        _SYMBOL_INDEX_FOR_RANKING = None
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
@@ -1701,10 +2147,22 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
+    repo_map = _format_repo_skeleton_map(symbol_index, files, issue)
+    if repo_map and used + len(repo_map) <= MAX_PRELOADED_CONTEXT_CHARS + _REPO_MAP_MAX_CHARS:
+        parts.append(repo_map)
+        used += len(repo_map)
+
     for rank_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
         # XL_NARROW_V2: per-file budget scales by rank position
         budget = _xlnv2_per_file_budget(rank_idx)
-        snippet = _read_context_file(repo, relative_path, budget, needles=needles)
+        sk = symbol_index.get(relative_path)
+        if sk:
+            localized_syms = _localize_file_symbols(issue, sk)
+            snippet = _read_localized_symbol_regions(
+                repo, relative_path, budget, localized_syms, needles=needles,
+            )
+        else:
+            snippet = _read_context_file(repo, relative_path, budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -1875,6 +2333,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Explicit path or backtick-ident match: ranking is strong even if
         # the scored list is empty (mentioned files bypass the score loop).
         top_score = max(top_score, 100)
+    idx = _SYMBOL_INDEX_FOR_RANKING
+    if idx:
+        reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx)
+        if reranked:
+            ranked = reranked
+            top_score = max(top_score, loc_top)
     return ranked, top_score
 
 
@@ -6539,7 +7003,7 @@ Evidence priority when picking what to patch: explicit issue text > failing/expe
 INSPECTION STRATEGY
 ====================================================================
 
-Inspect only what you need to locate the owner of the bug and patch safely. Order: preloaded snippets first, then one or two focused searches (`rg`, fall back to `grep -R`), then the exact target region (`sed -n '120,220p'`), then nearby tests, then call sites only if a signature/public API may change.
+Inspect only what you need to locate the owner of the bug and patch safely. Order: **repo map (symbol skeleton) first** to pick the right file/class/function, then the localized preloaded regions (not whole files), then one or two focused searches (`rg`, fall back to `grep -R`), then `sed -n` on the line numbers from the map, then nearby tests, then call sites only if a signature/public API may change.
 
 When the issue quotes a long error message, stack trace line, or expected output (20+ characters in quotes or backticks), `rg -F` that exact phrase first — it usually lands on the throw site or test assertion you must edit.
 
@@ -6730,7 +7194,7 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     if preloaded_context.strip():
         context_section = f"""
 {_PRELOAD_BEGIN_MARKER}
-Preloaded likely relevant tracked-file snippets (already read for you — do not re-read):
+Preloaded repo map + localized regions (symbol-targeted — do not re-read whole files):
 
 {preloaded_context}
 {_PRELOAD_END_MARKER}
@@ -9845,25 +10309,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # the probe can't starve the action loop. Best-effort — empty
         # results just leave the prompt unchanged.
         _baseline_failing_tests: List[Tuple[str, str]] = []
-        _baseline_budget = time_remaining()
-        if _likely_tests and _baseline_budget > 115.0:
-            _baseline_max_tests = min(
-                3,
-                len(_likely_tests),
-                max(1, int((_baseline_budget - 100.0) // 50.0) + 1),
-            )
-            _baseline_timeout = 4 if _baseline_budget < 170.0 else 6
+        if _likely_tests and time_remaining() > 200.0:
             _baseline_t0 = time.monotonic()
             _baseline_failing_tests = _run_failing_tests_baseline(
-                repo,
-                _likely_tests,
-                timeout_seconds=_baseline_timeout,
-                max_tests=_baseline_max_tests,
+                repo, _likely_tests, timeout_seconds=6, max_tests=3
             )
             logs.append(
                 "BASELINE_TESTS: "
-                f"checked={min(_baseline_max_tests, len(_likely_tests))} "
-                f"timeout={_baseline_timeout}s "
+                f"checked={min(3, len(_likely_tests))} "
                 f"failing={len(_baseline_failing_tests)} "
                 f"elapsed={time.monotonic() - _baseline_t0:.1f}s"
             )
@@ -10165,29 +10618,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     if success:
                         break
                     continue
-                if (
-                    verification_nudges_used < 1
-                    and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
-                ):
-                    _final_verify = _suggest_targeted_test_command(
-                        repo,
-                        get_patch(repo),
-                        known_node_ids=known_test_node_ids,
-                        failed_node_ids=last_failed_test_names,
-                    )
-                    if _final_verify:
-                        verification_nudges_used += 1
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "You have a patch but have not run a targeted verification recently. "
-                                    "Run this command next, then fix any failures:\n"
-                                    f"  `{_final_verify}`"
-                                ),
-                            }
-                        )
-                        continue
                 logs.append("\nFINAL_SUMMARY:\n" + final)
                 success = True
 
@@ -10317,14 +10747,10 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " all passed",
         " tests passed",
         "success",
-        "test result: ok",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
-
-    if re.search(r"(?m)^ok$", lower):
-        return True
 
     has_good = any(marker in lower for marker in good_markers)
     has_bad = any(marker in lower for marker in bad_markers)
