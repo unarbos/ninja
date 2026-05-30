@@ -5409,6 +5409,64 @@ def _verify_baseline_tests_pass(
     return None
 
 
+def _baseline_context_ranking_suffix(
+    failing: List[Tuple[str, str]],
+    tracked: Optional[set] = None,
+) -> str:
+    """Build issue suffix for build_preloaded_context ranking only.
+
+    Baseline probe runs before preload so failing pytest node ids, their
+    companion source files, and traceback/assert tokens feed
+    _rank_context_files, _preload_needles, and _symbol_grep_hits even when
+    the issue prose never names paths.
+    """
+    if not failing:
+        return ""
+    tracked = tracked or set()
+    lines = [
+        "Baseline probe failures (file-targeting hints — not new requirements):",
+    ]
+    seen: set = set()
+
+    def _add(token: str) -> None:
+        token = (token or "").strip()
+        if len(token) < 3:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        lines.append(token)
+
+    for node_id, output in failing[:3]:
+        _add(node_id)
+        test_path = node_id.split("::", 1)[0]
+        _add(test_path)
+        if tracked:
+            partner = _find_test_partner(test_path, tracked)
+            if partner:
+                _add(partner)
+        stem = Path(test_path).stem
+        if stem.startswith("test_") and len(stem) > 5:
+            _add(stem[5:])
+        tail = (output or "")[-1200:]
+        for raw in tail.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            file_match = re.search(r'File "([^"]+)"', raw)
+            if file_match:
+                rel = file_match.group(1)
+                if not rel.startswith(("/", "\\\\")):
+                    _add(rel)
+            if any(
+                marker in raw
+                for marker in ("Error", "AssertionError", "assert", "Expected", "FAILED")
+            ):
+                _add(raw[:160])
+    return "\n\n" + "\n".join(lines)
+
+
 def _format_failing_tests_section(failing: List[Tuple[str, str]]) -> str:
     """Render baseline failing-test output as a primary-context block to inject
     at the top of the initial user prompt. Each entry surfaces the test node id
@@ -9617,14 +9675,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 if stripped != patch_text:
                     result["patch"] = stripped
                     result["lockfile_stripped"] = True
-                repaired = _repair_hunk_header_counts(result["patch"])
-                if repaired != result["patch"]:
-                    result["patch"] = repaired
-                    result["hunk_headers_repaired"] = True
                 dropped = _drop_malformed_diff_blocks(result["patch"])
                 if dropped != result["patch"]:
                     result["patch"] = dropped
                     result["malformed_blocks_dropped"] = True
+                # Repair only after malformed blocks are stripped — hunk-count
+                # repair on garbage diffs can corrupt valid hunks downstream.
+                repaired = _repair_hunk_header_counts(result["patch"])
+                if repaired != result["patch"]:
+                    result["patch"] = repaired
+                    result["hunk_headers_repaired"] = True
                 # Catastrophic-pattern guard: when the patch creates
                 # several new source files and a majority are empty,
                 # strip the empty ones rather than ship the stub-only
@@ -10163,31 +10223,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             return False
 
         # Merged gate order: syntax → test-correctness → completeness → final-review.
-        # Correctness gates (ground-truth or structural) consume refinement budget
-        # before the cosmetic final-review, so a real failure is never displaced
-        # by low-signal hunk cleanup.
+        # When baseline probe surfaced failing tests, run test-correctness before
+        # syntax — ground-truth regression beats static parse errors on partial patches.
+        _refinement_gate_order = (
+            ("test", "syntax") if _baseline_failing_tests else ("syntax", "test")
+        )
 
-        # --- Gate 1: syntax -------------------------------------------------
-        if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
+        def _try_syntax_refinement_gate() -> bool:
+            nonlocal syntax_fix_turns_used, total_refinement_turns_used
+            if syntax_fix_turns_used >= MAX_SYNTAX_FIX_TURNS:
+                return False
             syntax_errors = _check_syntax(repo, patch)
-            if syntax_errors:
-                syntax_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_syntax_fix_prompt(syntax_errors),
-                    "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
+            if not syntax_errors:
+                return False
+            syntax_fix_turns_used += 1
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_syntax_fix_prompt(syntax_errors),
+                "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+            )
+            return True
 
-        # --- Gate 2: test-correctness (merge of baseline-verify + companion) -
-        # Run the single most authoritative test once: prefer the originally
-        # failing tests surfaced at prompt time (ground truth for the bug),
-        # else the companion test. Feed the first still-failing tail back via
-        # build_test_fix_prompt. The gate is marked used after running a probe
-        # (regardless of outcome) so we never re-run expensive tests on a later
-        # refinement check.
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+        def _try_test_refinement_gate() -> bool:
+            nonlocal test_fix_turns_used, total_refinement_turns_used
+            if test_fix_turns_used >= MAX_TEST_FIX_TURNS:
+                return False
             test_failure: Optional[Tuple[str, str]] = None
             probed = False
             if _baseline_failing_tests:
@@ -10210,26 +10271,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     failed_node_ids=last_failed_test_names,
                 )
             if probed:
-                # Mark used regardless of outcome — the probe already spent
-                # budget; don't re-run it on the next refinement check.
                 test_fix_turns_used += 1
-            if test_failure is not None:
-                # The probe just spent up to ~18-24s of wall-clock the floor
-                # check above couldn't account for; recheck before queuing.
-                if time_remaining() < _REFINEMENT_TIME_FLOOR_SECONDS:
-                    logs.append(
-                        "REFINEMENT_TIME_GATED_POST_TEST:\n  "
-                        f"remaining={time_remaining():.1f}s "
-                        f"floor={_REFINEMENT_TIME_FLOOR_SECONDS:.1f}s"
-                    )
-                    return False
-                node_id, new_failure = test_failure
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(node_id, new_failure),
-                    f"TEST_FIX_QUEUED:\n  {node_id}",
+            if test_failure is None:
+                return False
+            if time_remaining() < _REFINEMENT_TIME_FLOOR_SECONDS:
+                logs.append(
+                    "REFINEMENT_TIME_GATED_POST_TEST:\n  "
+                    f"remaining={time_remaining():.1f}s "
+                    f"floor={_REFINEMENT_TIME_FLOOR_SECONDS:.1f}s"
                 )
+                return False
+            node_id, new_failure = test_failure
+            total_refinement_turns_used += 1
+            queue_refinement_turn(
+                assistant_text,
+                build_test_fix_prompt(node_id, new_failure),
+                f"TEST_FIX_QUEUED:\n  {node_id}",
+            )
+            return True
+
+        for _gate_name in _refinement_gate_order:
+            if _gate_name == "syntax" and _try_syntax_refinement_gate():
+                return True
+            if _gate_name == "test" and _try_test_refinement_gate():
                 return True
 
         # --- Gate 3: completeness (merge of deletion + destructive + criteria +
@@ -10338,7 +10402,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         except Exception:
             pass
         repo_summary = get_repo_summary(repo)
-        preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
         _likely_tests = _discover_likely_test_nodes(repo, issue, _tracked_set_for_checks)
         known_test_node_ids = [n for n, _ in _likely_tests]
@@ -10362,6 +10425,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 f"failing={len(_baseline_failing_tests)} "
                 f"elapsed={time.monotonic() - _baseline_t0:.1f}s"
             )
+
+        # Boost file ranking by appending failing test paths to the issue used for context loading
+        ranking_issue = issue
+        if _baseline_failing_tests:
+            ranking_issue += _baseline_context_ranking_suffix(
+                _baseline_failing_tests,
+                tracked=_tracked_set_for_checks,
+            )
+            logs.append(
+                "BASELINE_RANKING_BOOST: "
+                f"nodes={len(_baseline_failing_tests)} "
+                f"suffix_chars={len(ranking_issue) - len(issue)}"
+            )
+
+        preloaded_context, preloaded_files = build_preloaded_context(repo, ranking_issue)
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
