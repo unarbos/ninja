@@ -106,6 +106,20 @@ _ACCEPTANCE_CHECKPOINTS_BUDGET = 2000  # cap on the numbered 'Acceptance checkpo
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 25
 
+# Context engineering (GraphRAG / RAPTOR retrieval).
+_RETRIEVAL_CONTEXT_TOKEN_BUDGET = 8000
+_RETRIEVAL_CONTEXT_CHAR_BUDGET = _RETRIEVAL_CONTEXT_TOKEN_BUDGET * 4
+_REPOGRAPH_BFS_HOPS = 2
+_RAPTOR_CLUSTER_SIZE = 6
+_RAPTOR_MAX_CLUSTERS = 24
+_RAPTOR_SUMMARY_CHARS = 400
+
+# Hybrid workflow: optional single-shot pipeline before ReAct (traceback bugs only).
+_PIPELINE_MAX_CANDIDATES = 1
+_PIPELINE_MAX_TOKENS = 1536
+_PIPELINE_TIMEOUT = 22
+_PIPELINE_COMMAND_TIMEOUT = 15
+
 # Loop guards and companion-test targeting.
 COMMAND_LOOP_THRESHOLD = 5
 COMMAND_LOOP_SIG_WINDOW = 8
@@ -653,8 +667,7 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
 def extract_actions_in_order(model_text: str) -> List[Tuple[str, Any]]:
     """Walk the model text and return all <command> and <edit> blocks in
     document order. Returns list of (kind, value) tuples where kind is
-    'command' (value=str) or 'edit' (value=dict). Used by the dispatch loop
-    so the model can interleave reads and edits naturally.
+    'command' (value=str) or 'edit' (value=dict).
     """
     out: List[Tuple[int, str, Any]] = []
     for m in ACTION_RE.finditer(model_text):
@@ -662,7 +675,6 @@ def extract_actions_in_order(model_text: str) -> List[Tuple[str, Any]]:
         if cmd:
             out.append((m.start(), "command", cmd))
     for ed in extract_edits(model_text):
-        # find the position of this edit's raw match in the text
         idx = model_text.find(ed["raw"])
         out.append((idx if idx >= 0 else 0, "edit", ed))
     out.sort(key=lambda t: t[0])
@@ -1444,6 +1456,26 @@ _LOCALIZE_SYMBOL_CTX_BEFORE = 6
 _LOCALIZE_SYMBOL_CTX_AFTER = 18
 # Set only during build_preloaded_context so _rank_context_files keeps king signature.
 _SYMBOL_INDEX_FOR_RANKING: Optional[Dict[str, FileSkeleton]] = None
+_PRELOAD_TRACE_FRAMES: List[Tuple[str, int]] = []
+
+# RE-based localization (trace frames, exceptions, docstrings, JS call graph).
+_TRACE_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_ISSUE_EXCEPTION_RE = re.compile(r"\b([A-Za-z_][\w.]*(?:Error|Exception|Warning))\b")
+_PY_DOCSTRING_RE = re.compile(
+    r"(?:^[\t ]*(?:async\s+)?def\s+(\w+)|^[\t ]*class\s+(\w+))[^\n]*\n"
+    r"[\t ]*(?:\"\"\"|''')(.*?)(?:\"\"\"|''')",
+    re.DOTALL | re.MULTILINE,
+)
+_JS_DOCBLOCK_RE = re.compile(r"/\*\*(.*?)\*/", re.DOTALL)
+_JS_TS_CALL_RE = re.compile(r"(?:^|[=(\s,])(?:await\s+)?([A-Za-z_$][\w$]*)\s*\(")
+_JS_TS_METHOD_CALL_RE = re.compile(r"\.([A-Za-z_$][\w$]*)\s*\(")
+_JS_FN_PAT = re.compile(
+    r"(?:^|\n)(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\("
+    r"|(?:^|\n)(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\("
+    r"|(?:^|\n)\s+(\w+)\s*\([^)]*\)\s*\{",
+    re.MULTILINE,
+)
+_TRACE_FRAME_FILE_BOOST = 80
 
 # Skeleton extraction (per-language line scanners)
 _SKEL_PY_CLASS_RE = re.compile(r"^(\s*)class\s+([A-Za-z_]\w*)", re.M)
@@ -1614,7 +1646,15 @@ def _extract_file_skeleton(repo: Path, relative_path: str) -> Optional[FileSkele
         return None
     names = " ".join(s.name for s in symbols)
     sigs = " ".join(s.signature for s in symbols)
-    index_text = f"{relative_path} {names} {sigs}".lower()
+    doc_blob = ""
+    if suffix == ".py":
+        docs = _extract_python_docstrings(text)
+        doc_blob = " ".join(docs.get(s.name, "") for s in symbols if docs.get(s.name))
+    elif suffix in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+        docs = _extract_docstrings_regex(text, suffix)
+        if docs:
+            doc_blob = " ".join(docs.values())
+    index_text = f"{relative_path} {names} {sigs} {doc_blob}".lower()
     return FileSkeleton(path=relative_path, symbols=symbols, index_text=index_text)
 
 
@@ -1760,12 +1800,219 @@ def _multistep_localize_file_ranking(
     return out, top
 
 
-def _localize_file_symbols(issue_text: str, sk: FileSkeleton) -> List[SkeletonSymbol]:
-    """Fine pass: rank symbols inside one file (BM25 + token overlap)."""
+def _normalize_trace_path(raw: str, tracked: set) -> Optional[str]:
+    """Map traceback path to a tracked repo-relative path when possible."""
+    if not raw:
+        return None
+    p = raw.replace("\\", "/").lstrip("./")
+    if p in tracked:
+        return p
+    for rel in tracked:
+        if rel.endswith("/" + p) or rel.endswith(p):
+            return rel
+    tail = p.split("/")[-1]
+    matches = [r for r in tracked if r.endswith("/" + tail) or r == tail]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _extract_trace_frames(text: str, tracked: set) -> List[Tuple[str, int]]:
+    """Pull (file, line) pairs from tracebacks via regex; paths normalized to tracked set."""
+    if not text or not tracked:
+        return []
+    out: List[Tuple[str, int]] = []
+    seen: set = set()
+    for m in _TRACE_FRAME_RE.finditer(text):
+        rel = _normalize_trace_path(m.group(1), tracked)
+        if not rel:
+            continue
+        try:
+            ln = int(m.group(2))
+        except ValueError:
+            continue
+        key = (rel, ln)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _trace_frame_file_boost(issue_text: str, tracked: set) -> Dict[str, int]:
+    """Rank boost for files appearing in issue tracebacks (regex, zero LLM cost)."""
+    boosts: Dict[str, int] = {}
+    for rel, _ln in _extract_trace_frames(issue_text, tracked):
+        boosts[rel] = boosts.get(rel, 0) + _TRACE_FRAME_FILE_BOOST
+    return boosts
+
+
+def _issue_exception_names(issue_text: str) -> set:
+    names: set = set()
+    for m in _ISSUE_EXCEPTION_RE.finditer(issue_text or ""):
+        names.add(m.group(1))
+        names.add(m.group(1).rsplit(".", 1)[-1])
+    return names
+
+
+def _extract_docstrings_regex(text: str, suffix: str) -> Dict[str, str]:
+    """Regex docstring/index enrichment when ast is unavailable."""
+    out: Dict[str, str] = {}
+    low = suffix.lower()
+    if low.endswith(".py"):
+        for m in _PY_DOCSTRING_RE.finditer(text):
+            name = m.group(1) or m.group(2) or ""
+            body = re.sub(r"\s+", " ", (m.group(3) or "").strip())[:240]
+            if name and body:
+                out[name] = body
+    elif low.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")):
+        for m in _JS_DOCBLOCK_RE.finditer(text):
+            body = re.sub(r"\s+", " ", (m.group(1) or "").strip())[:240]
+            if body:
+                out[f"block_{len(out)}"] = body
+    return out
+
+
+def _extract_python_docstrings(text: str) -> Dict[str, str]:
+    import ast
+
+    out: Dict[str, str] = {}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return _extract_docstrings_regex(text, ".py")
+
+    class Visitor(ast.NodeVisitor):
+        def visit(self, node: "ast.AST") -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                doc = ast.get_docstring(node) or ""
+                doc = re.sub(r"\s+", " ", doc.strip())[:240]
+                if doc:
+                    out[node.name] = doc
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return out
+
+
+def _regex_call_graph_js_ts(text: str) -> Tuple[Dict[str, set], Dict[str, set]]:
+    """±1 hop call graph for JS/TS via regex (no babel)."""
+    callees: Dict[str, set] = {}
+    callers: Dict[str, set] = {}
+    names: List[Tuple[str, int]] = []
+    for m in _JS_FN_PAT.finditer(text):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if name and name not in {"if", "for", "while", "switch", "catch"}:
+            names.append((name, m.start()))
+    if not names:
+        return callees, callers
+    for idx, (name, start) in enumerate(names):
+        end = names[idx + 1][1] if idx + 1 < len(names) else len(text)
+        body = text[start:end]
+        callees.setdefault(name, set())
+        for cm in _JS_TS_CALL_RE.finditer(body):
+            callee = cm.group(1)
+            if callee and callee not in {name, "if", "for", "while", "return"}:
+                callees[name].add(callee)
+                callers.setdefault(callee, set()).add(name)
+        for cm in _JS_TS_METHOD_CALL_RE.finditer(body):
+            callee = cm.group(1)
+            if callee:
+                callees[name].add(callee)
+                callers.setdefault(callee, set()).add(name)
+    return callees, callers
+
+
+def _python_call_graph(text: str) -> Tuple[Dict[str, set], Dict[str, set]]:
+    """AST call graph for Python edit-context enrichment."""
+    import ast
+
+    callees: Dict[str, set] = {}
+    callers: Dict[str, set] = {}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return callees, callers
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.current_fn: Optional[str] = None
+
+        def visit_FunctionDef(self, node: "ast.FunctionDef") -> None:
+            prev = self.current_fn
+            self.current_fn = node.name
+            callees.setdefault(node.name, set())
+            self.generic_visit(node)
+            self.current_fn = prev
+
+        def visit_AsyncFunctionDef(self, node: "ast.AsyncFunctionDef") -> None:
+            prev = self.current_fn
+            self.current_fn = node.name
+            callees.setdefault(node.name, set())
+            self.generic_visit(node)
+            self.current_fn = prev
+
+        def visit_Call(self, node: "ast.Call") -> None:
+            if self.current_fn:
+                callee = None
+                if isinstance(node.func, ast.Name):
+                    callee = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    callee = node.func.attr
+                if callee:
+                    callees[self.current_fn].add(callee)
+                    callers.setdefault(callee, set()).add(self.current_fn)
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return callees, callers
+
+
+def _format_trace_pin_block(
+    repo: Path,
+    frames: List[Tuple[str, int]],
+    budget: int = 3200,
+) -> str:
+    """Pin exact traceback line windows into preload (regex-localized, zero LLM)."""
+    if not frames:
+        return ""
+    header = (
+        "### Traceback pin (regex-extracted file:line — inspect before broad search)\n"
+        "Frames pulled from issue/failure tracebacks; edit near these lines first.\n"
+    )
+    parts = [header]
+    used = len(header)
+    ctx = 10
+    for rel, ln in frames[:6]:
+        try:
+            lines = (repo / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        start = max(0, ln - 1 - ctx)
+        end = min(len(lines), ln - 1 + ctx + 1)
+        body = "\n".join(f"{i + 1:5d}| {lines[i]}" for i in range(start, end))
+        block = f"**{rel}:{ln}**\n```\n{body}\n```"
+        if used + len(block) > budget:
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts) if len(parts) > 1 else ""
+
+
+def _localize_file_symbols(
+    issue_text: str,
+    sk: FileSkeleton,
+    *,
+    trace_frames: Optional[List[Tuple[str, int]]] = None,
+) -> List[SkeletonSymbol]:
+    """Fine pass: rank symbols inside one file (BM25 + token overlap + RE hints)."""
     if not sk.symbols:
         return []
     qterms = set(_localization_query_terms(issue_text))
-    if not qterms:
+    exc_names = _issue_exception_names(issue_text)
+    frame_lines: set = set()
+    if trace_frames:
+        frame_lines = {ln for path, ln in trace_frames if path == sk.path}
+    if not qterms and not exc_names and not frame_lines:
         return sk.symbols[:_LOCALIZE_TOP_SYMBOLS_PER_FILE]
     scored: List[Tuple[float, SkeletonSymbol]] = []
     for sym in sk.symbols:
@@ -1773,7 +2020,13 @@ def _localize_file_symbols(issue_text: str, sk: FileSkeleton) -> List[SkeletonSy
         tokens = set(_tokenize_index_text(blob))
         overlap = len(qterms & tokens)
         name_hit = 3.0 if sym.name.lower() in qterms else 0.0
-        scored.append((overlap + name_hit, sym))
+        exc_hit = 4.0 if sym.name in exc_names or any(e in sym.name for e in exc_names) else 0.0
+        line_hit = 0.0
+        if sym.line in frame_lines:
+            line_hit = 5.0
+        elif frame_lines:
+            line_hit = max(0.0, 3.0 - 0.15 * min(abs(sym.line - ln) for ln in frame_lines))
+        scored.append((overlap + name_hit + exc_hit + line_hit, sym))
     scored.sort(key=lambda x: (-x[0], x[1].line))
     return [s for score, s in scored if score > 0][: _LOCALIZE_TOP_SYMBOLS_PER_FILE] or [
         s for _, s in scored[:_LOCALIZE_TOP_SYMBOLS_PER_FILE]
@@ -1858,6 +2111,28 @@ def _read_localized_symbol_regions(
     joined = "\n\n".join(parts)
     if needles:
         return _extract_relevant_regions(joined, needles, max_chars)
+    # RE call-graph: append ±1 hop neighbor symbol names for edit awareness.
+    try:
+        suffix = Path(relative_path).suffix.lower()
+        if suffix == ".py":
+            callees_map, callers_map = _python_call_graph(text)
+        elif suffix in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            callees_map, callers_map = _regex_call_graph_js_ts(text)
+        else:
+            callees_map, callers_map = {}, {}
+        if callees_map or callers_map:
+            hints: List[str] = []
+            for sym in symbols[:3]:
+                cs = sorted(callees_map.get(sym.name, set()))[:6]
+                rs = sorted(callers_map.get(sym.name, set()))[:6]
+                if cs:
+                    hints.append(f"{sym.name} calls: {', '.join(cs)}")
+                if rs:
+                    hints.append(f"{sym.name} called by: {', '.join(rs)}")
+            if hints:
+                joined += "\n\n# call-graph (regex/AST ±1 hop)\n" + "\n".join(hints)
+    except Exception:
+        pass
     return _truncate(joined, max_chars)
 
 
@@ -1956,6 +2231,364 @@ def _extract_relevant_regions(
 
 
 # === v71 GRAFT END ===
+
+
+# ---------------------------------------------------------------------------
+# Context engineering: RepoGraph + RAPTOR retrieval + budget enforcement
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RepoGraphNode:
+    node_id: str  # "path::SymbolName"
+    file_path: str
+    symbol: str
+    kind: str
+    line: int
+
+
+@dataclass
+class SemanticChunk:
+    chunk_id: str
+    file_path: str
+    symbol: str
+    line: int
+    text: str
+    summary_line: str
+    similarity: float = 0.0
+    protected: bool = False
+
+
+@dataclass
+class RaptorCluster:
+    cluster_id: int
+    summary: str
+    members: List[SemanticChunk]
+
+
+_TRACE_FILE_LINE_RE = _TRACE_FRAME_RE  # alias for fault-site protection in RAPTOR chunks
+
+
+def _extract_fault_sites(issue_text: str, tracked: Optional[set] = None) -> List[Tuple[str, int]]:
+    """Parse stack-trace file:line pairs; normalize when tracked set is available."""
+    if tracked:
+        return _extract_trace_frames(issue_text, tracked)
+    sites: List[Tuple[str, int]] = []
+    seen: set = set()
+    for m in _TRACE_FRAME_RE.finditer(issue_text or ""):
+        path = m.group(1).strip().lstrip("./")
+        try:
+            line_no = int(m.group(2))
+        except ValueError:
+            continue
+        key = (path, line_no)
+        if key not in seen:
+            seen.add(key)
+            sites.append(key)
+    return sites[:12]
+
+
+def _build_repo_graph(
+    repo: Path,
+    symbol_index: Dict[str, FileSkeleton],
+) -> Tuple[Dict[str, RepoGraphNode], Dict[str, List[str]]]:
+    """Directed call/import graph: nodes = functions/classes, edges = calls."""
+    import ast
+
+    nodes: Dict[str, RepoGraphNode] = {}
+    edges: Dict[str, List[str]] = {}
+
+    def _node_id(path: str, sym: str) -> str:
+        return f"{path}::{sym}"
+
+    module_to_paths: Dict[str, List[str]] = {}
+    for path in symbol_index:
+        mod = path.replace("/", ".").removesuffix(".py")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        module_to_paths.setdefault(mod, []).append(path)
+        base = Path(path).stem
+        module_to_paths.setdefault(base, []).append(path)
+
+    for path, sk in symbol_index.items():
+        for sym in sk.symbols:
+            nid = _node_id(path, sym.name)
+            nodes[nid] = RepoGraphNode(nid, path, sym.name, sym.kind, sym.line)
+            edges.setdefault(nid, [])
+
+    for path, sk in symbol_index.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            text = (repo / path).read_text(encoding="utf-8", errors="replace")[:_SKELETON_READ_MAX_BYTES]
+            tree = ast.parse(text)
+        except Exception:
+            continue
+        local_syms = {s.name: _node_id(path, s.name) for s in sk.symbols}
+        imported: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.asname or alias.name.split(".")[0]
+                    mod_key = alias.name.split(".")[0]
+                    for mp in module_to_paths.get(mod_key, []):
+                        msk = symbol_index.get(mp)
+                        if msk and msk.symbols:
+                            imported[name] = _node_id(mp, msk.symbols[0].name)
+                        break
+            elif isinstance(node, ast.ImportFrom):
+                if not node.module:
+                    continue
+                mod_key = node.module.split(".")[0]
+                candidates = module_to_paths.get(node.module, []) + module_to_paths.get(mod_key, [])
+                for alias in node.names or []:
+                    for mp in candidates:
+                        msk = symbol_index.get(mp)
+                        if not msk:
+                            continue
+                        for s in msk.symbols:
+                            if s.name == alias.name:
+                                imported[alias.name] = _node_id(mp, s.name)
+                                break
+
+        class CallVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.current_fn: Optional[str] = None
+
+            def visit_FunctionDef(self, node: "ast.FunctionDef") -> None:
+                prev = self.current_fn
+                self.current_fn = local_syms.get(node.name)
+                self.generic_visit(node)
+                self.current_fn = prev
+
+            def visit_AsyncFunctionDef(self, node: "ast.AsyncFunctionDef") -> None:
+                prev = self.current_fn
+                self.current_fn = local_syms.get(node.name)
+                self.generic_visit(node)
+                self.current_fn = prev
+
+            def visit_Call(self, node: "ast.Call") -> None:
+                if not self.current_fn:
+                    self.generic_visit(node)
+                    return
+                callee = None
+                func = node.func
+                if isinstance(func, ast.Name):
+                    callee = func.id
+                elif isinstance(func, ast.Attribute):
+                    callee = func.attr
+                if callee:
+                    target = local_syms.get(callee) or imported.get(callee)
+                    if target and target not in edges.get(self.current_fn, []):
+                        edges.setdefault(self.current_fn, []).append(target)
+                self.generic_visit(node)
+
+        CallVisitor().visit(tree)
+
+    return nodes, edges
+
+
+def _repograph_neighborhood(
+    origin_node_ids: List[str],
+    edges: Dict[str, List[str]],
+    hops: int = _REPOGRAPH_BFS_HOPS,
+) -> List[str]:
+    """BFS over call graph to collect neighborhood node ids."""
+    visited: set = set()
+    frontier = list(origin_node_ids)
+    for _ in range(hops + 1):
+        nxt: List[str] = []
+        for nid in frontier:
+            if nid in visited:
+                continue
+            visited.add(nid)
+            for tgt in edges.get(nid, []):
+                if tgt not in visited:
+                    nxt.append(tgt)
+        frontier = nxt
+    return list(visited)
+
+
+def _chunk_similarity(query_terms: List[str], text: str) -> float:
+    if not query_terms or not text:
+        return 0.0
+    tokens = set(_tokenize_index_text(text))
+    qset = set(query_terms)
+    overlap = len(qset & tokens)
+    if overlap == 0:
+        return 0.0
+    return overlap / max(1, len(qset))
+
+
+def _build_semantic_chunks(
+    repo: Path,
+    symbol_index: Dict[str, FileSkeleton],
+    ranked_files: List[str],
+    issue_text: str,
+    fault_sites: List[Tuple[str, int]],
+) -> List[SemanticChunk]:
+    """Chunk repo into symbol-level semantic units for RAPTOR retrieval."""
+    qterms = _localization_query_terms(issue_text)
+    chunks: List[SemanticChunk] = []
+    for path in ranked_files:
+        sk = symbol_index.get(path)
+        if not sk:
+            continue
+        symbols = _localize_file_symbols(issue_text, sk) or sk.symbols[:4]
+        try:
+            text = (repo / path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if len(text) > _SKELETON_READ_MAX_BYTES:
+            text = text[:_SKELETON_READ_MAX_BYTES]
+        lines = text.splitlines()
+        for sym in symbols:
+            start = max(0, sym.line - 1 - _LOCALIZE_SYMBOL_CTX_BEFORE)
+            end = min(len(lines), sym.line - 1 + _LOCALIZE_SYMBOL_CTX_AFTER)
+            body = "\n".join(f"{i + 1:5d}| {lines[i]}" for i in range(start, end))
+            summary_line = f"{sym.kind} {sym.name} @ {path}:L{sym.line}"
+            chunk_text = f"{summary_line}\n{body}"
+            protected = False
+            for tp, ln in fault_sites:
+                if _paths_match(path, tp) and start < ln <= end:
+                    protected = True
+                    break
+            sim = _chunk_similarity(qterms, chunk_text)
+            chunks.append(
+                SemanticChunk(
+                    chunk_id=f"{path}::{sym.name}@{sym.line}",
+                    file_path=path,
+                    symbol=sym.name,
+                    line=sym.line,
+                    text=chunk_text,
+                    summary_line=summary_line,
+                    similarity=sim,
+                    protected=protected,
+                )
+            )
+    chunks.sort(key=lambda c: (-c.similarity, c.file_path, c.line))
+    return chunks
+
+
+def _paths_match(chunk_path: str, trace_path: str) -> bool:
+    a = chunk_path.strip().lstrip("./")
+    b = trace_path.strip().lstrip("./")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _build_raptor_clusters(chunks: List[SemanticChunk]) -> List[RaptorCluster]:
+    """Greedy TF-IDF-style clustering with deterministic summaries."""
+    if not chunks:
+        return []
+    clusters: List[RaptorCluster] = []
+    remaining = list(chunks)
+    cluster_id = 0
+    while remaining and cluster_id < _RAPTOR_MAX_CLUSTERS:
+        anchor = remaining.pop(0)
+        members = [anchor]
+        bucket: List[SemanticChunk] = []
+        for ch in remaining:
+            if len(members) >= _RAPTOR_CLUSTER_SIZE:
+                break
+            anchor_tokens = set(_tokenize_index_text(anchor.text))
+            ch_tokens = set(_tokenize_index_text(ch.text))
+            jacc = len(anchor_tokens & ch_tokens) / max(1, len(anchor_tokens | ch_tokens))
+            same_file = ch.file_path == anchor.file_path
+            if jacc >= 0.15 or (same_file and jacc >= 0.05):
+                members.append(ch)
+            else:
+                bucket.append(ch)
+        remaining = bucket
+        sym_list = ", ".join(f"{m.symbol}" for m in members[:8])
+        file_list = ", ".join(sorted({m.file_path for m in members}))
+        summary = _truncate(
+            f"Cluster {cluster_id}: {sym_list} — files: {file_list}",
+            _RAPTOR_SUMMARY_CHARS,
+        )
+        clusters.append(RaptorCluster(cluster_id=cluster_id, summary=summary, members=members))
+        cluster_id += 1
+    return clusters
+
+
+def _raptor_retrieve_clusters(
+    clusters: List[RaptorCluster],
+    issue_text: str,
+    cluster_cap: int = 8,
+) -> List[RaptorCluster]:
+    qterms = _localization_query_terms(issue_text)
+    scored: List[Tuple[float, RaptorCluster]] = []
+    for cl in clusters:
+        score = _chunk_similarity(qterms, cl.summary + " " + " ".join(m.summary_line for m in cl.members))
+        scored.append((score, cl))
+    scored.sort(key=lambda x: (-x[0], x[1].cluster_id))
+    return [cl for score, cl in scored[:cluster_cap] if score > 0] or [cl for _, cl in scored[:cluster_cap]]
+
+
+def _enforce_retrieval_budget(
+    chunks: List[SemanticChunk],
+    char_budget: int = _RETRIEVAL_CONTEXT_CHAR_BUDGET,
+) -> List[SemanticChunk]:
+    """Hard cap retrieval context; drop lowest-similarity first; keep fault-site."""
+    if not chunks:
+        return []
+    protected = [c for c in chunks if c.protected]
+    rest = sorted([c for c in chunks if not c.protected], key=lambda c: (-c.similarity, c.file_path))
+    selected: List[SemanticChunk] = []
+    used = 0
+    for ch in protected:
+        if used + len(ch.text) <= char_budget:
+            selected.append(ch)
+            used += len(ch.text)
+    for ch in rest:
+        if used + len(ch.text) > char_budget:
+            continue
+        selected.append(ch)
+        used += len(ch.text)
+    selected.sort(key=lambda c: (-c.similarity, c.file_path, c.line))
+    return selected
+
+
+def _format_raptor_context(clusters: List[RaptorCluster], selected_chunks: List[SemanticChunk]) -> str:
+    parts: List[str] = []
+    if clusters:
+        summary_lines = ["### RAPTOR retrieval (cluster summaries — drill into members below)"]
+        for cl in clusters:
+            summary_lines.append(f"- {cl.summary}")
+        parts.append("\n".join(summary_lines))
+    chunk_ids = {c.chunk_id for c in selected_chunks}
+    for cl in clusters:
+        for m in cl.members:
+            if m.chunk_id not in chunk_ids:
+                continue
+            block = f"#### `{m.file_path}` — {m.symbol} (L{m.line})\n```\n{m.text}\n```"
+            parts.append(block)
+    return "\n\n".join(parts)
+
+
+def _expand_files_via_repograph(
+    ranked_files: List[str],
+    symbol_index: Dict[str, FileSkeleton],
+    graph_nodes: Dict[str, RepoGraphNode],
+    graph_edges: Dict[str, List[str]],
+    issue_text: str,
+) -> List[str]:
+    origin_ids: List[str] = []
+    for path in ranked_files[:5]:
+        sk = symbol_index.get(path)
+        if not sk:
+            continue
+        for sym in _localize_file_symbols(issue_text, sk)[:2]:
+            nid = f"{path}::{sym.name}"
+            if nid in graph_nodes:
+                origin_ids.append(nid)
+    neighborhood = _repograph_neighborhood(origin_ids, graph_edges, _REPOGRAPH_BFS_HOPS)
+    extra_files: List[str] = []
+    seen = set(ranked_files)
+    for nid in neighborhood:
+        node = graph_nodes.get(nid)
+        if node and node.file_path not in seen:
+            seen.add(node.file_path)
+            extra_files.append(node.file_path)
+    return ranked_files + extra_files[:8]
 
 
 _FENCED_CODE_RE = re.compile(r"```[ \t]*([\w.+#-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
@@ -2082,12 +2715,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     """
     tracked_set = set(_tracked_files(repo))
     symbol_index = _build_repo_symbol_index(repo, tracked_set)
-    global _SYMBOL_INDEX_FOR_RANKING
+    global _SYMBOL_INDEX_FOR_RANKING, _PRELOAD_TRACE_FRAMES
+    _PRELOAD_TRACE_FRAMES = _extract_trace_frames(issue, tracked_set)
+    fault_sites = list(_PRELOAD_TRACE_FRAMES)
+    graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
     _SYMBOL_INDEX_FOR_RANKING = symbol_index
     try:
         files, top_score = _rank_context_files(repo, issue)
     finally:
         _SYMBOL_INDEX_FOR_RANKING = None
+
+    files = _expand_files_via_repograph(
+        files, symbol_index, graph_nodes, graph_edges, issue,
+    )
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
@@ -2147,17 +2787,47 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
+    if _PRELOAD_TRACE_FRAMES:
+        pin_block = _format_trace_pin_block(repo, _PRELOAD_TRACE_FRAMES)
+        if pin_block and used + len(pin_block) <= MAX_PRELOADED_CONTEXT_CHARS + 3500:
+            parts.append(pin_block)
+            used += len(pin_block)
+
     repo_map = _format_repo_skeleton_map(symbol_index, files, issue)
     if repo_map and used + len(repo_map) <= MAX_PRELOADED_CONTEXT_CHARS + _REPO_MAP_MAX_CHARS:
         parts.append(repo_map)
         used += len(repo_map)
 
-    for rank_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+    # RAPTOR-style hierarchical retrieval: cluster summaries first, then members.
+    semantic_chunks = _build_semantic_chunks(
+        repo, symbol_index, files[:MAX_PRELOADED_FILES], issue, fault_sites,
+    )
+    raptor_clusters = _build_raptor_clusters(semantic_chunks)
+    top_clusters = _raptor_retrieve_clusters(raptor_clusters, issue)
+    cluster_member_ids = {m.chunk_id for cl in top_clusters for m in cl.members}
+    raptor_chunks = [c for c in semantic_chunks if c.chunk_id in cluster_member_ids]
+    if not raptor_chunks:
+        raptor_chunks = semantic_chunks[:12]
+    budgeted_chunks = _enforce_retrieval_budget(raptor_chunks, _RETRIEVAL_CONTEXT_CHAR_BUDGET)
+    raptor_block = _format_raptor_context(top_clusters, budgeted_chunks)
+    if raptor_block and used + len(raptor_block) <= MAX_PRELOADED_CONTEXT_CHARS + _RETRIEVAL_CONTEXT_CHAR_BUDGET:
+        parts.append(raptor_block)
+        used += len(raptor_block)
+        for ch in budgeted_chunks:
+            if ch.file_path not in included:
+                included.append(ch.file_path)
+
+    raptor_files = {c.file_path for c in budgeted_chunks}
+    preload_files = [f for f in files[:MAX_PRELOADED_FILES] if f not in raptor_files]
+
+    for rank_idx, relative_path in enumerate(preload_files):
         # XL_NARROW_V2: per-file budget scales by rank position
         budget = _xlnv2_per_file_budget(rank_idx)
         sk = symbol_index.get(relative_path)
         if sk:
-            localized_syms = _localize_file_symbols(issue, sk)
+            localized_syms = _localize_file_symbols(
+                issue, sk, trace_frames=_PRELOAD_TRACE_FRAMES,
+            )
             snippet = _read_localized_symbol_regions(
                 repo, relative_path, budget, localized_syms, needles=needles,
             )
@@ -2285,6 +2955,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     err_boost = _issue_error_string_boost(repo, tracked_set, issue)
+    trace_boost = _trace_frame_file_boost(issue, tracked_set)
     # Rare-term boost: OAuthCallbackHandler should outweigh generic "data".
     idf_weights = _term_idf_weights(terms, tracked)
     scored: List[Tuple[int, str]] = []
@@ -2317,6 +2988,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                 _ERROR_STRING_MAX_BOOST,
                 _ERROR_STRING_BASE_BOOST + _ERROR_STRING_PER_HIT_BOOST * err_hits,
             )
+        score += trace_boost.get(relative_path, 0)
         if score > 0:
             scored.append((score, relative_path))
 
@@ -9651,8 +10323,182 @@ def solve(
     )
 
 
+# -----------------------------
+# Hybrid workflow: optional single-shot pipeline before ReAct (traceback bugs only).
+# -----------------------------
+
+
+def _classify_issue_route(issue_text: str) -> str:
+    """Route traceback bugs through one cheap pipeline shot; everything else → ReAct."""
+    if _TRACEBACK_RE.search(issue_text or ""):
+        return "pipeline_first"
+    return "agent"
+
+
+def _build_pipeline_localization_context(repo: Path, issue_text: str) -> Tuple[str, List[str]]:
+    """Fixed localization pass output for pipeline handoff / agent bootstrap."""
+    ctx, files = build_preloaded_context(repo, issue_text)
+    tracked = set(_tracked_files(repo))
+    symbol_index = _build_repo_symbol_index(repo, tracked)
+    graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
+    ranked, _ = _rank_context_files(repo, issue_text)
+    expanded = _expand_files_via_repograph(ranked, symbol_index, graph_nodes, graph_edges, issue_text)
+    summary = (
+        "### Pipeline localization (grounded starting context)\n"
+        f"Top files: {', '.join(expanded[:8])}\n\n"
+        + (ctx[:6000] if ctx else "")
+    )
+    return summary, expanded[:12]
+
+
+def _validate_pipeline_patch(
+    repo: Path,
+    issue_text: str,
+    patch: str,
+    baseline_failing: List[Tuple[str, str]],
+    command_timeout: int,
+) -> bool:
+    if not patch.strip():
+        return False
+    if _check_syntax(repo, patch):
+        return False
+    if baseline_failing:
+        still_failing = _verify_baseline_tests_pass(
+            repo, baseline_failing, timeout_seconds=min(command_timeout, 12),
+        )
+        if still_failing is not None:
+            return False
+    blockers = _patch_ship_blockers(patch, issue_text)
+    return not blockers
+
+
+def _generate_pipeline_candidate(
+    repo: Path,
+    issue_text: str,
+    localization_ctx: str,
+    target_files: List[str],
+    *,
+    model: str,
+    api_base: Optional[str],
+    api_key: Optional[str],
+    candidate_idx: int,
+) -> str:
+    """Single-shot candidate patch via structured edits."""
+    snippets: List[str] = []
+    for path in target_files[:3]:
+        snip = _read_context_file(repo, path, 2500)
+        if snip.strip():
+            snippets.append(f"### {path}\n```\n{snip}\n```")
+    prompt = (
+        f"You are an agentless patch generator (candidate {candidate_idx + 1}). "
+        "Emit ONLY `<edit>` blocks (and optionally one `<command>` test), then "
+        "`<final>pipeline candidate</final>`. Smallest root-cause fix.\n\n"
+        f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
+        f"LOCALIZATION:\n{_truncate(localization_ctx, 4000)}\n\n"
+        + "\n\n".join(snippets)
+    )
+    try:
+        response, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "Agentless patch generator. Output edits only."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=_PIPELINE_MAX_TOKENS,
+            timeout=_PIPELINE_TIMEOUT,
+            max_retries=1,
+        )
+    except Exception:
+        return ""
+    for kind, value in extract_actions_in_order(response or ""):
+        if kind == "edit":
+            execute_edit(value, repo)
+        elif kind == "command":
+            run_command(value, repo, timeout=_PIPELINE_COMMAND_TIMEOUT)
+    return get_patch(repo)
+
+
+def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
+    """Fixed pipeline: localization → candidate patches → validation."""
+    repo_path = kwargs["repo_path"]
+    issue = kwargs["issue"]
+    model = kwargs.get("model")
+    api_base = kwargs.get("api_base")
+    api_key = kwargs.get("api_key")
+    command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
+    logs: List[str] = ["AGENTLESS_PIPELINE: start"]
+    try:
+        repo = _repo_path(repo_path)
+        ensure_git_repo(repo)
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+        loc_ctx, target_files = _build_pipeline_localization_context(repo, issue)
+        tracked = set(_tracked_files(repo))
+        likely_tests = _discover_likely_test_nodes(repo, issue, tracked)
+        baseline_failing = _run_failing_tests_baseline(
+            repo, likely_tests, timeout_seconds=6, max_tests=2,
+        ) if likely_tests else []
+
+        initial_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo),
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout.strip()
+
+        best_patch = ""
+        for idx in range(_PIPELINE_MAX_CANDIDATES):
+            if initial_head:
+                subprocess.run(
+                    ["git", "reset", "--hard", initial_head],
+                    cwd=str(repo), capture_output=True, timeout=30, check=False,
+                )
+            patch = _generate_pipeline_candidate(
+                repo, issue, loc_ctx, target_files,
+                model=model_name, api_base=base, api_key=key, candidate_idx=idx,
+            )
+            logs.append(f"PIPELINE_CANDIDATE_{idx + 1}: patch_chars={len(patch)}")
+            if _validate_pipeline_patch(repo, issue, patch, baseline_failing, command_timeout):
+                logs.append(f"PIPELINE_SUCCESS: candidate={idx + 1}")
+                return AgentResult(
+                    patch=patch, logs=_safe_join_logs(logs),
+                    steps=idx + 1, cost=0.0, success=True,
+                ).to_dict() | {"localization_context": loc_ctx, "pipeline_candidate": idx + 1}
+            if patch.strip() and len(patch) > len(best_patch):
+                best_patch = patch
+
+        logs.append("PIPELINE_NO_VALID_CANDIDATE: handing off to ReAct agent")
+        if initial_head:
+            subprocess.run(
+                ["git", "reset", "--hard", initial_head],
+                cwd=str(repo), capture_output=True, timeout=30, check=False,
+            )
+        return AgentResult(
+            patch=best_patch, logs=_safe_join_logs(logs),
+            steps=_PIPELINE_MAX_CANDIDATES, cost=0.0, success=False,
+        ).to_dict() | {"localization_context": loc_ctx}
+    except Exception:
+        logs.append("PIPELINE_FATAL:\n" + traceback.format_exc())
+        return AgentResult(
+            patch="", logs=_safe_join_logs(logs), steps=0, cost=None, success=False,
+        ).to_dict() | {"localization_context": ""}
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Multi-shot solve with emergency rescue + lockfile-strip post-process."""
+    _issue_for_route = kwargs.get("issue", "") or ""
+    _route = _classify_issue_route(_issue_for_route)
+    _pipeline_localization = kwargs.get("_pipeline_localization", "")
+    _pipeline_fast_result: Optional[Dict[str, Any]] = None
+    if _route != "agent" and not kwargs.get("_skip_pipeline"):
+        _pipe = _run_agentless_pipeline(**kwargs)
+        if _pipe.get("success") and (_pipe.get("patch") or "").strip():
+            _pipe["hybrid_route"] = _route
+            _pipe["pipeline_fast_path"] = True
+            _pipeline_fast_result = _pipe
+        else:
+            _pipeline_localization = _pipe.get("localization_context") or _pipeline_localization
+            kwargs = {**kwargs, "_pipeline_localization": _pipeline_localization}
+    kwargs = {**kwargs, "_hybrid_route": _route}
     repo_path = kwargs["repo_path"]
     _issue_text = kwargs.get("issue", "") or ""
     _multishot_repo_obj = None
@@ -9840,6 +10686,9 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         except Exception:
             pass
         return result
+
+    if _pipeline_fast_result is not None:
+        return _finalize(_pipeline_fast_result)
 
     try:
         _multishot_started = time.monotonic()
@@ -10068,6 +10917,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
     wall_clock_budget = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
     prior_attempt_summary = kwargs.get("_prior_attempt_summary", "")
+    pipeline_localization = kwargs.get("_pipeline_localization", "")
     repo: Optional[Path] = None
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
@@ -10443,6 +11293,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
+            + (_pipeline_localization + "\n\n" if pipeline_localization else "")
             + _format_failing_tests_section(_baseline_failing_tests)
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
