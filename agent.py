@@ -4208,6 +4208,233 @@ def _patch_added_lines_by_file(patch: str) -> "Dict[str, List[str]]":
     return out
 
 
+def _patch_removed_lines_by_file(patch: str) -> "Dict[str, List[str]]":
+    """Mirror of _patch_added_lines_by_file for removed bodies (without '-')."""
+    out: Dict[str, List[str]] = {}
+    cur: Optional[str] = None
+    for line in patch.splitlines():
+        m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, [])
+            continue
+        if cur is None:
+            continue
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith("-"):
+            out[cur].append(line[1:])
+    return out
+
+
+# -----------------------------
+# Post-patch static-analysis checks (Python-only):
+#   * deleted-symbol-still-referenced: catch NameError where the patch removed
+#     a top-level def/class/assignment that the post-patch file still
+#     references and has not re-bound elsewhere.
+#   * unused-added-variables: flag newly-added top-level bindings that are
+#     never read anywhere in the post-patch file.
+# Both are conservative by design: bounded to <=4 findings each, and skip
+# files with star-imports / globals() / exec / eval (those make static
+# binding analysis unreliable).
+# -----------------------------
+
+_TOP_DEF_RE = re.compile(r"^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_TOP_CLASS_RE = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(:]")
+_TOP_BIND_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=]+)?=\s*[^=]")
+
+
+def _py_static_analysis_skips(tree: Any) -> bool:
+    """Return True when the file uses dynamic-binding constructs (star-import,
+    globals(), exec, eval) that make static binding analysis unreliable."""
+    import ast as _ast
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ImportFrom) and any(
+            getattr(a, "name", None) == "*" for a in (node.names or [])
+        ):
+            return True
+        if isinstance(node, _ast.Call):
+            f = node.func
+            if isinstance(f, _ast.Name) and f.id in ("globals", "exec", "eval"):
+                return True
+    return False
+
+
+def _py_top_level_bindings(tree: Any) -> "set[str]":
+    """Names bound at module scope by def/class/assign/aug-assign/ann-assign/
+    import. Best-effort; tuple/list unpack targets and import-from aliases are
+    included."""
+    import ast as _ast
+    names: set = set()
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, _ast.Assign):
+            for tgt in node.targets:
+                for t in _ast.walk(tgt):
+                    if isinstance(t, _ast.Name):
+                        names.add(t.id)
+        elif isinstance(node, (_ast.AugAssign, _ast.AnnAssign)):
+            tgt = node.target
+            if isinstance(tgt, _ast.Name):
+                names.add(tgt.id)
+        elif isinstance(node, _ast.Import):
+            for a in node.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _py_loaded_names(tree: Any) -> "set[str]":
+    """Names referenced anywhere in the module (Load context)."""
+    import ast as _ast
+    out: set = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Name) and isinstance(node.ctx, _ast.Load):
+            out.add(node.id)
+    return out
+
+
+def _deleted_symbol_still_referenced(repo: Path, patch: str) -> List[str]:
+    """Catch NameError where the patch removed a top-level def/class/assignment
+    that the post-patch file still references and has not re-bound elsewhere.
+    Bounded to <=4 findings; skips files with star-imports/globals/exec/eval."""
+    import ast as _ast
+    findings: List[str] = []
+    if not patch.strip() or "diff --git " not in patch:
+        return findings
+    removed_by_file = _patch_removed_lines_by_file(patch)
+    repo_resolved = repo.resolve()
+    for relative_path in _patch_changed_files(patch):
+        if len(findings) >= 4:
+            break
+        if not relative_path.endswith(".py"):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not full.is_file():
+            continue
+        source = _br_safe_read(full)
+        if source is None:
+            continue
+        try:
+            tree = _ast.parse(source)
+        except Exception:
+            continue
+        if _py_static_analysis_skips(tree):
+            continue
+        bound = _py_top_level_bindings(tree)
+        loaded = _py_loaded_names(tree)
+        removed = removed_by_file.get(relative_path, [])
+        seen: set = set()
+        for raw in removed:
+            stripped = raw.lstrip()
+            indent = len(raw) - len(stripped)
+            if indent > 0:
+                continue  # only top-level removals count
+            name: Optional[str] = None
+            m = _TOP_DEF_RE.match(stripped)
+            if m:
+                name = m.group(1)
+            else:
+                m = _TOP_CLASS_RE.match(stripped)
+                if m:
+                    name = m.group(1)
+                else:
+                    m = _TOP_BIND_RE.match(stripped)
+                    if m:
+                        name = m.group(1)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name in bound:
+                continue  # re-bound elsewhere; no NameError risk
+            if name not in loaded:
+                continue  # not referenced post-patch; safe deletion
+            findings.append(
+                f"{relative_path}: removed top-level `{name}` is still referenced "
+                f"in this file and not re-bound — likely NameError at import/run time"
+            )
+            if len(findings) >= 4:
+                break
+    return findings
+
+
+def _unused_added_variables(repo: Path, patch: str) -> List[str]:
+    """Flag newly-added top-level bindings (assign/def/class) that are never
+    read anywhere in the post-patch file. Bounded to <=4 findings; skips
+    files with star-imports/globals/exec/eval."""
+    import ast as _ast
+    findings: List[str] = []
+    if not patch.strip() or "diff --git " not in patch:
+        return findings
+    added_by_file = _patch_added_lines_by_file(patch)
+    repo_resolved = repo.resolve()
+    for relative_path in _patch_changed_files(patch):
+        if len(findings) >= 4:
+            break
+        if not relative_path.endswith(".py"):
+            continue
+        full = (repo / relative_path).resolve()
+        try:
+            full.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not full.is_file():
+            continue
+        source = _br_safe_read(full)
+        if source is None:
+            continue
+        try:
+            tree = _ast.parse(source)
+        except Exception:
+            continue
+        if _py_static_analysis_skips(tree):
+            continue
+        loaded = _py_loaded_names(tree)
+        added = added_by_file.get(relative_path, [])
+        seen: set = set()
+        for raw in added:
+            stripped = raw.lstrip()
+            indent = len(raw) - len(stripped)
+            if indent > 0:
+                continue  # only top-level additions count
+            name: Optional[str] = None
+            kind: str = "binding"
+            m = _TOP_DEF_RE.match(stripped)
+            if m:
+                name, kind = m.group(1), "function"
+            else:
+                m = _TOP_CLASS_RE.match(stripped)
+                if m:
+                    name, kind = m.group(1), "class"
+                else:
+                    m = _TOP_BIND_RE.match(stripped)
+                    if m:
+                        name, kind = m.group(1), "variable"
+            if not name or name in seen:
+                continue
+            # private/dunder names are conventionally allowed to be unused
+            if name.startswith("_"):
+                continue
+            seen.add(name)
+            if name in loaded:
+                continue
+            findings.append(
+                f"{relative_path}: added top-level {kind} `{name}` is never read "
+                f"in this file — likely dead code or wrong name"
+            )
+            if len(findings) >= 4:
+                break
+    return findings
+
+
 def _js_named_import_pairs(import_body: str) -> "List[Tuple[str, str]]":
     """Return (imported_name, local_name) for `{ ... }` named specifiers only."""
     pairs: List[Tuple[str, str]] = []
@@ -4501,6 +4728,17 @@ def _check_broken_references(repo: Path, patch: str) -> List[str]:
                 findings.extend(_broken_refs_js(relative_path, source, added, full, repo))
         except Exception:
             continue
+    # Post-patch Python static-analysis: catch NameError from deleted-but-
+    # still-referenced symbols, and flag added top-level bindings that the
+    # post-patch file never reads. Both bounded to <=4 findings each.
+    try:
+        findings.extend(_deleted_symbol_still_referenced(repo, patch))
+    except Exception:
+        pass
+    try:
+        findings.extend(_unused_added_variables(repo, patch))
+    except Exception:
+        pass
     out: List[str] = []
     for f in findings:
         if f not in out:
@@ -7828,9 +8066,9 @@ Evidence priority when picking what to patch: explicit issue text > failing/expe
 INSPECTION STRATEGY
 ====================================================================
 
-Inspect only what you need to locate the owner of the bug and patch safely. Order: **repo map (symbol skeleton) first** to pick the right file/class/function, then the localized preloaded regions (not whole files), then one or two focused searches (`rg`, fall back to `grep -R`), then `sed -n` on the line numbers from the map, then nearby tests, then call sites only if a signature/public API may change.
+Inspect only what you need to locate the owner of the bug and patch safely. Order: **repo map (symbol skeleton) first** to pick the right file/class/function, then the localized preloaded regions (not whole files), then one or two focused searches (`grep -rn`, or `grep -rnF` for an exact phrase; `rg` is NOT available here), then `sed -n` on the line numbers from the map, then nearby tests, then call sites only if a signature/public API may change.
 
-When the issue quotes a long error message, stack trace line, or expected output (20+ characters in quotes or backticks), `rg -F` that exact phrase first — it usually lands on the throw site or test assertion you must edit.
+When the issue quotes a long error message, stack trace line, or expected output (20+ characters in quotes or backticks), `grep -rnF` that exact phrase first — it usually lands on the throw site or test assertion you must edit.
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor/minified bundles, broad test suites before a targeted fix exists.
 
@@ -8043,7 +8281,7 @@ Before planning, read the ENTIRE issue above and identify every requirement (the
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE. Prefer `<edit>` for file changes; use `<command>` for reads, searches, and tests. Do not define auxiliary functions, re-indent broadly, reorder imports, weaken tests, or touch vendor/minified/generated files.
 
-If preloaded snippets show the target code, edit with `<edit>` immediately — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused `rg -F` / `sed -n` commands (use exact quoted phrases from the issue when present), then edit.
+If preloaded snippets show the target code, edit with `<edit>` immediately — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused `grep -rnF` / `sed -n` commands (use exact quoted phrases from the issue when present), then edit.
 
 When multiple files need edits, include EVERY `<edit>` and `<command>` block needed in the SAME response. Do not split edits across turns.
 
@@ -8856,7 +9094,7 @@ def build_hail_mary_prompt(issue_text: str) -> str:
         "RE-READ THE ISSUE:\n\n"
         f"{short}\n\n"
         "Make ONE task-supported code edit consistent with the issue. Pick the most "
-        "likely target file from the preloaded snippets, or use one focused `rg -F` if the target is still unclear. "
+        "likely target file from the preloaded snippets, or use one focused `grep -rnF` if the target is still unclear. "
         "Use a single `<edit op=\"replace\">` (preferred) with exact old/new text. "
         "Do NOT change file modes or permissions. "
         "Do NOT delete files. Do NOT add comments only. If no safe edit is supported "
@@ -11495,7 +11733,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
-            + (_pipeline_localization + "\n\n" if pipeline_localization else "")
+            + (pipeline_localization + "\n\n" if pipeline_localization else "")
             + _format_failing_tests_section(_baseline_failing_tests)
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
