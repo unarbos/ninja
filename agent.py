@@ -2746,9 +2746,13 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if not files:
         return "", []
 
-    files = _augment_with_test_partners(files, tracked_set)
+    # Expand wiring/siblings before test partners so late-added sources still
+    # receive tests/test_foo.py in preload (see _backfill_companion_tests_*).
     files = _augment_with_integration_partners(files, tracked_set, issue)
     files = _augment_with_directory_siblings(files, tracked_set)
+    files = _augment_with_test_partners(files, tracked_set)
+    if _companion_test_preload_gaps(files, tracked_set) > 0:
+        files = _backfill_companion_tests_after_expansion(files, tracked_set)
     # v71 graft: compute needles for region-aware file reading
     needles = _preload_needles(issue)
 
@@ -5045,6 +5049,12 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     # Rust — inline _test.rs and the `tests/{stem}.rs` integration convention.
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
     ("{stem}.rs", "tests/{stem}.rs"),
+    ("{stem}.rs", "tests/test_{stem}.rs"),
+    ("{stem}.rs", "test/test_{stem}.rs"),
+    ("{stem}.rs", "test/{stem}_test.rs"),
+    ("{stem}.rs", "tests/{stem}_test.rs"),
+    ("{stem}.rs", "test_{stem}.rs"),
+    ("{stem}.rs", "{stem}_test.rs"),
     # Ruby — rspec convention and minitest fallback.
     ("{stem}.rb", "spec/{stem}_spec.rb"),
     ("{stem}.rb", "test/{stem}_test.rb"),
@@ -5089,6 +5099,82 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
             augmented.append(partner)
             seen.add(partner)
     return augmented
+
+
+def _looks_like_test_path(relative_path: str) -> bool:
+    """Heuristic: path is probably a test/spec file (for preload + ship gates)."""
+    low = relative_path.replace("\\", "/").lower()
+    if low.startswith("test/") or low.startswith("tests/"):
+        return True
+    name = Path(relative_path).name.lower()
+    if (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith("_test.go")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.js")
+        or name.endswith(".test.tsx")
+        or name.endswith(".test.jsx")
+        or ".spec." in name
+    ):
+        return True
+    return False
+
+
+def _companion_test_preload_gaps(files: List[str], tracked: set) -> int:
+    """Count ranked source files whose companion test is missing from the preload list."""
+    if not files or not tracked:
+        return 0
+    present = set(files)
+    gaps = 0
+    for relative_path in files:
+        if _looks_like_test_path(relative_path):
+            continue
+        partner = _find_test_partner(relative_path, tracked)
+        if partner and partner not in present:
+            gaps += 1
+    return gaps
+
+
+def _backfill_companion_tests_after_expansion(files: List[str], tracked: set) -> List[str]:
+    """Insert missing companion tests immediately after their source file.
+
+    Integration and directory-sibling expansion can append new source paths after
+    the first test-partner pass. Without a backfill sweep, preload omits
+    tests/test_foo.py for those late-added targets and the model often patches
+    only the implementation file (duel loss: failing companion test).
+    """
+    if not files or not tracked:
+        return files
+    present = set(files)
+    pending: List[Tuple[int, str]] = []
+    for idx, relative_path in enumerate(files):
+        if _looks_like_test_path(relative_path):
+            continue
+        partner = _find_test_partner(relative_path, tracked)
+        if partner and partner not in present:
+            pending.append((idx, partner))
+            present.add(partner)
+    if not pending:
+        return files
+    out = list(files)
+    for idx, partner in sorted(pending, key=lambda item: -item[0]):
+        out.insert(idx + 1, partner)
+    return out
+
+
+def _issue_named_test_paths_not_touched(patch: str, issue_text: str) -> List[str]:
+    """Test paths explicitly named in the issue that the patch never modifies."""
+    if not patch.strip():
+        return []
+    mentions = _extract_issue_path_mentions(issue_text)
+    missing: List[str] = []
+    for path in mentions:
+        if not _looks_like_test_path(path):
+            continue
+        if _patch_touches_files(patch, [path]) == 0:
+            missing.append(path)
+    return missing
 
 
 # -----------------------------
@@ -6685,6 +6771,12 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
                 if forbidden in f:
                     blockers.append(f"forbidden_path_touched:{forbidden}")
                     break
+    named_tests_missing = _issue_named_test_paths_not_touched(patch, issue)
+    if named_tests_missing:
+        blockers.append(
+            "issue_named_test_untouched:"
+            + ",".join(named_tests_missing[:4])
+        )
     return blockers
 
 
@@ -9299,6 +9391,8 @@ def _empty_new_file_paths(patch: str) -> List[str]:
             if substantive >= _STUB_SUBSTANTIVE_LINE_THRESHOLD:
                 break
         if substantive < _STUB_SUBSTANTIVE_LINE_THRESHOLD:
+            if _is_path_imported_in_patch(patch, path):
+                continue
             out.append(path)
     return out
 
@@ -9491,6 +9585,86 @@ def _drop_malformed_diff_blocks(patch: str) -> str:
 
 _LINT_JS_TS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _LINT_PY_EXTS = (".py",)
+
+_JS_IMPORT_LINE_RE = re.compile(
+    r"^\+(\s*)"
+    r"(import\s+(?:[^'\"]*?\s+from\s+)?['\"][^'\"]+['\"]\s*;?)"
+    r"\s*$"
+)
+_PY_IMPORT_LINE_RE = re.compile(
+    r"^\+(\s*)"
+    r"((?:from\s+[\w.]+\s+import\s+[\w*,\s()]+|import\s+[\w.,\s]+))"
+    r"\s*$"
+)
+
+
+def _patch_has_probable_duplicate_function_decls(patch: str) -> bool:
+    """Cheap pre-scan: duplicate named JS/TS function bodies on '+' lines."""
+    if not patch.strip() or "diff --git " not in patch:
+        return False
+    decl_pat = re.compile(
+        r"^\+(\s*)"
+        r"(?:export\s+(?:default\s+)?)?"
+        r"(?:async\s+)?"
+        r"(?:function\s+)?"
+        r"([A-Za-z_$][\w$]*)\s*"
+        r"(?:<[^>]*>)?\s*"
+        r"\(([^)]*)\)"
+        r".*\{\s*$"
+    )
+    try:
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        for block in blocks:
+            if not block.startswith("diff --git "):
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm or not fm.group(1).endswith(_LINT_JS_TS_EXTS):
+                continue
+            seen_sigs: set = set()
+            for ln in block.splitlines():
+                m = decl_pat.match(ln)
+                if not m:
+                    continue
+                sig = (m.group(2), re.sub(r"\s+", "", m.group(3)))
+                if sig in seen_sigs:
+                    return True
+                seen_sigs.add(sig)
+        return False
+    except Exception:
+        return True
+
+
+def _patch_has_probable_duplicate_imports(patch: str) -> bool:
+    """Cheap pre-scan: repeated normalized import on '+' lines in one file block."""
+    if not patch.strip() or "diff --git " not in patch:
+        return False
+    try:
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        for block in blocks:
+            if not block.startswith("diff --git "):
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                continue
+            path = fm.group(1)
+            if path.endswith(_LINT_JS_TS_EXTS):
+                pat = _JS_IMPORT_LINE_RE
+            elif path.endswith(_LINT_PY_EXTS):
+                pat = _PY_IMPORT_LINE_RE
+            else:
+                continue
+            seen: set = set()
+            for ln in block.splitlines():
+                m = pat.match(ln)
+                if not m:
+                    continue
+                norm = re.sub(r"\s+", " ", m.group(2)).strip()
+                if norm in seen:
+                    return True
+                seen.add(norm)
+        return False
+    except Exception:
+        return True
 
 
 def _dedupe_duplicate_function_decls(patch: str) -> str:
@@ -9697,18 +9871,6 @@ def _ensure_use_client_directive(patch: str) -> str:
         return result
     except Exception:
         return patch
-
-
-_JS_IMPORT_LINE_RE = re.compile(
-    r"^\+(\s*)"
-    r"(import\s+(?:[^'\"]*?\s+from\s+)?['\"][^'\"]+['\"]\s*;?)"
-    r"\s*$"
-)
-_PY_IMPORT_LINE_RE = re.compile(
-    r"^\+(\s*)"
-    r"((?:from\s+[\w.]+\s+import\s+[\w*,\s()]+|import\s+[\w.,\s]+))"
-    r"\s*$"
-)
 
 
 def _dedupe_duplicate_imports(patch: str) -> str:
@@ -10095,6 +10257,43 @@ _M4_JS_STUB_RE = re.compile(
 )
 
 
+def _is_path_imported_in_patch(patch: str, target_path: str) -> bool:
+    """Check if the stem of target_path is imported or required in other files in the patch."""
+    if not patch.strip() or not target_path:
+        return False
+    try:
+        target_stem = Path(target_path).stem
+        if not target_stem:
+            return False
+        # Avoid checking extremely short stems that could match arbitrary words
+        if len(target_stem) < 3:
+            return False
+        
+        # Look for target_stem in added lines of other files
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        for block in blocks:
+            if not block.startswith("diff --git "):
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                continue
+            path = fm.group(1)
+            # Skip the target file itself
+            if path == target_path:
+                continue
+            
+            for line in block.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    # Check if the line looks like an import/require referencing the stem
+                    low = line.lower()
+                    if target_stem.lower() in low:
+                        if "import" in low or "require" in low or "from" in low or "use " in low or "mod " in low:
+                            return True
+        return False
+    except Exception:
+        return False
+
+
 def _strip_pure_stub_new_files(patch: str) -> str:
     """Drop new-file diff blocks that contain only empty function stubs.
 
@@ -10162,6 +10361,9 @@ def _strip_pure_stub_new_files(patch: str) -> str:
                 real_code += 1
             # If no real code AND at least one stub indicator → drop the file
             if real_code == 0 and stub_indicators >= 1:
+                if _is_path_imported_in_patch(patch, path):
+                    out_blocks.append(block)
+                    continue
                 any_dropped = True
                 continue
             out_blocks.append(block)
