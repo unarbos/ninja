@@ -147,8 +147,11 @@ _MID_LOOP_HAIL_MARY_BUDGET_FRACTION = 0.55
 # tool calls). Adding a step-count trigger catches the analysis-paralysis case
 # BEFORE 55% of wall-clock has expired, buying back useful edit-and-verify
 # cycles on the back end.
-_MID_LOOP_HAIL_MARY_STEP_TRIGGER = 7
-MAX_MID_LOOP_HAIL_MARY_TURNS = 1
+_MID_LOOP_HAIL_MARY_ABS_SECONDS = 62.0   # empty-patch rescue floor (fires by 62s
+                                         # regardless of budget; empty-gated so
+                                         # cannot regress a won, non-empty task)
+_MID_LOOP_HAIL_MARY_STEP_TRIGGER = 5
+MAX_MID_LOOP_HAIL_MARY_TURNS = 2
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -156,7 +159,8 @@ MAX_MID_LOOP_HAIL_MARY_TURNS = 1
 MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
-MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_TEST_FIX_TURNS = 2     # run+repair the authoritative test up to twice (capped
+                           # by unchanged MAX_TOTAL_REFINEMENT_TURNS=3)
 MAX_BASELINE_VERIFY_TURNS = 1  # re-run originally-failing tests on patched repo; fix any still-failing
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -709,6 +713,36 @@ def _command_stuck_in_loop(recent: List[str]) -> bool:
 # Structured edit executor
 # -----------------------------
 
+# Code-file suffixes where an HTML entity like &lt; / &gt; / -&gt; is NEVER the
+# intended literal — it is the model HTML-escaping structural chars (generics,
+# lambdas, JSX) to avoid breaking the <edit> tag parser. We write that escaped
+# text verbatim today, yielding uncompilable code (real duel loss 067366:
+# "HTML entities replace angle brackets and lambdas across every new Java file").
+# Markup formats (.html/.xml/.svg/.md/.vue/.svelte) are EXCLUDED — there &lt; is
+# a legitimate literal.
+_CODE_ENTITY_SUFFIXES = {
+    ".java", ".kt", ".scala", ".py", ".go", ".rs", ".c", ".cc", ".cpp", ".cxx",
+    ".h", ".hpp", ".cs", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".rb",
+    ".php", ".swift", ".dart", ".sql", ".css", ".scss", ".sh", ".zig",
+}
+
+
+def _maybe_unescape_code_entities(text: str, rel: str) -> str:
+    """Unescape HTML entities in edit content destined for a CODE file, but ONLY
+    when the telltale structural escape (&lt; / &gt;) is present — so a stray
+    `&amp;` inside a string literal never triggers it. No-op for markup files and
+    for content with no structural entities."""
+    if not text or Path(rel).suffix.lower() not in _CODE_ENTITY_SUFFIXES:
+        return text
+    if "&lt;" not in text and "&gt;" not in text:
+        return text
+    try:
+        import html as _html
+        return _html.unescape(text)
+    except Exception:
+        return text
+
+
 def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
     """Execute one structured <edit> block. Returns a CommandResult with the
     same shape as run_command so format_observation handles it uniformly.
@@ -738,6 +772,12 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
         return _err(f"Invalid path: {edit.get('path')!r}")
     fp = repo / rel
     op = edit.get("op", "replace")
+    # Repair model HTML-escaping of structural chars in code files (&lt; -> <,
+    # -&gt; -> ->, etc). Applied to old too so a replace whose <old> was escaped
+    # still matches the real (unescaped) file content.
+    for _k in ("content", "new", "old"):
+        if edit.get(_k):
+            edit[_k] = _maybe_unescape_code_entities(edit[_k], rel)
     try:
         if op == "write":
             content = edit.get("content") or ""
@@ -5180,6 +5220,266 @@ def _check_script_module_imports(repo: Path, patch: str) -> List[str]:
     return out[:4]
 
 
+_STUB_COMMON_STEMS = {
+    "index", "types", "type", "utils", "util", "const", "constants", "base",
+    "main", "app", "init", "mod", "lib", "helpers", "helper", "config", "common",
+}
+
+
+def _referenced_empty_new_files(patch: str) -> List[str]:
+    """Language-agnostic ship-stopper: a NEW source file created EMPTY (≤1
+    substantive line) whose stem is referenced by OTHER added lines in the same
+    patch — new code imports a file that does not exist yet → guaranteed compile
+    failure (the `e69de29` losses). Surfaced into the syntax gate so the model
+    FILLS the file; finalize()'s majority-empty STRIP path excludes these so it
+    never deletes an importer's target. Conservative: truly-empty only, stem ≥3,
+    common stems skipped, JS/TS requires a path-style (not bare-stem) reference."""
+    empties = _detect_empty_new_files(patch)
+    if not empties:
+        return []
+    empty_paths: List[str] = []
+    for e in empties:
+        try:
+            body = e.split(":", 1)[1]
+            path = body.rsplit("(", 1)[0]
+            n = int(body.rsplit("(", 1)[1].split("sub")[0])
+        except Exception:
+            continue
+        if n <= 1:
+            empty_paths.append(path)
+    if not empty_paths:
+        return []
+    empty_set = set(empty_paths)
+    added_by_file = _patch_added_lines_by_file(patch)
+    other_blob = "\n".join(
+        "\n".join(lines) for fp, lines in added_by_file.items() if fp not in empty_set
+    )
+    if not other_blob.strip():
+        return []
+    _bare_ref_suffixes = {".java", ".kt", ".scala", ".cs", ".py", ".rb", ".go", ".rs", ".php"}
+    findings: List[str] = []
+    for path in empty_paths:
+        stem = Path(path).stem
+        if len(stem) < 3 or stem.lower() in _STUB_COMMON_STEMS:
+            continue
+        suffix = Path(path).suffix.lower()
+        base = Path(path).name
+        referenced = False
+        if suffix in _bare_ref_suffixes:
+            if re.search(r"\b" + re.escape(stem) + r"\b", other_blob):
+                referenced = True
+        else:
+            if base in other_blob or ("/" + stem) in other_blob or ("./" + stem) in other_blob:
+                referenced = True
+        if referenced:
+            findings.append(
+                f"empty_referenced_newfile:{path} -- new file is imported by other "
+                "patched code but was left EMPTY; implement its real contents "
+                "(do not ship a placeholder)"
+            )
+        if len(findings) >= 4:
+            break
+    return findings[:4]
+
+
+def _referenced_empty_new_file_paths(patch: str) -> List[str]:
+    """Just the paths from _referenced_empty_new_files (for finalize coordination)."""
+    out: List[str] = []
+    for f in _referenced_empty_new_files(patch):
+        try:
+            out.append(f.split(":", 1)[1].split(" -- ", 1)[0].strip())
+        except Exception:
+            continue
+    return out
+
+
+_DESTRUCTIVE_SHIP_SRC_SUFFIXES = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt", ".scala",
+    ".cs", ".swift", ".vue", ".svelte", ".rb", ".php", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".zig", ".dart", ".css", ".scss", ".html",
+)
+
+
+def _destructive_ship_stoppers(patch: str) -> List[str]:
+    """Hard-stop two near-always-wrong destructive shapes that lost real duels:
+    (a) an EXISTING source file emptied to a zero-byte blob (e.g. EndingsView.jsx
+    replaced with e69de29), and (b) a NEW test file created EMPTY. Routes through
+    the bounded syntax-refinement loop so the model restores/implements the file.
+
+    Near-zero false positives: keys on git's canonical empty-blob hash
+    (`index <hash>..e69de29`), not a line-count heuristic. A real deletion uses
+    `git rm` (which emits `+++ /dev/null`, no `+++ b/<path>`) and never matches —
+    only a file KEPT-but-emptied does, which is essentially never intended."""
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    for blk in patch.split("diff --git "):
+        if not blk.strip():
+            continue
+        if not re.search(r"\nindex\s+([0-9a-f]+)\.\.e69de29\b", blk):
+            continue
+        path = ""
+        for ln in blk.splitlines():
+            if ln.startswith("+++ b/"):
+                path = ln[6:].strip()
+                break
+        if not path:
+            continue  # deletion (+++ /dev/null) — not our case
+        is_new = ("new file mode" in blk) or ("--- /dev/null" in blk)
+        if is_new:
+            if _looks_like_test_path(path):
+                findings.append(
+                    f"empty_new_test_file:{path} -- a required test file was "
+                    "created EMPTY; implement real test cases"
+                )
+        elif Path(path).suffix.lower() in _DESTRUCTIVE_SHIP_SRC_SUFFIXES:
+            findings.append(
+                f"emptied_existing_file:{path} -- you replaced an existing file's "
+                "entire contents with an EMPTY file; restore it and make only the "
+                "change the task requires"
+            )
+        if len(findings) >= 4:
+            break
+    return findings[:4]
+
+
+_JS_TS_IMPORT_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_NAMED_IMPORT_RE = re.compile(r"import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['\"]")
+
+
+def _unused_added_imports(repo: Path, patch: str) -> List[str]:
+    """JS/TS dead-import guard. The king's _unused_added_variables covers Python
+    via AST, but JS/TS unused imports are a gap — and the duels lost on exactly
+    this ('imports ChevronLeft but never uses it'). Flags a NAMED import the patch
+    ADDED whose identifier appears exactly once in the post-patch file (i.e. only
+    on the import line). Conservative: named imports only, skips `import type`,
+    same-line `} from` only; ≤4 findings; an identifier used anywhere (even a
+    comment/string) is never flagged, so it under-reports rather than mis-fires."""
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if Path(rel).suffix.lower() not in _JS_TS_IMPORT_SUFFIXES:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            for ln in added_by_file.get(rel, []):
+                s = ln.strip()
+                if s.startswith("import type") or "import type {" in s:
+                    continue
+                m = _NAMED_IMPORT_RE.search(s)
+                if not m:
+                    continue
+                for raw_name in m.group(1).split(","):
+                    name = raw_name.strip().split(" as ")[-1].strip()
+                    if not name or not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                        continue
+                    occ = len(re.findall(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", source))
+                    if occ <= 1:
+                        findings.append(
+                            f"unused_import:{rel}: `{name}` is imported but never used "
+                            "— remove the dead import"
+                        )
+                    if len(findings) >= 4:
+                        break
+                if len(findings) >= 4:
+                    break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
+_GO_IMPORT_BLOCK_RE = re.compile(r"import\s*\((.*?)\)", re.DOTALL)
+_GO_IMPORT_LINE_RE = re.compile(r"^\s*(?:([A-Za-z_.]\w*|\.|_)\s+)?\"([^\"]+)\"\s*$")
+_GO_SINGLE_IMPORT_RE = re.compile(r"^\s*import\s+(?:([A-Za-z_.]\w*|\.|_)\s+)?\"([^\"]+)\"\s*$")
+
+
+def _unused_go_imports(repo: Path, patch: str) -> List[str]:
+    """Go fails to COMPILE on an unused import — and gofmt -e (our only Go check)
+    is parse-only and misses it. The recurring loss (067362): the patch removes
+    the last user of a package but leaves its import, breaking the build.
+
+    CAUSAL gate keeps FP near-zero: flag a package only when (a) it has ZERO uses
+    in the post-patch file body AND (b) the patch REMOVED a use of it — i.e. this
+    edit is what made it dead. Never owns pre-existing dead imports. Skips `_`
+    (side-effect) and `.` (dot) imports."""
+    findings: List[str] = []
+    try:
+        removed_by_file = _patch_removed_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if not rel.endswith(".go"):
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            # Collect (alias, path) entries from grouped and single imports.
+            entries: List[Tuple[str, str]] = []
+            block_spans: List[Tuple[int, int]] = []
+            for m in _GO_IMPORT_BLOCK_RE.finditer(source):
+                block_spans.append((m.start(), m.end()))
+                for ln in m.group(1).splitlines():
+                    lm = _GO_IMPORT_LINE_RE.match(ln)
+                    if lm:
+                        entries.append((lm.group(1) or "", lm.group(2)))
+            for ln in source.splitlines():
+                sm = _GO_SINGLE_IMPORT_RE.match(ln)
+                if sm:
+                    entries.append((sm.group(1) or "", sm.group(2)))
+            if not entries:
+                continue
+            # Body with every import-block region masked so the import line
+            # itself never counts as a use.
+            body_chars = list(source)
+            for s, e in block_spans:
+                for i in range(s, e):
+                    body_chars[i] = " "
+            body = "".join(body_chars)
+            removed_blob = "".join(removed_by_file.get(rel, []))
+            seen: set = set()
+            for alias, path in entries:
+                if alias in ("_", "."):
+                    continue
+                if alias:
+                    ident = alias
+                else:
+                    seg = path.split("/")[-1]
+                    if re.fullmatch(r"v\d+", seg) and "/" in path:
+                        seg = path.split("/")[-2]
+                    ident = seg
+                if not re.fullmatch(r"[A-Za-z_]\w*", ident) or ident in seen:
+                    continue
+                seen.add(ident)
+                use_re = r"(?<![\w.])" + re.escape(ident) + r"(?![\w])"
+                if len(re.findall(use_re, body)) == 0 and re.search(use_re, removed_blob):
+                    findings.append(
+                        f"unused_import:{rel}: Go package `{ident}` is imported but no "
+                        "longer used after this edit — Go fails to compile on unused "
+                        "imports; remove the import"
+                    )
+                if len(findings) >= 4:
+                    break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -5219,6 +5519,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     errors.extend(_check_malformed_colors(repo, patch))
     errors.extend(_check_css_syntax(repo, patch))
     errors.extend(_check_script_module_imports(repo, patch))
+    # Lean keepers: pure-static destructive/empty-file guards (no toolchain).
+    errors.extend(_referenced_empty_new_files(patch))
+    errors.extend(_destructive_ship_stoppers(patch))
+    errors.extend(_unused_added_imports(repo, patch))
+    errors.extend(_unused_go_imports(repo, patch))
     return errors
 
 
@@ -8072,6 +8377,8 @@ When the issue quotes a long error message, stack trace line, or expected output
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor/minified bundles, broad test suites before a targeted fix exists.
 
+SANDBOX REALITY — your shell is a minimal Linux container (python3, bash, git, grep, sed, awk, find, sort, cat, ls). The following are NOT installed: `rg`, `node`/`npm`/`npx`, `go`, `cargo`/`rustc`, `tsc`, `swiftc`, `dart`, `jq`, `tree`, `gcc`/`g++`, `java`/`mvn`. There is NO network — `pip install`, `npm install`, `go get`, dependency downloads, and curl/wget all FAIL. Do NOT spend steps invoking absent tools or installing anything: for non-Python repos (JS/TS/Go/Rust/Swift/Dart/Java) you usually CANNOT run their build or tests, so verify by reading the code carefully instead. `python3 -m pytest` works only when the project's deps are already importable; if a test command errors with ModuleNotFound or command-not-found, stop retrying it and rely on careful code review. Every wasted command is a step you do not get back on a short wall.
+
 ====================================================================
 ROOT CAUSE RULE
 ====================================================================
@@ -8134,6 +8441,8 @@ Error messages are often tested exactly. When changing one, match capitalization
 **Verbatim quoting rule.** When the issue quotes a user-facing string — a UI label, chart title, route URL, button text, page heading, config key, env-var name, phone number, email, asset filename — that string is the spec. Copy it exactly. Do not abbreviate, translate, paraphrase, change punctuation, or change case. End users and tests rely on the literal characters; an abbreviated label is a different label.
 
 **Existing-symbol fidelity.** The same rule applies to code-level identifiers the existing repo or issue already names: function and method names, field/column names, constant names, file paths, and library API surfaces. When the issue mentions `get_users()`, do not invent `fetch_users()` or `getUserList()`. When an existing model has a `base_start` field, do not introduce `startBase`. When an API exposes `setDoc(ref, data)`, do not call `addDoc(ref, data)`. Grep the surrounding code or the imports to confirm the exact name before adding a call — invented synonyms are runtime errors, not stylistic preferences.
+
+**New-value convention mirroring.** When you must INTRODUCE a value the issue does not literally quote — a new storage/cookie key, a new state variable or status field, a new backend command/event name, a new UI control, or a styling approach — do not default to your own phrasing. First grep the repo for the nearest analogous existing value and COPY its convention: if other storage keys are `tiwlo_session`/`tiwlo_prefs`, your new consent key is `tiwlo_cookie_consent_v1`, not `cookie_consent_v1`; if the surrounding file's vocabulary is `socket`, the status variable is `socketStatus`, not `connectionStatus`; if existing backend commands follow a `verb_noun` scheme like `session_log_snapshot`, match it; if sibling components use a shared toggle/checkbox component and the screen styles with Tailwind utility classes, reuse that component family and styling system rather than introducing a raw element or inline styles. The lowest-surprise choice — the one a maintainer of THIS repo would reach for by reflex — is almost always the intended one. Apply this only AFTER a grep confirms an analogous existing value; invent your own only when no analogue exists.
 
 **No field-name aliasing.** Reuse a field's canonical name end to end — never expose, map, or serialize an existing field under a second name. No serializer `source=`/`alias=` rename, no `{camelName: obj.snake_name}` remap in a selector or response builder, no getter/property that merely re-points to an existing field. The consumer (UI, test, API client) reads the canonical key; an alias delivers the value under the wrong key and leaves the expected key missing. If the issue explicitly asks to RENAME a field, change it everywhere and remove the old name — do not add the alias alongside it.
 
@@ -9565,6 +9874,69 @@ def _is_valid_diff_block(block: str) -> bool:
     return True
 
 
+_HUNK_HDR_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _patch_well_formed(patch: str) -> bool:
+    """True if `patch` is a structurally valid unified diff git can parse: every
+    file block passes _is_valid_diff_block AND every hunk header's counts match
+    its body. A finalize transform that runs AFTER the early hunk-count repair
+    can re-break the counts, yielding git's 'corrupt patch at line N' (shipped as
+    a 0-score tie in duel 006026). Used to trigger a fallback to the clean diff.
+    Count semantics mirror _recompute_hunk_header exactly (context = any line not
+    +/-/\\)."""
+    if not patch.strip():
+        return True
+    blocks: List[str] = []
+    cur: List[str] = []
+    for line in patch.split("\n"):
+        if line.startswith("diff --git ") and cur:
+            blocks.append("\n".join(cur))
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    for blk in blocks:
+        if not blk.strip():
+            continue
+        if not _is_valid_diff_block(blk):
+            return False
+        lines = blk.split("\n")
+        i, n = 0, len(lines)
+        while i < n:
+            m = _HUNK_HDR_RE.match(lines[i])
+            if not m:
+                i += 1
+                continue
+            ol = int(m.group(2)) if m.group(2) is not None else 1
+            nl = int(m.group(4)) if m.group(4) is not None else 1
+            oc = nc = 0
+            j = i + 1
+            while j < n:
+                bl = lines[j]
+                if bl.startswith("@@ ") or bl.startswith("diff --git "):
+                    break
+                if bl == "":
+                    # trailing-newline artifact / blank — not a counted body line
+                    j += 1
+                    continue
+                if bl.startswith("+") and not bl.startswith("+++"):
+                    nc += 1
+                elif bl.startswith("-") and not bl.startswith("---"):
+                    oc += 1
+                elif bl.startswith("\\"):
+                    pass
+                else:
+                    oc += 1
+                    nc += 1
+                j += 1
+            if oc != ol or nc != nl:
+                return False
+            i = j
+    return True
+
+
 _STUB_SOURCE_SUFFIXES = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".java", ".kt", ".scala", ".swift",
@@ -10980,7 +11352,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 # at least one substantive block survives the strip.
                 _new_files_count = len(_patch_newly_created_files(result["patch"]))
                 if _new_files_count >= _STUB_PATTERN_MIN_NEW_FILES:
-                    _empty_paths = _empty_new_file_paths(result["patch"])
+                    # Never strip an empty new file that other patched code imports
+                    # (the FILL gate owns those); stripping would break the importer.
+                    _ref_empty = set(_referenced_empty_new_file_paths(result["patch"]))
+                    _empty_paths = [p for p in _empty_new_file_paths(result["patch"]) if p not in _ref_empty]
                     if _empty_paths and len(_empty_paths) / max(1, _new_files_count) >= _STUB_PATTERN_EMPTY_FRACTION:
                         _stripped = _strip_empty_new_files_from_patch(result["patch"], _empty_paths)
                         if _stripped != result["patch"]:
@@ -11052,6 +11427,25 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                                 if _stripped_off and _stripped_off != result["patch"]:
                                     result["patch"] = _stripped_off
                                     result["s3_off_scope_dropped"] = _off_scope[:6]
+                except Exception:
+                    pass
+                # PATCH-VALIDITY GUARD (must be LAST): transforms above can run
+                # after the early hunk-count repair and re-break counts → git
+                # rejects with 'corrupt patch at line N' and the round is a
+                # 0-score tie (duel 006026). Re-repair counts as the final step,
+                # then if the diff is STILL not well-formed, fall back to the
+                # clean working-tree diff (structurally valid by git construction;
+                # the winner patch is already applied to the tree at this point).
+                try:
+                    _revalid = _repair_hunk_header_counts(result["patch"])
+                    if _revalid != result["patch"]:
+                        result["patch"] = _revalid
+                        result["hunk_headers_repaired_final"] = True
+                    if not _patch_well_formed(result["patch"]) and _multishot_repo_obj is not None:
+                        _clean = get_patch(_multishot_repo_obj)
+                        if _clean.strip() and _patch_well_formed(_clean):
+                            result["patch"] = _clean
+                            result["patch_validity_fallback"] = "clean_working_tree"
                 except Exception:
                     pass
             # Two-tier salvage: never ship `success=False AND empty patch`
@@ -11796,7 +12190,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             # is sufficient -- empty patches are bad enough that we want both
             # safety nets active.
             _hm_time_trigger = (
-                _elapsed_now >= _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget
+                _elapsed_now >= min(
+                    _MID_LOOP_HAIL_MARY_BUDGET_FRACTION * wall_clock_budget,
+                    _MID_LOOP_HAIL_MARY_ABS_SECONDS,
+                )
             )
             _hm_step_trigger = step >= _MID_LOOP_HAIL_MARY_STEP_TRIGGER
             if (
