@@ -114,10 +114,21 @@ _RAPTOR_CLUSTER_SIZE = 6
 _RAPTOR_MAX_CLUSTERS = 24
 _RAPTOR_SUMMARY_CHARS = 400
 
-# Hybrid workflow: optional single-shot pipeline before ReAct (traceback bugs only).
-_PIPELINE_MAX_CANDIDATES = 1
-_PIPELINE_MAX_TOKENS = 1536
-_PIPELINE_TIMEOUT = 22
+# Hybrid workflow: Generate–Prune–Select (Trae) + execution-free-first pipeline.
+# Sweet spot is 5–6 diverse candidates (performance declines beyond ~6).
+_GPS_MAX_CANDIDATES = 5
+_GPS_SELECTOR_MAX_INPUT = 6
+# Prompt diversity only — validator proxy owns all sampling/decoding params.
+_GPS_CODER_VARIANT_HINTS: Tuple[str, ...] = (
+    "Prefer the smallest surgical fix at the throw site.",
+    "Trace the call chain upward; fix the root cause, not a symptom.",
+    "Mirror the style of the surrounding module; change only what the issue requires.",
+    "If the issue names a test or error string, align the fix to that assertion.",
+    "Consider edge cases and backwards compatibility before editing.",
+)
+_PIPELINE_MAX_CANDIDATES = _GPS_MAX_CANDIDATES
+_PIPELINE_MAX_TOKENS = 1400
+_PIPELINE_TIMEOUT = 18
 _PIPELINE_COMMAND_TIMEOUT = 15
 
 # Loop guards and companion-test targeting.
@@ -584,7 +595,23 @@ FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 # no-op. Backwards compatible: <command> continues to dispatch as before;
 # <edit> blocks are parsed by extract_edits() and executed by execute_edit().
 EDIT_RE = re.compile(r"<edit\b([^>]*)>\s*(.*?)\s*</edit>", re.IGNORECASE | re.DOTALL)
-_EDIT_ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+# Tolerate double-quoted, single-quoted, AND unquoted attribute values. Models
+# frequently emit `<edit path='A.java' op='write'>`; the old double-quote-only
+# regex matched ZERO attrs there -> empty path -> the whole edit silently failed
+# ("Invalid path"), surfacing as unexplained incompleteness.
+_EDIT_ATTR_RE = re.compile(r"""(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'">]+))""")
+
+
+def _parse_edit_attrs(attr_str: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in _EDIT_ATTR_RE.finditer(attr_str or ""):
+        val = m.group(2)
+        if val is None:
+            val = m.group(3)
+        if val is None:
+            val = m.group(4)
+        out[m.group(1).lower()] = val or ""
+    return out
 _EDIT_BLOCK_RE = re.compile(
     r"<(old|new|content)\b[^>]*>\n?(.*?)\n?</\1>",
     re.IGNORECASE | re.DOTALL,
@@ -642,10 +669,11 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
     dicts with normalized fields. Tolerates extra whitespace and inner-block
     ordering."""
     out: List[Dict[str, Any]] = []
-    for m in EDIT_RE.finditer(model_text):
-        attrs = dict(_EDIT_ATTR_RE.findall(m.group(1) or ""))
+
+    def _mk(attr_str: str, body: str, raw: str) -> Dict[str, Any]:
+        attrs = _parse_edit_attrs(attr_str)
         blocks: Dict[str, str] = {}
-        for b in _EDIT_BLOCK_RE.finditer(m.group(2) or ""):
+        for b in _EDIT_BLOCK_RE.finditer(body or ""):
             blocks[b.group(1).lower()] = b.group(2)
         try:
             line_arg = int(attrs.get("line", "0") or 0)
@@ -655,16 +683,48 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
             count_arg = int(attrs.get("count", "1") or 1)
         except ValueError:
             count_arg = 1
-        out.append({
+        op = (attrs.get("op") or "replace").lower()
+        content = blocks.get("content", "")
+        new = blocks.get("new", "")
+        old = blocks.get("old", "")
+        # Wrong-block recovery: a write/insert whose payload the model put in the
+        # WRONG tag (<new>/<old> instead of <content>) would otherwise silently
+        # write an EMPTY file — a whole deliverable missing (the dominant
+        # incompleteness loss). Adopt the populated block. Gated to content empty
+        # AND another block carrying text, so it never overrides an intentional
+        # empty file (all blocks empty) or a replace's intentional empty <new>.
+        if op in ("write", "insert") and not content.strip():
+            if new.strip():
+                content = new
+            elif old.strip():
+                content = old
+        return {
             "path": attrs.get("path", ""),
-            "op": (attrs.get("op") or "replace").lower(),
+            "op": op,
             "line": line_arg,
             "count": count_arg,
-            "old": blocks.get("old", ""),
-            "new": blocks.get("new", ""),
-            "content": blocks.get("content", ""),
-            "raw": m.group(0),
-        })
+            "old": old,
+            "new": new,
+            "content": content,
+            "raw": raw,
+        }
+
+    for m in EDIT_RE.finditer(model_text):
+        out.append(_mk(m.group(1) or "", m.group(2) or "", m.group(0)))
+
+    # Salvage a TRUNCATED final edit: the response hit the token cap so the
+    # closing </edit> never arrived (EDIT_RE then drops the whole edit, surfacing
+    # as unexplained incompleteness). Recover only when the last <edit ...> opener
+    # sits after the last </edit> AND its inner <content>/<new>/<old> IS properly
+    # closed (only the wrapper tag was lost, content intact); never salvage an
+    # unterminated content block (partial code is riskier than a clean miss).
+    last_open = None
+    for om in re.finditer(r"<edit\b([^>]*)>", model_text, re.IGNORECASE):
+        last_open = om
+    if last_open is not None:
+        tail = model_text[last_open.end():]
+        if "</edit>" not in tail and re.search(r"</(old|new|content)>", tail, re.IGNORECASE):
+            out.append(_mk(last_open.group(1) or "", tail, model_text[last_open.start():]))
     return out
 
 
@@ -743,6 +803,35 @@ def _maybe_unescape_code_entities(text: str, rel: str) -> str:
         return text
 
 
+_FENCE_OPEN_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*[\w.+#/-]*[ \t]*$")
+_FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
+_NO_FENCE_STRIP_SUFFIXES = {".md", ".markdown", ".mdx", ".rst", ".txt"}
+
+
+def _strip_wrapping_code_fence(text: str, rel: str) -> str:
+    """Strip a single ```lang ... ``` fence that wraps the ENTIRE edit payload —
+    the model emitting a markdown code block instead of raw file content, whose
+    fence lines otherwise land in the source file as syntax errors. No-op for
+    markdown/text files (fences are legitimate there) and when the payload is not
+    fully fence-wrapped or contains an interior fence (ambiguous)."""
+    if not text or Path(rel).suffix.lower() in _NO_FENCE_STRIP_SUFFIXES:
+        return text
+    lines = text.split("\n")
+    first = 0
+    while first < len(lines) and lines[first].strip() == "":
+        first += 1
+    last = len(lines) - 1
+    while last >= 0 and lines[last].strip() == "":
+        last -= 1
+    if first >= last:
+        return text
+    if _FENCE_OPEN_RE.match(lines[first]) and _FENCE_CLOSE_RE.match(lines[last]):
+        inner = lines[first + 1:last]
+        if not any(_FENCE_CLOSE_RE.match(ln) for ln in inner):
+            return "\n".join(inner)
+    return text
+
+
 def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
     """Execute one structured <edit> block. Returns a CommandResult with the
     same shape as run_command so format_observation handles it uniformly.
@@ -778,6 +867,9 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
     for _k in ("content", "new", "old"):
         if edit.get(_k):
             edit[_k] = _maybe_unescape_code_entities(edit[_k], rel)
+    for _k in ("content", "new"):
+        if edit.get(_k):
+            edit[_k] = _strip_wrapping_code_fence(edit[_k], rel)
     try:
         if op == "write":
             content = edit.get("content") or ""
@@ -4735,9 +4827,6 @@ def _broken_refs_java(path: str, source: str, added: List[str], full: Path, repo
     return res
 
 
-# JS/TS removed-declaration patterns. Each regex captures the SYMBOL NAME that
-# the patch is deleting (matched against a `-` removed line, leading `-`
-# stripped). Conservative on purpose: only the simple, common forms.
 _JS_REMOVED_CONST_RE = re.compile(
     r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]"
 )
@@ -4946,12 +5035,18 @@ def _check_broken_references(repo: Path, patch: str) -> List[str]:
         findings.extend(_unused_added_variables(repo, patch))
     except Exception:
         pass
+    try:
+        findings.extend(_wrong_path_to_created_module(repo, patch))
+    except Exception:
+        pass
     # Cross-language same-file removed-symbol-still-referenced (JS/TS/PHP).
-    # Mirrors the king's Python analog: a `-export function X` / `-const X =` /
-    # `-use Foo\Bar;` removal that the post-patch file still references is a
-    # compile error. Targets recurring duel losses 067444-style (TS:
-    # `readSessionMetaCwd` declaration removed but `metaCwd,` shorthand
-    # remains) and PHP `use ...Request;` removed-but-still-used cases.
+    # Mirrors the Python analog (_deleted_symbol_still_referenced): a
+    # `-export function X` / `-const X =` / `-use Foo\Bar;` removal that the
+    # post-patch file still references is a compile/load error. Targets recurring
+    # losses 067444-style (TS shorthand) and PHP `use ...Request;` removed-but-used.
+    # NOTE: duplicate-import/redeclaration binding is already enforced here by
+    # _broken_refs_js (duplicate-declaration branch), so the standalone
+    # _patch_has_probable_duplicate_imports signal is retained but redundant.
     try:
         findings.extend(_removed_symbol_still_referenced_js_ts(repo, patch))
     except Exception:
@@ -4965,6 +5060,155 @@ def _check_broken_references(repo: Path, patch: str) -> List[str]:
         if f not in out:
             out.append(f)
     return out[:6]
+
+
+def _js_import_resolves_to_file(repo: Path, importer_full: Path, mod: str) -> bool:
+    """True if a relative specifier `mod` resolves to ANY real file on the
+    post-patch tree (bare path, +ext, or /index.ext). Unlike _js_module_file_missing
+    this does NOT bail when the parent dir is absent — a missing intermediate dir is
+    exactly the wrong-depth fingerprint we want to detect, so 'unresolved' must read
+    as broken, not as 'skip'."""
+    base = importer_full.parent / mod
+    raw = str(base)
+    cands = [base] + [Path(raw + ext) for ext in _JS_TS_SUFFIXES]
+    cands += [base / ("index" + ext) for ext in (".ts", ".tsx", ".js", ".jsx")]
+    repo_resolved = repo.resolve()
+    for c in cands:
+        try:
+            cr = c.resolve()
+            cr.relative_to(repo_resolved)
+        except Exception:
+            continue
+        if cr.is_file():
+            return True
+    return False
+
+
+def _repo_js_stem_index(repo: Path) -> "Dict[str, List[str]]":
+    """One capped walk of the repo building {basename-stem -> [rel JS/TS paths]}.
+    Skips vendored/build dirs (CONTEXT_SKIP_PARTS) and bounds the walk so a giant
+    tree can't blow the time budget. Used to find the unambiguous intended target
+    of a wrong-depth relative import."""
+    index: Dict[str, List[str]] = {}
+    repo_resolved = repo.resolve()
+    seen = 0
+    CAP = 40000
+    for dirpath, dirnames, filenames in os.walk(repo_resolved):
+        # prune vendored/build dirs in place so os.walk doesn't descend them
+        dirnames[:] = [d for d in dirnames if d not in CONTEXT_SKIP_PARTS]
+        for fn in filenames:
+            seen += 1
+            if seen > CAP:
+                return index
+            p = Path(fn)
+            if p.suffix.lower() not in _JS_TS_SUFFIXES:
+                continue
+            try:
+                rel = str(Path(dirpath, fn).resolve().relative_to(repo_resolved))
+            except Exception:
+                continue
+            index.setdefault(p.stem, []).append(rel)
+    return index
+
+
+# Stems too generic to disambiguate by basename alone — many files share them, so
+# "exactly one match" would be luck, not intent. Never suggest these.
+_AMBIGUOUS_JS_STEMS = {"index", "utils", "util", "types", "type", "constants",
+                       "config", "helpers", "helper", "common", "main"}
+
+
+def _wrong_path_to_created_module(repo: Path, patch: str) -> List[str]:
+    """Wrong-DEPTH relative import whose intended target EXISTS but at a different
+    depth than written -> module-not-found. Two cases, both near-zero FP:
+
+      (A) created-file case (loss 067383, original): the patch ITSELF created the
+          module (e.g. root `lib/supabase-admin.js`) but the added import
+          `../../../lib/...` from app/api/admin/create-user/route.js resolves to
+          nonexistent `app/lib/...`. High confidence: the file plainly exists.
+
+      (B) pre-existing-file case (loss 067383 variant, lost AGAIN in 006078): the
+          added import `../../../lib/supabase` resolves to nonexistent
+          `app/lib/supabase`, but a root `lib/supabase.ts` ALREADY exists (correct
+          path was one `../` deeper). Fires only when EXACTLY ONE repo file shares
+          the import's last segment as its JS/TS basename stem — the unambiguous
+          intended target.
+
+    _broken_refs_js misses BOTH because _js_module_file_missing conservatively bails
+    when the wrong path's parent dir is absent (the wrong-depth fingerprint). This is
+    strictly additive: case (B) only runs when that bail would happen (parent dir
+    absent), so it cannot double-fire with _broken_refs_js.
+
+    FP controls: (a) only when the added import resolves to NO real file on the
+    post-patch tree; (b) created file (A) or EXACTLY ONE same-stem file (B);
+    (c) ambiguous common stems (index/utils/types/...) are skipped."""
+    findings: List[str] = []
+    try:
+        created = _patch_newly_created_files(patch)
+        # stem (basename without a JS/TS extension) -> created relative path(s)
+        created_by_stem: Dict[str, List[str]] = {}
+        for cpath in created:
+            if Path(cpath).suffix.lower() not in _JS_TS_SUFFIXES:
+                continue
+            stem = Path(cpath).stem
+            created_by_stem.setdefault(stem, []).append(cpath)
+        added_by_file = _patch_added_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        repo_index: Optional[Dict[str, List[str]]] = None  # built lazily, once
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if Path(rel).suffix.lower() not in _JS_TS_SUFFIXES:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            for ln in added_by_file.get(rel, []):
+                if len(findings) >= 4:
+                    break
+                for mod in _added_rel_imports(ln):
+                    target_stem = Path(mod).name
+                    # (A) created-file case — preserved, takes precedence.
+                    if target_stem in created_by_stem:
+                        if _js_import_resolves_to_file(repo, full, mod):
+                            continue  # path is fine — resolves to a real file
+                        correct = created_by_stem[target_stem]
+                        findings.append(
+                            f"{rel}: import '{mod}' resolves to no file, but this patch "
+                            f"created `{correct[0]}` — the relative path/depth is wrong "
+                            f"(module-not-found at runtime); point the import at the file "
+                            f"you created."
+                        )
+                        if len(findings) >= 4:
+                            break
+                        continue
+                    # (B) pre-existing-file case. Only the gap _broken_refs_js leaves:
+                    # the wrong path's parent dir must be ABSENT (else that check owns
+                    # it). Skip ambiguous stems and anything that resolves fine.
+                    if target_stem in _AMBIGUOUS_JS_STEMS:
+                        continue
+                    wrong_parent = (full.parent / mod).parent
+                    if wrong_parent.is_dir():
+                        continue  # _broken_refs_js / _js_module_file_missing territory
+                    if _js_import_resolves_to_file(repo, full, mod):
+                        continue
+                    if repo_index is None:
+                        repo_index = _repo_js_stem_index(repo)
+                    matches = repo_index.get(target_stem, [])
+                    if len(matches) != 1:
+                        continue  # 0 = forgot-to-create (not ours); >1 = ambiguous
+                    findings.append(
+                        f"{rel}: import '{mod}' resolves to no file (its directory "
+                        f"doesn't exist), but exactly one module with that name already "
+                        f"exists at `{matches[0]}` — the relative path/depth is wrong "
+                        f"(module-not-found at runtime); fix the import to point there."
+                    )
+                    if len(findings) >= 4:
+                        break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
 
 
 def _unfiltered_mutation_findings(
@@ -5579,6 +5823,100 @@ def _unused_added_imports(repo: Path, patch: str) -> List[str]:
     return findings[:4]
 
 
+_JS_COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_JS_COMMENT_LINE_RE = re.compile(r"//[^\n]*")
+_JS_STRING_RE = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""", re.DOTALL)
+
+
+def _js_strip_comments_strings(text: str) -> str:
+    """Blank out block/line comments and string/template literals so an
+    identifier surviving ONLY inside a comment or string is not mistaken for a
+    real reference. Best-effort (not a tokenizer): block comments first, then
+    line comments, then quoted spans. Used only to suppress false positives."""
+    try:
+        text = _JS_COMMENT_BLOCK_RE.sub(" ", text)
+        text = _JS_COMMENT_LINE_RE.sub(" ", text)
+        text = _JS_STRING_RE.sub(" ", text)
+    except Exception:
+        return text
+    return text
+
+
+def _removed_js_import_still_used(repo: Path, patch: str) -> List[str]:
+    """JS/TS reference-breakage guard — the exact INVERSE of
+    _unused_added_imports. The recurring loss (the `toast` family, 3x in one
+    duel): the patch REMOVES a named import that is still used elsewhere in the
+    file, producing a reference error / compile breakage and churn penalty.
+
+    FP polarity is inverted vs the dead-import sibling (an occurrence CREATES a
+    flag here), so the guardrails are load-bearing:
+      (A) skip if the name is still imported by ANY surviving import line
+          (relocation / consolidation / dedup) — the dominant FP class;
+      (B) search a body with all `import ... from` statements masked, so a
+          surviving import never self-counts as a use (mirrors Go masking);
+      (C) strip comments/strings before the search, so a name surviving only in
+          a comment/string is not a false "use";
+      (D) named `{...}` imports only (default/namespace use-sites are dotted
+          member access — too ambiguous); skip `import type`; word-boundary
+          match; ≤4 findings; fail-closed to []."""
+    findings: List[str] = []
+    try:
+        removed_by_file = _patch_removed_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if Path(rel).suffix.lower() not in _JS_TS_IMPORT_SUFFIXES:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            # (A) Identifiers still imported anywhere in the post-patch file.
+            still_imported: set = set()
+            for m in _JS_IMPORT_FROM_RE.finditer(source):
+                body = m.group("body")
+                for _imp, loc in _js_named_import_pairs(body):
+                    still_imported.add(loc)
+                lead = body.split("{", 1)[0]
+                dm = re.search(r"\*\s+as\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)", lead)
+                if dm:
+                    still_imported.add(dm.group(1) or dm.group(2))
+            # (B)+(C) Mask import statements, then strip comments/strings.
+            body_masked = _js_strip_comments_strings(_JS_IMPORT_FROM_RE.sub(" ", source))
+            for ln in removed_by_file.get(rel, []):
+                s = ln.strip()
+                if s.startswith("import type") or "import type {" in s:
+                    continue
+                m = _NAMED_IMPORT_RE.search(s)
+                if not m:
+                    continue
+                for raw_name in m.group(1).split(","):
+                    name = raw_name.strip().split(" as ")[-1].strip()
+                    if not name or not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                        continue
+                    if name in still_imported:
+                        continue
+                    use_re = r"(?<![\w$])" + re.escape(name) + r"(?![\w$])"
+                    if re.search(use_re, body_masked):
+                        findings.append(
+                            f"removed_import:{rel}: `{name}` import was removed but it is "
+                            "still used elsewhere in the file — restore the import "
+                            "(JS/TS reference error)"
+                        )
+                    if len(findings) >= 4:
+                        break
+                if len(findings) >= 4:
+                    break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
 _GO_IMPORT_BLOCK_RE = re.compile(r"import\s*\((.*?)\)", re.DOTALL)
 _GO_IMPORT_LINE_RE = re.compile(r"^\s*(?:([A-Za-z_.]\w*|\.|_)\s+)?\"([^\"]+)\"\s*$")
 _GO_SINGLE_IMPORT_RE = re.compile(r"^\s*import\s+(?:([A-Za-z_.]\w*|\.|_)\s+)?\"([^\"]+)\"\s*$")
@@ -5661,6 +5999,182 @@ def _unused_go_imports(repo: Path, patch: str) -> List[str]:
     return findings[:4]
 
 
+_RUST_MOD_SKIP_NAMES = {"main.rs", "lib.rs", "mod.rs", "build.rs"}
+_RUST_AUTO_DIRS = {"tests", "benches", "examples"}
+
+
+def _rust_unregistered_module(repo: Path, patch: str) -> List[str]:
+    """Cross-file Rust mod-wiring guard. Our rustc check (_check_rust_syntax_one)
+    is parse-only PER FILE and cannot see that a newly-created module file was
+    never registered with `mod <name>;` in its parent — an unreachable module
+    that makes the WHOLE crate fail to compile (recurring loss 067390 / 067395:
+    created src/types/hardware.rs but never added `mod hardware;` to mod.rs).
+
+    Fires ONLY when the patch CREATES a non-special `.rs` file under `src/` and
+    NO `mod <name>` token exists in ANY plausible parent (same-dir mod.rs, the
+    2018-edition sibling `<dir>.rs`, or the crate roots lib.rs/main.rs) NOR in
+    anything this patch added. Guardrails keep FP low (each only suppresses,
+    never invents, a flag):
+      (1) `#[path = "..."]` can register the file under a different name -> skip.
+      (2) inline `mod <name> { ... }` declarations are caught by the broad token
+          scan (`\\bmod\\s+<name>\\b`), so a same-named inline mod suppresses.
+      (3) a created `foo/mod.rs` registers the DIRECTORY `foo` on the grandparent
+          -> module name is the dir name, parent is one level up.
+      (4) tests/ benches/ examples/ are auto-discovered by cargo (no mod needed)
+          -> skipped. Files outside any `src/` are skipped (workspace binaries)."""
+    findings: List[str] = []
+    try:
+        rs_created = [c for c in _patch_newly_created_files(patch) if c.endswith(".rs")]
+        if not rs_created:
+            return findings
+        added_by_file = _patch_added_lines_by_file(patch)
+        all_added = "\n".join("\n".join(v) for v in added_by_file.values())
+        repo_resolved = repo.resolve()
+        for cpath in rs_created:
+            if len(findings) >= 4:
+                break
+            p = Path(cpath)
+            parts = p.parts
+            if any(seg in _RUST_AUTO_DIRS for seg in parts):
+                continue
+            if "src" not in parts:
+                continue
+            base = p.name
+            if base == "mod.rs":
+                mod_name = p.parent.name
+                reg_dir = p.parent.parent
+            elif base in _RUST_MOD_SKIP_NAMES:
+                continue
+            else:
+                mod_name = p.stem
+                reg_dir = p.parent
+            if not mod_name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", mod_name):
+                continue
+            candidates: List[Path] = [
+                reg_dir / "mod.rs",
+                reg_dir.parent / (reg_dir.name + ".rs"),
+            ]
+            try:
+                src_idx = parts.index("src")
+                src_root = Path(*parts[: src_idx + 1])
+                candidates.append(src_root / "lib.rs")
+                candidates.append(src_root / "main.rs")
+            except (ValueError, TypeError):
+                pass
+            blob_parts: List[str] = [all_added]
+            for cand in candidates:
+                full = (repo / cand).resolve()
+                try:
+                    full.relative_to(repo_resolved)
+                except (ValueError, RuntimeError):
+                    continue
+                txt = _br_safe_read(full)
+                if txt:
+                    blob_parts.append(txt)
+            blob = "\n".join(blob_parts)
+            # (1) a #[path] attribute referencing this file registers it elsewhere.
+            if "#[path" in blob and (base in blob or mod_name in blob):
+                continue
+            # (2)+(token) any `mod <name>` (file or inline) means it's registered.
+            if re.search(r"\bmod\s+" + re.escape(mod_name) + r"\b", blob):
+                continue
+            findings.append(
+                f"rust_unregistered_module:{cpath}: created Rust module but no "
+                f"`mod {mod_name};` / `pub mod {mod_name};` registers it in the parent "
+                f"(mod.rs / lib.rs / main.rs) — the module is unreachable and the "
+                f"crate will not compile; add the mod declaration"
+            )
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
+_ROBOTS_SITEMAP_RE = re.compile(
+    r"(?:^|/)app/api/(robots\.txt|sitemap(?:\.xml)?)/route\.[jt]sx?$"
+)
+
+
+def _robots_sitemap_wrong_route(patch: str) -> List[str]:
+    """Next.js App Router canonical-path guard. `robots.txt` and `sitemap.xml`
+    MUST be served from the domain root (crawlers fetch /robots.txt); a route file
+    under `app/api/` serves them at /api/robots.txt and silently fails the spec —
+    a recurring duel loss (067366/067358/067363/067361). Near-0 FP: a robots/
+    sitemap route under app/api/ is essentially always wrong; only fires on a
+    CHANGED file whose path matches `app/api/<robots.txt|sitemap[.xml]>/route.*`."""
+    findings: List[str] = []
+    try:
+        for rel in _patch_changed_files(patch):
+            m = _ROBOTS_SITEMAP_RE.search(rel.replace("\\", "/"))
+            if not m:
+                continue
+            name = m.group(1)
+            correct = rel.replace("/app/api/", "/app/").replace("app/api/", "app/", 1)
+            findings.append(
+                f"{rel}: `{name}` is routed under app/api/ so it serves at "
+                f"/api/{name} — crawlers only read it at the domain ROOT. Move the "
+                f"route to `{correct}` so it serves at /{name}."
+            )
+            if len(findings) >= 4:
+                break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
+_DSIH_SCRIPT_RE = re.compile(
+    r"dangerouslySetInnerHTML\s*=\s*\{\{[^}]*?(?:__html|html)\b", re.DOTALL
+)
+
+
+def _dangerous_inner_html_script(repo: Path, patch: str) -> List[str]:
+    """Flag a `dangerouslySetInnerHTML` whose __html string contains a literal
+    `<script ...>` tag. Browsers do NOT execute <script> inserted via innerHTML,
+    so GA4/GTM/Pixel injected this way silently never run — a recurring duel loss
+    (067359/067363/067361). Fire only when the patch ADDED a dangerouslySetInnerHTML
+    on a JS/TS file AND the post-patch source has `<script` inside that prop's
+    object literal. Conservative: scans the braces-balanced object after the prop;
+    bails on any parse ambiguity; ≤4 findings."""
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if Path(rel).suffix.lower() not in _JS_TS_SUFFIXES:
+                continue
+            if not any("dangerouslySetInnerHTML" in ln for ln in added_by_file.get(rel, [])):
+                continue  # only when THIS patch added the injection
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            for m in _DSIH_SCRIPT_RE.finditer(source):
+                # walk a bounded window from the prop to the closing `}}` and look
+                # for a literal opening <script tag inside the injected html.
+                window = source[m.start(): m.start() + 4000]
+                end = window.find("}}")
+                if end != -1:
+                    window = window[:end]
+                if re.search(r"<script\b", window):
+                    findings.append(
+                        f"{rel}: `dangerouslySetInnerHTML` injects a string containing "
+                        f"a `<script>` tag — scripts inserted via innerHTML do NOT "
+                        f"execute, so this analytics/inline script silently never runs. "
+                        f"Use next/script `<Script>` or create the element via "
+                        f"document.createElement('script')."
+                    )
+                if len(findings) >= 4:
+                    break
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -5705,6 +6219,10 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     errors.extend(_destructive_ship_stoppers(patch))
     errors.extend(_unused_added_imports(repo, patch))
     errors.extend(_unused_go_imports(repo, patch))
+    errors.extend(_removed_js_import_still_used(repo, patch))
+    errors.extend(_rust_unregistered_module(repo, patch))
+    errors.extend(_robots_sitemap_wrong_route(patch))
+    errors.extend(_dangerous_inner_html_script(repo, patch))
     return errors
 
 
@@ -7638,6 +8156,303 @@ def _patch_duel_score(patch: str, issue: str) -> int:
     return score
 
 
+def _patch_ast_fingerprint(patch: str) -> str:
+    """AST-normalized structural fingerprint for Trae-style deduplication."""
+    import ast as _ast
+
+    per_file: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/.+? b/(.+?)$", line)
+            current = m.group(1) if m else None
+        elif (
+            current
+            and current.endswith(".py")
+            and line.startswith("+")
+            and not line.startswith("+++")
+        ):
+            per_file.setdefault(current, []).append(line[1:])
+    if not per_file:
+        return "hunk:" + str(sorted(_patch_hunk_signature(patch)))
+    parts: List[str] = []
+    for path in sorted(per_file):
+        snippet = "\n".join(per_file[path]).strip()
+        if not snippet:
+            parts.append(f"{path}:empty")
+            continue
+        try:
+            tree = _ast.parse(snippet)
+            parts.append(f"{path}:{_ast.dump(tree, include_attributes=False)}")
+        except SyntaxError:
+            normalized = "\n".join(ln.strip() for ln in per_file[path])
+            parts.append(f"{path}:raw:{hash(normalized)}")
+    return "|".join(parts)
+
+
+def _gps_dedupe_patches(candidates: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+    """Stage-1 prune: collapse AST- and hunk-identical samples."""
+    seen: set = set()
+    unique: List[Tuple[int, str]] = []
+    for idx, patch in candidates:
+        if not patch.strip():
+            continue
+        key = (_patch_ast_fingerprint(patch), str(sorted(_patch_hunk_signature(patch))))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((idx, patch))
+    return unique
+
+
+def _execution_free_reward_score(
+    patch: str,
+    issue_text: str,
+    *,
+    consensus_votes: int = 1,
+) -> float:
+    """SWE-RM style execution-free reward (trained on test labels; inferred without runs)."""
+    if not patch.strip():
+        return 0.0
+    score = float(_patch_duel_score(patch, issue_text))
+    score += 12.0 * max(0, consensus_votes - 1)
+    delta_lines = sum(
+        1
+        for ln in patch.splitlines()
+        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+    )
+    score -= min(8.0, delta_lines * 0.05)
+    score -= 25.0 * len(_patch_ship_blockers(patch, issue_text))
+    return max(0.0, score)
+
+
+@dataclass
+class _GpsCandidate:
+    source_idx: int
+    patch: str
+    reward: float
+    consensus_votes: int
+    regression_pass: Optional[bool] = None
+
+
+def _named_path_coverage_count(patch: str, issue_text: str) -> int:
+    """Tie-breaker signal: how many issue-NAMED files this patch actually edits.
+
+    Graded complement to the existing BINARY `_patch_covers_required_paths`
+    (+30 all-or-nothing in _patch_duel_score). On multi-file tasks the dominant
+    loss class is incompleteness: every candidate misses the binary bonus, so
+    reward goes flat and selection falls back to (-votes, len(patch)) — which can
+    pick a LESS-complete patch. This counts the issue-named files covered so the
+    selector can prefer the more-complete tie.
+
+    Guardrails by construction:
+      * counts ONLY files the issue explicitly names (reuses the canonical
+        _extract_issue_path_mentions) -> never rewards churn / over-scoping into
+        unnamed files (the 067407 failure mode);
+      * capped at the number of named paths;
+      * 0 for all candidates when the issue names <2 paths (single-file tasks)
+        -> pure no-op, zero regression risk."""
+    try:
+        required = _extract_issue_path_mentions(issue_text)
+        if len(required) < 2:
+            return 0
+        changed = _patch_changed_files(patch)
+        covered = 0
+        for req in required:
+            if any(req == c or c.endswith("/" + req) for c in changed):
+                covered += 1
+        return covered
+    except Exception:
+        return 0
+
+
+def _gps_prune_and_score(
+    raw: List[Tuple[int, str]],
+    issue_text: str,
+) -> List[_GpsCandidate]:
+    """Generate–Prune stage: dedup → execution-free reward + consensus votes."""
+    unique = _gps_dedupe_patches(raw)
+    if not unique:
+        return []
+    labeled = [(str(i), p) for i, (_, p) in enumerate(unique)]
+    clusters = _cluster_patches(labeled)
+    vote_by_local: Dict[int, int] = {}
+    for cluster in clusters:
+        for local_i in cluster:
+            vote_by_local[local_i] = len(cluster)
+    scored: List[_GpsCandidate] = []
+    for local_i, (orig_idx, patch) in enumerate(unique):
+        votes = vote_by_local.get(local_i, 1)
+        scored.append(
+            _GpsCandidate(
+                source_idx=orig_idx,
+                patch=patch,
+                reward=_execution_free_reward_score(patch, issue_text, consensus_votes=votes),
+                consensus_votes=votes,
+            )
+        )
+    scored.sort(key=lambda c: (-c.reward, -c.consensus_votes,
+                               -_named_path_coverage_count(c.patch, issue_text),
+                               len(c.patch)))
+    return scored[:_GPS_SELECTOR_MAX_INPUT]
+
+
+def _gps_regression_prune(
+    repo: Path,
+    candidates: List[_GpsCandidate],
+    issue_text: str,
+    baseline_failing: List[Tuple[str, str]],
+    command_timeout: int,
+    initial_head: str,
+) -> List[_GpsCandidate]:
+    """Stage-2 prune: regression-test unique candidates (SWE-HERO execution layer)."""
+    if not baseline_failing or not initial_head:
+        return candidates
+    passing: List[_GpsCandidate] = []
+    failing: List[_GpsCandidate] = []
+    for cand in candidates:
+        subprocess.run(
+            ["git", "reset", "--hard", initial_head],
+            cwd=str(repo), capture_output=True, timeout=30, check=False,
+        )
+        if not _multishot_apply_patch(repo, cand.patch):
+            failing.append(cand)
+            continue
+        if _validate_pipeline_patch(repo, issue_text, cand.patch, baseline_failing, command_timeout):
+            cand.regression_pass = True
+            passing.append(cand)
+        else:
+            cand.regression_pass = False
+            failing.append(cand)
+    if passing:
+        return passing + failing
+    return candidates
+
+
+def _gps_selector_dual_verify(
+    issue_text: str,
+    top: List[_GpsCandidate],
+    *,
+    infer_model: str,
+    infer_api_base: Optional[str],
+    infer_api_key: Optional[str],
+) -> Optional[int]:
+    """Trae Selector: contextual dual-verify when reward scores are ambiguous."""
+    if len(top) < 2:
+        return None
+    if top[0].reward - top[1].reward > 8.0:
+        return None
+    blocks: List[str] = []
+    for i, cand in enumerate(top[:3]):
+        blocks.append(
+            f"### Candidate {i + 1} (coder={cand.source_idx + 1}, "
+            f"reward={cand.reward:.0f}, votes={cand.consensus_votes})\n"
+            f"```diff\n{_truncate(cand.patch, 1400)}\n```"
+        )
+    prompt = (
+        "You are the Selector agent. Pick the ONE patch most likely to fix the "
+        "issue with the smallest correct change. Reply with ONLY a single digit "
+        "(1, 2, or 3).\n\n"
+        f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
+        + "\n\n".join(blocks)
+    )
+    try:
+        response, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "Patch selector. Output one digit only."},
+                {"role": "user", "content": prompt},
+            ],
+            model=infer_model,
+            api_base=infer_api_base,
+            api_key=infer_api_key,
+            max_tokens=8,
+            timeout=12,
+            max_retries=1,
+        )
+    except Exception:
+        return None
+    m = re.search(r"[123]", (response or "").strip())
+    if not m:
+        return None
+    pick = int(m.group(0)) - 1
+    return pick if 0 <= pick < len(top[:3]) else None
+
+
+def _gps_selector_pick(
+    issue_text: str,
+    candidates: List[_GpsCandidate],
+    *,
+    infer_model: str,
+    infer_api_base: Optional[str],
+    infer_api_key: Optional[str],
+) -> _GpsCandidate:
+    """Pick winner: regression pass > reward > consensus > optional LLM verify."""
+    if not candidates:
+        raise ValueError("empty candidate pool")
+    regress_pass = [c for c in candidates if c.regression_pass is True]
+    pool = regress_pass if regress_pass else candidates
+    pool = sorted(pool, key=lambda c: (-c.reward, -c.consensus_votes,
+                                       -_named_path_coverage_count(c.patch, issue_text),
+                                       len(c.patch)))
+    dual_idx = _gps_selector_dual_verify(
+        issue_text,
+        pool[:3],
+        infer_model=infer_model,
+        infer_api_base=infer_api_base,
+        infer_api_key=infer_api_key,
+    )
+    if dual_idx is not None and dual_idx < len(pool[:3]):
+        return pool[:3][dual_idx]
+    return pool[0]
+
+
+def _pick_stronger_patch_execution_free(
+    issue_text: str,
+    patch_a: str,
+    label_a: str,
+    patch_b: str,
+    label_b: str,
+    inference_cfg: Optional[Tuple[Optional[str], Optional[str], Optional[str]]] = None,
+) -> Tuple[str, str]:
+    """Dual-workflow duel: SWE-RM reward first; LLM selector only when tied."""
+    if not patch_a.strip():
+        return patch_b, label_b
+    if not patch_b.strip():
+        return patch_a, label_a
+    score_a = _execution_free_reward_score(patch_a, issue_text)
+    score_b = _execution_free_reward_score(patch_b, issue_text)
+    margin = 10.0
+    if score_a >= score_b + margin:
+        return patch_a, label_a
+    if score_b >= score_a + margin:
+        return patch_b, label_b
+    if inference_cfg and all(inference_cfg):
+        try:
+            model_name, base, key = _resolve_inference_config(*inference_cfg)
+            pool = [
+                _GpsCandidate(0, patch_a, score_a, 1),
+                _GpsCandidate(1, patch_b, score_b, 1),
+            ]
+            pick = _gps_selector_dual_verify(
+                issue_text,
+                pool,
+                infer_model=model_name,
+                infer_api_base=base,
+                infer_api_key=key,
+            )
+            if pick == 1:
+                return patch_b, label_b
+            if pick == 0:
+                return patch_a, label_a
+        except Exception:
+            pass
+    if score_b > score_a:
+        return patch_b, label_b
+    if score_a > score_b:
+        return patch_a, label_a
+    return (patch_a, label_a) if len(patch_a) <= len(patch_b) else (patch_b, label_b)
+
+
 def build_ship_blocker_prompt(blockers: List[str], issue: str) -> str:
     short = issue[:1200] if len(issue) > 1200 else issue
     items = "\n".join(f"  - {b}" for b in blockers[:6])
@@ -8551,6 +9366,12 @@ Evidence priority when picking what to patch: explicit issue text > failing/expe
 ====================================================================
 INSPECTION STRATEGY
 ====================================================================
+
+====================================================================
+REASONING BEFORE EXECUTION (SWE-ZERO → SWE-HERO)
+====================================================================
+
+Internalize the bug from the issue text and code reading before running tests. Early turns should be read-only inspection (`grep`, `sed`, repo map, targeted file reads). Run tests only after you have a concrete hypothesis and a minimal fix direction — execution verifies semantics; it should not be your primary discovery loop.
 
 Inspect only what you need to locate the owner of the bug and patch safely. Order: **repo map (symbol skeleton) first** to pick the right file/class/function, then the localized preloaded regions (not whole files), then one or two focused searches (`grep -rn`, or `grep -rnF` for an exact phrase; `rg` is NOT available here), then `sed -n` on the line numbers from the map, then nearby tests, then call sites only if a signature/public API may change.
 
@@ -10430,17 +11251,7 @@ def _patch_has_probable_duplicate_function_decls(patch: str) -> bool:
 
 
 def _patch_has_probable_duplicate_imports(patch: str) -> bool:
-    """Cheap pre-scan: repeated normalized import on '+' lines in one file block.
-
-    Two complementary signals:
-      (a) The same NORMALISED import statement added twice (king's original
-          check — catches verbatim repeats);
-      (b) The same JS/TS NAMED-IMPORT BINDING added twice from DIFFERENT
-          modules (e.g. `+import { X } from 'a'` and `+import { X } from 'b'`
-          in the same file) — TypeScript fails with `Cannot redeclare
-          block-scoped variable 'X'`. Duel 067388-style: two `import` lines
-          declaring the same binding compile-fail before any runtime check.
-    """
+    """Cheap pre-scan: repeated normalized import on '+' lines in one file block."""
     if not patch.strip() or "diff --git " not in patch:
         return False
     try:
@@ -10459,10 +11270,6 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
             else:
                 continue
             seen: set = set()
-            # Signal (b): track which JS/TS named-import bindings the patch
-            # adds; same binding from any two modules = redeclare error.
-            seen_bindings: set = set()
-            is_js_ts = path.endswith(_LINT_JS_TS_EXTS)
             for ln in block.splitlines():
                 m = pat.match(ln)
                 if not m:
@@ -10471,25 +11278,6 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
                 if norm in seen:
                     return True
                 seen.add(norm)
-                if is_js_ts:
-                    # Extract named-import binding identifiers (handles `as`).
-                    # `import { Foo, Bar as B } from 'mod'` → {Foo, B}.
-                    bm = re.search(r"\{([^}]*)\}", norm)
-                    if bm:
-                        for raw in bm.group(1).split(","):
-                            name = raw.strip().split(" as ")[-1].strip()
-                            if name and re.match(r"^[A-Za-z_$][\w$]*$", name):
-                                if name in seen_bindings:
-                                    return True
-                                seen_bindings.add(name)
-                    # Default binding: `import X from '...'` or
-                    # `import X, { Y } from '...'`.
-                    dm = re.match(r"^import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*[,\s]", norm)
-                    if dm:
-                        name = dm.group(1)
-                        if name in seen_bindings:
-                            return True
-                        seen_bindings.add(name)
         return False
     except Exception:
         return True
@@ -11412,17 +12200,22 @@ def _generate_pipeline_candidate(
     api_base: Optional[str],
     api_key: Optional[str],
     candidate_idx: int,
+    variant_hint: str = "",
+    execution_free: bool = True,
 ) -> str:
-    """Single-shot candidate patch via structured edits."""
+    """Coder agent: single-shot candidate patch (SWE-ZERO execution-free by default)."""
     snippets: List[str] = []
     for path in target_files[:3]:
         snip = _read_context_file(repo, path, 2500)
         if snip.strip():
             snippets.append(f"### {path}\n```\n{snip}\n```")
+    variant_line = f"\nStrategy hint: {variant_hint}\n" if variant_hint else ""
     prompt = (
-        f"You are an agentless patch generator (candidate {candidate_idx + 1}). "
-        "Emit ONLY `<edit>` blocks (and optionally one `<command>` test), then "
-        "`<final>pipeline candidate</final>`. Smallest root-cause fix.\n\n"
+        f"You are a Coder agent (sample {candidate_idx + 1}/{_GPS_MAX_CANDIDATES}). "
+        "Reason about the fix from the issue and code context without running tests. "
+        "Emit ONLY `<edit>` blocks, then `<final>pipeline candidate</final>`. "
+        "Smallest root-cause fix."
+        f"{variant_line}\n\n"
         f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
         f"LOCALIZATION:\n{_truncate(localization_ctx, 4000)}\n\n"
         + "\n\n".join(snippets)
@@ -11430,7 +12223,7 @@ def _generate_pipeline_candidate(
     try:
         response, _, _ = chat_completion(
             messages=[
-                {"role": "system", "content": "Agentless patch generator. Output edits only."},
+                {"role": "system", "content": "Coder agent. Output edits only; no test commands."},
                 {"role": "user", "content": prompt},
             ],
             model=model,
@@ -11445,20 +12238,20 @@ def _generate_pipeline_candidate(
     for kind, value in extract_actions_in_order(response or ""):
         if kind == "edit":
             execute_edit(value, repo)
-        elif kind == "command":
+        elif kind == "command" and not execution_free:
             run_command(value, repo, timeout=_PIPELINE_COMMAND_TIMEOUT)
     return get_patch(repo)
 
 
 def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
-    """Fixed pipeline: localization → candidate patches → validation."""
+    """Generate–Prune–Select: Coder pool → dedup/reward prune → regression → Selector."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
     api_base = kwargs.get("api_base")
     api_key = kwargs.get("api_key")
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
-    logs: List[str] = ["AGENTLESS_PIPELINE: start"]
+    logs: List[str] = ["GPS_PIPELINE: start (generate → prune → select)"]
     try:
         repo = _repo_path(repo_path)
         ensure_git_repo(repo)
@@ -11475,35 +12268,90 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
             capture_output=True, text=True, timeout=10, check=False,
         ).stdout.strip()
 
-        best_patch = ""
+        # Phase 1 (SWE-ZERO): execution-free generation — K diverse Coder samples.
+        raw_generated: List[Tuple[int, str]] = []
         for idx in range(_PIPELINE_MAX_CANDIDATES):
             if initial_head:
                 subprocess.run(
                     ["git", "reset", "--hard", initial_head],
                     cwd=str(repo), capture_output=True, timeout=30, check=False,
                 )
+            variant = _GPS_CODER_VARIANT_HINTS[idx % len(_GPS_CODER_VARIANT_HINTS)]
             patch = _generate_pipeline_candidate(
                 repo, issue, loc_ctx, target_files,
                 model=model_name, api_base=base, api_key=key, candidate_idx=idx,
+                variant_hint=variant, execution_free=True,
             )
-            logs.append(f"PIPELINE_CANDIDATE_{idx + 1}: patch_chars={len(patch)}")
-            if _validate_pipeline_patch(repo, issue, patch, baseline_failing, command_timeout):
-                logs.append(f"PIPELINE_SUCCESS: candidate={idx + 1}")
-                return AgentResult(
-                    patch=patch, logs=_safe_join_logs(logs),
-                    steps=idx + 1, cost=0.0, success=True,
-                ).to_dict() | {"localization_context": loc_ctx, "pipeline_candidate": idx + 1}
-            if patch.strip() and len(patch) > len(best_patch):
-                best_patch = patch
+            logs.append(
+                f"GPS_GENERATE_{idx + 1}: patch_chars={len(patch)} variant={idx}"
+            )
+            if patch.strip():
+                raw_generated.append((idx, patch))
 
-        logs.append("PIPELINE_NO_VALID_CANDIDATE: handing off to ReAct agent")
+        if not raw_generated:
+            logs.append("GPS_EMPTY_POOL: handing off to ReAct agent")
+            return AgentResult(
+                patch="", logs=_safe_join_logs(logs),
+                steps=_PIPELINE_MAX_CANDIDATES, cost=0.0, success=False,
+            ).to_dict() | {"localization_context": loc_ctx}
+
+        # Phase 2 (Prune): AST/hunk dedup + execution-free reward + consensus votes.
+        pruned = _gps_prune_and_score(raw_generated, issue)
+        logs.append(
+            "GPS_PRUNE: "
+            f"generated={len(raw_generated)} unique_scored={len(pruned)}"
+        )
+
+        # Phase 3 (SWE-HERO): execution-backed regression prune on diverse survivors.
+        pruned = _gps_regression_prune(
+            repo, pruned, issue, baseline_failing, command_timeout, initial_head,
+        )
+        regress_ok = sum(1 for c in pruned if c.regression_pass is True)
+        logs.append(f"GPS_REGRESSION: pass={regress_ok} pool={len(pruned)}")
+
+        # Early exit: any regression-passing candidate ships immediately.
+        for cand in pruned:
+            if cand.regression_pass is True:
+                logs.append(
+                    f"GPS_SUCCESS: coder={cand.source_idx + 1} "
+                    f"reward={cand.reward:.0f} votes={cand.consensus_votes}"
+                )
+                if initial_head:
+                    subprocess.run(
+                        ["git", "reset", "--hard", initial_head],
+                        cwd=str(repo), capture_output=True, timeout=30, check=False,
+                    )
+                    _multishot_apply_patch(repo, cand.patch)
+                logs.append(
+                    f"GPS_WINNER: coder={cand.source_idx + 1} "
+                    f"reward={cand.reward:.0f} votes={cand.consensus_votes}"
+                )
+                return AgentResult(
+                    patch=cand.patch, logs=_safe_join_logs(logs),
+                    steps=cand.source_idx + 1, cost=0.0, success=True,
+                ).to_dict() | {"localization_context": loc_ctx}
+
+        # Phase 4 (Selector): reward + dual-verify; hand best patch to ReAct if none pass.
+        winner = _gps_selector_pick(
+            issue,
+            pruned,
+            infer_model=model_name,
+            infer_api_base=base,
+            infer_api_key=key,
+        )
+        logs.append(
+            "GPS_SELECT: "
+            f"coder={winner.source_idx + 1} reward={winner.reward:.0f} "
+            f"votes={winner.consensus_votes} regress={winner.regression_pass}"
+        )
         if initial_head:
             subprocess.run(
                 ["git", "reset", "--hard", initial_head],
                 cwd=str(repo), capture_output=True, timeout=30, check=False,
             )
+        logs.append("GPS_NO_REGRESSION_PASS: handing off to ReAct agent")
         return AgentResult(
-            patch=best_patch, logs=_safe_join_logs(logs),
+            patch=winner.patch, logs=_safe_join_logs(logs),
             steps=_PIPELINE_MAX_CANDIDATES, cost=0.0, success=False,
         ).to_dict() | {"localization_context": loc_ctx}
     except Exception:
@@ -11519,6 +12367,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     _route = _classify_issue_route(_issue_for_route)
     _pipeline_localization = kwargs.get("_pipeline_localization", "")
     _pipeline_fast_result: Optional[Dict[str, Any]] = None
+    _pipeline_handoff_patch = ""
     if _route != "agent" and not kwargs.get("_skip_pipeline"):
         _pipe = _run_agentless_pipeline(**kwargs)
         if _pipe.get("success") and (_pipe.get("patch") or "").strip():
@@ -11527,6 +12376,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _pipeline_fast_result = _pipe
         else:
             _pipeline_localization = _pipe.get("localization_context") or _pipeline_localization
+            _pipeline_handoff_patch = (_pipe.get("patch") or "").strip()
             kwargs = {**kwargs, "_pipeline_localization": _pipeline_localization}
     kwargs = {**kwargs, "_hybrid_route": _route}
     repo_path = kwargs["repo_path"]
@@ -11852,8 +12702,24 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _finalize(_maybe_emergency(_result1, _multishot_started))
 
         clusters = _cluster_patches([(c[0], c[2]) for c in candidates])
-        # Sort clusters: largest first, tiebreak by max score in cluster
-        clusters.sort(key=lambda cl: (-len(cl), -max(candidates[i][3] for i in cl)))
+        cluster_votes: Dict[int, int] = {}
+        for cluster in clusters:
+            for i in cluster:
+                cluster_votes[i] = len(cluster)
+        # Sort clusters: largest first, tiebreak by max execution-free reward in cluster
+        clusters.sort(
+            key=lambda cl: (
+                -len(cl),
+                -max(
+                    _execution_free_reward_score(
+                        candidates[i][2],
+                        _issue_text,
+                        consensus_votes=cluster_votes.get(i, 1),
+                    )
+                    for i in cl
+                ),
+            )
+        )
         winner_cluster = clusters[0]
 
         # Variance reduction: when 2-3 attempts all produced distinct answers
@@ -11907,8 +12773,19 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         except Exception:
                             pass
 
-        # Within the largest cluster, pick by score then by line count.
-        winner_idx = max(winner_cluster, key=lambda i: (candidates[i][3], candidates[i][4]))
+        # Within the largest cluster: execution-free reward, then duel score, substance.
+        winner_idx = max(
+            winner_cluster,
+            key=lambda i: (
+                _execution_free_reward_score(
+                    candidates[i][2],
+                    _issue_text,
+                    consensus_votes=cluster_votes.get(i, 1),
+                ),
+                candidates[i][3],
+                candidates[i][4],
+            ),
+        )
 
         _winner_label, _winner_result, _winner_patch, _winner_score, _winner_n = candidates[winner_idx]
         # Telemetry: flag low-confidence ship for downstream debugging
@@ -11924,6 +12801,29 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _winner_result["multishot_winner"] = _winner_label
         _winner_result["multishot_cluster_size"] = len(winner_cluster)
         _winner_result["multishot_total_candidates"] = len(candidates)
+
+        # Dual workflow: GPS handoff vs ReAct winner (execution-free reward + selector).
+        if _pipeline_handoff_patch and (_winner_patch or "").strip():
+            _picked_patch, _picked_label = _pick_stronger_patch_execution_free(
+                _issue_text,
+                _pipeline_handoff_patch,
+                "gps",
+                _winner_patch,
+                _winner_label,
+                inference_cfg=(
+                    kwargs.get("model"),
+                    kwargs.get("api_base"),
+                    kwargs.get("api_key"),
+                ),
+            )
+            if _picked_patch != _winner_patch:
+                if _multishot_repo_obj is not None and _multishot_initial_head:
+                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+                    _multishot_apply_patch(_multishot_repo_obj, _picked_patch)
+                _winner_result["patch"] = _picked_patch
+            if _picked_label == "gps":
+                _winner_result["multishot_winner"] = "gps_over_react"
+
         return _finalize(_maybe_emergency(_winner_result, _multishot_started))
 
     except Exception as exc:
