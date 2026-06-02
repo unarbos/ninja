@@ -204,6 +204,14 @@ _REFINEMENT_TIME_FLOOR_SECONDS = 32.0   # min remaining seconds to queue any
 _HAIL_MARY_TIME_FLOOR_SECONDS = 18.0    # min remaining seconds for the
                                         # empty-patch hail-mary turn
 
+# Validator proxy commonly caps ~40 chat requests per task. Track usage in-process
+# and degrade multishot/GPS/refinement before hard limits cause empty patches.
+_LLM_REQUEST_BUDGET = 38
+_LLM_REQUEST_RESERVE_REACT = 6
+_LLM_REQUEST_RESERVE_MULTISHOT_RETRY = 10
+_LLM_REQUEST_RESERVE_GPS = 8
+_llm_requests_used = 0
+
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -254,6 +262,24 @@ DANGEROUS_PATTERNS = [
 # -----------------------------
 # Data structures
 # -----------------------------
+
+def _reset_llm_request_budget() -> None:
+    global _llm_requests_used
+    _llm_requests_used = 0
+
+
+def _llm_requests_remaining() -> int:
+    return max(0, _LLM_REQUEST_BUDGET - _llm_requests_used)
+
+
+def _llm_request_budget_exhausted(*, reserve: int = 0) -> bool:
+    return _llm_requests_remaining() <= max(0, reserve)
+
+
+def _note_llm_request() -> None:
+    global _llm_requests_used
+    _llm_requests_used += 1
+
 
 @dataclass
 class CommandResult:
@@ -329,15 +355,28 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
     omitted = max(0, len(messages) - len(head) - len(tail))
     if omitted == 0:
         return messages
-    note = {
-        "role": "user",
-        "content": (
-            f"[{omitted} older interaction messages omitted to stay within the "
-            "time/token budget. Continue from the recent observations and make "
-            "the smallest useful patch.]"
-        ),
-    }
+    plan_excerpt = _extract_plan_excerpt(messages)
+    note_body = (
+        f"[{omitted} older interaction messages omitted to stay within the "
+        "time/token budget. Continue from the recent observations and make "
+        "the smallest useful patch.]"
+    )
+    if plan_excerpt:
+        note_body += (
+            "\n\nYour earlier plan (stay aligned; do not restart discovery):\n"
+            + plan_excerpt
+        )
+    note = {"role": "user", "content": note_body}
     return [*head, note, *tail]
+
+
+def _extract_plan_excerpt(messages: List[Dict[str, str]], max_chars: int = 1200) -> str:
+    for msg in messages[:8]:
+        content = msg.get("content") or ""
+        m = re.search(r"<plan>(.*?)</plan>", content, re.DOTALL | re.IGNORECASE)
+        if m:
+            return _truncate(m.group(1).strip(), max_chars)
+    return ""
 
 
 def _normalize_api_base(api_base: str) -> str:
@@ -409,6 +448,12 @@ def chat_completion(
     out immediately because retrying won't change the outcome.
     """
 
+    if _llm_request_budget_exhausted():
+        raise RuntimeError(
+            "LLM request budget exhausted for this task "
+            f"({_llm_requests_used}/{_LLM_REQUEST_BUDGET}); ship current patch"
+        )
+
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
 
@@ -464,14 +509,67 @@ def chat_completion(
     except Exception as e:
         raise RuntimeError(f"Unexpected model response shape: {data}") from e
 
+    _note_llm_request()
     usage = data.get("usage") or {}
-    cost = 0.0 if usage else None
+    prompt_t = int(usage.get("prompt_tokens") or 0)
+    completion_t = int(usage.get("completion_tokens") or 0)
+    cost = float(prompt_t + completion_t) if (prompt_t or completion_t) else None
     return content, cost, data
 
 
 # -----------------------------
 # Shell execution
 # -----------------------------
+
+_SANDBOX_TOOL_PROBE: Dict[str, bool] = {}
+
+_SANDBOX_MISSING_TOOL_HINTS: Tuple[str, str, ...] = (
+    ("rg", "rg is not installed — use `grep -rn` or `grep -rnF 'exact phrase'` instead."),
+    ("npm", "npm is not available (no network). Inspect and edit source directly."),
+    ("npx", "npx is not available."),
+    ("yarn", "yarn is not available."),
+    ("pnpm", "pnpm is not available."),
+    ("cargo", "cargo/rust is not installed — verify by reading code."),
+    ("rustc", "rustc is not installed."),
+    ("go", "go is not installed — verify by reading code instead of `go test`."),
+    ("node", "node is not installed."),
+    ("tsc", "tsc is not installed."),
+    ("dart", "dart is not installed."),
+    ("swift", "swift is not installed."),
+    ("mvn", "mvn is not installed."),
+    ("gradle", "gradle is not installed."),
+    ("jq", "jq is not installed — use python3 -c or grep/sed instead."),
+)
+
+
+def _sandbox_has_executable(name: str) -> bool:
+    key = (name or "").strip()
+    if not key or not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
+        return True
+    if key not in _SANDBOX_TOOL_PROBE:
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", f"command -v {key} >/dev/null 2>&1"],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+            _SANDBOX_TOOL_PROBE[key] = proc.returncode == 0
+        except Exception:
+            _SANDBOX_TOOL_PROBE[key] = False
+    return _SANDBOX_TOOL_PROBE[key]
+
+
+def _sandbox_command_preflight(command: str) -> Optional[str]:
+    lowered = command.strip().lower()
+    for tool, hint in _SANDBOX_MISSING_TOOL_HINTS:
+        if re.search(rf"(?:^|[;&|]\s*){re.escape(tool)}\b", lowered):
+            if not _sandbox_has_executable(tool):
+                return hint
+    if re.search(r"\bpip\s+install\b", lowered) or re.search(r"\bpip3\s+install\b", lowered):
+        return "pip install is blocked (no network). Use only dependencies already in the repo."
+    return None
+
 
 # MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
 # repo. You may improve command validation, environment handling, timeouts, and
@@ -487,6 +585,17 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stdout="",
             stderr="Empty command ignored.",
             duration_sec=0.0,
+        )
+
+    preflight = _sandbox_command_preflight(command)
+    if preflight:
+        return CommandResult(
+            command=command,
+            exit_code=127,
+            stdout="",
+            stderr=preflight,
+            duration_sec=0.0,
+            blocked=True,
         )
 
     blocked_pattern = _is_dangerous_command(command)
@@ -8279,6 +8388,29 @@ def _cluster_patches(candidates: List[Tuple[str, str]]) -> List[List[int]]:
     return list(clusters.values())
 
 
+def _patch_ready_to_ship(
+    patch: str,
+    issue_text: str,
+    repo: Optional[Path] = None,
+    *,
+    min_substantive: int = 2,
+) -> bool:
+    """High-confidence patch: skip expensive multishot retries when true."""
+    if not patch.strip():
+        return False
+    if _multishot_count_substantive(patch) < min_substantive:
+        return False
+    if _patch_ship_blockers(patch, issue_text):
+        return False
+    if repo is not None:
+        try:
+            if _check_syntax(repo, patch):
+                return False
+        except Exception:
+            pass
+    return _patch_duel_score(patch, issue_text) >= 48
+
+
 def _patch_duel_score(patch: str, issue: str) -> int:
     """Rank candidate patches for multishot winner selection (higher is better)."""
     if not patch.strip():
@@ -12584,10 +12716,33 @@ def solve(
 
 
 def _classify_issue_route(issue_text: str) -> str:
-    """Route traceback bugs through one cheap pipeline shot; everything else → ReAct."""
-    if _TRACEBACK_RE.search(issue_text or ""):
+    """Route traceback / file:line error issues through GPS; others → ReAct."""
+    text = issue_text or ""
+    if _TRACEBACK_RE.search(text):
+        return "pipeline_first"
+    if re.search(
+        r"(?:^|\n)\s*(?:File |at )[\"']?[\w./-]+\.(?:py|ts|tsx|js|go|rs|java):\d+",
+        text,
+        re.MULTILINE,
+    ) and re.search(
+        r"\b(?:AssertionError|TypeError|ValueError|KeyError|AttributeError|"
+        r"NameError|SyntaxError|ImportError|RuntimeError|Exception|FAILED)\b",
+        text,
+    ):
         return "pipeline_first"
     return "agent"
+
+
+def _gps_generation_count() -> int:
+    """Scale GPS coder samples to remaining LLM request budget."""
+    remaining = _llm_requests_remaining()
+    if remaining < _LLM_REQUEST_RESERVE_GPS + _LLM_REQUEST_RESERVE_REACT:
+        return 0
+    if remaining >= 28:
+        return _GPS_MAX_CANDIDATES
+    if remaining >= 20:
+        return 3
+    return 2
 
 
 def _build_pipeline_localization_context(repo: Path, issue_text: str) -> Tuple[str, List[str]]:
@@ -12706,8 +12861,16 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
         ).stdout.strip()
 
         # Phase 1 (SWE-ZERO): execution-free generation — K diverse Coder samples.
+        _gps_k = _gps_generation_count()
+        if _gps_k <= 0:
+            logs.append("GPS_SKIPPED: insufficient LLM request budget")
+            return AgentResult(
+                patch="", logs=_safe_join_logs(logs),
+                steps=0, cost=0.0, success=False,
+            ).to_dict() | {"localization_context": loc_ctx}
+
         raw_generated: List[Tuple[int, str]] = []
-        for idx in range(_PIPELINE_MAX_CANDIDATES):
+        for idx in range(_gps_k):
             if initial_head:
                 subprocess.run(
                     ["git", "reset", "--hard", initial_head],
@@ -12800,12 +12963,19 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Multi-shot solve with emergency rescue + lockfile-strip post-process."""
+    _reset_llm_request_budget()
     _issue_for_route = kwargs.get("issue", "") or ""
     _route = _classify_issue_route(_issue_for_route)
     _pipeline_localization = kwargs.get("_pipeline_localization", "")
     _pipeline_fast_result: Optional[Dict[str, Any]] = None
     _pipeline_handoff_patch = ""
-    if _route != "agent" and not kwargs.get("_skip_pipeline"):
+    if (
+        _route != "agent"
+        and not kwargs.get("_skip_pipeline")
+        and not _llm_request_budget_exhausted(
+            reserve=_LLM_REQUEST_RESERVE_GPS + _LLM_REQUEST_RESERVE_REACT
+        )
+    ):
         _pipe = _run_agentless_pipeline(**kwargs)
         if _pipe.get("success") and (_pipe.get("patch") or "").strip():
             _pipe["hybrid_route"] = _route
@@ -13026,6 +13196,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                     pass
         except Exception:
             pass
+        try:
+            result["llm_requests_used"] = _llm_requests_used
+        except Exception:
+            pass
         return result
 
     def _maybe_emergency(result: Dict[str, Any], started_at: float) -> Dict[str, Any]:
@@ -13075,11 +13249,19 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD or _patch_ready_to_ship(
+            _patch1, _issue_text, _multishot_repo_obj
+        ):
             _result1["multishot_attempts"] = 1
+            if _patch_ready_to_ship(_patch1, _issue_text, _multishot_repo_obj):
+                _result1["multishot_early_ship"] = True
             return _finalize(_result1)
 
         _elapsed = time.monotonic() - _multishot_started
+        if _llm_request_budget_exhausted(reserve=_LLM_REQUEST_RESERVE_MULTISHOT_RETRY):
+            _result1["multishot_attempts"] = 1
+            _result1["multishot_skipped_retry"] = "llm_request_budget"
+            return _finalize(_maybe_emergency(_result1, _multishot_started))
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -13135,6 +13317,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
+        if _patch_ready_to_ship(_patch2, _issue_text, _multishot_repo_obj):
+            _result2["multishot_attempts"] = 2
+            _result2["multishot_winner"] = "retry"
+            _result2["multishot_early_ship"] = True
+            return _finalize(_result2)
+
         # Attempt 3: only if remaining budget allows AND attempt 2 produced
         # something different from attempt 1 (otherwise no clustering signal
         # to be gained from a 3rd sample on the same fixed point).
@@ -13142,7 +13330,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _result3 = None
         _patch3 = ""
-        if _remaining >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 25.0:
+        if (
+            _remaining >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 25.0
+            and not _llm_request_budget_exhausted(
+                reserve=_LLM_REQUEST_RESERVE_MULTISHOT_RETRY + 4
+            )
+        ):
             if _multishot_repo_obj is not None:
                 _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
             _attempt3_budget = max(25.0, min(55.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE))
@@ -13207,7 +13400,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 and _result3 is not None):
             _elapsed_consensus = time.monotonic() - _multishot_started
             _remaining_consensus = _MULTISHOT_TOTAL_BUDGET - _elapsed_consensus
-            if _remaining_consensus >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 20.0:
+            if (
+                _remaining_consensus >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 20.0
+                and not _llm_request_budget_exhausted(
+                    reserve=_LLM_REQUEST_RESERVE_REACT + 2
+                )
+            ):
                 # Isolate the consensus attempt: if _solve_attempt or the
                 # revert/cluster path throws, fall back to the existing
                 # winner_cluster selection rather than letting the
@@ -13273,18 +13471,20 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_apply_patch(_multishot_repo_obj, _winner_patch)
 
         try:
-            _augmented_patch = _coverage_closure_pass(
-                _multishot_repo_obj,
-                _multishot_initial_head,
-                _winner_patch,
-                _issue_text,
-                _multishot_started,
-                (
-                    kwargs.get("model"),
-                    kwargs.get("api_base"),
-                    kwargs.get("api_key"),
-                ),
-            )
+            _augmented_patch = None
+            if not _llm_request_budget_exhausted(reserve=3):
+                _augmented_patch = _coverage_closure_pass(
+                    _multishot_repo_obj,
+                    _multishot_initial_head,
+                    _winner_patch,
+                    _issue_text,
+                    _multishot_started,
+                    (
+                        kwargs.get("model"),
+                        kwargs.get("api_base"),
+                        kwargs.get("api_key"),
+                    ),
+                )
             if _augmented_patch is not None:
                 _winner_patch = _augmented_patch
                 _winner_result["patch"] = _augmented_patch
@@ -13811,6 +14011,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
+                break
+
+            if _llm_request_budget_exhausted(reserve=1):
+                _budget_patch = get_patch(repo) if repo is not None else ""
+                logs.append(
+                    f"LLM_REQUEST_BUDGET_STOP:\nused={_llm_requests_used}/"
+                    f"{_LLM_REQUEST_BUDGET} has_patch={bool(_budget_patch.strip())}"
+                )
+                if _budget_patch.strip():
+                    success = True
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
@@ -17921,6 +18131,32 @@ def _agent_self_checks() -> None:
     injected = _inject_added_line_after_first_hunk(hunk_block, "import React from 'react';")
     if not _patch_well_formed(injected):
         raise AssertionError("_inject_added_line_after_first_hunk must preserve hunk counts")
+
+    _reset_llm_request_budget()
+    assert _llm_requests_remaining() == _LLM_REQUEST_BUDGET
+    _note_llm_request()
+    assert _llm_requests_remaining() == _LLM_REQUEST_BUDGET - 1
+
+    minimal_patch = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " x = 1\n"
+        "+y = 2\n"
+        "+z = 3\n"
+    )
+    assert _patch_ready_to_ship(
+        minimal_patch,
+        "Fix foo.py — update assignments in foo.py",
+        None,
+        min_substantive=2,
+    )
+
+    blocked = _sandbox_command_preflight("rg -n pattern .")
+    if blocked is None:
+        blocked = _sandbox_command_preflight("npm test")
+    assert blocked is not None and "not" in blocked.lower()
 
 
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
