@@ -204,14 +204,6 @@ _REFINEMENT_TIME_FLOOR_SECONDS = 32.0   # min remaining seconds to queue any
 _HAIL_MARY_TIME_FLOOR_SECONDS = 18.0    # min remaining seconds for the
                                         # empty-patch hail-mary turn
 
-# Validator proxy commonly caps ~40 chat requests per task. Track usage in-process
-# and degrade multishot/GPS/refinement before hard limits cause empty patches.
-_LLM_REQUEST_BUDGET = 38
-_LLM_REQUEST_RESERVE_REACT = 6
-_LLM_REQUEST_RESERVE_MULTISHOT_RETRY = 10
-_LLM_REQUEST_RESERVE_GPS = 8
-_llm_requests_used = 0
-
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
@@ -262,24 +254,6 @@ DANGEROUS_PATTERNS = [
 # -----------------------------
 # Data structures
 # -----------------------------
-
-def _reset_llm_request_budget() -> None:
-    global _llm_requests_used
-    _llm_requests_used = 0
-
-
-def _llm_requests_remaining() -> int:
-    return max(0, _LLM_REQUEST_BUDGET - _llm_requests_used)
-
-
-def _llm_request_budget_exhausted(*, reserve: int = 0) -> bool:
-    return _llm_requests_remaining() <= max(0, reserve)
-
-
-def _note_llm_request() -> None:
-    global _llm_requests_used
-    _llm_requests_used += 1
-
 
 @dataclass
 class CommandResult:
@@ -355,28 +329,15 @@ def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]
     omitted = max(0, len(messages) - len(head) - len(tail))
     if omitted == 0:
         return messages
-    plan_excerpt = _extract_plan_excerpt(messages)
-    note_body = (
-        f"[{omitted} older interaction messages omitted to stay within the "
-        "time/token budget. Continue from the recent observations and make "
-        "the smallest useful patch.]"
-    )
-    if plan_excerpt:
-        note_body += (
-            "\n\nYour earlier plan (stay aligned; do not restart discovery):\n"
-            + plan_excerpt
-        )
-    note = {"role": "user", "content": note_body}
+    note = {
+        "role": "user",
+        "content": (
+            f"[{omitted} older interaction messages omitted to stay within the "
+            "time/token budget. Continue from the recent observations and make "
+            "the smallest useful patch.]"
+        ),
+    }
     return [*head, note, *tail]
-
-
-def _extract_plan_excerpt(messages: List[Dict[str, str]], max_chars: int = 1200) -> str:
-    for msg in messages[:8]:
-        content = msg.get("content") or ""
-        m = re.search(r"<plan>(.*?)</plan>", content, re.DOTALL | re.IGNORECASE)
-        if m:
-            return _truncate(m.group(1).strip(), max_chars)
-    return ""
 
 
 def _normalize_api_base(api_base: str) -> str:
@@ -448,12 +409,6 @@ def chat_completion(
     out immediately because retrying won't change the outcome.
     """
 
-    if _llm_request_budget_exhausted():
-        raise RuntimeError(
-            "LLM request budget exhausted for this task "
-            f"({_llm_requests_used}/{_LLM_REQUEST_BUDGET}); ship current patch"
-        )
-
     model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
 
@@ -509,67 +464,14 @@ def chat_completion(
     except Exception as e:
         raise RuntimeError(f"Unexpected model response shape: {data}") from e
 
-    _note_llm_request()
     usage = data.get("usage") or {}
-    prompt_t = int(usage.get("prompt_tokens") or 0)
-    completion_t = int(usage.get("completion_tokens") or 0)
-    cost = float(prompt_t + completion_t) if (prompt_t or completion_t) else None
+    cost = 0.0 if usage else None
     return content, cost, data
 
 
 # -----------------------------
 # Shell execution
 # -----------------------------
-
-_SANDBOX_TOOL_PROBE: Dict[str, bool] = {}
-
-_SANDBOX_MISSING_TOOL_HINTS: Tuple[str, str, ...] = (
-    ("rg", "rg is not installed — use `grep -rn` or `grep -rnF 'exact phrase'` instead."),
-    ("npm", "npm is not available (no network). Inspect and edit source directly."),
-    ("npx", "npx is not available."),
-    ("yarn", "yarn is not available."),
-    ("pnpm", "pnpm is not available."),
-    ("cargo", "cargo/rust is not installed — verify by reading code."),
-    ("rustc", "rustc is not installed."),
-    ("go", "go is not installed — verify by reading code instead of `go test`."),
-    ("node", "node is not installed."),
-    ("tsc", "tsc is not installed."),
-    ("dart", "dart is not installed."),
-    ("swift", "swift is not installed."),
-    ("mvn", "mvn is not installed."),
-    ("gradle", "gradle is not installed."),
-    ("jq", "jq is not installed — use python3 -c or grep/sed instead."),
-)
-
-
-def _sandbox_has_executable(name: str) -> bool:
-    key = (name or "").strip()
-    if not key or not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
-        return True
-    if key not in _SANDBOX_TOOL_PROBE:
-        try:
-            proc = subprocess.run(
-                ["bash", "-lc", f"command -v {key} >/dev/null 2>&1"],
-                capture_output=True,
-                timeout=3,
-                check=False,
-            )
-            _SANDBOX_TOOL_PROBE[key] = proc.returncode == 0
-        except Exception:
-            _SANDBOX_TOOL_PROBE[key] = False
-    return _SANDBOX_TOOL_PROBE[key]
-
-
-def _sandbox_command_preflight(command: str) -> Optional[str]:
-    lowered = command.strip().lower()
-    for tool, hint in _SANDBOX_MISSING_TOOL_HINTS:
-        if re.search(rf"(?:^|[;&|]\s*){re.escape(tool)}\b", lowered):
-            if not _sandbox_has_executable(tool):
-                return hint
-    if re.search(r"\bpip\s+install\b", lowered) or re.search(r"\bpip3\s+install\b", lowered):
-        return "pip install is blocked (no network). Use only dependencies already in the repo."
-    return None
-
 
 # MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
 # repo. You may improve command validation, environment handling, timeouts, and
@@ -585,17 +487,6 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stdout="",
             stderr="Empty command ignored.",
             duration_sec=0.0,
-        )
-
-    preflight = _sandbox_command_preflight(command)
-    if preflight:
-        return CommandResult(
-            command=command,
-            exit_code=127,
-            stdout="",
-            stderr=preflight,
-            duration_sec=0.0,
-            blocked=True,
         )
 
     blocked_pattern = _is_dangerous_command(command)
@@ -2991,6 +2882,11 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
          displacing the primary target files.
     """
     tracked_set = set(_tracked_files(repo))
+    try:
+        issue_symbols = _extract_issue_symbols(issue)
+    except Exception:
+        issue_symbols = []
+    search_issue = issue if not issue_symbols else issue + '\n' + '\n'.join(issue_symbols)
     symbol_index = _build_repo_symbol_index(repo, tracked_set)
     global _SYMBOL_INDEX_FOR_RANKING, _PRELOAD_TRACE_FRAMES
     _PRELOAD_TRACE_FRAMES = _extract_trace_frames(issue, tracked_set)
@@ -3003,7 +2899,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         _SYMBOL_INDEX_FOR_RANKING = None
 
     files = _expand_files_via_repograph(
-        files, symbol_index, graph_nodes, graph_edges, issue,
+        files, symbol_index, graph_nodes, graph_edges, search_issue,
     )
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
@@ -3015,7 +2911,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # likely targets rather than guessing from path-mention-style cues.
     rescue_files: List[str] = []
     if top_score < _RESCUE_RANKER_TOP_SCORE_THRESHOLD:
-        rescue_files = _broad_grep_fallback(repo, issue, tracked_set)
+        rescue_files = _broad_grep_fallback(repo, search_issue, tracked_set)
         if rescue_files:
             existing = set(files)
             files = [f for f in rescue_files if f not in existing] + files
@@ -3025,13 +2921,13 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
 
     # Expand wiring/siblings before test partners so late-added sources still
     # receive tests/test_foo.py in preload (see _backfill_companion_tests_*).
-    files = _augment_with_integration_partners(files, tracked_set, issue)
+    files = _augment_with_integration_partners(files, tracked_set, search_issue)
     files = _augment_with_directory_siblings(files, tracked_set)
     files = _augment_with_test_partners(files, tracked_set)
     if _companion_test_preload_gaps(files, tracked_set) > 0:
         files = _backfill_companion_tests_after_expansion(files, tracked_set)
     # v71 graft: compute needles for region-aware file reading
-    needles = _preload_needles(issue)
+    needles = _preload_needles(search_issue)
 
     parts: List[str] = []
     included: List[str] = []
@@ -3072,17 +2968,17 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
             parts.append(pin_block)
             used += len(pin_block)
 
-    repo_map = _format_repo_skeleton_map(symbol_index, files, issue)
+    repo_map = _format_repo_skeleton_map(symbol_index, files, search_issue)
     if repo_map and used + len(repo_map) <= MAX_PRELOADED_CONTEXT_CHARS + _REPO_MAP_MAX_CHARS:
         parts.append(repo_map)
         used += len(repo_map)
 
     # RAPTOR-style hierarchical retrieval: cluster summaries first, then members.
     semantic_chunks = _build_semantic_chunks(
-        repo, symbol_index, files[:MAX_PRELOADED_FILES], issue, fault_sites,
+        repo, symbol_index, files[:MAX_PRELOADED_FILES], search_issue, fault_sites,
     )
     raptor_clusters = _build_raptor_clusters(semantic_chunks)
-    top_clusters = _raptor_retrieve_clusters(raptor_clusters, issue)
+    top_clusters = _raptor_retrieve_clusters(raptor_clusters, search_issue)
     cluster_member_ids = {m.chunk_id for cl in top_clusters for m in cl.members}
     raptor_chunks = [c for c in semantic_chunks if c.chunk_id in cluster_member_ids]
     if not raptor_chunks:
@@ -3105,7 +3001,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         sk = symbol_index.get(relative_path)
         if sk:
             localized_syms = _localize_file_symbols(
-                issue, sk, trace_frames=_PRELOAD_TRACE_FRAMES,
+                search_issue, sk, trace_frames=_PRELOAD_TRACE_FRAMES,
             )
             snippet = _read_localized_symbol_regions(
                 repo, relative_path, budget, localized_syms, needles=needles,
@@ -3133,7 +3029,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    likely_tests = _discover_likely_test_nodes(repo, issue, tracked_set)
+    likely_tests = _discover_likely_test_nodes(repo, search_issue, tracked_set)
     if likely_tests:
         test_lines = [
             "### Likely relevant tests (issue-keyword ranked — run with `path::test_name` when possible)\n"
@@ -7215,6 +7111,8 @@ def _format_action_observation(result: CommandResult, command: str = "") -> str:
                 "PYTEST_SUMMARY:",
                 _truncate(compressed, MAX_OBSERVATION_CHARS),
             ]
+            if result.stdout.strip():
+                parts.extend(["", "STDOUT_TAIL:", _truncate(result.stdout, 1200)])
             if result.stderr.strip() and result.exit_code != 0:
                 parts.extend(["", "STDERR_TAIL:", _truncate(result.stderr, 2000)])
             return "\n".join(parts) + "\n"
@@ -8388,29 +8286,6 @@ def _cluster_patches(candidates: List[Tuple[str, str]]) -> List[List[int]]:
     return list(clusters.values())
 
 
-def _patch_ready_to_ship(
-    patch: str,
-    issue_text: str,
-    repo: Optional[Path] = None,
-    *,
-    min_substantive: int = 2,
-) -> bool:
-    """High-confidence patch: skip expensive multishot retries when true."""
-    if not patch.strip():
-        return False
-    if _multishot_count_substantive(patch) < min_substantive:
-        return False
-    if _patch_ship_blockers(patch, issue_text):
-        return False
-    if repo is not None:
-        try:
-            if _check_syntax(repo, patch):
-                return False
-        except Exception:
-            pass
-    return _patch_duel_score(patch, issue_text) >= 48
-
-
 def _patch_duel_score(patch: str, issue: str) -> int:
     """Rank candidate patches for multishot winner selection (higher is better)."""
     if not patch.strip():
@@ -9428,6 +9303,11 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
     # Decorator / annotation references (`@cache`, `@deprecated`)
     for match in _DECORATOR_RE.finditer(issue_text):
         if _accept(match.group(1)) and len(out) >= max_symbols:
+            return out
+
+    # Backtick-wrapped names and paths (``src/utils/helpers.py``)
+    for match in _BACKTICK_IDENT_RE.finditer(issue_text):
+        if _accept(match.group(1), allow_short=True) and len(out) >= max_symbols:
             return out
 
     # Original single-token identifiers
@@ -10853,6 +10733,10 @@ def _coverage_closure_pass(
     except Exception:
         explicit = []
     try:
+        issue_symbols = _extract_issue_symbols(issue_text)
+    except Exception:
+        issue_symbols = []
+    try:
         touched = _patch_changed_files(winner_patch)[:5]
         touched_set = set(_patch_changed_files(winner_patch))
     except Exception:
@@ -10867,19 +10751,28 @@ def _coverage_closure_pass(
         if snip.strip():
             snippets.append(f"### {path}\n```\n{snip}\n```")
     bullets = "\n".join(f"- {c}" for c in uncovered[:_COVERAGE_CLOSURE_MAX_EDITS])
-    extras = "\n".join(f"- {e}" for e in explicit[:5]) if explicit else "(none)"
+    extras_source: List[str] = []
+    for item in explicit + issue_symbols:
+        if item and item not in extras_source:
+            extras_source.append(item)
+    extras = "\n".join(f"- {e}" for e in extras_source[:5]) if extras_source else "(none)"
+    anchors = "\n".join(f"- {s}" for s in issue_symbols[:8]) if issue_symbols else "(none)"
     prompt = (
         "Follow-up implementation pass. The current draft patch handles most "
         "of the task but the following requirements still appear unimplemented:\n"
         f"{bullets}\n\n"
         f"Additional verbatim names that may need wiring:\n{extras}\n\n"
+        f"Identifier-shaped anchors extracted from the issue:\n{anchors}\n\n"
         "For EACH bullet, implement the named behaviour by editing or adding "
         "the actual code path that exercises it (function/method body, "
         "conditional branch, return/raise statement, route handler, import "
-        "wiring, real assignment). Comments, docstrings, and string constants "
+        "wiring, real assignment). When a bullet mentions one of the anchors "
+        "above, use that exact symbol or path to locate the change and make "
+        "the code path real. Comments, docstrings, and string constants "
         "alone do NOT count and will be rejected by the verifier. Do NOT "
         "rewrite unrelated logic. Do NOT add features not named above. Prefer "
-        "editing files already changed by the draft patch. Emit only <edit> "
+        "editing files already changed by the draft patch, but edit the named "
+        "file directly when the issue points elsewhere. Emit only <edit> "
         "blocks then <final>done</final>.\n\n"
         f"TASK:\n{_truncate(issue_text, 1800)}\n\n"
         + "\n\n".join(snippets)
@@ -12716,33 +12609,10 @@ def solve(
 
 
 def _classify_issue_route(issue_text: str) -> str:
-    """Route traceback / file:line error issues through GPS; others → ReAct."""
-    text = issue_text or ""
-    if _TRACEBACK_RE.search(text):
-        return "pipeline_first"
-    if re.search(
-        r"(?:^|\n)\s*(?:File |at )[\"']?[\w./-]+\.(?:py|ts|tsx|js|go|rs|java):\d+",
-        text,
-        re.MULTILINE,
-    ) and re.search(
-        r"\b(?:AssertionError|TypeError|ValueError|KeyError|AttributeError|"
-        r"NameError|SyntaxError|ImportError|RuntimeError|Exception|FAILED)\b",
-        text,
-    ):
+    """Route traceback bugs through one cheap pipeline shot; everything else → ReAct."""
+    if _TRACEBACK_RE.search(issue_text or ""):
         return "pipeline_first"
     return "agent"
-
-
-def _gps_generation_count() -> int:
-    """Scale GPS coder samples to remaining LLM request budget."""
-    remaining = _llm_requests_remaining()
-    if remaining < _LLM_REQUEST_RESERVE_GPS + _LLM_REQUEST_RESERVE_REACT:
-        return 0
-    if remaining >= 28:
-        return _GPS_MAX_CANDIDATES
-    if remaining >= 20:
-        return 3
-    return 2
 
 
 def _build_pipeline_localization_context(repo: Path, issue_text: str) -> Tuple[str, List[str]]:
@@ -12861,16 +12731,8 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
         ).stdout.strip()
 
         # Phase 1 (SWE-ZERO): execution-free generation — K diverse Coder samples.
-        _gps_k = _gps_generation_count()
-        if _gps_k <= 0:
-            logs.append("GPS_SKIPPED: insufficient LLM request budget")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=0, cost=0.0, success=False,
-            ).to_dict() | {"localization_context": loc_ctx}
-
         raw_generated: List[Tuple[int, str]] = []
-        for idx in range(_gps_k):
+        for idx in range(_PIPELINE_MAX_CANDIDATES):
             if initial_head:
                 subprocess.run(
                     ["git", "reset", "--hard", initial_head],
@@ -12963,19 +12825,12 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Multi-shot solve with emergency rescue + lockfile-strip post-process."""
-    _reset_llm_request_budget()
     _issue_for_route = kwargs.get("issue", "") or ""
     _route = _classify_issue_route(_issue_for_route)
     _pipeline_localization = kwargs.get("_pipeline_localization", "")
     _pipeline_fast_result: Optional[Dict[str, Any]] = None
     _pipeline_handoff_patch = ""
-    if (
-        _route != "agent"
-        and not kwargs.get("_skip_pipeline")
-        and not _llm_request_budget_exhausted(
-            reserve=_LLM_REQUEST_RESERVE_GPS + _LLM_REQUEST_RESERVE_REACT
-        )
-    ):
+    if _route != "agent" and not kwargs.get("_skip_pipeline"):
         _pipe = _run_agentless_pipeline(**kwargs)
         if _pipe.get("success") and (_pipe.get("patch") or "").strip():
             _pipe["hybrid_route"] = _route
@@ -13196,10 +13051,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                     pass
         except Exception:
             pass
-        try:
-            result["llm_requests_used"] = _llm_requests_used
-        except Exception:
-            pass
         return result
 
     def _maybe_emergency(result: Dict[str, Any], started_at: float) -> Dict[str, Any]:
@@ -13249,19 +13100,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
-        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD or _patch_ready_to_ship(
-            _patch1, _issue_text, _multishot_repo_obj
-        ):
+        if _n1 >= _MULTISHOT_LOW_SIGNAL_THRESHOLD:
             _result1["multishot_attempts"] = 1
-            if _patch_ready_to_ship(_patch1, _issue_text, _multishot_repo_obj):
-                _result1["multishot_early_ship"] = True
             return _finalize(_result1)
 
         _elapsed = time.monotonic() - _multishot_started
-        if _llm_request_budget_exhausted(reserve=_LLM_REQUEST_RESERVE_MULTISHOT_RETRY):
-            _result1["multishot_attempts"] = 1
-            _result1["multishot_skipped_retry"] = "llm_request_budget"
-            return _finalize(_maybe_emergency(_result1, _multishot_started))
         if (_MULTISHOT_TOTAL_BUDGET - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
             _result1["multishot_attempts"] = 1
             _result1["multishot_skipped_retry"] = "insufficient_time"
@@ -13317,12 +13160,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
-        if _patch_ready_to_ship(_patch2, _issue_text, _multishot_repo_obj):
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            _result2["multishot_early_ship"] = True
-            return _finalize(_result2)
-
         # Attempt 3: only if remaining budget allows AND attempt 2 produced
         # something different from attempt 1 (otherwise no clustering signal
         # to be gained from a 3rd sample on the same fixed point).
@@ -13330,12 +13167,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _result3 = None
         _patch3 = ""
-        if (
-            _remaining >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 25.0
-            and not _llm_request_budget_exhausted(
-                reserve=_LLM_REQUEST_RESERVE_MULTISHOT_RETRY + 4
-            )
-        ):
+        if _remaining >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 25.0:
             if _multishot_repo_obj is not None:
                 _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
             _attempt3_budget = max(25.0, min(55.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE))
@@ -13400,12 +13232,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 and _result3 is not None):
             _elapsed_consensus = time.monotonic() - _multishot_started
             _remaining_consensus = _MULTISHOT_TOTAL_BUDGET - _elapsed_consensus
-            if (
-                _remaining_consensus >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 20.0
-                and not _llm_request_budget_exhausted(
-                    reserve=_LLM_REQUEST_RESERVE_REACT + 2
-                )
-            ):
+            if _remaining_consensus >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 20.0:
                 # Isolate the consensus attempt: if _solve_attempt or the
                 # revert/cluster path throws, fall back to the existing
                 # winner_cluster selection rather than letting the
@@ -13471,20 +13298,18 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _multishot_apply_patch(_multishot_repo_obj, _winner_patch)
 
         try:
-            _augmented_patch = None
-            if not _llm_request_budget_exhausted(reserve=3):
-                _augmented_patch = _coverage_closure_pass(
-                    _multishot_repo_obj,
-                    _multishot_initial_head,
-                    _winner_patch,
-                    _issue_text,
-                    _multishot_started,
-                    (
-                        kwargs.get("model"),
-                        kwargs.get("api_base"),
-                        kwargs.get("api_key"),
-                    ),
-                )
+            _augmented_patch = _coverage_closure_pass(
+                _multishot_repo_obj,
+                _multishot_initial_head,
+                _winner_patch,
+                _issue_text,
+                _multishot_started,
+                (
+                    kwargs.get("model"),
+                    kwargs.get("api_base"),
+                    kwargs.get("api_key"),
+                ),
+            )
             if _augmented_patch is not None:
                 _winner_patch = _augmented_patch
                 _winner_result["patch"] = _augmented_patch
@@ -14011,16 +13836,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
-                break
-
-            if _llm_request_budget_exhausted(reserve=1):
-                _budget_patch = get_patch(repo) if repo is not None else ""
-                logs.append(
-                    f"LLM_REQUEST_BUDGET_STOP:\nused={_llm_requests_used}/"
-                    f"{_LLM_REQUEST_BUDGET} has_patch={bool(_budget_patch.strip())}"
-                )
-                if _budget_patch.strip():
-                    success = True
                 break
 
             _elapsed_now = time.monotonic() - solve_started_at
@@ -18131,32 +17946,6 @@ def _agent_self_checks() -> None:
     injected = _inject_added_line_after_first_hunk(hunk_block, "import React from 'react';")
     if not _patch_well_formed(injected):
         raise AssertionError("_inject_added_line_after_first_hunk must preserve hunk counts")
-
-    _reset_llm_request_budget()
-    assert _llm_requests_remaining() == _LLM_REQUEST_BUDGET
-    _note_llm_request()
-    assert _llm_requests_remaining() == _LLM_REQUEST_BUDGET - 1
-
-    minimal_patch = (
-        "diff --git a/foo.py b/foo.py\n"
-        "--- a/foo.py\n"
-        "+++ b/foo.py\n"
-        "@@ -1,2 +1,4 @@\n"
-        " x = 1\n"
-        "+y = 2\n"
-        "+z = 3\n"
-    )
-    assert _patch_ready_to_ship(
-        minimal_patch,
-        "Fix foo.py — update assignments in foo.py",
-        None,
-        min_substantive=2,
-    )
-
-    blocked = _sandbox_command_preflight("rg -n pattern .")
-    if blocked is None:
-        blocked = _sandbox_command_preflight("npm test")
-    assert blocked is not None and "not" in blocked.lower()
 
 
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
