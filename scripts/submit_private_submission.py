@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
-"""Submit agent.py to the Subnet 66 private submission API."""
+"""Submit agent.py or a multi-file harness to the Subnet 66 private submission API."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import importlib
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_API_URL = "https://ninja66.ai/api/submissions"
-USER_AGENT = "ninja66-private-submission/1.0"
+USER_AGENT = "ninja66-private-submission/2.0"
 MAX_AGENT_BYTES = 5_000_000
+MAX_BUNDLE_BYTES = 5_000_000
 PRIVATE_SUBMISSION_RE = re.compile(r"^private-submission:[A-Za-z0-9_.-]{1,128}:[0-9a-f]{64}$")
+DEFAULT_ENTRYPOINT = "agent.py"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Submit a private Subnet 66 ninja agent.py.")
-    parser.add_argument("--agent", type=Path, default=Path("agent.py"), help="Path to submitted agent.py.")
+    parser = argparse.ArgumentParser(description="Submit a private Subnet 66 ninja harness.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--agent", type=Path, help="Path to submitted agent.py (v1).")
+    source.add_argument("--bundle", type=Path, help="Path to a harness directory containing agent.py (v2).")
+    source.add_argument("--archive", type=Path, help="Path to a .tar.gz or .zip harness archive (v2).")
     parser.add_argument("--api-url", default=os.getenv("NINJA_SUBMISSION_API", DEFAULT_API_URL))
     parser.add_argument("--submission-id", help="Optional stable submission id. Defaults to hotkey/hash derived id.")
     parser.add_argument("--hotkey", help="Expected miner hotkey SS58 address. Defaults to loaded wallet hotkey.")
@@ -45,28 +53,47 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        agent_path = args.agent.expanduser().resolve()
-        agent_py = agent_path.read_bytes()
-        if len(agent_py) > MAX_AGENT_BYTES:
-            raise ValueError(f"{agent_path} is {len(agent_py)} bytes; max is {MAX_AGENT_BYTES} bytes")
-        agent_sha256 = hashlib.sha256(agent_py).hexdigest()
+        bundle_files, archive_bytes, archive_name = load_submission_payload(args)
         wallet = load_wallet(args)
         hotkey = wallet.hotkey.ss58_address
         if args.hotkey and args.hotkey != hotkey:
             raise ValueError(f"loaded wallet hotkey {hotkey} does not match --hotkey {args.hotkey}")
-        submission_id = args.submission_id or derive_submission_id(hotkey=hotkey, agent_sha256=agent_sha256)
-        signature_payload = private_submission_signature_payload(
-            hotkey=hotkey,
-            submission_id=submission_id,
-            agent_sha256=agent_sha256,
-        )
+
+        if bundle_files is not None:
+            agent_sha256 = hashlib.sha256(bundle_files[DEFAULT_ENTRYPOINT]).hexdigest()
+            bundle_sha256 = canonical_bundle_sha256(bundle_files)
+            content_sha256 = bundle_sha256
+            submission_id = args.submission_id or derive_submission_id(hotkey=hotkey, content_sha256=content_sha256)
+            signature_payload = bundle_signature_payload(
+                hotkey=hotkey,
+                submission_id=submission_id,
+                bundle_sha256=bundle_sha256,
+            )
+            source_label = str(args.bundle or args.archive)
+        else:
+            agent_path = args.agent.expanduser().resolve()
+            agent_py = agent_path.read_bytes()
+            if len(agent_py) > MAX_AGENT_BYTES:
+                raise ValueError(f"{agent_path} is {len(agent_py)} bytes; max is {MAX_AGENT_BYTES} bytes")
+            agent_sha256 = hashlib.sha256(agent_py).hexdigest()
+            bundle_sha256 = None
+            content_sha256 = agent_sha256
+            submission_id = args.submission_id or derive_submission_id(hotkey=hotkey, content_sha256=content_sha256)
+            signature_payload = private_submission_signature_payload(
+                hotkey=hotkey,
+                submission_id=submission_id,
+                agent_sha256=agent_sha256,
+            )
+            source_label = str(agent_path)
+
         signature = sign_payload(wallet, signature_payload)
         identity = build_username_identity(args=args, wallet=wallet)
         print_request_summary(
-            agent_path=agent_path,
+            source_label=source_label,
             hotkey=hotkey,
             submission_id=submission_id,
             agent_sha256=agent_sha256,
+            bundle_sha256=bundle_sha256,
             signature_payload=signature_payload,
             identity=identity,
         )
@@ -74,15 +101,36 @@ def main() -> int:
             print("dry_run: true")
             return 0
 
-        response = post_submission(
-            api_url=args.api_url,
-            hotkey=hotkey,
-            submission_id=submission_id,
-            signature=signature,
-            identity=identity,
-            agent_filename=agent_path.name,
-            agent_py=agent_py,
-        )
+        if archive_bytes is not None:
+            response = post_bundle_submission(
+                api_url=args.api_url,
+                hotkey=hotkey,
+                submission_id=submission_id,
+                signature=signature,
+                identity=identity,
+                archive_name=archive_name or "bundle.tar.gz",
+                archive_bytes=archive_bytes,
+            )
+        elif bundle_files is not None:
+            response = post_bundle_submission(
+                api_url=args.api_url,
+                hotkey=hotkey,
+                submission_id=submission_id,
+                signature=signature,
+                identity=identity,
+                archive_name="bundle.tar.gz",
+                archive_bytes=build_tar_gz(bundle_files),
+            )
+        else:
+            response = post_agent_submission(
+                api_url=args.api_url,
+                hotkey=hotkey,
+                submission_id=submission_id,
+                signature=signature,
+                identity=identity,
+                agent_filename=args.agent.name,
+                agent_py=agent_py,
+            )
         print(json.dumps(response, indent=2, sort_keys=True))
         if not bool(response.get("accepted")):
             return 1
@@ -97,6 +145,100 @@ def main() -> int:
         return 2
 
 
+def load_submission_payload(args: argparse.Namespace) -> tuple[dict[str, bytes] | None, bytes | None, str | None]:
+    if args.archive is not None:
+        archive_path = args.archive.expanduser().resolve()
+        archive_bytes = archive_path.read_bytes()
+        if len(archive_bytes) > MAX_BUNDLE_BYTES:
+            raise ValueError(f"{archive_path} is {len(archive_bytes)} bytes; max is {MAX_BUNDLE_BYTES} bytes")
+        bundle_files = bundle_files_from_archive(archive_bytes, archive_name=archive_path.name)
+        enforce_bundle_size_limit(bundle_files)
+        return bundle_files, archive_bytes, archive_path.name
+    if args.bundle is not None:
+        bundle_files = collect_harness_from_directory(args.bundle)
+        enforce_bundle_size_limit(bundle_files)
+        return bundle_files, None, None
+    return None, None, None
+
+
+def collect_harness_from_directory(path: Path) -> dict[str, bytes]:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"--bundle must be a directory: {resolved}")
+    files: dict[str, bytes] = {}
+    for file_path in sorted(resolved.rglob("*.py")):
+        relative = file_path.relative_to(resolved)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if "scripts" in relative.parts:
+            continue
+        files[relative.as_posix()] = file_path.read_bytes()
+    if DEFAULT_ENTRYPOINT not in files:
+        raise ValueError(f"harness directory must include `{DEFAULT_ENTRYPOINT}`")
+    return files
+
+
+def bundle_files_from_archive(data: bytes, *, archive_name: str) -> dict[str, bytes]:
+    lowered = archive_name.lower()
+    if lowered.endswith((".tar.gz", ".tgz")) or data[:2] != b"PK":
+        return files_from_tar_gz(data)
+    return files_from_zip(data)
+
+
+def files_from_tar_gz(data: bytes) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            if not member.isfile() or member.issym() or member.islnk():
+                continue
+            path = normalize_relative_path(member.name)
+            files[path] = archive.extractfile(member).read()  # type: ignore[union-attr]
+    return files
+
+
+def files_from_zip(data: bytes) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            path = normalize_relative_path(info.filename)
+            files[path] = archive.read(info)
+    return files
+
+
+def normalize_relative_path(raw_path: str) -> str:
+    path = raw_path.replace("\\", "/").lstrip("./")
+    parts = [part for part in path.split("/") if part and part not in {".", ".."}]
+    if not parts:
+        raise ValueError(f"invalid archive path `{raw_path}`")
+    return "/".join(parts)
+
+
+def canonical_bundle_sha256(files: dict[str, bytes]) -> str:
+    lines = [
+        f"{path}:{hashlib.sha256(content).hexdigest()}"
+        for path, content in sorted(files.items())
+    ]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def enforce_bundle_size_limit(files: dict[str, bytes]) -> None:
+    total = sum(len(content) for content in files.values())
+    if total > MAX_BUNDLE_BYTES:
+        raise ValueError(f"bundle is {total} bytes; maximum is {MAX_BUNDLE_BYTES} bytes")
+
+
+def build_tar_gz(files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path, content in sorted(files.items()):
+            info = tarfile.TarInfo(name=path)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
 def load_wallet(args: argparse.Namespace) -> Any:
     try:
         bt = importlib.import_module("bittensor")
@@ -108,13 +250,17 @@ def load_wallet(args: argparse.Namespace) -> Any:
     return bt.Wallet(**wallet_kwargs)
 
 
-def derive_submission_id(*, hotkey: str, agent_sha256: str) -> str:
+def derive_submission_id(*, hotkey: str, content_sha256: str) -> str:
     safe_hotkey = re.sub(r"[^A-Za-z0-9_.-]", "-", hotkey)[:16] or "hotkey"
-    return f"{safe_hotkey}-{agent_sha256[:16]}"
+    return f"{safe_hotkey}-{content_sha256[:16]}"
 
 
 def private_submission_signature_payload(*, hotkey: str, submission_id: str, agent_sha256: str) -> bytes:
     return f"tau-private-submission-v1:{hotkey}:{submission_id}:{agent_sha256.lower()}".encode("utf-8")
+
+
+def bundle_signature_payload(*, hotkey: str, submission_id: str, bundle_sha256: str) -> bytes:
+    return f"tau-private-submission-v2:{hotkey}:{submission_id}:{bundle_sha256.lower()}".encode("utf-8")
 
 
 def sign_payload(wallet: Any, payload: bytes) -> str:
@@ -178,17 +324,20 @@ def build_username_identity(*, args: argparse.Namespace, wallet: Any) -> dict[st
 
 def print_request_summary(
     *,
-    agent_path: Path,
+    source_label: str,
     hotkey: str,
     submission_id: str,
     agent_sha256: str,
+    bundle_sha256: str | None,
     signature_payload: bytes,
     identity: dict[str, str],
 ) -> None:
-    print(f"agent: {agent_path}")
+    print(f"source: {source_label}")
     print(f"hotkey: {hotkey}")
     print(f"submission_id: {submission_id}")
     print(f"agent_sha256: {agent_sha256}")
+    if bundle_sha256:
+        print(f"bundle_sha256: {bundle_sha256}")
     print(f"signature_payload: {signature_payload.decode('utf-8')}")
     if identity:
         print(f"agent_username: {identity['agent_username']}")
@@ -196,7 +345,7 @@ def print_request_summary(
         print(f"username_signature_payload: {username_signature_payload(identity['agent_username']).decode('utf-8')}")
 
 
-def post_submission(
+def post_agent_submission(
     *,
     api_url: str,
     hotkey: str,
@@ -214,6 +363,32 @@ def post_submission(
     fields.update(identity)
     files = {"agent": (agent_filename, agent_py, "text/x-python")}
     body, content_type = encode_multipart_form(fields=fields, files=files)
+    return post_multipart(api_url=api_url, body=body, content_type=content_type)
+
+
+def post_bundle_submission(
+    *,
+    api_url: str,
+    hotkey: str,
+    submission_id: str,
+    signature: str,
+    identity: dict[str, str],
+    archive_name: str,
+    archive_bytes: bytes,
+) -> dict[str, Any]:
+    fields = {
+        "hotkey": hotkey,
+        "submission_id": submission_id,
+        "signature": signature,
+    }
+    fields.update(identity)
+    content_type = "application/gzip" if archive_name.lower().endswith((".tar.gz", ".tgz")) else "application/zip"
+    files = {"bundle": (archive_name, archive_bytes, content_type)}
+    body, multipart_type = encode_multipart_form(fields=fields, files=files)
+    return post_multipart(api_url=api_url, body=body, content_type=multipart_type)
+
+
+def post_multipart(*, api_url: str, body: bytes, content_type: str) -> dict[str, Any]:
     request = urllib.request.Request(
         api_url,
         data=body,
