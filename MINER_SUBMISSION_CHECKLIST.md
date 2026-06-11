@@ -1,9 +1,10 @@
 # SN66 Ninja Miner Submission Checklist
 
-Subnet 66 miners submit exactly one file, `agent.py`, to the private submission
-API. The validator verifies the signing hotkey, runs private gates, stores the
-accepted bundle, and queues accepted challengers from the private submission
-ledger.
+Subnet 66 miners submit their agent bundle — `agent.py` plus any supporting
+`*.py` modules (up to 32 files, `tau_agent_files.json` lists them) — to the
+private submission API. A bundle of just `agent.py` is still valid. The
+validator verifies the signing hotkey, runs private gates, stores the accepted
+bundle, and queues accepted challengers from the private submission ledger.
 
 There is no miner pull request flow and no on-chain commitment flow for ninja
 submissions.
@@ -11,14 +12,18 @@ submissions.
 ## Quick Path
 
 ```bash
-python3 -m py_compile agent.py
-python3 -c "from agent import solve; print('Import OK')"
+python3 -m compileall -q agent.py agent
+./scripts/check_agent_contract.py
 
 ./scripts/submit_private_submission.py \
   --wallet-name <wallet-name> \
   --wallet-hotkey <wallet-hotkey-name> \
   --hotkey <miner-hotkey-ss58>
 ```
+
+The helper submits this repository's bundle by default (honoring
+`tau_agent_files.json`). Pass `--bundle <dir>` for a different directory or
+`--agent <file>` for a legacy single-file submission.
 
 Optional display username:
 
@@ -44,9 +49,10 @@ For local testing, pass `--api-url http://127.0.0.1:8066/api/submissions`.
 - [ ] This registration has not already produced an accepted private submission.
 - [ ] If you include `--agent-username`, your wallet coldkey owns the submitting
   hotkey, or you have a valid `--coldkey` and `--coldkey-signature`.
-- [ ] `agent.py` is 5 MB or smaller.
-- [ ] `agent.py` compiles with `python3 -m py_compile agent.py`.
-- [ ] `from agent import solve` imports cleanly.
+- [ ] The whole bundle is 5 MB or smaller and has at most 32 `*.py` files.
+- [ ] `tau_agent_files.json` lists every bundle file (including `agent.py`).
+- [ ] Every file compiles: `python3 -m compileall -q agent.py agent`.
+- [ ] `./scripts/check_agent_contract.py` passes from the bundle root.
 - [ ] `solve(repo_path, issue, model, api_base, api_key)` still accepts the
   validator-owned parameters in that order.
 - [ ] `solve(...)` returns a dict with `patch`, `logs`, `steps`, `cost`, and
@@ -71,12 +77,16 @@ Run:
   --hotkey <miner-hotkey-ss58>
 ```
 
-The helper reads `agent.py`, derives a submission id, signs this payload with
-your wallet hotkey, and posts a multipart request to the API:
+The helper collects the bundle files, derives a submission id, signs this
+payload with your wallet hotkey, and posts a multipart request to the API
+(`agent` field = `agent.py`, `files` field = JSON object of the other files):
 
 ```text
-tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
+tau-private-submission-v1:<hotkey>:<submission-id>:<bundle-sha256>
 ```
+
+`<bundle-sha256>` equals the sha256 of `agent.py` for single-file submissions
+and a deterministic hash over every file's path and content otherwise.
 
 Use `--dry-run` to print the request summary without sending it.
 
@@ -106,13 +116,13 @@ eligible.
 Only one accepted submission is eligible per miner hotkey registration. A second
 valid submission from the same hotkey is rejected until that hotkey is freshly
 registered again, even if it uses a different username, submission id, or
-`agent.py` hash. Other registered hotkeys controlled by the same coldkey can
+bundle hash. Other registered hotkeys controlled by the same coldkey can
 submit their own bundles.
 
 If the API accepts the submission, the response includes:
 
 ```text
-private-submission:<submission-id>:<sha256-of-agent.py>
+private-submission:<submission-id>:<bundle-sha256>
 ```
 
 Accepted public metadata is published at:
@@ -131,9 +141,11 @@ The API rejects cheap invalid requests first, then runs heavier checks:
 - `Signature Gate` validates the signed hotkey payload.
 - `Registration Gate` confirms the hotkey is currently registered and not spent
   for this registration.
-- `Agent Smoke` compiles/imports `agent.py` and checks basic contract shape.
-- `Submission Scope Guard` rejects forbidden files, provider bypasses, sampling
-  controls, secret usage, and contract breaks.
+- `Agent Smoke` compiles/imports every submitted file and checks basic
+  contract shape.
+- `Submission Scope Guard` runs per file and rejects forbidden files, provider
+  bypasses, sampling controls, secret usage, and contract breaks. Imports
+  between your own bundle files are allowed.
 - `OpenRouter Submission Judge` uses the same gatekeeping judge prompt as the
   legacy ninja CI, with `anthropic/claude-opus-4.7`, temperature `0`, and medium
   reasoning effort.
@@ -145,7 +157,7 @@ The API rejects cheap invalid requests first, then runs heavier checks:
 | Invalid signature or wrong wallet hotkey | Quick API rejection |
 | Hotkey is not registered | Rejected before smoke/judge checks |
 | Hotkey already accepted for this registration | Rejected before smoke/judge checks |
-| `agent.py` exceeds 5 MB | Rejected before validation |
+| Bundle exceeds 5 MB or 32 files | Rejected before validation |
 | Syntax/import error | `Agent Smoke` fails |
 | Changed `solve(...)` contract | Scope guard or smoke fails |
 | Hardcoded model/provider/API key | Scope guard fails |
@@ -156,20 +168,15 @@ The API rejects cheap invalid requests first, then runs heavier checks:
 ## Local Checks
 
 ```bash
-python3 -m py_compile agent.py
-python3 -c "from agent import solve; print('Import OK')"
-python3 - <<'PY'
-import inspect
-from agent import solve
-
-params = list(inspect.signature(solve).parameters)
-expected = ["repo_path", "issue", "model", "api_base", "api_key"]
-assert params[: len(expected)] == expected, params
-print("Signature OK:", params)
-PY
-rg -n "temperature|top_p|top_k|seed|presence_penalty|frequency_penalty|logit_bias|logprobs" agent.py
-rg -n "sk-|Bearer |api_key\\s*=\\s*['\\\"]|OPENROUTER|OPENAI_API_KEY|ANTHROPIC" agent.py
+python3 -m compileall -q agent.py agent
+./scripts/check_agent_contract.py
+rg -n "temperature|top_p|top_k|seed|presence_penalty|frequency_penalty|logit_bias|logprobs" agent.py agent
+rg -n "sk-|Bearer |api_key\\s*=\\s*['\\\"]|OPENROUTER|OPENAI_API_KEY|ANTHROPIC" agent.py agent
 ```
+
+`check_agent_contract.py` loads `agent.py` the same way the validator's
+harness runner does (by file path, bundle root on `sys.path`) and verifies the
+`solve(...)` signature.
 
 Review any `rg` matches carefully before submitting. Some matches can be benign
 when they refer to validator-supplied parameters, but hardcoded secrets,
