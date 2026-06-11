@@ -1,24 +1,30 @@
 # ninja
 
-`ninja` is the miner-facing starter harness for Subnet 66. Miners should edit
-`agent.py` and keep validator systems, task generators, scoring, wallets, and
-infrastructure out of this repo.
+`ninja` is the miner-facing starter harness for Subnet 66. The harness is a
+multi-file Python bundle: `agent.py` is the entrypoint and the `agent/`
+package holds the rest of the agent (stdlib-only). Miners should edit the agent code and keep validator systems,
+task generators, scoring, wallets, and infrastructure out of this repo.
 
-Production submissions are private. Send your `agent.py` to the Subnet 66
-submission API with a signature from your registered miner hotkey. Once the API
-accepts it, the validator can queue it directly from the private submission
-ledger.
+Production submissions are private. Send your harness (every `*.py` file, up
+to 32) to the Subnet 66 submission API with a signature from your registered
+miner hotkey. Once the API accepts it, the validator can queue it directly
+from the private submission ledger. Single-file submissions of just `agent.py`
+remain fully supported.
 
 For the miner-facing submission guide, see
 [`MINER_SUBMISSION_CHECKLIST.md`](./MINER_SUBMISSION_CHECKLIST.md).
 
 ## What You Are Allowed To Edit
 
-- `agent.py` for miner submissions
+- `agent.py` (the entrypoint; keep the validator-owned contract lines intact)
+- `agent/` modules, or your own `*.py` modules (relative imports between
+  your files are allowed)
+- `tau_agent_files.json` — the manifest listing every file of your bundle
+  (a JSON array of relative paths including `agent.py`)
 
-Do not add production mining changes outside `agent.py`. Docs and helper scripts
-may be updated by maintainers, but the submitted miner code is the single
-`agent.py` file sent to the private submission API.
+Do not add production mining changes outside the agent bundle. Docs and helper
+scripts may be updated by maintainers, but the submitted miner code is the set
+of `*.py` files sent to the private submission API.
 
 Nothing else should be added here for production mining, including
 (but not limited to):
@@ -56,9 +62,11 @@ solve(
 }
 ```
 
-The starter implementation is intentionally one file with no external Python
-dependencies. It uses the validator-provided OpenAI-compatible
-`/v1/chat/completions` endpoint and a bash action loop.
+The starter implementation has no external Python dependencies. `agent.py`
+keeps the entry-point contract and delegates to the `agent/` package, which
+implements a bash action loop against the validator-provided OpenAI-compatible
+`/v1/chat/completions` endpoint. The per-round time budget is exported into
+the container as `TAU_AGENT_TIMEOUT_SECONDS`, so the agent can pace itself.
 
 Miners should not add their own OpenRouter/OpenAI keys or hardcode a model. The
 validator passes a managed model id, proxy URL, and per-run proxy token into
@@ -73,9 +81,10 @@ miner-controlled fields before forwarding.
 
 ## Editing
 
-Work directly in `agent.py`. The validator owns the task repo and sandbox, so
-changes should focus on how the agent reasons, gathers context, edits files, and
-returns a diff.
+Work in `agent.py` and the `agent/` modules (or replace `agent/` with
+your own modules — keep `tau_agent_files.json` in sync). The validator owns
+the task repo and sandbox, so changes should focus on how the agent reasons,
+gathers context, edits files, and returns a diff.
 
 Useful local environment variables for sandbox runs:
 
@@ -114,9 +123,12 @@ Submissions are rejected if they:
 
 ## Private Submission Flow
 
-1. Edit `agent.py`.
+1. Edit the agent bundle (`agent.py` + your modules).
 2. Make sure the hotkey you will sign with is currently registered on Subnet 66.
-3. Submit it to the private API with your registered miner hotkey wallet:
+3. Submit it to the private API with your registered miner hotkey wallet. By
+   default the helper bundles this repository (honoring
+   `tau_agent_files.json`); pass `--bundle <dir>` for another directory or
+   `--agent <file>` for a legacy single-file submission:
 
 ```bash
 ./scripts/submit_private_submission.py \
@@ -128,8 +140,12 @@ Submissions are rejected if they:
 The script signs this payload with your hotkey:
 
 ```text
-tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
+tau-private-submission-v1:<hotkey>:<submission-id>:<bundle-sha256>
 ```
+
+`<bundle-sha256>` is the sha256 of `agent.py` for single-file submissions
+(unchanged from before), and a deterministic hash over every file's path and
+content for multi-file bundles. The helper prints it before sending.
 
 You can also attach a display username for private submissions:
 
@@ -165,14 +181,14 @@ accepted, no pull request or on-chain commitment is required. The response
 includes the private submission commitment id the validator tracks internally:
 
 ```text
-private-submission:<submission-id>:<sha256-of-agent.py>
+private-submission:<submission-id>:<bundle-sha256>
 ```
 
 Only one accepted submission is eligible per miner hotkey registration. After an
 accepted submission, that hotkey is spent for future submissions until it is
 freshly registered again. A second valid submission from the same hotkey in the
 same registration period is rejected even if it uses a different username,
-submission id, or `agent.py` hash. Other registered hotkeys controlled by the
+submission id, or bundle hash. Other registered hotkeys controlled by the
 same coldkey can still submit their own bundles.
 
 Accepted public submission metadata is visible at:
@@ -202,11 +218,13 @@ not already spent its current registration on an accepted private submission.
 Username labels do not change this rule; spending is tracked by registered
 hotkey and registration block.
 
-`Agent Smoke` compiles `agent.py` and checks for obvious static issues.
+`Agent Smoke` compiles every submitted file and checks for obvious static
+issues.
 
-`Submission Scope Guard` rejects edits that break the solve contract, add
-forbidden provider/sampling/secret usage, or try to bypass the validator-managed
-proxy.
+`Submission Scope Guard` runs per file. It rejects edits that break the solve
+contract, add forbidden provider/sampling/secret usage, or try to bypass the
+validator-managed proxy. Imports between the files of your own bundle are
+allowed.
 
 `OpenRouter Submission Judge` uses the same gatekeeping judge prompt as the
 legacy ninja CI, run through OpenRouter with `anthropic/claude-opus-4.7`,
@@ -245,6 +263,7 @@ plus the configured margin.
 The validator still compares king and challenger patches for copy detection, but
 that pairwise similarity does not affect the round score.
 
-When a private challenger becomes king, the validator publishes the winning
-`agent.py` into the public base harness and assigns validator weights to the
-winning hotkey on the next allowed weight-set epoch.
+When a private challenger becomes king, the validator assigns validator
+weights to the winning hotkey on the next allowed weight-set epoch. Single-file
+kings are published into the public base harness; multi-file kings keep
+running from their private bundle (base-repo publication stays single-file).
