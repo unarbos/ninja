@@ -12,6 +12,9 @@ _QUIET_TOOL_DEFAULTS = {
     "TQDM_DISABLE": "1",
     "NO_COLOR": "1",
     "GIT_PAGER": "cat",
+    # Keep verification runs from leaving __pycache__/*.pyc behind, which
+    # repo_diff could otherwise sweep into the final patch as binary churn.
+    "PYTHONDONTWRITEBYTECODE": "1",
 }
 
 

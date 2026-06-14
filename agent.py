@@ -17,7 +17,7 @@ Contract (unchanged from the public single-file base agent):
 
 Layout:
     agent.py             validator-owned contract + thin solve() wiring
-    agent/prompts.py     system/instance templates tuned for diff-match scoring
+    agent/prompts.py     system/instance templates for complete, verified fixes
     agent/model.py       stdlib OpenAI-compatible chat client with retries
     agent/environment.py fresh-subshell bash executor
     agent/agent_loop.py  the query -> act -> observe step loop
@@ -44,7 +44,10 @@ from agent.repo_diff import collect_repo_patch
 # -----------------------------
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "50"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
+# Allow a single command enough time to run a small reproduction or assertion
+# that demonstrates the fix is correct. Still far under the per-round wall
+# budget so the loop finishes and reports its own patch.
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "40"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -82,6 +85,10 @@ def _wall_clock_limit_seconds() -> float:
 
 WALL_CLOCK_LIMIT_SECONDS = _wall_clock_limit_seconds()
 
+# Headroom kept before the wall limit so a repair pass leaves time for the
+# final diff collection instead of being killed mid-write.
+WALL_CLOCK_RESERVE_SECONDS = 10.0
+
 
 def _normalize_api_base(api_base: str) -> str:
     base = api_base.rstrip("/")
@@ -115,6 +122,63 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     return build_task_prompt(task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context)
 
 
+# Minimum wall-clock headroom (seconds) needed to attempt a repair pass; below
+# this we keep the first patch rather than start work we cannot finish.
+VERIFY_REPAIR_MIN_BUDGET_SECONDS = 45.0
+VERIFY_REPAIR_MAX_STEPS = 14
+
+
+def _changed_py_files(patch_text: str) -> list:
+    """Python files touched by the patch (parsed from its `+++ b/` headers)."""
+    paths = []
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[len("+++ b/"):].strip()
+            if path.endswith(".py") and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _py_syntax_errors(repo_dir: str, patch_text: str) -> list:
+    """Changed .py files whose current on-disk content does not parse."""
+    broken = []
+    for rel in _changed_py_files(patch_text):
+        full = os.path.join(repo_dir, rel)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                source = handle.read()
+        except OSError:
+            continue
+        try:
+            compile(source, rel, "exec")
+        except SyntaxError as exc:
+            broken.append(f"{rel}: line {exc.lineno}: {exc.msg}")
+        except (ValueError, TypeError):
+            broken.append(f"{rel}: could not be parsed")
+    return broken
+
+
+def _repair_reason(repo_dir: str, patch_text: str) -> Optional[str]:
+    """Deterministic signal that the emitted patch is empty or broken, else None."""
+    if not (patch_text or "").strip():
+        return "the current change set is empty; no fix was produced yet"
+    broken = _py_syntax_errors(repo_dir, patch_text)
+    if broken:
+        return "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8])
+    return None
+
+
+def _build_repair_task(issue_text: str, reason: str) -> str:
+    return (
+        "A previous attempt to solve the task below left the repository in an "
+        "incomplete or broken state. " + reason + "\n\n"
+        "Inspect the current state of the repository, then finish and correct "
+        "the change so it fully and correctly solves the task. Re-read each "
+        "edited region to confirm it is syntactically valid before submitting.\n\n"
+        "Original task:\n" + issue_text
+    )
+
+
 def solve(
     repo_path: str,
     issue: str,
@@ -144,6 +208,43 @@ def solve(
             config=run_config,
             task=build_initial_user_prompt(issue, "", ""),
         )
+
+        # Verification gate: the base agent submits on the first completion
+        # signal with no check, so it ships some empty or syntactically broken
+        # patches. If the emitted change is empty or leaves an edited Python file
+        # unparseable AND wall-clock budget remains, run one bounded repair pass
+        # and keep it only when it is strictly better (a
+        # non-empty patch with no syntax errors). Never worsen the first result.
+        repair_note = ""
+        try:
+            remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
+            reason = _repair_reason(repo_path, outcome.patch)
+            if reason is not None and remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS:
+                repair_config = AgentRunConfig(
+                    repo_dir=repo_path,
+                    model_name=model_name,
+                    base_url=base_url,
+                    auth_token=proxy_token,
+                    max_steps=min(max_steps, VERIFY_REPAIR_MAX_STEPS),
+                    command_timeout=command_timeout,
+                    max_tokens=max_tokens,
+                    max_observation_chars=MAX_OBSERVATION_CHARS,
+                    max_log_chars=MAX_TOTAL_LOG_CHARS,
+                    wall_clock_limit=remaining - WALL_CLOCK_RESERVE_SECONDS,
+                )
+                repaired = run_agent_loop(
+                    config=repair_config,
+                    task=build_initial_user_prompt(_build_repair_task(issue, reason), "", ""),
+                )
+                if (
+                    repaired.patch.strip()
+                    and not _py_syntax_errors(repo_path, repaired.patch)
+                ):
+                    outcome = repaired
+                    repair_note = " (repair pass adopted)"
+        except Exception:
+            repair_note = " (repair pass skipped after error)"
+
         elapsed = time.monotonic() - started
         return {
             "patch": outcome.patch,
@@ -151,7 +252,7 @@ def solve(
             "steps": outcome.steps,
             "cost": outcome.cost,
             "success": outcome.success,
-            "message": f"{outcome.exit_status}: {outcome.message} in {elapsed:.1f}s",
+            "message": f"{outcome.exit_status}: {outcome.message} in {elapsed:.1f}s{repair_note}",
         }
     except Exception:
         fallback_patch = collect_repo_patch(repo_path)

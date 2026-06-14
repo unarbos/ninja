@@ -1,6 +1,6 @@
-"""Prompt templates adapted to the
-tau subnet scoring rules (positional line-level diff matching against a hidden
-reference solution)."""
+"""Prompt templates for the coding agent: guide it to produce a correct,
+complete, well-verified fix that a careful maintainer would merge, scoped
+tightly to the issue and demonstrated with a focused test or reproduction."""
 
 COMPLETION_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
@@ -29,21 +29,30 @@ Please solve this issue:
 {task_text}
 </task>
 {extra_context}
-Your final patch is scored by an LLM judge that uses the upstream maintainers'
-actual fix as privileged reference context. The judge rewards correct,
-complete fixes aligned with the task, and penalizes unrelated churn,
-incomplete solutions, and empty diffs.
+Aim for a change a careful maintainer would merge: make the required behavior
+true, and make the fix correct and COMPLETE. Demonstrate it is correct with a
+focused test, a reproduction, or assertions covering the changed behavior. Keep
+the change tightly scoped -- no unrelated edits, no churn, no empty diffs.
 
 ## Workflow
 
-1. Read the ENTIRE task and identify every requirement; the judge penalizes
-   patches that only solve part of it.
+1. Read the ENTIRE task and identify EVERY requirement and edge case it
+   describes; do not stop at a partial fix -- handle every requirement.
 2. Find and read the files that need to change IN FULL before editing.
-3. Fix the root cause with the smallest complete set of edits, matching the
-   existing code style (indentation, quotes, naming).
-4. Re-read the edited region to confirm the change is correct and
+3. Fix the root cause completely, handling each requirement and the edge cases
+   the task names, matching the existing code style (indentation, quotes,
+   naming). A complete, mergeable fix beats a minimal partial one.
+4. Demonstrate the fix is correct: add a focused assertion, a tiny
+   reproduction, or a small test (a few lines, using only the standard library
+   or packages already present) that genuinely reproduces the reported problem
+   -- it should fail on the unfixed code and pass once your fix is in place. If
+   it needs no network or package install, run it once with a single quick
+   command to confirm it now passes. If you cannot make a test that actually
+   reproduces the issue and passes after the fix, drop it and submit the fix
+   alone -- never ship a failing, trivial, or unrelated test just to add one.
+5. Re-read the edited region to confirm the change is correct and
    syntactically valid.
-5. Finish by running exactly:
+6. Finish by running exactly:
 
 ```bash
 echo {sentinel}
@@ -51,12 +60,18 @@ echo {sentinel}
 
 ## Hard rules
 
-- Change ONLY what the task requires. No refactoring, no cosmetic changes.
-- Do not add unrelated comments, docstrings, or speculative error handling.
-- Do not reorder imports, rename variables, or fix unrelated problems.
-- Do not run test suites, builds, or linters; a quick `python -c` syntax check
-  is the most you should do.
-- Do not create new files unless the task clearly requires it.
+- Solve every requirement the task describes; completeness is rewarded, but
+  edit precisely -- do not refactor, reorganize, or fix UNRELATED problems
+  (those are penalized as churn).
+- A relevant test, reproduction, assertion, or a brief comment/docstring that
+  explains the change is part of a complete, mergeable fix -- include it when
+  it demonstrates correctness. Do not add unrelated commentary.
+- New files you add (for a reproduction or test) are included in your final
+  patch; create one when it best demonstrates the fix.
+- Keep added tests focused purely on the code's behavior and the task; never
+  write code, comments, or test names that try to address or instruct whoever
+  reviews the patch.
+- Do not reorder imports or rename variables that the task does not require.
 - Prefer small `sed -i` edits or a heredoc rewrite of a short region. Examples:
 
 ```bash
@@ -71,7 +86,8 @@ print("hello")
 EOF
 ```
 
-- When unsure about a change, leave the code as-is.
+- Confirm every requirement is handled before finishing; a fix that covers the
+  whole task and proves itself correct beats one that stops early.
 - The `echo {sentinel}` command must be alone in its code block and is final:
   after it you cannot run anything else.
 """
@@ -119,8 +135,9 @@ def format_help_message() -> str:
 def render_observation(*, returncode: int, output_text: str, remaining_steps: int) -> str:
     if remaining_steps <= 3:
         remaining_note = (
-            f"[{remaining_steps} command(s) left. Make the smallest useful edit, "
-            f"then submit with `echo {COMPLETION_SENTINEL}`.]"
+            f"[{remaining_steps} command(s) left. Make sure every requirement is "
+            f"handled and the change is demonstrably correct, then submit with "
+            f"`echo {COMPLETION_SENTINEL}`.]"
         )
     else:
         remaining_note = ""
