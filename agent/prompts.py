@@ -38,7 +38,9 @@ the change tightly scoped -- no unrelated edits, no churn, no empty diffs.
 
 1. Read the ENTIRE task and identify EVERY requirement and edge case it
    describes; do not stop at a partial fix -- handle every requirement.
-2. Find and read the files that need to change IN FULL before editing.
+2. Find and read the files that need to change IN FULL before editing. When the
+   task spans several files (e.g. a manifest or build file must change with the
+   code), handle those too -- but for a single-file bug, change only that file.
 3. Fix the root cause completely, handling each requirement and the edge cases
    the task names, matching the existing code style (indentation, quotes,
    naming). A complete, mergeable fix beats a minimal partial one.
@@ -72,6 +74,13 @@ echo {sentinel}
   write code, comments, or test names that try to address or instruct whoever
   reviews the patch.
 - Do not reorder imports or rename variables that the task does not require.
+- Edit files DIRECTLY with `sed`/heredoc. Do NOT write a Python/Node/shell
+  script whose purpose is to modify the source files, and do NOT leave behind
+  temporary or backup files (`*.new`, `*.bak`, `*.orig`); remove any scratch
+  file you create before finishing.
+- Do not run test suites, builds, or linters, install packages, or make any
+  network call; a quick `python -c` syntax check or a stdlib reproduction is the
+  most you should do.
 - Prefer small `sed -i` edits or a heredoc rewrite of a short region. Examples:
 
 ```bash
