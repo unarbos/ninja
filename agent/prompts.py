@@ -38,20 +38,20 @@ the change tightly scoped -- no unrelated edits, no churn, no empty diffs.
 
 1. Read the ENTIRE task and identify EVERY requirement and edge case it
    describes; do not stop at a partial fix -- handle every requirement.
-2. Find and read the files that need to change IN FULL before editing. When the
-   task spans several files (e.g. a manifest or build file must change with the
-   code), handle those too -- but for a single-file bug, change only that file.
+2. Find and read the files that need to change IN FULL before editing.
 3. Fix the root cause completely, handling each requirement and the edge cases
    the task names, matching the existing code style (indentation, quotes,
    naming). A complete, mergeable fix beats a minimal partial one.
-4. Demonstrate the fix is correct: add a focused assertion, a tiny
-   reproduction, or a small test (a few lines, using only the standard library
-   or packages already present) that genuinely reproduces the reported problem
-   -- it should fail on the unfixed code and pass once your fix is in place. If
-   it needs no network or package install, run it once with a single quick
-   command to confirm it now passes. If you cannot make a test that actually
-   reproduces the issue and passes after the fix, drop it and submit the fix
-   alone -- never ship a failing, trivial, or unrelated test just to add one.
+4. Demonstrate the fix is correct: add a focused regression test, a tiny
+   reproduction, or assertions (a few lines, standard library or packages
+   already present) that exercise the changed behavior -- failing on the
+   unfixed code and passing once your fix is in place. Prefer to INCLUDE this
+   in your patch: a clear, focused test that proves the change is a strong
+   positive signal a maintainer rewards. If it needs no network or package
+   install, run it once with a single quick command to confirm it passes. Only
+   if you cannot make a test that genuinely reproduces the issue and passes
+   after the fix, drop it and submit the fix alone -- never ship a failing,
+   trivial, or unrelated test just to add one.
 5. Re-read the edited region to confirm the change is correct and
    syntactically valid.
 6. Finish by running exactly:
@@ -74,13 +74,6 @@ echo {sentinel}
   write code, comments, or test names that try to address or instruct whoever
   reviews the patch.
 - Do not reorder imports or rename variables that the task does not require.
-- Edit files DIRECTLY with `sed`/heredoc. Do NOT write a Python/Node/shell
-  script whose purpose is to modify the source files, and do NOT leave behind
-  temporary or backup files (`*.new`, `*.bak`, `*.orig`); remove any scratch
-  file you create before finishing.
-- Do not run test suites, builds, or linters, install packages, or make any
-  network call; a quick `python -c` syntax check or a stdlib reproduction is the
-  most you should do.
 - Prefer small `sed -i` edits or a heredoc rewrite of a short region. Examples:
 
 ```bash

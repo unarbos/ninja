@@ -31,7 +31,6 @@ sampling).
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 import traceback
 from typing import Any, Dict, Optional, Tuple
@@ -180,47 +179,6 @@ def _build_repair_task(issue_text: str, reason: str) -> str:
     )
 
 
-# Untracked editor/patch scratch files an agent sometimes leaves behind while
-# editing (e.g. a `cli.ts.new` next to `cli.ts`) get folded into the scored
-# patch where the judge reads them as broken/messy churn. We delete them before
-# the patch is collected. SAFETY: a scratch file is by definition a shadow of a
-# real file, so we only delete `X<suffix>` when the sibling `X` actually exists
-# -- this catches every true artifact while never touching a legitimately-named
-# untracked deliverable (e.g. a real file named config.orig).
-_EDIT_ARTIFACT_SUFFIXES = (".new", ".orig", ".bak", ".rej")
-
-
-def _artifact_sibling(rel: str) -> Optional[str]:
-    """The real file a scratch path shadows, or None if it is not an artifact."""
-    if rel.endswith("~"):
-        return rel[:-1] or None
-    for suffix in _EDIT_ARTIFACT_SUFFIXES:
-        if rel.endswith(suffix):
-            return rel[: -len(suffix)] or None
-    return None
-
-
-def _strip_edit_artifacts(repo_dir: str) -> int:
-    """Remove untracked editor/patch scratch files whose real sibling exists."""
-    removed = 0
-    try:
-        listing = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-            cwd=repo_dir, capture_output=True, text=True, timeout=30, check=False,
-        ).stdout or ""
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
-    for rel in [p for p in listing.split("\0") if p]:
-        sibling = _artifact_sibling(rel)
-        if sibling and os.path.exists(os.path.join(repo_dir, sibling)):
-            try:
-                os.remove(os.path.join(repo_dir, rel))
-                removed += 1
-            except OSError:
-                pass
-    return removed
-
-
 def solve(
     repo_path: str,
     issue: str,
@@ -287,23 +245,13 @@ def solve(
         except Exception:
             repair_note = " (repair pass skipped after error)"
 
-        # Patch hygiene: drop editor/patch scratch files (never a real
-        # deliverable) and re-collect, so the judge scores only the real change.
-        patch = outcome.patch
-        try:
-            if _strip_edit_artifacts(repo_path) > 0:
-                patch = collect_repo_patch(repo_path)
-                repair_note += " (stripped scratch files)"
-        except Exception:
-            pass
-
         elapsed = time.monotonic() - started
         return {
-            "patch": patch,
+            "patch": outcome.patch,
             "logs": outcome.logs,
             "steps": outcome.steps,
             "cost": outcome.cost,
-            "success": bool(patch.strip()),
+            "success": outcome.success,
             "message": f"{outcome.exit_status}: {outcome.message} in {elapsed:.1f}s{repair_note}",
         }
     except Exception:
