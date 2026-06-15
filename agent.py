@@ -31,7 +31,7 @@ sampling).
 from __future__ import annotations
 
 import os
-import shutil
+import json
 import subprocess
 import time
 import traceback
@@ -160,86 +160,151 @@ def _py_syntax_errors(repo_dir: str, patch_text: str) -> list:
     return broken
 
 
-# Non-Python syntax check, TOOLCHAIN-ONLY. The king's repair gate runs compile()
-# on .py only, so the polyglot pool ships compile-fatal patches unscored. We
-# extend it to JavaScript using `node --check` WHEN node is present in the
-# sandbox. We deliberately do NOT add a stdlib bracket-balance fallback: it
-# cannot see duplicate-definition errors (a real failure mode) and false-
-# positives on regex / template-literal / minified code, which would fire
-# needless re-solves and RAISE our retest variance. No tool present -> no opinion
-# -> identical to the king's baseline. node is the only polyglot toolchain
-# reliably present in the network-isolated sandbox, so we scope this to .js.
-#
-# JSX HARD GUARD (variance-safety): `node --check` is a plain V8 parser and
-# CANNOT parse JSX/Flow. The live pool is JS/TS/React-dominant (~31% of rounds
-# touch React/JSX), so a perfectly VALID React patch trips node in two ways:
-#   (1) a .jsx extension -> ERR_UNKNOWN_FILE_EXTENSION (always, regardless of
-#       validity) -> we EXCLUDE .jsx from the gate entirely; and
-#   (2) JSX/Flow inside a .js file -> SyntaxError "Unexpected token '<'" (a
-#       parser artifact, not a real syntax bug) -> we SKIP files whose error is
-#       that artifact (see _js_syntax_errors). Both make node's verdict a false
-#       'broken' on good code, which would fire a needless repair re-solve =
-#       exactly the variance/latency injection the thesis forbids. After these
-#       guards, the gate only flags GENUINELY broken plain JS and degrades to a
-#       no-op everywhere else, so it can only reduce variance, never add it.
-_JS_EXTS = (".js", ".mjs", ".cjs")
-
-# stderr substrings that mean node refused for a NON-syntax-bug reason (JSX/Flow
-# or unknown extension), i.e. a false positive we must NOT treat as broken.
-_JS_FALSE_POSITIVE_MARKERS = (
-    "ERR_UNKNOWN_FILE_EXTENSION",
-    "Unexpected token '<'",
-)
-
-
-def _changed_js_files(patch_text: str) -> list:
+def _changed_source_files(patch_text: str, exts: tuple) -> list:
+    """Files with the given extensions touched by the patch (`+++ b/` headers)."""
     paths = []
     for line in patch_text.splitlines():
         if line.startswith("+++ b/"):
-            rel = line[len("+++ b/"):].strip()
-            if rel.endswith(_JS_EXTS) and rel not in paths:
-                paths.append(rel)
+            path = line[len("+++ b/"):].strip()
+            if path.endswith(exts) and path not in paths:
+                paths.append(path)
     return paths
 
 
-def _js_syntax_errors(repo_dir: str, patch_text: str) -> list:
-    """Changed .js files that fail `node --check` (toolchain verdict, no heuristic).
-    Returns [] when node is absent so the gate degrades to the king's baseline."""
-    if shutil.which("node") is None:
-        return []
+def _run_check(cmd: list, cwd: str) -> Optional[str]:
+    """Run an external syntax checker. Return a short error string only on a
+    CONFIRMED failure; return None if it passes OR the tool is unavailable, so a
+    missing tool never produces a false repair trigger."""
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return None
+    msg = (proc.stderr or proc.stdout or "").strip()
+    return (msg.splitlines()[0][:200] if msg else "failed syntax check")
+
+
+def _syntax_errors(repo_dir: str, patch_text: str) -> list:
+    """Changed files that are definitely unparseable -- a POLYGLOT extension of
+    the base king's Python-only check (its blind spot: it ships broken
+    non-Python patches unrepaired). Every checker is conservative: a missing
+    tool or any ambiguity yields nothing, so repair only fires on a real break.
+    The repair adopt-gate re-runs this, so even a false positive can never
+    worsen the kept patch -- worst case is a wasted repair pass."""
     broken = []
-    for rel in _changed_js_files(patch_text):
+    # Python -- stdlib compile (identical to the base agent).
+    for rel in _changed_source_files(patch_text, (".py",)):
         full = os.path.join(repo_dir, rel)
-        if not os.path.isfile(full):
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+        except OSError:
             continue
         try:
-            res = subprocess.run(
-                ["node", "--check", full],
-                cwd=repo_dir, capture_output=True, text=True,
-                timeout=15, encoding="utf-8", errors="replace", check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            compile(source, rel, "exec")
+        except SyntaxError as exc:
+            broken.append(f"{rel}: line {exc.lineno}: {exc.msg}")
+        except (ValueError, TypeError):
+            broken.append(f"{rel}: could not be parsed")
+    # JSON -- stdlib, always available, zero false positives.
+    for rel in _changed_source_files(patch_text, (".json",)):
+        full = os.path.join(repo_dir, rel)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
             continue
-        if res.returncode != 0:
-            stderr = res.stderr or ""
-            # Skip node's JSX/Flow/unknown-extension false positives: these are
-            # parser limitations on VALID React/Flow code, not real syntax bugs.
-            # Acting on them would re-roll a good patch (variance injection).
-            if any(marker in stderr for marker in _JS_FALSE_POSITIVE_MARKERS):
-                continue
-            broken.append(f"{rel}: JavaScript syntax error")
+        try:
+            json.loads(content)
+        except ValueError as exc:
+            broken.append(f"{rel}: invalid JSON: {str(exc)[:120]}")
+    # Plain JS -- `node --check` parses .js/.mjs/.cjs (skip .jsx/.ts; node would
+    # false-flag JSX/TS syntax). Skips silently when node is absent.
+    for rel in _changed_source_files(patch_text, (".js", ".mjs", ".cjs")):
+        err = _run_check(["node", "--check", rel], repo_dir)
+        if err:
+            broken.append(f"{rel}: {err}")
+    # Go -- `gofmt -e` parses Go. Skips silently when gofmt is absent.
+    for rel in _changed_source_files(patch_text, (".go",)):
+        err = _run_check(["gofmt", "-e", rel], repo_dir)
+        if err:
+            broken.append(f"{rel}: {err}")
     return broken
 
 
-def _repair_reason(repo_dir: str, patch_text: str) -> Optional[str]:
-    """Deterministic signal that the emitted patch is empty or broken, else None."""
+def _all_changed_files(patch_text: str) -> list:
+    """Every file the patch touches (`+++ b/` headers), excluding /dev/null."""
+    out = []
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            p = line[len("+++ b/"):].strip()
+            if p and p != "/dev/null" and p not in out:
+                out.append(p)
+    return out
+
+
+def _is_test_path(path: str) -> bool:
+    p = path.lower()
+    base = p.rsplit("/", 1)[-1]
+    if any(seg in ("test", "tests", "spec", "specs", "__tests__") for seg in p.split("/")[:-1]):
+        return True
+    if base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py") or base.startswith("test")):
+        return True
+    if ".test." in base or ".spec." in base or base.endswith("_spec.rb") or base.endswith("_test.go"):
+        return True
+    return False
+
+
+def _source_files(patch_text: str) -> set:
+    """Non-test files the patch changes -- the actual fix surface."""
+    return {p for p in _all_changed_files(patch_text) if not _is_test_path(p)}
+
+
+def _python_test_outcome(repo_dir: str, patch_text: str) -> str:
+    """'none' (no python test added), 'pass', 'fail' (a definitive pytest exit-1
+    failure), or 'unknown'. Conservative + time-bounded: runs ONLY the first
+    added python test, and treats anything ambiguous (collection/import/usage
+    error, no pytest) as 'unknown' so it never falsely declares a fix wrong."""
+    tests = [p for p in _all_changed_files(patch_text)
+             if _is_test_path(p) and p.endswith(".py")
+             and os.path.isfile(os.path.join(repo_dir, p))]
+    if not tests:
+        return "none"
+    rel = tests[0]
+    for exe in ("python", "python3"):
+        try:
+            proc = subprocess.run(
+                [exe, "-m", "pytest", rel, "-x", "-q", "-p", "no:cacheprovider"],
+                cwd=repo_dir, capture_output=True, text=True, timeout=25,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return "pass"
+        if proc.returncode == 1:
+            return "fail"
+        return "unknown"  # 2/3/4/5 = collection/usage/no-tests -> ambiguous
+    return "unknown"
+
+
+def _repair_reason(repo_dir: str, patch_text: str, check_tests: bool = True):
+    """(kind, message) when the first patch should be repaired, else None.
+    Cheap kinds 'empty'/'syntax' are the base king's checks. Behavioral kinds
+    'test_fail'/'no_test' target the gemini solver's real failure mode: it ships
+    many valid-but-undemonstrated/wrong patches the base king never rescues, and
+    the duel data shows that is exactly where it loses rounds (LLM score < 0.7)."""
     if not (patch_text or "").strip():
-        return "the current change set is empty; no fix was produced yet"
-    broken = _py_syntax_errors(repo_dir, patch_text)
-    if not broken:
-        broken = _js_syntax_errors(repo_dir, patch_text)
+        return ("empty", "the current change set is empty; no fix was produced yet")
+    broken = _syntax_errors(repo_dir, patch_text)
     if broken:
-        return "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8])
+        return ("syntax", "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8]))
+    if check_tests:
+        outcome = _python_test_outcome(repo_dir, patch_text)
+        if outcome == "fail":
+            return ("test_fail", "your own regression test currently FAILS, so the fix is wrong or incomplete; correct the fix until that test passes (never weaken the test).")
+        if outcome == "none" and _source_files(patch_text):
+            return ("no_test", "the fix changes source but includes no test proving it works; ADD one focused regression test that fails on the original bug and passes with your fix, and KEEP the existing source fix in place.")
     return None
 
 
@@ -293,8 +358,13 @@ def solve(
         repair_note = ""
         try:
             remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
-            reason = _repair_reason(repo_path, outcome.patch)
-            if reason is not None and remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS:
+            # Behavioral probes run a test, so only run them when there is budget
+            # for a repair afterwards -- never spend a round we cannot improve.
+            can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
+            reason = _repair_reason(repo_path, outcome.patch, check_tests=can_repair)
+            if reason is not None and can_repair:
+                kind, message = reason
+                orig_sources = _source_files(outcome.patch)
                 repair_config = AgentRunConfig(
                     repo_dir=repo_path,
                     model_name=model_name,
@@ -309,15 +379,23 @@ def solve(
                 )
                 repaired = run_agent_loop(
                     config=repair_config,
-                    task=build_initial_user_prompt(_build_repair_task(issue, reason), "", ""),
+                    task=build_initial_user_prompt(_build_repair_task(issue, message), "", ""),
                 )
-                if (
-                    repaired.patch.strip()
-                    and not _py_syntax_errors(repo_path, repaired.patch)
-                    and not _js_syntax_errors(repo_path, repaired.patch)
-                ):
-                    outcome = repaired
-                    repair_note = " (repair pass adopted)"
+                rp = repaired.patch
+                # Adopt-gate -- strictly safe: only replace the first patch when the
+                # repair is DEMONSTRABLY better, never when it could be worse.
+                if rp.strip() and not _syntax_errors(repo_path, rp):
+                    rtest = _python_test_outcome(repo_path, rp)
+                    if kind in ("empty", "syntax", "test_fail"):
+                        # first patch was empty/broken/test-failing: keep the repair
+                        # only if it is now non-empty, valid, and not test-failing.
+                        adopt = rtest != "fail"
+                    else:  # no_test: replace only if we GAINED a passing test AND
+                        # kept the original fix surface (so the fix is not lost).
+                        adopt = rtest == "pass" and orig_sources.issubset(_source_files(rp))
+                    if adopt:
+                        outcome = repaired
+                        repair_note = " (repair adopted: %s)" % kind
         except Exception:
             repair_note = " (repair pass skipped after error)"
 
