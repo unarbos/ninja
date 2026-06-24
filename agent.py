@@ -227,6 +227,7 @@ Wire every new symbol into its call sites; leave no stub, TODO, placeholder, pas
 Demonstrate the fix is correct: add a focused regression test that fails before your fix and passes after -- include it in your patch.
 On large or multi-file tasks, make your first edit within 4 steps; do not spend more than 3 steps reading before writing.
 Before submitting: re-read every edited region to confirm correctness and no unrelated edits; verify syntax (`python3 -m py_compile` for Python, `node --check` for JS/TS).
+Output only valid source: no stray leading `n` from a broken newline, no literal `$1`/`$2` sed backreference, no duplicated function/method, no blank-line padding, no file-mode changes, and no backup/original copies (edit the real file in place).
 """
 # ^ NEXT27 CHANGE 2: hashirama's "Verify and Polish" syntax-check step, as a
 # 4th rider line. Closes the TS/JS syntax-quality gap behind losses T3/T7.
@@ -302,14 +303,17 @@ echo {sentinel}
   comment/docstring that explains the change is part of a complete fix --
   include it when it demonstrates correctness. Add no unrelated commentary and no
   leftover debug prints.
-- PRECISE EDITS, NOT REWRITES. Prefer a small `sed -i` edit or a heredoc rewrite
-  of a short region over rewriting a whole file. Examples:
+- PRECISE EDITS, NOT REWRITES. Edit with a scalpel, but prefer a heredoc rewrite
+  of the affected region (or a short file) over `sed` for anything multi-line --
+  `sed` with newlines or backreferences corrupts code (stray `n`, literal `$1`).
+  Reserve `sed -i` for a single-line, single-token substitution:
 
 ```bash
-sed -i 's/old_text/new_text/' path/to/file.py
+sed -i 's/old_token/new_token/' path/to/file.py
 ```
 
-Create or rewrite a short file when that is genuinely cleanest:
+For anything spanning multiple lines, re-read the region and rewrite it with a
+heredoc -- this avoids escaping mistakes entirely:
 
 ```bash
 cat <<'EOF' > path/to/file.py
@@ -317,11 +321,22 @@ print("hello")
 EOF
 ```
 
+- CLEAN OUTPUT, NO CORRUPTION. Every edit must be valid source. Never leave a
+  stray leading `n` from a mangled newline, a literal `$1`/`$2` sed
+  backreference, a duplicated function/method, or runs of blank-line padding. Do
+  not change file modes (no `chmod`) and never create backup/original copies
+  (`*Original.*`, `*.bak`, `*_old.*`) -- edit the real file in place.
+
 - NEW FILES BELONG IN THE PATCH. Any new test or reproduction file you create is
   part of your final patch; add one when it best demonstrates the fix.
 - TESTS STAY ON-TOPIC. Keep added tests focused purely on the code's behavior
   and this task; never write code, comments, or test names aimed at instructing
   or addressing whoever reviews the patch.
+- STAY IN SCOPE. Do not delete or rewrite working code the task does not mention,
+  do not add a file or symbol you do not wire into its call sites, and do not add
+  unrelated config or metadata (package.json fields, licenses) the task did not
+  request. Implement REAL behavior wired to the existing code -- never hardcode or
+  fake a result (e.g. `const isQuizMode = true`) just to look correct.
 - COMPLETENESS WINS. Confirm every requirement is handled before finishing; a
   fix that covers the whole task and proves itself correct beats one that stops
   early.
@@ -964,6 +979,8 @@ _SHADOW_SUFFIXES = (".new", ".fixed", ".orig", ".bak", ".rej", ".tmp", ".swp", "
 def collect_repo_patch(repo_dir: str) -> str:
     untracked = _untracked_files(repo_dir)
     _scrub_scratch(repo_dir, untracked)
+    _scrub_backup_copies(repo_dir, untracked)
+    _restore_mode_changes(repo_dir)
     diff = _run_git(["diff", "--binary", "--", "."], repo_dir)
     listing = _run_git(["ls-files", "--others", "--exclude-standard", "-z"], repo_dir)
     for relative_path in [item for item in listing.split("\0") if item]:
@@ -1015,6 +1032,70 @@ def _scrub_scratch(repo_dir: str, untracked: list) -> None:
                     os.remove(abs_path)
             except OSError:
                 continue
+    except Exception:
+        return
+
+
+# Revert spurious file-mode-only churn (e.g. 100755 -> 100644 on mvnw/deploy.sh).
+# The diff judge penalizes permission changes and they never help a code task, so
+# the executable bit is restored to its indexed value before the diff is taken.
+_MODE_CHANGE_RE = re.compile(r"^\s*mode change (\d+) => (\d+) (.+)$")
+
+
+def _restore_mode_changes(repo_dir: str) -> None:
+    try:
+        summary = _run_git(["diff", "--summary"], repo_dir)
+        for line in summary.splitlines():
+            m = _MODE_CHANGE_RE.match(line)
+            if not m:
+                continue
+            old_mode, rel = m.group(1), m.group(3).strip()
+            abs_path = os.path.join(repo_dir, rel)
+            try:
+                os.chmod(abs_path, int(old_mode, 8) & 0o7777)
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        return
+
+
+# Agent-created backup/original duplicate files (e.g. `Connect4Original.java` left
+# beside `Connect4.java`) are pure noise the judge punishes. We delete an
+# untracked file only when its implied original exists in the same directory.
+_BACKUP_STEM_SUFFIXES = ("original", "copy", "backup", "orig", "_old", "_orig",
+                         "_backup", "_copy", "-old", "-copy", "-backup")
+_BACKUP_EXT_SUFFIXES = (".bak", ".orig", ".backup", ".old", ".copy", ".save")
+
+
+def _implied_original(basename: str) -> Optional[str]:
+    low = basename.lower()
+    for suf in _BACKUP_EXT_SUFFIXES:
+        if low.endswith(suf) and len(basename) > len(suf):
+            return basename[: -len(suf)]
+    if "." not in basename:
+        return None
+    stem, ext = basename.rsplit(".", 1)
+    stem_low = stem.lower()
+    for suf in _BACKUP_STEM_SUFFIXES:
+        if stem_low.endswith(suf) and len(stem) > len(suf):
+            return stem[: -len(suf)].rstrip(" _-") + "." + ext
+    return None
+
+
+def _scrub_backup_copies(repo_dir: str, untracked: list) -> None:
+    try:
+        for rel in untracked or []:
+            base = os.path.basename(rel.rstrip("/"))
+            implied = _implied_original(base)
+            if not implied:
+                continue
+            sibling = os.path.join(repo_dir, os.path.dirname(rel), implied)
+            abs_path = os.path.join(repo_dir, rel)
+            if os.path.isfile(sibling) and os.path.isfile(abs_path):
+                try:
+                    os.remove(abs_path)
+                except OSError:
+                    continue
     except Exception:
         return
 
@@ -1623,6 +1704,115 @@ def _duplicate_definition_error(text: str, rel: str):
     return None
 
 
+# Java/Kotlin have no `function`/`def` keyword, so _DUP_DEF_RE cannot see a
+# duplicated METHOD. This catches the common AI-patch failure of pasting the same
+# method twice (e.g. `updatePost(...)` appended three times). Conservative: only
+# methods with >=1 parameter and an identical normalized signature are flagged,
+# so overloads (different params) and trivial no-arg methods do not false-fire.
+_JAVA_METHOD_RE = re.compile(
+    r"(?:public|private|protected|static|final|abstract|synchronized|native|default)"
+    r"[\w<>\[\],\s.@]*?\b(\w+)\s*\(([^;{}]*)\)\s*(?:throws[\w\s,.]*)?\{"
+)
+_KOTLIN_FUN_RE = re.compile(r"\bfun\s+(?:<[^>]*>\s*)?(\w+)\s*\(([^)]*)\)")
+
+
+def _duplicate_method_error(text: str, rel: str):
+    code = _strip_code_noise(text)
+    if not code:
+        return None
+    rex = _KOTLIN_FUN_RE if rel.endswith(".kt") else _JAVA_METHOD_RE
+    seen = {}
+    for m in rex.finditer(code):
+        params = re.sub(r"\s+", "", m.group(2) or "")
+        if not params:  # skip no-arg methods -- overload/inheritance false positives
+            continue
+        key = m.group(1) + "(" + params + ")"
+        seen[key] = seen.get(key, 0) + 1
+    dups = sorted(k.split("(")[0] for k, c in seen.items() if c > 1)
+    if dups:
+        return (f"{rel}: duplicate method definition(s): {', '.join(dups[:4])} "
+                "(same signature defined more than once -> compile error)")
+    return None
+
+
+# ============================================================
+# ADDITION 3: mechanical patch-corruption double-check (compile-fail -> 0 guard)
+# ============================================================
+
+# A leading `n` left from a mangled "\n" (broken sed/heredoc), followed by the
+# indentation that belonged to the next line, e.g. "+n        // comment". Fires
+# only when `n` is followed by 2+ spaces then code/comment, or directly by a
+# comment marker -- never on a real identifier or aligned assignment.
+_N_ARTIFACT_RE = re.compile(r"^n(?:[ \t]{2,}(?://|#|/\*|[A-Za-z{}])|//|/\*)")
+# A stray sed/regex backreference placeholder ($1, $2, ...) that leaked into
+# non-shell source. Checked after crude string-stripping, only for languages
+# where a bare `$N` is never valid (excludes .sh/.php/.js/.ts where it is legal).
+_DOLLAR_PH_RE = re.compile(r"(?<![\w$])\$[1-9]\b")
+_DOLLAR_PH_EXTS = (".rs", ".kt", ".java", ".go", ".cpp", ".cc", ".cxx", ".hpp",
+                   ".h", ".c", ".cs", ".swift", ".scala", ".py")
+_STRINGY_RE = re.compile(r"\"([^\"\\]|\\.)*\"|'([^'\\]|\\.)*'|`[^`]*`")
+
+
+def _patch_corruption_error(patch_text: str, repo_dir: str):
+    """Detect mechanical corruption that compiles-fails to a 0 score: a stray
+    leading `n` (mangled newline), a leaked `$1` sed backreference, a long run of
+    blank padding, or a source file accidentally emptied. Returns a repair
+    message or None. Conservative -- targets near-certain corruption only."""
+    try:
+        cur_path = ""
+        cur_ext = ""
+        blank_run = 0
+        per_file_add = {}
+        per_file_rem = {}
+        for raw in patch_text.splitlines():
+            if raw.startswith("+++ b/"):
+                cur_path = raw[len("+++ b/"):].strip()
+                cur_ext = os.path.splitext(cur_path)[1].lower()
+                blank_run = 0
+                continue
+            if raw.startswith("+") and not raw.startswith("+++"):
+                body = raw[1:]
+                if _N_ARTIFACT_RE.match(body):
+                    return ("a stray 'n' (a mangled newline from a broken sed/heredoc) "
+                            "starts an added line in " + (cur_path or "the patch") +
+                            " -- e.g. `" + body[:60].rstrip() + "`. Re-open the file and "
+                            "rewrite the affected region with a heredoc (cat > FILE <<'EOF' "
+                            "... EOF), not sed; remove every accidental leading 'n'.")
+                if cur_ext in _DOLLAR_PH_EXTS and _DOLLAR_PH_RE.search(_STRINGY_RE.sub('""', body)):
+                    return ("a leaked sed backreference placeholder ($1/$2) is in an added "
+                            "line of " + (cur_path or "the patch") + " -- e.g. `" +
+                            body.strip()[:60] + "`. That is invalid source. Rewrite the "
+                            "region with a heredoc, writing the real code instead of `$N`.")
+                if cur_path:
+                    per_file_add[cur_path] = per_file_add.get(cur_path, 0) + (1 if body.strip() else 0)
+                if body.strip():
+                    blank_run = 0
+                else:
+                    blank_run += 1
+                    if blank_run >= 10:
+                        return ("a block of " + str(blank_run) + "+ blank lines was added to " +
+                                (cur_path or "the patch") + " -- junk padding. Re-edit the "
+                                "region with a heredoc and remove the blank-line run.")
+                continue
+            if raw.startswith("-") and not raw.startswith("---"):
+                if cur_path:
+                    per_file_rem[cur_path] = per_file_rem.get(cur_path, 0) + 1
+            blank_run = 0
+        for path, rem in per_file_rem.items():
+            if rem >= 3 and per_file_add.get(path, 0) == 0:
+                full = os.path.join(repo_dir, path)
+                try:
+                    if os.path.isfile(full) and os.path.getsize(full) == 0:
+                        return ("the file " + path + " was emptied (all content removed). "
+                                "Restore its real content and make only the change the task "
+                                "requires.")
+                except OSError:
+                    continue
+    except Exception:
+        return None
+    return None
+
+
 def _syntax_errors(repo_dir: str, patch_text: str) -> list:
     broken = []
     for rel in _changed_source_files(patch_text, (".py",)):
@@ -1690,6 +1880,16 @@ def _syntax_errors(repo_dir: str, patch_text: str) -> list:
             continue
         if _CS_REPEATED_BASE_RE.search(_strip_code_noise(text)):
             broken.append(f"{rel}: malformed repeated base type (e.g. ': X : X')")
+    for rel in _changed_source_files(patch_text, (".java", ".kt")):
+        full = os.path.join(repo_dir, rel)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        err = _duplicate_method_error(text, rel)
+        if err:
+            broken.append(err)
     return broken
 
 
@@ -1809,9 +2009,149 @@ def _completeness_check_reason(issue_text: str, patch_text: str) -> Optional[str
     return None
 
 
+# ============================================================
+# ADDITION 4: scope-creep guards (delete working code / orphan file / metadata)
+# ============================================================
+
+# Vocabulary that legitimizes deletion/restructuring, so guard 1 stays quiet.
+_DELETION_OK_RE = re.compile(
+    r"\b(refactor|rename|restructur|convert|migrat|reorganiz|remov|delet|"
+    r"deprecat|drop|replace|consolidat|extract|clean\s*up)\b",
+    re.I,
+)
+_DEF_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)"
+    r"(?P<pub>export\s+|pub\s+|public\s+)?"
+    r"(?:default\s+|async\s+|abstract\s+|final\s+|static\s+|open\s+)*"
+    r"(?:"
+    r"(?:class|struct|enum|trait|interface)\s+(?P<a>[A-Za-z_$][\w$]*)"
+    r"|(?:function|fn|def|fun|func)\s+(?P<b>[A-Za-z_$][\w$]*)"
+    r"|type\s+(?P<c>[A-Za-z_$][\w$]*)"
+    r"|(?:const|let|var|val)\s+(?P<d>[A-Za-z_$][\w$]*)\s*="
+    r")"
+)
+_WIRED_EXTS = (".js", ".jsx", ".ts", ".tsx", ".vue", ".py", ".java", ".kt",
+               ".go", ".rs", ".rb", ".php", ".cs", ".scala", ".swift")
+_ENTRYPOINT_STEMS = frozenset({
+    "index", "main", "app", "__init__", "mod", "lib", "setup", "conf", "config",
+    "manage", "wsgi", "asgi", "server", "conftest", "middleware", "routes", "router",
+})
+
+
+def _iter_defs(line: str, ext: str):
+    m = _DEF_LINE_RE.match(line)
+    if not m:
+        return
+    name = m.group("a") or m.group("b") or m.group("c") or m.group("d")
+    if not name:
+        return
+    is_pub = bool(m.group("pub")) or name[0].isupper()
+    if ext == ".py":
+        is_pub = is_pub or (len(m.group("indent")) == 0 and not name.startswith("_"))
+    yield name, is_pub
+
+
+def _scope_creep_reason(issue_text: str, patch_text: str):
+    """Detect scope creep that loses rounds: deleting working public symbols the
+    task did not ask to remove, creating a new source file nothing wires in, or
+    adding cosmetic/incorrect package.json metadata. Conservative & fail-open --
+    returns a repair message or None."""
+    try:
+        deletion_ok = bool(_DELETION_OK_RE.search(issue_text or ""))
+        cur_path = ""
+        cur_ext = ""
+        is_new = False
+        prev_minus = None
+        removed_pub = []
+        added_names = set()
+        new_files = {}
+        added_by_file = {}
+        pkg_added = []
+        for raw in patch_text.splitlines():
+            if raw.startswith("--- "):
+                prev_minus = raw[4:].strip()
+                continue
+            if raw.startswith("+++ "):
+                cur_path = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+                cur_ext = os.path.splitext(cur_path)[1].lower()
+                is_new = (prev_minus == "/dev/null")
+                if is_new and cur_path != "/dev/null" and not _is_test_path(cur_path):
+                    new_files[cur_path] = []
+                continue
+            if raw.startswith("+") and not raw.startswith("+++"):
+                body = raw[1:]
+                for nm, _pub in _iter_defs(body, cur_ext):
+                    added_names.add(nm)
+                if cur_path in new_files:
+                    new_files[cur_path].append(body)
+                added_by_file[cur_path] = added_by_file.get(cur_path, "") + body + "\n"
+                if cur_path.endswith("package.json"):
+                    pkg_added.append(body)
+                continue
+            if raw.startswith("-") and not raw.startswith("---"):
+                if not deletion_ok:
+                    for nm, pub in _iter_defs(raw[1:], cur_ext):
+                        if pub:
+                            removed_pub.append(nm)
+                continue
+        # 1. deleted public symbols that are not re-added
+        gone = [n for n in dict.fromkeys(removed_pub) if n not in added_names]
+        if gone:
+            return ("the patch deletes definitions the task did not ask to remove: "
+                    + ", ".join(gone[:5]) + ". Restore them and keep the change scoped "
+                    "to the task -- removing working code loses the round.")
+        # 2. orphan new file: its exported symbols are referenced nowhere else in the patch
+        for path, body_lines in new_files.items():
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in _WIRED_EXTS:
+                continue
+            base = os.path.basename(path)
+            stem = os.path.splitext(base)[0]
+            if stem.lower() in _ENTRYPOINT_STEMS or "/migrations/" in path or "/migration/" in path:
+                continue
+            if path in (issue_text or "") or base in (issue_text or ""):
+                continue
+            syms = set()
+            for ln in body_lines:
+                for nm, _pub in _iter_defs(ln, ext):
+                    syms.add(nm)
+            if not syms:
+                continue
+            referenced = False
+            for other_path, other_text in added_by_file.items():
+                if other_path == path:
+                    continue
+                low = other_text.lower()
+                if stem.lower() in low or any(s in other_text for s in syms):
+                    referenced = True
+                    break
+            if not referenced:
+                return ("you created the new file " + path + " but nothing in the patch "
+                        "imports or uses it (" + ", ".join(sorted(syms)[:4]) + "). Wire it "
+                        "into the app where the task needs it, or remove it.")
+        # 3. cosmetic / incorrect package.json metadata
+        if pkg_added:
+            joined = "\n".join(pkg_added)
+            if re.search(r'"description"\s*:\s*"[^"]*(?:```|##)', joined):
+                return ("package.json `description` contains README/markdown text; set a "
+                        "short plain description (or leave it unchanged) and focus on the fix.")
+            if re.search(r'"main"\s*:\s*"[^"]*\.config\.js"', joined):
+                return ("package.json `main` points to a config file; remove this unless the "
+                        "task explicitly asks to set the package entry point.")
+            if re.search(r'"license"\s*:', joined) and "licens" not in (issue_text or "").lower():
+                return ("the patch adds a `license` field the task did not request; drop "
+                        "unrelated metadata and focus on the actual fix.")
+        return None
+    except Exception:
+        return None
+
+
 def _repair_reason(repo_dir: str, patch_text: str, issue_text: str = "", check_tests: bool = True):
     if not (patch_text or "").strip():
         return ("empty", "the current change set is empty; no fix was produced yet")
+    corrupt = _patch_corruption_error(patch_text, repo_dir)
+    if corrupt:
+        return ("corruption", corrupt)
     broken = _syntax_errors(repo_dir, patch_text)
     if broken:
         return ("syntax", "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8]))
@@ -1822,6 +2162,9 @@ def _repair_reason(repo_dir: str, patch_text: str, issue_text: str = "", check_t
     )
     if q:
         return ("quality", q)
+    scope = _scope_creep_reason(issue_text, patch_text)
+    if scope:
+        return ("scope", scope)
     cov = task_coverage_reason(issue_text, patch_text)
     if cov:
         return ("coverage", cov)
@@ -2042,6 +2385,10 @@ def solve(
                         adopt = True  # Any non-empty syntactically valid patch is better than empty
                     elif kind == "syntax":
                         adopt = True  # Any syntactically valid patch is better than syntax-broken
+                    elif kind == "corruption":
+                        adopt = not _patch_corruption_error(rp, repo_path)
+                    elif kind == "scope":
+                        adopt = rtest != "fail" and not _scope_creep_reason(issue, rp)
                     elif kind == "coverage":
                         adopt = rtest != "fail"
                     elif kind in ("quality", "test_fail"):
@@ -2071,7 +2418,7 @@ def solve(
             if remaining >= 60:
                 # Check if the current patch is broken
                 reason = _repair_reason(repo_path, outcome.patch, issue_text=issue, check_tests=False)
-                if reason is not None and reason[0] in ("empty", "syntax"):
+                if reason is not None and reason[0] in ("empty", "syntax", "corruption"):
                     # Reset the repository to clean state
                     _run_git(["reset", "--hard", "HEAD"], repo_path)
                     _run_git(["clean", "-fd"], repo_path)
