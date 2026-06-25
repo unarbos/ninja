@@ -223,10 +223,8 @@ The command runs in a fresh subshell at the repository root; directory changes
 and shell variables do not persist between turns. Chain with `&&` when needed.
 Never output more than one code block.
 
-        Wire every new symbol into its call sites; leave no stub, TODO, placeholder, pass, or unimplemented branch.
+Wire every new symbol into its call sites; leave no stub, TODO, placeholder, pass, or unimplemented branch.
 Demonstrate the fix is correct: add a focused regression test that fails before your fix and passes after -- include it in your patch.
-For UI components, implement complete, functional logic with state management and event handlers.
-Write robust, non-brittle tests that verify functional correctness and avoid asserting on fragile details like specific CSS styles or classes.
 Before your first edit, find the file that DEFINES or OWNS the behavior in the task (grep for definitions; if the task names a path, open that path) -- do not patch callers, tests, or wrappers by mistake.
 On large or multi-file tasks, make your first edit within 4 steps; do not spend more than 3 steps reading before writing.
 Before submitting: re-read every edited region to confirm correctness and no unrelated edits; verify syntax (`python3 -m py_compile` for Python, `node --check` for JS/TS).
@@ -286,8 +284,7 @@ no empty diffs.
    route, config key, or export -- must be connected to its call sites and
    actually exercised end-to-end. Leave NOTHING half-built: no stub, no TODO, no
    placeholder, no bare `pass`, no `NotImplemented`, no unimplemented branch. An
-   unwired or stubbed change counts as INCOMPLETE and loses the round. For UI components,
-   implement complete, functional logic with state management and event handlers.
+   unwired or stubbed change counts as INCOMPLETE and loses the round.
 6. PROVE IT WITH A TEST. Add a focused regression test, a tiny reproduction, or
    a few assertions (standard library or packages already in the repo) that
    exercise the changed behavior -- they must FAIL on the unfixed code and PASS
@@ -295,8 +292,7 @@ no empty diffs.
    is a strong positive signal. If it needs no network or install, run it once
    with a single command to confirm it passes. Only drop the test if you truly
    cannot reproduce the issue -- never ship a failing, trivial, or unrelated
-   test just to have one. Write robust, non-brittle tests that verify functional
-   correctness and avoid asserting on fragile details like specific CSS styles or classes.
+   test just to have one.
 7. RE-READ AND VERIFY. Re-read every region you edited to confirm it is correct,
    churn-free, and syntactically valid (`python3 -m py_compile` for Python,
    `node --check` for JS/TS, etc.). Re-scan the task and confirm each requirement
@@ -987,6 +983,25 @@ _MSG_ERROR_LINE_RE = re.compile(
 )
 _MSG_CONTEXT_LINES = 2
 _MSG_MAX_PICKED_LINES = 120
+# Symbol-scoped retention: when a relevant line lands inside a code block we keep
+# the WHOLE enclosing def/class/func body (a compilable region) instead of a 2-line
+# island, so the model still sees the full body of the function it must patch. A
+# block is bounded by a header line (lower-or-equal indent `def `/`class `/`func `,
+# or a brace-style header) and by the line where indentation returns to that
+# header's level (or the matching closing brace).
+_MSG_BLOCK_MAX_LINES = 80
+# Headers that open an indentation-scoped (Python-like) block.
+_BLOCK_HEADER_INDENT_RE = re.compile(
+    r"^(\s*)(?:async\s+)?(?:def|class)\b"
+)
+# Headers that open a brace-scoped block (go/rust/js/ts/java/c-family) AND end the
+# physical line with an opening brace -- a deterministic, parser-free heuristic.
+_BLOCK_HEADER_BRACE_RE = re.compile(
+    r"^(\s*)(?:(?:async\s+)?func\b|(?:export\s+)?(?:async\s+)?function\b|"
+    r"class\b|struct\b|interface\b|impl\b|enum\b|fn\b|"
+    r"(?:public|private|protected|static|final|virtual|override)[\w\s<>,]*?\([^;{}]*\))"
+    r".*\{\s*$"
+)
 
 
 def _msg_keyword_patterns(keywords: list) -> list:
@@ -999,20 +1014,155 @@ def _msg_keyword_patterns(keywords: list) -> list:
     return patterns
 
 
+def _leading_indent(line: str) -> int:
+    """Width of leading whitespace (tabs expand to 4) for blank-insensitive scan."""
+    width = 0
+    for ch in line:
+        if ch == " ":
+            width += 1
+        elif ch == "\t":
+            width += 4
+        else:
+            break
+    return width
+
+
+def _enclosing_block_span(lines: list, hit: int) -> tuple:
+    """Return (start, end_exclusive) of the smallest enclosing def/class/func block
+    containing line `hit`. Falls back to a tight _MSG_CONTEXT_LINES window when no
+    code header encloses the hit. Pure stdlib indentation/brace scan -- deterministic
+    (no parsing, no AST, byte-stable)."""
+    n = len(lines)
+    if not (0 <= hit < n):
+        lo = max(0, hit - _MSG_CONTEXT_LINES)
+        hi = min(n, hit + _MSG_CONTEXT_LINES + 1)
+        return lo, hi
+    hit_line = lines[hit]
+    hit_indent = _leading_indent(hit_line)
+    # 1) Walk UP to the nearest header at strictly-lower-or-equal indent.
+    header = None
+    header_indent = 0
+    i = hit
+    while i >= 0:
+        line = lines[i]
+        if not line.strip():
+            i -= 1
+            continue
+        ind = _leading_indent(line)
+        if ind > hit_indent and i != hit:
+            i -= 1
+            continue
+        m_ind = _BLOCK_HEADER_INDENT_RE.match(line)
+        m_brace = _BLOCK_HEADER_BRACE_RE.match(line)
+        if (m_ind or m_brace) and ind <= hit_indent:
+            header = i
+            header_indent = ind
+            brace_style = m_brace is not None and m_ind is None
+            break
+        if ind < hit_indent and i != hit:
+            # Dedented past the hit's own scope without finding a header: the hit
+            # is at top level / outside any def -- no enclosing block.
+            break
+        i -= 1
+    if header is None:
+        lo = max(0, hit - _MSG_CONTEXT_LINES)
+        hi = min(n, hit + _MSG_CONTEXT_LINES + 1)
+        return lo, hi
+    # 2) Walk DOWN from the header to where indentation returns to <= header level
+    #    (for indent style) or the matching closing brace (for brace style).
+    if brace_style:
+        depth = 0
+        seen_open = False
+        end = header + 1
+        for j in range(header, n):
+            depth += lines[j].count("{") - lines[j].count("}")
+            if "{" in lines[j]:
+                seen_open = True
+            end = j + 1
+            if seen_open and depth <= 0:
+                break
+    else:
+        end = n
+        for j in range(header + 1, n):
+            line = lines[j]
+            if not line.strip():
+                continue
+            if _leading_indent(line) <= header_indent:
+                end = j
+                break
+        else:
+            end = n
+    # Cap an over-long block deterministically: header + body head + body tail.
+    if end - header > _MSG_BLOCK_MAX_LINES:
+        head = header + _MSG_BLOCK_MAX_LINES - (_MSG_BLOCK_MAX_LINES // 3)
+        return header, min(end, head)
+    return header, end
+
+
 def _msg_lines_with_context(lines: list, indices: set) -> list:
-    picked: set = set()
-    for i in indices:
-        for j in range(max(0, i - _MSG_CONTEXT_LINES), min(len(lines), i + _MSG_CONTEXT_LINES + 1)):
-            picked.add(j)
-    ordered = sorted(picked)
-    if len(ordered) > _MSG_MAX_PICKED_LINES:
+    """Keep, for every hit, its WHOLE enclosing def/class/func block (compilable
+    region) instead of a 2-line island; union the spans and cap deterministically."""
+    if not indices:
+        return list(lines)
+    spans = []
+    for i in sorted(indices):
+        spans.append(_enclosing_block_span(lines, i))
+    # Merge overlapping/adjacent spans (sorted by start) into a minimal cover.
+    spans.sort()
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    picked = []
+    for start, end in merged:
+        for j in range(start, end):
+            picked.append(j)
+    if len(picked) > _MSG_MAX_PICKED_LINES:
         half = _MSG_MAX_PICKED_LINES // 2
-        ordered = ordered[:half] + ordered[-half:]
-    return [lines[i] for i in ordered]
+        picked = picked[:half] + picked[-half:]
+    return [lines[i] for i in picked]
+
+
+def _largest_top_level_block(lines: list) -> tuple:
+    """No keyword/error hit matched: instead of blindly guillotining the file
+    middle (the old truncate_text fallback, which evicts the target function body),
+    keep the LARGEST top-level def/class/func block. Deterministic: ties broken by
+    earliest start. Returns (start, end_exclusive) or (None, None) if no block."""
+    n = len(lines)
+    best = None
+    best_size = 0
+    j = 0
+    while j < n:
+        line = lines[j]
+        if not line.strip():
+            j += 1
+            continue
+        ind = _leading_indent(line)
+        if ind == 0 and (
+            _BLOCK_HEADER_INDENT_RE.match(line) or _BLOCK_HEADER_BRACE_RE.match(line)
+        ):
+            start, end = _enclosing_block_span(lines, j)
+            size = end - start
+            if size > best_size:
+                best_size = size
+                best = (start, end)
+            j = max(end, j + 1)
+            continue
+        j += 1
+    if best is None:
+        return None, None
+    return best
 
 
 def compress_message_content(text: str, *, keywords: list = None, limit: int) -> str:
-    """Shrink one chat message by keeping error/task-keyword lines; else truncate."""
+    """Shrink one chat message by keeping the WHOLE enclosing code block (a
+    compilable def/class/func body) around every error/task-keyword line, so the
+    model still sees the full body of the function it must patch. When nothing
+    matches we keep the largest top-level block + head instead of guillotining the
+    file middle (the old blind-truncate fallback evicted the target body)."""
     if limit <= 0 or len(text) <= limit:
         return text
     lines = text.splitlines()
@@ -1027,13 +1177,74 @@ def compress_message_content(text: str, *, keywords: list = None, limit: int) ->
             if pattern.search(line):
                 hit_indices.add(i)
     if not hit_indices:
-        return truncate_text(text, limit)
+        # No relevant line matched. Rather than guillotine the middle (where the
+        # target function body usually lives) keep the largest top-level block plus
+        # the head, then GREEDILY FILL the remaining budget with the adjacent lines
+        # (head + tail of the file) so a prose/green file keeps a complete function
+        # AND never hands the model fewer chars than the king's plain truncate_text
+        # would. Only fall back to truncate_text if there is no block at all.
+        start, end = _largest_top_level_block(lines)
+        if start is None:
+            return truncate_text(text, limit)
+        head_keep = min(start, _MSG_CONTEXT_LINES * 4)
+        kept = set(range(0, head_keep)) | set(range(start, end))
+        n = len(lines)
+
+        def _render(idx_set: set) -> str:
+            picked = [lines[i] for i in sorted(idx_set)]
+            head = (
+                f"[message compressed: {len(picked)} of {len(lines)} lines "
+                f"-- largest complete code block retained]\n"
+            )
+            return head + "\n".join(picked)
+
+        # Greedily extend outward (deterministically) to fill the SAME budget the
+        # king's plain truncate_text would have used, instead of stopping at one
+        # block + a tiny head (the bug: that handed the model ~33% of the king's
+        # material on no-hit rounds). Probe the down-direction (tail after the
+        # block) first, then the up-direction (lines between the head and the block
+        # start), one line at a time, re-measuring exactly so we never exceed limit
+        # and never undershoot what truncate_text would have kept.
+        down = end          # next unkept index below the block
+        up = head_keep      # next unkept index between head and block (grows toward start)
+        used = len(_render(kept))
+        while used < limit and (down < n or up < start):
+            grew = False
+            if down < n and used + len(lines[down]) + 1 <= limit:
+                kept.add(down)
+                down += 1
+                used = len(_render(kept))
+                grew = True
+            if used < limit and up < start and used + len(lines[up]) + 1 <= limit:
+                kept.add(up)
+                up += 1
+                used = len(_render(kept))
+                grew = True
+            if not grew:
+                break
+        compressed = _render(kept)
+        # Whole-line fill leaves a sub-line remainder when the next line is wider
+        # than the leftover budget. If a line directly BELOW the kept tail remains
+        # (contiguous with the rendered text), top the remainder up with a partial
+        # slice of it so the candidate never returns fewer chars than the king's
+        # plain truncate_text would, while staying coherent, byte-stable and within
+        # limit. (We only extend the contiguous tail -- never splice an out-of-order
+        # line -- so the appended fragment reads as a real continuation.)
+        slack = limit - len(compressed)
+        if slack > 1 and down < n and lines[down]:
+            partial = ("\n" + lines[down])[:slack]
+            candidate = compressed + partial
+            if len(candidate) <= limit:
+                compressed = candidate
+        if len(compressed) <= limit:
+            return compressed
+        return truncate_text(compressed, limit)
     picked_lines = _msg_lines_with_context(lines, hit_indices)
     compressed = "\n".join(picked_lines)
     if len(picked_lines) < len(lines):
         header = (
             f"[message compressed: {len(picked_lines)} of {len(lines)} lines "
-            f"with errors or task keywords]\n"
+            f"-- whole enclosing code blocks for errors/task keywords]\n"
         )
         compressed = header + compressed
     if len(compressed) <= limit:
@@ -1055,9 +1266,32 @@ _KEYWORD_SKIP = frozenset({
     "files", "test", "tests", "class", "function", "method", "implement", "create",
     "add", "fix", "update", "change", "remove", "delete", "ensure", "make", "use",
 })
+# Definition headers seen in OBSERVATION turns (cat/grep output): capture the symbol
+# name so prose tasks ("make the widget render twice") can intersect a plain word
+# ("widget") against a real `def widget(`/`class Widget(`/`func Widget(` name and so
+# earn a keyword -- avoiding the keyword-less blind-truncate path on prose/green tasks.
+_DEF_NAME_RE = re.compile(
+    r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)"
+    r"|^\s*(?:export\s+)?(?:async\s+)?(?:func|function)\s+([A-Za-z_]\w*)"
+    r"|^\s*(?:pub\s+)?fn\s+([A-Za-z_]\w*)",
+)
+_PROSE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 
-def _extract_task_keywords(task_text: str, limit: int = 8) -> list:
+def _seen_definition_names(observation_text: str) -> list:
+    """Deterministically collect def/class/func names already visible in observation
+    output (sorted, deduped). Pure regex over text in memory -- byte-stable."""
+    names = set()
+    for line in (observation_text or "").splitlines():
+        m = _DEF_NAME_RE.match(line)
+        if m:
+            name = next((g for g in m.groups() if g), None)
+            if name and len(name) >= 3:
+                names.add(name)
+    return sorted(names)
+
+
+def _extract_task_keywords(task_text: str, limit: int = 8, *, defined_names: list = None) -> list:
     seen = []
     for match in _KEYWORD_FILE_RE.finditer(task_text or ""):
         path = match.group(1).strip().lstrip("./")
@@ -1078,7 +1312,27 @@ def _extract_task_keywords(task_text: str, limit: int = 8) -> list:
         if low not in seen:
             seen.append(low)
         if len(seen) >= limit:
-            break
+            return seen
+    # Prose intersection: if the structured patterns above found few keywords (common
+    # on prose-phrased tasks), intersect plain prose tokens with the names of defs we
+    # have actually observed in the repo, so we keep those real function bodies rather
+    # than blind-truncating them. Deterministic: defined_names is pre-sorted; prose
+    # tokens are appended in sorted order; no set iteration into output.
+    if defined_names and len(seen) < limit:
+        lowered_defs = {}
+        for name in defined_names:
+            lowered_defs.setdefault(name.lower(), name)
+        prose_low = set()
+        for match in _PROSE_TOKEN_RE.finditer(task_text or ""):
+            low = match.group(0).lower()
+            if low in _KEYWORD_SKIP or len(low) < 3:
+                continue
+            prose_low.add(low)
+        for low in sorted(prose_low & set(lowered_defs.keys())):
+            if low not in seen:
+                seen.append(low)
+            if len(seen) >= limit:
+                break
     return seen
 
 
@@ -1466,6 +1720,11 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     message = f"step limit of {config.max_steps} reached"
     format_retries = 0
     task_keywords = _extract_task_keywords(config.issue_text)
+    # When the issue prose yields a sparse keyword set (the path that used to fall
+    # through to blind-truncate), enrich it with names of defs actually observed in
+    # the repo so the compressor keeps those real function bodies. Recomputed only
+    # while sparse; deterministic (sorted def-name intersection), no extra LLM pass.
+    keywords_enrichable = len(task_keywords) < 8
     write_deadline_fired = False
 
     for step in range(1, max(1, config.max_steps) + 1):
@@ -1473,6 +1732,19 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             exit_status = "TimeExceeded"
             message = f"wall clock limit of {config.wall_clock_limit:.0f}s reached"
             break
+        if keywords_enrichable:
+            observed = "\n".join(
+                str(m.get("content") or "")
+                for m in messages[2:]
+                if m.get("role") == "user"
+            )
+            defined = _seen_definition_names(observed)
+            if defined:
+                task_keywords = _extract_task_keywords(
+                    config.issue_text, defined_names=defined
+                )
+                if len(task_keywords) >= 8:
+                    keywords_enrichable = False
         messages[:] = _cap_messages(messages, config.max_message_chars, task_keywords)
         try:
             reply = model.query(messages)
@@ -1570,8 +1842,42 @@ def _message_chars(messages: list) -> int:
     return sum(len(str(m.get("content") or "")) for m in messages)
 
 
+# Last-wins detection of the file the model is ACTIVELY editing: the target of the
+# most recent write/edit command in an assistant turn. We protect that file's body
+# from being shredded while an unrelated traceback is preserved. Anchored, ordered
+# (last match in the last assistant turn wins) -- no set/hash ordering into output.
+_EDIT_TARGET_RES = (
+    re.compile(r"(?:cat|tee)\s+(?:-a\s+)?(?:<<[-']?\w+['\"]?\s+)?>{1,2}\s*([\w./~-]+)"),
+    re.compile(r">{1,2}\s*([\w./][\w./~-]*\.\w+)"),
+    re.compile(r"\btee\s+(?:-a\s+)?([\w./~-]+)"),
+    re.compile(r"\bsed\s+-i[\w]*\s+(?:-e\s+\S+\s+|'[^']*'\s+|\"[^\"]*\"\s+)?([\w./~-]+)"),
+    re.compile(r"\bpython3?\s+-c\b.*?open\(\s*['\"]([\w./~-]+)['\"]"),
+)
+
+
+def _detect_edit_target(rest: list) -> str:
+    """Scan assistant turns oldest->newest; the LAST write/edit target wins. Returns
+    a basename-or-path string or '' . Deterministic, anchored regex over text only."""
+    target = ""
+    for msg in rest:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content") or ""
+        for rgx in _EDIT_TARGET_RES:
+            for m in rgx.finditer(content):
+                cand = m.group(1).strip().strip("'\"")
+                if not cand or cand in ("/dev/null", "-"):
+                    continue
+                if "." not in cand.rsplit("/", 1)[-1]:
+                    continue
+                target = cand
+    return target
+
+
 def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
-    """Keep system + task; compress old turns in two passes; drop pairs last."""
+    """Keep system + task; compress old turns in two passes; drop pairs last.
+    Additionally: never shred the most-recent observation that shows the body of the
+    file the model is actively editing -- compress an unrelated traceback first."""
     if max_chars <= 0 or _message_chars(messages) <= max_chars:
         return messages
     if len(messages) <= 2:
@@ -1583,10 +1889,28 @@ def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
     recent_start = max(0, len(rest) - _RECENT_MESSAGES_FULL)
     compressed_pass: dict = {}
 
+    # Identify the active edit-target file and the most-recent user/observation turn
+    # that contains its source, so we can keep that owner-file body intact. We only
+    # protect ONE old turn (outside the always-full recent window) -- the freshest
+    # observation of the target's content -- so the budget surface is unchanged.
+    edit_target = _detect_edit_target(rest)
+    protected_idx = None
+    if edit_target:
+        target_base = edit_target.rsplit("/", 1)[-1]
+        needles = [n for n in (edit_target, target_base, target_base.rsplit(".", 1)[0]) if n]
+        for idx in range(recent_start - 1, -1, -1):
+            if rest[idx].get("role") != "user":
+                continue
+            content = rest[idx]["content"]
+            if any(n in content for n in needles):
+                protected_idx = idx
+                break
+
     while rest and _message_chars(pinned + rest) > max_chars:
+        # Recompute the protected index defensively (drops shift indices).
         compress_idx = None
         best_len = 0
-        for idx in range(recent_start):
+        for idx in range(min(recent_start, len(rest))):
             content = rest[idx]["content"]
             clen = len(content)
             if clen <= _COMPRESSED_FLOOR_CHARS:
@@ -1594,7 +1918,20 @@ def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
             passes = compressed_pass.get(idx, 0)
             if passes == 0 and clen <= _COMPRESS_TRIGGER_CHARS:
                 continue
+            # Protect the owner-file observation: keep it at the higher limit and
+            # only after every other compressible turn is already maximally shrunk,
+            # so an unrelated traceback is compressed first and the target body stays.
+            if idx == protected_idx and any(
+                jdx != protected_idx
+                and jdx < min(recent_start, len(rest))
+                and len(rest[jdx]["content"]) > _COMPRESSED_FLOOR_CHARS
+                and compressed_pass.get(jdx, 0) == 0
+                for jdx in range(min(recent_start, len(rest)))
+            ):
+                continue
             limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
+            if idx == protected_idx:
+                limit = _COMPRESSED_MESSAGE_CHARS
             if clen > limit and clen > best_len:
                 best_len = clen
                 compress_idx = idx
@@ -1602,6 +1939,8 @@ def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
         if compress_idx is not None:
             passes = compressed_pass.get(compress_idx, 0)
             limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
+            if compress_idx == protected_idx:
+                limit = _COMPRESSED_MESSAGE_CHARS
             content = rest[compress_idx]["content"]
             shrunk = compress_message_content(content, keywords=keywords, limit=limit)
             if shrunk != content:
@@ -1618,8 +1957,14 @@ def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
             and rest[1].get("role") == "user"
         ):
             rest = rest[2:]
+            if protected_idx is not None:
+                protected_idx -= 2
         else:
             rest = rest[1:]
+            if protected_idx is not None:
+                protected_idx -= 1
+        if protected_idx is not None and protected_idx < 0:
+            protected_idx = None
     return pinned + rest
 
 
@@ -1788,16 +2133,13 @@ def _is_large_repo_task(issue: str) -> bool:
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
     base = build_task_prompt(task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context)
-    # Restore the proven acceptance criteria checklist injection. The checklist forces the agent to
-    # systematically cross-check every single stated requirement and edge case, boosting completeness scores.
-    checklist_txt = ""
-    try:
-        criteria = extract_criteria(issue)
-        if criteria:
-            checklist_txt = "\n\n" + format_checklist(criteria)
-    except Exception:
-        pass
-    prompt = base + checklist_txt + _FILE_TARGET_HINT
+    # NEXT41 CHANGE 2: acceptance-checklist injection REMOVED. The gate-40 deep
+    # analysis found the 5-15 item checklist lengthened prompts and added noise
+    # on large/complex tasks WITHOUT improving patch quality, while the king
+    # injects no checklist. `extract_criteria()` and `format_checklist()` remain
+    # DEFINED in this file but are no longer called here -- the prompt is now
+    # king-exact (task + context only).
+    prompt = base + _FILE_TARGET_HINT
     # NEXT41 CHANGE 3: language-hint injection REMOVED. The `_language_hints()`
     # function and its C++/FEATURE regexes were deleted entirely (the king has
     # no language hints; they were too narrow and overfit). Only the king's 6
@@ -1854,7 +2196,7 @@ def _changed_source_files(patch_text: str, exts: tuple) -> list:
 
 def _run_check(cmd: list, cwd: str) -> Optional[str]:
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=20)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if proc.returncode == 0:
@@ -2078,14 +2420,6 @@ def _syntax_errors(repo_dir: str, patch_text: str) -> list:
     for rel in _changed_source_files(patch_text, (".js", ".mjs", ".cjs")):
         err = _run_check(["node", "--check", rel], repo_dir)
         if err:
-            try:
-                full = os.path.join(repo_dir, rel)
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
-                if "import React" in content or "react" in content.lower() or ("<" in content and ">" in content):
-                    continue
-            except Exception:
-                pass
             broken.append(f"{rel}: {err}")
     for rel in _changed_source_files(patch_text, (".go",)):
         err = _run_check(["gofmt", "-e", rel], repo_dir)
@@ -2600,8 +2934,6 @@ def solve(
                     outcome = recovered
 
         repair_note = ""
-
-        # 3. Repair pass (verify-repair gate)
         try:
             remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
             can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
@@ -2655,9 +2987,45 @@ def solve(
                         adopt = rtest != "fail" and (rep_added >= orig_added)
                     if adopt:
                         outcome = repaired
-                        repair_note += " (repair adopted: %s)" % kind
+                        repair_note = " (repair adopted: %s)" % kind
         except Exception:
-            repair_note += " (repair pass skipped after error)"
+            repair_note = " (repair pass skipped after error)"
+
+        # NEW CRITICAL STRONGEST PART: Secondary recovery run for broken patches!
+        # If the patch is still broken (has syntax errors, or is empty) after the repair pass,
+        # we reset the repository and run a clean, targeted recovery run.
+        try:
+            remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
+            if remaining >= 60:
+                # Check if the current patch is broken
+                reason = _repair_reason(repo_path, outcome.patch, issue_text=issue, check_tests=False)
+                if reason is not None and reason[0] in ("empty", "syntax", "corruption"):
+                    # Reset the repository to clean state
+                    _run_git(["reset", "--hard", "HEAD"], repo_path)
+                    _run_git(["clean", "-fd"], repo_path)
+                    
+                    recovery_prompt = _recovery_prompt(issue)
+                    recovery_max_steps = 18 if _is_large_repo_task(issue) else 12
+                    recovery_config = AgentRunConfig(
+                        repo_dir=repo_path,
+                        model_name=model_name,
+                        base_url=base_url,
+                        auth_token=proxy_token,
+                        max_steps=min(recovery_max_steps, max_steps),
+                        command_timeout=command_timeout,
+                        max_tokens=max_tokens,
+                        max_observation_chars=MAX_OBSERVATION_CHARS,
+                        max_log_chars=MAX_TOTAL_LOG_CHARS,
+                        max_message_chars=MAX_MESSAGE_CHARS,
+                        wall_clock_limit=remaining - 10.0,
+                        issue_text=issue,
+                    )
+                    recovered = run_agent_loop(config=recovery_config, task=build_initial_user_prompt(recovery_prompt, "", ""))
+                    if recovered.patch.strip() and not _syntax_errors(repo_path, recovered.patch):
+                        outcome = recovered
+                        repair_note += " (secondary recovery adopted)"
+        except Exception:
+            pass
 
         # NEXT27 CHANGE 1 (PRIMARY -- hashirama's polish pass):
         # After the verify-repair gate, if the patch is now CORRECT (no repair
@@ -2689,10 +3057,15 @@ def solve(
             # 0.2). Only fire polish when >= 90s remain -- enough for a
             # meaningful refinement; otherwise keep the original correct patch.
             time_remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
-            # Re-enable polish pass but keep it tightly guarded: only fire if >= 100 seconds remain
-            # and there is an actual repair/minimization or test benefit.
-            # GATED BY: ONLY Polish if there are files actually changed and we have plenty of budget left.
-            if polish_reason is None and can_repair and outcome.patch.strip() and time_remaining >= 100:
+            # NEXT41 CHANGE 1: polish mechanism DISABLED. The gate-40 deep
+            # analysis (research/GATE_40_DEEP_ANALYSIS_2026-06-18.md) showed the
+            # polish pass burns 1-3 steps and can REPLACE a working patch with a
+            # degraded one, while the 1262-line king (no polish) consistently
+            # outscores our 2139-line agent. We strip toward king purity by never
+            # firing the polish pass. `_build_polish_task` and
+            # `_polish_worth_adopting` remain DEFINED and king-byte-identical
+            # below; this call site is simply gated off with `and False`.
+            if False and polish_reason is None and can_repair and outcome.patch.strip() and time_remaining >= 90:
                 kind, message = (
                     "polish",
                     "The fix is correct and passes all tests, but we must polish and "
