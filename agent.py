@@ -225,6 +225,7 @@ Never output more than one code block.
 
 Wire every new symbol into its call sites; leave no stub, TODO, placeholder, pass, or unimplemented branch.
 Demonstrate the fix is correct: add a focused regression test that fails before your fix and passes after -- include it in your patch.
+Before your first edit, find the file that DEFINES or OWNS the behavior in the task (grep for definitions; if the task names a path, open that path) -- do not patch callers, tests, or wrappers by mistake.
 On large or multi-file tasks, make your first edit within 4 steps; do not spend more than 3 steps reading before writing.
 Before submitting: re-read every edited region to confirm correctness and no unrelated edits; verify syntax (`python3 -m py_compile` for Python, `node --check` for JS/TS).
 Output only valid source: no stray leading `n` from a broken newline, no literal `$1`/`$2` sed backreference, no duplicated function/method, no blank-line padding, no file-mode changes, and no backup/original copies (edit the real file in place).
@@ -265,18 +266,26 @@ no empty diffs.
 1. MAP EVERY REQUIREMENT. Read the whole task first and list every requirement
    and edge case it states. Do not stop at a partial fix -- a fix that handles
    only part of the task loses.
-2. READ BEFORE YOU EDIT. Open and read the files you will change IN FULL before
-   touching them. Never guess at code structure you have not read.
-3. FIX THE ROOT CAUSE, MATCH THE STYLE. Solve the underlying cause for every
+2. FIND THE RIGHT FILE FIRST. Before any edit, identify the file that OWNS the
+   behavior the task describes -- not a caller, wrapper, test, or config file.
+   If the task names a file path, open that exact path first. If it names a
+   class, function, or symbol, grep for where it is DEFINED (e.g.
+   `grep -rn 'class Foo\\|def foo\\|func Foo' .` or the language equivalent)
+   and edit the definition site, not a mere import or call site. If several
+   files match, prefer the one whose path or name best matches the task subject.
+   Do not edit a plausible-but-wrong file just because it is easier to change.
+3. READ BEFORE YOU EDIT. Open and read the target file IN FULL before touching
+   it. Never guess at code structure you have not read.
+4. FIX THE ROOT CAUSE, MATCH THE STYLE. Solve the underlying cause for every
    requirement and edge case. Mirror the surrounding code style exactly --
    indentation, quote style, and naming conventions. A complete, well-matched
    fix beats a minimal half-fix.
-4. WIRE EVERY NEW SYMBOL. Anything you introduce -- a function, class, method,
+5. WIRE EVERY NEW SYMBOL. Anything you introduce -- a function, class, method,
    route, config key, or export -- must be connected to its call sites and
    actually exercised end-to-end. Leave NOTHING half-built: no stub, no TODO, no
    placeholder, no bare `pass`, no `NotImplemented`, no unimplemented branch. An
    unwired or stubbed change counts as INCOMPLETE and loses the round.
-5. PROVE IT WITH A TEST. Add a focused regression test, a tiny reproduction, or
+6. PROVE IT WITH A TEST. Add a focused regression test, a tiny reproduction, or
    a few assertions (standard library or packages already in the repo) that
    exercise the changed behavior -- they must FAIL on the unfixed code and PASS
    once your fix is in place. Include this in your patch; a clean, focused test
@@ -284,11 +293,11 @@ no empty diffs.
    with a single command to confirm it passes. Only drop the test if you truly
    cannot reproduce the issue -- never ship a failing, trivial, or unrelated
    test just to have one.
-6. RE-READ AND VERIFY. Re-read every region you edited to confirm it is correct,
+7. RE-READ AND VERIFY. Re-read every region you edited to confirm it is correct,
    churn-free, and syntactically valid (`python3 -m py_compile` for Python,
    `node --check` for JS/TS, etc.). Re-scan the task and confirm each requirement
    appears in your diff.
-7. FINISH. When fully done, run exactly:
+8. FINISH. When fully done, run exactly:
 
 ```bash
 echo {sentinel}
@@ -337,6 +346,9 @@ EOF
   unrelated config or metadata (package.json fields, licenses) the task did not
   request. Implement REAL behavior wired to the existing code -- never hardcode or
   fake a result (e.g. `const isQuizMode = true`) just to look correct.
+- RIGHT FILE ONLY. Your patch must edit the file that implements the task's
+  behavior. Fixing the wrong file -- even with valid syntax -- loses the round.
+  If the task names paths or symbols, your diff must touch those targets.
 - COMPLETENESS WINS. Confirm every requirement is handled before finishing; a
   fix that covers the whole task and proves itself correct beats one that stops
   early.
@@ -954,9 +966,116 @@ def execute_command(command: str, *, cwd: str, timeout: int) -> dict:
 def truncate_text(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
-    half = max(1, limit // 2)
-    elided = len(text) - 2 * half
-    return f"{text[:half]}\n[... {elided} characters elided ...]\n{text[-half:]}"
+    elision = "\n[... truncated ...]\n"
+    budget = limit - len(elision)
+    if budget < 2:
+        return text[:limit]
+    half = max(1, budget // 2)
+    return f"{text[:half]}{elision}{text[-half:]}"
+
+
+_MSG_ERROR_LINE_RE = re.compile(
+    r"Traceback \(most recent call last\)|"
+    r"\b(Error|Exception|FAILED|Failure|AssertionError|SyntaxError|"
+    r"TypeError|ValueError|NameError|ImportError|ModuleNotFoundError|"
+    r"panic:|fatal error|ENOENT|No such file)\b",
+    re.I,
+)
+_MSG_CONTEXT_LINES = 2
+_MSG_MAX_PICKED_LINES = 120
+
+
+def _msg_keyword_patterns(keywords: list) -> list:
+    patterns = []
+    for keyword in keywords:
+        term = keyword.strip()
+        if len(term) < 3:
+            continue
+        patterns.append(re.compile(re.escape(term), re.I))
+    return patterns
+
+
+def _msg_lines_with_context(lines: list, indices: set) -> list:
+    picked: set = set()
+    for i in indices:
+        for j in range(max(0, i - _MSG_CONTEXT_LINES), min(len(lines), i + _MSG_CONTEXT_LINES + 1)):
+            picked.add(j)
+    ordered = sorted(picked)
+    if len(ordered) > _MSG_MAX_PICKED_LINES:
+        half = _MSG_MAX_PICKED_LINES // 2
+        ordered = ordered[:half] + ordered[-half:]
+    return [lines[i] for i in ordered]
+
+
+def compress_message_content(text: str, *, keywords: list = None, limit: int) -> str:
+    """Shrink one chat message by keeping error/task-keyword lines; else truncate."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    if not lines:
+        return text
+    hit_indices: set = set()
+    for i, line in enumerate(lines):
+        if _MSG_ERROR_LINE_RE.search(line):
+            hit_indices.add(i)
+    for pattern in _msg_keyword_patterns(keywords or []):
+        for i, line in enumerate(lines):
+            if pattern.search(line):
+                hit_indices.add(i)
+    if not hit_indices:
+        return truncate_text(text, limit)
+    picked_lines = _msg_lines_with_context(lines, hit_indices)
+    compressed = "\n".join(picked_lines)
+    if len(picked_lines) < len(lines):
+        header = (
+            f"[message compressed: {len(picked_lines)} of {len(lines)} lines "
+            f"with errors or task keywords]\n"
+        )
+        compressed = header + compressed
+    if len(compressed) <= limit:
+        return compressed
+    return truncate_text(compressed, limit)
+
+
+_KEYWORD_FILE_RE = re.compile(
+    r"`?([\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|cpp|hpp|c|h|php|rb))\b`?",
+    re.I,
+)
+_KEYWORD_SYMBOL_RE = re.compile(
+    r"`([A-Za-z_][\w.]*)`"
+    r"|\b([A-Z][a-zA-Z0-9]{2,})\b"
+    r"|\b([a-z][a-z0-9]*(?:_[a-z][a-z0-9_]+)+)\b",
+)
+_KEYWORD_SKIP = frozenset({
+    "the", "and", "for", "with", "from", "this", "that", "task", "issue", "file",
+    "files", "test", "tests", "class", "function", "method", "implement", "create",
+    "add", "fix", "update", "change", "remove", "delete", "ensure", "make", "use",
+})
+
+
+def _extract_task_keywords(task_text: str, limit: int = 8) -> list:
+    seen = []
+    for match in _KEYWORD_FILE_RE.finditer(task_text or ""):
+        path = match.group(1).strip().lstrip("./")
+        base = path.rsplit("/", 1)[-1]
+        for term in (path, base, base.rsplit(".", 1)[0] if "." in base else base):
+            low = term.lower()
+            if low in _KEYWORD_SKIP or len(low) < 3:
+                continue
+            if low not in seen:
+                seen.append(low)
+            if len(seen) >= limit:
+                return seen
+    for match in _KEYWORD_SYMBOL_RE.finditer(task_text or ""):
+        term = next(g for g in match.groups() if g)
+        low = term.lower()
+        if low in _KEYWORD_SKIP or len(low) < 3:
+            continue
+        if low not in seen:
+            seen.append(low)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 # ============================================================
@@ -1155,6 +1274,33 @@ _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.DOTALL)
 # several `$` examples is NOT misparsed.
 _DOLLAR_LINE_RE = re.compile(r"(?m)^\s*\$[ \t]+(\S.*?)\s*$")
 _MAX_FORMAT_RETRIES = 3
+_RECENT_MESSAGES_FULL = 6
+_COMPRESS_TRIGGER_CHARS = 800
+_COMPRESSED_MESSAGE_CHARS = 1600
+_COMPRESSED_FLOOR_CHARS = 500
+_MIN_REST_MESSAGES = 4
+_WRITE_DEADLINE_STEP = 8
+
+
+def _write_deadline_message(step: int) -> str:
+    return (
+        f"[Write deadline: step {step} and the repository still has no changes on disk.]\n\n"
+        "You have spent too many turns exploring without editing. STOP reading, grepping, "
+        "or listing. Your NEXT command MUST create or modify a real source file for this "
+        "task (use `cat <<'EOF' > path` for a new file or a targeted in-place edit).\n"
+        "Pick the single most critical missing artifact the task requires (model, route, "
+        "handler, migration, view, or test) and write it now. Do NOT run another read-only "
+        "command."
+    )
+
+
+def _empty_submit_guard_message() -> str:
+    return (
+        "[Submit rejected: the repository has no changes on disk yet.]\n\n"
+        "You ran the completion command but the working tree diff is empty -- no file was "
+        "created or modified. Edit or create at least one real source file for this task, "
+        f"then run `echo {COMPLETION_SENTINEL}` again when the fix is on disk."
+    )
 
 
 def _parse_single_command(reply: str) -> Optional[str]:
@@ -1282,6 +1428,7 @@ class AgentRunConfig:
     max_tokens: int = 8192
     max_observation_chars: int = 16000
     max_log_chars: int = 260000
+    max_message_chars: int = 140000
     wall_clock_limit: float = 0.0
     issue_text: str = ""  # NEXT19: passed through to enable pre-submit checklist
 
@@ -1314,12 +1461,15 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     exit_status = "LimitsExceeded"
     message = f"step limit of {config.max_steps} reached"
     format_retries = 0
+    task_keywords = _extract_task_keywords(config.issue_text)
+    write_deadline_fired = False
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
             exit_status = "TimeExceeded"
             message = f"wall clock limit of {config.wall_clock_limit:.0f}s reached"
             break
+        messages[:] = _cap_messages(messages, config.max_message_chars, task_keywords)
         try:
             reply = model.query(messages)
         except ModelQueryError as exc:
@@ -1346,6 +1496,14 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         output_text = result.get("output") or ""
         log_lines.append(f"[step {step}] $ {command}\n{truncate_text(output_text, 2000)}")
         if _is_submission(output_text, result.get("returncode")):
+            if not collect_repo_patch(config.repo_dir).strip() and step < config.max_steps:
+                messages.append({"role": "user", "content": _empty_submit_guard_message()})
+                log_lines.append(f"[step {step}] empty submit rejected")
+                if not write_deadline_fired:
+                    write_deadline_fired = True
+                    messages.append({"role": "user", "content": _write_deadline_message(step)})
+                    log_lines.append(f"[step {step}] write deadline fired (empty submit)")
+                continue
             # NEXT41 CHANGE 2: pre-submit checklist interception DISABLED. The
             # king submits directly on the completion sentinel with no checklist
             # self-check step. Stripping toward king purity, we drop the
@@ -1376,6 +1534,14 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             remaining_steps=config.max_steps - step,
         )
         messages.append({"role": "user", "content": observation})
+        if (
+            not write_deadline_fired
+            and step >= _WRITE_DEADLINE_STEP
+            and not collect_repo_patch(config.repo_dir).strip()
+        ):
+            write_deadline_fired = True
+            messages.append({"role": "user", "content": _write_deadline_message(step)})
+            log_lines.append(f"[step {step}] write deadline fired (empty patch)")
 
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
@@ -1394,6 +1560,63 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
 def _is_submission(output_text: str, returncode) -> bool:
     lines = output_text.lstrip().splitlines()
     return bool(lines) and lines[0].strip() == COMPLETION_SENTINEL and not returncode
+
+
+def _message_chars(messages: list) -> int:
+    return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _cap_messages(messages: list, max_chars: int, keywords: list) -> list:
+    """Keep system + task; compress old turns in two passes; drop pairs last."""
+    if max_chars <= 0 or _message_chars(messages) <= max_chars:
+        return messages
+    if len(messages) <= 2:
+        return messages
+
+    pinned = [{**m} for m in messages[:2]]
+    rest = [{**m, "content": str(m.get("content") or "")} for m in messages[2:]]
+
+    recent_start = max(0, len(rest) - _RECENT_MESSAGES_FULL)
+    compressed_pass: dict = {}
+
+    while rest and _message_chars(pinned + rest) > max_chars:
+        compress_idx = None
+        best_len = 0
+        for idx in range(recent_start):
+            content = rest[idx]["content"]
+            clen = len(content)
+            if clen <= _COMPRESSED_FLOOR_CHARS:
+                continue
+            passes = compressed_pass.get(idx, 0)
+            if passes == 0 and clen <= _COMPRESS_TRIGGER_CHARS:
+                continue
+            limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
+            if clen > limit and clen > best_len:
+                best_len = clen
+                compress_idx = idx
+
+        if compress_idx is not None:
+            passes = compressed_pass.get(compress_idx, 0)
+            limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
+            content = rest[compress_idx]["content"]
+            shrunk = compress_message_content(content, keywords=keywords, limit=limit)
+            if shrunk != content:
+                rest[compress_idx] = {**rest[compress_idx], "content": shrunk}
+                compressed_pass[compress_idx] = passes + 1
+                continue
+
+        if len(rest) <= _MIN_REST_MESSAGES:
+            break
+
+        if (
+            len(rest) >= 2
+            and rest[0].get("role") == "assistant"
+            and rest[1].get("role") == "user"
+        ):
+            rest = rest[2:]
+        else:
+            rest = rest[1:]
+    return pinned + rest
 
 
 # ============================================================
@@ -1417,6 +1640,7 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
+MAX_MESSAGE_CHARS = 120000
 
 
 def _wall_clock_limit_seconds() -> float:
@@ -1520,6 +1744,11 @@ _CONSTRUCT_VERB_RE = re.compile(
 _API_TASK_HINT = (
     "\n[API task detected: map all files to create/modify before first edit]"
 )
+_FILE_TARGET_HINT = (
+    "\n[Before your first edit: locate the file that DEFINES or OWNS the task "
+    "behavior. Named path -> open it. Named symbol -> grep for its definition "
+    "and edit there, not in callers/tests/config. Read that file in full first.]"
+)
 
 
 def _is_api_route_task(issue: str) -> bool:
@@ -1561,7 +1790,7 @@ def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: 
     # injects no checklist. `extract_criteria()` and `format_checklist()` remain
     # DEFINED in this file but are no longer called here -- the prompt is now
     # king-exact (task + context only).
-    prompt = base
+    prompt = base + _FILE_TARGET_HINT
     # NEXT41 CHANGE 3: language-hint injection REMOVED. The `_language_hints()`
     # function and its C++/FEATURE regexes were deleted entirely (the king has
     # no language hints; they were too narrow and overfit). Only the king's 6
@@ -2304,6 +2533,7 @@ def solve(
             max_tokens=max_tokens,
             max_observation_chars=MAX_OBSERVATION_CHARS,
             max_log_chars=MAX_TOTAL_LOG_CHARS,
+            max_message_chars=MAX_MESSAGE_CHARS,
             wall_clock_limit=WALL_CLOCK_LIMIT_SECONDS,
         )
         run_config.issue_text = issue  # NEXT19: wire issue text for checklist interception
@@ -2340,6 +2570,7 @@ def solve(
                     max_tokens=max_tokens,
                     max_observation_chars=MAX_OBSERVATION_CHARS,
                     max_log_chars=MAX_TOTAL_LOG_CHARS,
+                    max_message_chars=MAX_MESSAGE_CHARS,
                     wall_clock_limit=remaining - 10.0,
                     issue_text=issue,
                 )
@@ -2371,6 +2602,7 @@ def solve(
                     max_tokens=max_tokens,
                     max_observation_chars=MAX_OBSERVATION_CHARS,
                     max_log_chars=MAX_TOTAL_LOG_CHARS,
+                    max_message_chars=MAX_MESSAGE_CHARS,
                     wall_clock_limit=remaining - WALL_CLOCK_RESERVE_SECONDS,
                     issue_text=issue,
                 )
@@ -2435,6 +2667,7 @@ def solve(
                         max_tokens=max_tokens,
                         max_observation_chars=MAX_OBSERVATION_CHARS,
                         max_log_chars=MAX_TOTAL_LOG_CHARS,
+                        max_message_chars=MAX_MESSAGE_CHARS,
                         wall_clock_limit=remaining - 10.0,
                         issue_text=issue,
                     )
@@ -2502,6 +2735,7 @@ def solve(
                     max_tokens=max_tokens,
                     max_observation_chars=MAX_OBSERVATION_CHARS,
                     max_log_chars=MAX_TOTAL_LOG_CHARS,
+                    max_message_chars=MAX_MESSAGE_CHARS,
                     wall_clock_limit=remaining - WALL_CLOCK_RESERVE_SECONDS,
                     issue_text=issue,
                 )
